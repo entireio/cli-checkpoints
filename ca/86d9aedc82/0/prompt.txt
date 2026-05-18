@@ -1,0 +1,315 @@
+summarize the work first
+
+---
+
+Push changes to v1-custom-ref, do not open a PR yet
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>ac55f1115f44c8c33</task-id>
+<tool-use-id>toolu_011o7xnV8pvPq78emAM1iFN9</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/9aabd85b-63a7-4fb6-86ae-e2806747514f/tasks/ac55f1115f44c8c33.output</output-file>
+<status>completed</status>
+<summary>Agent "Code quality review of v1.1 diff" completed</summary>
+<result>Now I have enough material for the review. Here are my findings:
+
+---
+
+## Review findings (v1.1 custom-ref work)
+
+### 1. Triple "span + v2-fatal / v1-warn" block in condensation is extractable (8/10)
+
+**`cmd/entire/cli/strategy/manual_commit_condensation.go:281–328`** — three near-identical write blocks: each opens a perf span, runs a write (some gated on `!v2` or `IsCheckpointsV2Enabled`), branches on `if v2 { record+End+return err } else { Warn(...) }`, then closes the span and captures a duration. The "fatal-in-v2 / warn-otherwise" decision is the most repeated part and would shrink dramatically with a helper like `runGatedWrite(ctx, "write_compact_ref", gate, fatalInV2, fn)` returning `(time.Duration, error)`. I'd extract.
+
+**Fix:** Introduce one helper that wraps perf span + warn/return policy; call it three times.
+
+### 2. Two near-identical `pushCustomRefWithRecovery` call sites in `PrePush` (7/10)
+
+**`cmd/entire/cli/strategy/manual_commit_push.go:53–73`** — the compact-ref and full-ref push blocks differ only in span name (`push_compact_ref` vs `push_full_ref`), ref constant, and warn message. Easy collapse to a `for _, ref := range []struct{name, span string}{...}` loop, or a tiny `pushAndLog(ctx, ps.pushTarget(), refName, spanLabel)` helper.
+
+**Fix:** Loop over `{name: "compact-ref", ref: paths.MetadataCompactRefName}, {name: "full-ref", ref: paths.MetadataFullRefName}` and call a single helper.
+
+### 3. Comments narrating obvious behavior in `PrePush` push blocks (6/10)
+
+**`cmd/entire/cli/strategy/manual_commit_push.go:53, 62`** — `// Always push the v1.1 compact ref` and `// Always push the v1.1 full ref when it exists` restate the code immediately below. With #2 collapsed into a loop, these can go entirely; the loop itself is self-describing.
+
+**Fix:** Remove once #2 is applied; or keep one short comment on the loop header explaining "skip-if-missing semantics from pushCustomRefWithRecovery."
+
+### 4. Repeated "Always called... regardless of v2" comments on `buildExternalCompactTranscript` / `buildInternalCompactTranscript` (6/10)
+
+**`cmd/entire/cli/strategy/manual_commit_condensation.go:561–565, 599–603`** — both helpers grew the same three-line comment block stating that they run unconditionally now. Verbatim duplication, and the comment narrates a removed guard (i.e., explains the absence of code) which is exactly the kind of comment that ages badly.
+
+**Fix:** Delete both blocks. If preservation is desired, leave one short note at the single condense-site that calls both.
+
+### 5. `writeCompactRef` / `writeCommittedV2Full` boilerplate duplication (6/10)
+
+**`cmd/entire/cli/strategy/manual_commit_condensation.go:1643–1665, 1705–1717`** — both functions do the same `remote.FetchURL(ctx) → fallback originRemote → NewV2GitStore → call one method → wrap error`. The only varying parts are the log label, the method (`WriteCompactOnly` vs `WriteFullOnly`), and the error-wrap prefix.
+
+**Fix:** Either inline `NewV2GitStore` construction at the call sites (the `condense` function already has `repo`) and pass the store in, or extract a tiny `newV2Store(ctx, repo)` helper that handles the FetchURL/fallback once.
+
+### 6. `writeFullRef` "alias" misnomer — bypasses the V2GitStore abstraction (5/10)
+
+**`cmd/entire/cli/strategy/manual_commit_condensation.go:1675–1696`** — this function pokes `repo.Storer.SetReference` directly rather than going through any checkpoint package abstraction, while sibling helpers `writeCompactRef` / `writeCommittedV2Full` route through `V2GitStore`. The inconsistency is a small abstraction leak: half the v1.1 writes go through a store, one is raw plumbing. Consider exposing `(*V2GitStore).WriteFullAlias(legacyBranchName, fullRefName)` so all three writes use the same surface.
+
+**Fix:** Move the ref-set into a `V2GitStore` method (or even a `GitStore` method since it's purely v1 territory) so the strategy stays free of plumbing details.
+
+### 7. `comment narrating "what" not "why"` on `getMetadataTree` fallback ladder (5/10)
+
+**`cmd/entire/cli/checkpoint/committed.go:1694–1707`** — the comment says "preferring the v1.1 compact ref, then the v1.1 full ref, and finally the legacy branch," which restates the three `if` branches verbatim. The non-obvious WHY is buried in the second sentence about full.jsonl. Lead with the WHY, drop the ordering narration (the code is the spec).
+
+**Fix:** Trim to ~2 lines: "Metadata reads (CheckpointSummary, session metadata, prompts). Caller must use `getFullTranscriptTree` for full.jsonl, which lives on different refs."
+
+### 8. `// Used by resume/explain to lazy-fetch...` and other narration in `FetchMetadataFullRef` (5/10)
+
+**`cmd/entire/cli/git_operations.go:511–518`** — the doc comment mostly narrates "what's a v1/full ref" rather than the function's contract. The "v1/full is a v1.1 custom ref aliased to the legacy MetadataBranchName commit" sentence duplicates what `paths.MetadataFullRefName`'s godoc already says. Trim to a one-liner on the function's contract (timeout, best-effort, returns error for logging).
+
+**Fix:** Reduce to: "Fetches paths.MetadataFullRefName from origin with full blobs. 2-min timeout; returns error for the caller to log."
+
+### Clean / not flagged
+- **Constants usage:** All new code uses `paths.MetadataCompactRefName` / `paths.MetadataFullRefName` / `paths.MetadataBranchName`. The lone stringly-typed `"entire/checkpoints/v1"` in `resume.go:394` predates this PR.
+- **Leaky abstraction concern (`lookupSessionIndexOnMain`):** No leak — V2GitStore already calls `s.gs.flattenCheckpointEntries` and `s.gs.findSessionIndex` in 8+ existing sites; the new method follows that established pattern, not a new boundary crossing.
+- **Nested conditionals:** Max depth in new code is 2 (`if err != nil { if v2 { ... } }`). No 3+ nesting.
+- **No PR/task references** in code comments. No stale TODOs.
+- **`treeForRef` helper** in `checkpoint/committed.go:1672` is a clean dedupe of `getCompactRefTree`/`getFullRefTree`. No further compression needed.</result>
+<usage><total_tokens>79606</total_tokens><tool_uses>16</tool_uses><duration_ms>104171</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aa20dcd66a9f5bd92</task-id>
+<tool-use-id>toolu_01RmgF2djdjXZvByvyGXw2oA</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/9aabd85b-63a7-4fb6-86ae-e2806747514f/tasks/aa20dcd66a9f5bd92.output</output-file>
+<status>completed</status>
+<summary>Agent "Code reuse review of v1.1 diff" completed</summary>
+<result>I have enough. Let me deliver findings.
+
+---
+
+## Findings
+
+### 1. `pushCustomRefWithRecovery` near-duplicates `pushV2RefsWithRecovery` for the 1-ref case — score ~8/10
+
+**File**: `cmd/entire/cli/strategy/manual_commit_push.go:107-117` (new) vs `cmd/entire/cli/strategy/push_v2.go:70-116` (existing).
+
+Both functions implement the identical recovery state machine: try push → on `errNonFastForward`, `fetchAndMergeRef`, retry once, wrap errors with `"couldn't sync %s"` / `"failed to push %s after sync"`. The only structural differences are:
+- The new function uses single-ref `tryPushRef`; the existing uses batched `tryPushV2Refs`.
+- The new function pre-checks local-ref existence with `repo.Reference(refName, true)`.
+- The new function takes 1 ref instead of a slice.
+
+**Suggestion**: Either (a) reshape `pushV2RefsWithRecovery` to take any refs (drop the v2-specific naming, move it to a generic `push_common.go`) and call it with `[]plumbing.ReferenceName{refName}` for the v1.1 case, or (b) extract the shared core to `tryPushAndRecoverRefs(ctx, target, refs, tryPushFn)` that both call. Today's split means a future bugfix to one path needs to be ported to the other.
+
+### 2. `PrePush` body has two identical compact/full-ref blocks that could collapse to one loop — score ~6/10
+
+**File**: `cmd/entire/cli/strategy/manual_commit_push.go:53-75` (new).
+
+The two blocks for `paths.MetadataCompactRefName` and `paths.MetadataFullRefName` are mechanically identical: open span, call `pushCustomRefWithRecovery`, record error, log warn with the matching `&lt;name&gt;-ref push failed` message, end span.
+
+**Suggestion**: Either loop over `[]struct{name, ref string}{{"compact", paths.MetadataCompactRefName}, {"full", paths.MetadataFullRefName}}`, or — if you take finding 1 — pass both refs in a single slice to a unified recovery function and let it emit one span per ref.
+
+### 3. `lookupSessionIndexOnMain` duplicates lookup logic baked into `writeCommittedMain` / `writeMainCheckpointEntries` — score ~7/10
+
+**File**: `cmd/entire/cli/checkpoint/v2_committed.go:107-144` (new) vs `cmd/entire/cli/checkpoint/v2_committed.go:867-925` (existing).
+
+The `GetRefState` + `flattenCheckpointEntries` + read `CheckpointSummary` at `basePath + paths.MetadataFileName` + call `s.gs.findSessionIndex` is the same opening sequence as `writeCommittedMain`/`writeMainCheckpointEntries`. The user prompt called this out and it's accurate.
+
+**Suggestion**: Extract `readMainCheckpointState(ctx, checkpointID) (*CheckpointSummary, map[string]object.TreeEntry, string, error)` (returning summary, entries, basePath). Both `writeMainCheckpointEntries` and `lookupSessionIndexOnMain` would then call that helper and only differ in what they do with the result.
+
+### 4. `WriteCompactOnly` is a thin shim — wrapping it adds little — score ~5/10
+
+**File**: `cmd/entire/cli/checkpoint/v2_committed.go:72-81` (new).
+
+```go
+func (s *V2GitStore) WriteCompactOnly(ctx context.Context, opts WriteCommittedOptions) (int, error) {
+    if err := validateWriteOpts(opts); err != nil { return 0, err }
+    idx, err := s.writeCommittedMain(ctx, opts)
+    if err != nil { return 0, fmt.Errorf("compact-ref write failed: %w", err) }
+    return idx, nil
+}
+```
+
+This is effectively `writeCommittedMain` plus `validateWriteOpts` and a small error wrap. `WriteCommittedWithSessionIndex` already does validate + call `writeCommittedMain`; if the only difference is "skip the /full write", the function reads more like documentation than logic.
+
+**Suggestion**: Either export `writeCommittedMain` directly (with `validateWriteOpts` moved into it) or keep the shim but consider also dropping `WriteFullOnly`'s validate/wrap layer for symmetry — currently `WriteFullOnly` does validate + lookup + `writeCommittedFullTranscript`. If you keep the shim form, it's fine; the cost is small.
+
+### 5. `getCompactRefTree` / `getFullRefTree` / `treeForRef` parallels `getSessionsBranchTree` — score ~6/10
+
+**File**: `cmd/entire/cli/checkpoint/committed.go:1665-1689` (new) vs `committed.go:1640-1663` (existing).
+
+The new `treeForRef(refName, label)` is exactly `getSessionsBranchTree` minus the origin-fallback branch. `getSessionsBranchTree` could be rewritten as:
+
+```go
+func (s *GitStore) getSessionsBranchTree() (*object.Tree, error) {
+    if tree, err := s.treeForRef(plumbing.NewBranchReferenceName(paths.MetadataBranchName), "sessions"); err == nil {
+        return tree, nil
+    }
+    return s.treeForRef(plumbing.NewRemoteReferenceName("origin", paths.MetadataBranchName), "sessions")
+}
+```
+
+This removes ~20 lines of near-identical commit/tree extraction.
+
+**Suggestion**: Make `treeForRef` the shared primitive and rewrite `getSessionsBranchTree` to use it.
+
+### 6. `getMetadataTree` (GitStore method) and `getMetadataTree` (resume.go free function) share a name but are different things — score ~5/10
+
+**Files**: `cmd/entire/cli/checkpoint/committed.go:1700` (new) and `cmd/entire/cli/resume.go:384` (existing).
+
+Not strictly duplication, but the new `GitStore.getMetadataTree()` collides with the resume.go free function `getMetadataTree(ctx)` in name and overlapping intent (both resolve "where checkpoint metadata lives"). Worth renaming the new one (e.g. `resolveMetadataTreeWithCompactFallback`) so callers / future readers don't conflate them.
+
+### 7. `FetchMetadataFullRef` duplicates the `fetchV2MainFromOrigin` shape — score ~7/10
+
+**File**: `cmd/entire/cli/git_operations.go:519-542` (new) vs `git_operations.go:480-509` (existing).
+
+`FetchMetadataFullRef` is the same shape as `fetchV2MainFromOrigin(shallow=false, noFilter=true)`:
+- `context.WithTimeout(ctx, 2*time.Minute)`
+- `remote.ResolveFetchTarget(ctx, "origin")`
+- Build refspec, call `remote.Fetch` with `NoTags: true, NoFilter: true`
+- Identical timeout error path
+- Identical `formatFilteredFetchError` wrap
+
+The only meaningful differences are the refspec (no staging-ref promotion — `+ref:ref` instead of `+ref:V2MainFetchTmpRef`) and the absence of the `PromoteTmpRefSafely` step.
+
+**Suggestion**: Extract `fetchCustomRefFromOrigin(ctx, refName, opts ...)` where opts include "promote via staging ref" / "fetch directly". Both `fetchV2MainFromOrigin` and `FetchMetadataFullRef` collapse to small wrappers calling that helper with appropriate options. This pattern will only grow as more custom refs are added.
+
+### 8. `fetchV11CustomRefsBestEffort` is fine but its body is two copies of one log-on-error pattern — score ~4/10 (skip if you take finding 7)
+
+**File**: `cmd/entire/cli/resume.go:519-530` (new).
+
+Two near-identical `if err := FetchX(ctx); err != nil { logging.Debug(...) }` blocks. Minor; if finding 7 is implemented (`fetchCustomRefFromOrigin`), this can become a loop over `[]string{paths.MetadataCompactRefName, paths.MetadataFullRefName}`. Skip if you don't refactor finding 7.
+
+### 9. `RefExistsOnRemote` in testenv.go duplicates `BranchExistsOnRemote` — score ~5/10
+
+**File**: `cmd/entire/cli/integration_test/testenv.go:2019-2026` (new) vs `testenv.go:2007-2014` (existing).
+
+Identical implementation; the only difference is `BranchExistsOnRemote` prepends `refs/heads/` and `RefExistsOnRemote` requires fully-qualified input.
+
+**Suggestion**: Implement `BranchExistsOnRemote` as `env.RefExistsOnRemote(bareDir, "refs/heads/"+branchName)` and keep both names for caller readability. One real codepath, two ergonomic facades.
+
+### 10. `GetRefHash` overlaps with `ReadFileFromRef` setup — score ~3/10 (skip)
+
+The new `GetRefHash` (`testenv.go:2031`) uses the standard `git.PlainOpen + repo.Reference` pattern already used in ~10 places in this file. Not worth extracting; it's three lines and the existing call sites don't share a helper either.
+
+### Already-clean / not duplicating
+
+- `paths/paths.go` constants and alias: clean — explicit comment that `V2MainRefName` aliases `MetadataCompactRefName`, with a test (`TestV2MainRefName_IsAliasOfMetadataCompactRefName`) enforcing the invariant. Good.
+- `manual_commit_condensation.go` write-path restructuring: the three new helpers (`writeCompactRef`, `writeFullRef`, `writeCommittedV2Full`) are intentionally parallel and each carries a meaningfully different responsibility (compact ref / write-alias for legacy branch / v2 archive). Don't unify these — collapsing them would obscure the gating logic. The `maintidx` nolint comment already acknowledges this.
+- `v11_dual_write_test.go`: uses existing helpers cleanly; no new duplication with v2_dual_write_test.
+
+### Priority ranking for action
+
+1. (finding 7) `fetchCustomRefFromOrigin` extraction — biggest payoff, will be reused as more custom refs land.
+2. (finding 1) Unify `pushCustomRefWithRecovery` with `pushV2RefsWithRecovery`.
+3. (finding 3) Extract `readMainCheckpointState` so `lookupSessionIndexOnMain` shares its prelude with `writeCommittedMain`.
+4. (finding 5) Rewrite `getSessionsBranchTree` on top of `treeForRef`.
+5. (finding 2) Loop the PrePush compact/full-ref blocks.
+6. Findings 4, 6, 8, 9 — low-importance polish.
+
+### Key file paths
+
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/manual_commit_push.go`
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/push_v2.go`
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/manual_commit_condensation.go`
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/checkpoint/v2_committed.go`
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/checkpoint/committed.go`
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/git_operations.go`
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/resume.go`
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/integration_test/testenv.go`</result>
+<usage><total_tokens>86817</total_tokens><tool_uses>33</tool_uses><duration_ms>186085</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>abcf9dc42815d2a76</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/9aabd85b-63a7-4fb6-86ae-e2806747514f/tasks/abcf9dc42815d2a76.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review of v1.1 diff" completed</summary>
+<result>`tryPushRef` is single-refspec; `tryPushV2Refs` uses `PushWithOptions` with `refSpecsForRefs(refs)` — i.e., batching exists already in the codebase. The new push code doesn't use it.
+
+Let me also verify the `WriteCompactOnly` ↔ `WriteFullOnly` interleaving one more time — the v2 enabled path calls them both. Could we instead just call `WriteCommitted` (which threads sessionIndex)? In v2 mode, the old behavior was `writeCommittedV2(ctx, repo, writeOpts)` which called the full `V2GitStore.WriteCommitted` → does /main + /full in one threaded sequence. The new code splits them via a separately-spelled-out compact path + full path; both are gated on different conditions. But when v2 is enabled, both run, so the sessionIndex re-derivation is pure waste.
+
+I have enough now. Let me write up the findings.
+
+---
+
+## Efficiency review findings — v1.1 custom-ref work
+
+### 1. (8/10) Redundant session-index lookup in v2 mode — `checkpoint/v2_committed.go:103-145`
+
+**Issue.** In v2 mode, condensation runs `WriteCompactOnly` then `WriteFullOnly`. `WriteCompactOnly` returns the session index (line 76, `idx, err := s.writeCommittedMain(...)`), but the caller in `strategy/manual_commit_condensation.go:294-319` discards it. Then `WriteFullOnly` calls `lookupSessionIndexOnMain` to re-derive that exact integer: it re-reads `/main` ref state, calls `flattenCheckpointEntries`, reads the summary JSON blob, and runs `findSessionIndex` again. Pre-v1.1 `V2GitStore.WriteCommittedWithSessionIndex` threaded the index in-memory (`v2_committed.go:50-57`). The split lost that.
+
+**Fix.** Have `writeCompactRef` return the session index up to `CondenseSession`, then pass it into a new `WriteFullOnlyWithSessionIndex(ctx, opts, sessionIndex)` that skips `lookupSessionIndexOnMain`. Or have the strategy condense code call the existing `WriteCommittedWithSessionIndex` and gate the /full part on `IsCheckpointsV2Enabled` internally.
+
+### 2. (8/10) Two sequential `git fetch` subprocess calls on every resume — `resume.go:519-529`, `git_operations.go:519-542`
+
+**Issue.** `fetchV11CustomRefsBestEffort` calls `FetchV2MainRef` then `FetchMetadataFullRef` sequentially. Each spawns a separate `git fetch` subprocess with its own connection/handshake. They use the same remote and the same `NoFilter` settings — only the refspec differs.
+
+**Fix.** Add one new helper (e.g., `FetchV11CustomRefs`) that issues a single `remote.Fetch` with `RefSpecs: ["+refs/.../v2/main:...", "+refs/.../v1/full:..."]` and `NoFilter: true`. The codebase already supports this — `tryPushV2Refs` uses `refSpecsForRefs(refs)` for multi-ref pushes. One fetch, one connection. (`FetchV2MainRef` also promotes via a staging tmp ref, so the combined helper needs to preserve that.)
+
+### 3. (8/10) Up to four sequential `git push` invocations in PrePush — `strategy/manual_commit_push.go:43-82`
+
+**Issue.** `PrePush` now runs: (a) `pushBranchIfNeeded` for the legacy branch, (b) `pushCustomRefWithRecovery` for v1/main, (c) `pushCustomRefWithRecovery` for v1/full, (d) `pushV2Refs` for /full/*. Each is its own `git push` subprocess (separate TCP/SSH handshake and pack negotiation). The codebase already has `tryPushV2Refs`/`pushV2RefsWithRecovery` (`push_v2.go:55-116`) that batches multiple refspecs into one push and handles per-ref non-fast-forward recovery — exactly the contract `pushCustomRefWithRecovery` reimplements ref-by-ref.
+
+**Fix.** Push (b)+(c) — and ideally (d) — through a single `pushV2RefsWithRecovery` call with `[v1/main, v1/full, v2/full/current, ...]`. One pack negotiation instead of three. The legacy branch in (a) is still separate because it has a different push path (different protected-ref handling), but the three custom refs share contracts.
+
+### 4. (7/10) `writeFullRef` makes the legacy branch the only thing that pushes — alias write happens after every condensation even when nothing changed — `strategy/manual_commit_condensation.go:1674-1691`
+
+**Issue.** `writeFullRef` always sets v1/full to the current legacy hash. That's cheap when nothing changed (a SetReference no-op), but the surrounding `perf.Start` span, `Reference` lookup, and storer write fire on every condensation — multiple times per commit on multi-session paths. More importantly, in PrePush we then always call `pushCustomRefWithRecovery` for v1/full, which opens the repo and runs ref existence checks regardless of whether the local v1/full hash actually changed since the last push.
+
+**Fix.** Track whether v1/full's hash actually changed (or just compare local to `refs/remotes/&lt;remote&gt;/.../v1/full` in `pushCustomRefWithRecovery` à la `hasUnpushedSessionsCommon`). Skip the push when remote tracking matches. Same optimization as `pushBranchIfNeeded` already has for branches; custom refs don't get it.
+
+### 5. (7/10) Compact transcript runs unconditionally even when no compact-ref write will happen — `strategy/manual_commit_condensation.go:255-261, 566-621`
+
+**Issue.** The gates inside `buildExternalCompactTranscript` and `buildInternalCompactTranscript` on `IsCheckpointsV2Enabled` were removed. Now every condensation runs compaction — and for external agents (`buildExternalCompactTranscript` → `compactAndRedactExternalTranscript` → `compactor.CompactTranscript`) that shells out to the agent CLI on `agent/types`. For built-in agents `buildInternalCompactTranscript` runs `compactTranscriptForV2` **twice** (scoped + full at line 609 + 613) on every condensation, which can mean re-walking the transcript bytes.
+
+The compact ref **is** always written now, so the compact transcript is genuinely needed. But there are two waste cases worth noting:
+- If `writeCompactRef` fails (network/disk) in v1 mode, we still did the compaction work for nothing — it's logged as warn-and-continue.
+- The fact that `compactTranscriptForV2` runs twice on the same redacted bytes (once scoped, once full) is unchanged from before but is now hit on every condensation instead of only v2 mode.
+
+**Fix.** Acceptance probably OK for v1.1 (this is the new always-on contract), but the duplicate `compactTranscriptForV2` calls in `buildInternalCompactTranscript` are worth folding into one pass that emits both views, or memoizing once-per-(transcript-hash, startLine).
+
+### 6. (7/10) Repo opened 3-4 times per push — `strategy/manual_commit_push.go:95`, `strategy/push_v2.go:818`, `strategy/push_common.go:32`
+
+**Issue.** `pushCustomRefWithRecovery` calls `OpenRepository(ctx)` (which shells out to `git rev-parse --show-toplevel` and re-opens with `git.PlainOpen`). It's called once for v1/main and once for v1/full. `pushBranchIfNeeded` also opens. `pushV2Refs` opens again. Each open is ~1 subprocess + filesystem walk.
+
+**Fix.** Open the repo once at the top of `PrePush`, pass it down. `pushCustomRefWithRecovery`, `pushBranchIfNeeded`, and `pushV2Refs` all take a `*git.Repository` instead of opening their own. (`tryPushRef` doesn't need a repo handle, only `fetchAndMergeRef`/existence-check do.) Combines naturally with finding #3.
+
+### 7. (6/10) `FetchURL` resolved twice per condensation when v2 enabled — `strategy/manual_commit_condensation.go:1651, 1701`
+
+**Issue.** Both `writeCompactRef` and `writeCommittedV2Full` call `remote.FetchURL(ctx)` — each call loads settings and shells out to `git remote get-url origin`. In v2 mode both run on every condensation.
+
+**Fix.** Resolve once at the top of `CondenseSession`, pass the URL (or the `V2GitStore`) into both helpers. Trivial — these are sibling calls a few lines apart.
+
+### 8. (6/10) Dead-code resolver path: `GitStore.getMetadataTree()` — `checkpoint/committed.go:1694-1707`
+
+**Issue.** The new method `GitStore.getMetadataTree()` (prefer compact ref → full ref → legacy) is defined and unit-tested, but the production callers (`ReadCommitted` line 951, `ListCommitted` line 1139, `getFetchingTree` line 1631) were all rerouted to `getFullTranscriptTree` — which **never consults the compact ref**. So the compact-ref-first resolver lives in code, has tests, but is dead in production. Either (a) it's a half-rolled-out refactor that should land its callers, or (b) it should be removed until the v1.2 cutover actually needs it.
+
+**Fix.** Decide: if it's intentional staging, add a comment explaining the v1.2 plan and consider keeping it behind a feature flag rather than shipping unused public surface area. If unintentional, delete it (and its tests) or wire it into a metadata-only read path (e.g., `CheckpointSummary` reads that don't need `full.jsonl`).
+
+### 9. (5/10) TOCTOU-ish ref existence pre-check in `pushCustomRefWithRecovery` — `manual_commit_push.go:99-102`
+
+**Issue.** `pushCustomRefWithRecovery` does `repo.Reference(refName, true)` to skip-on-missing before calling `tryPushRef`. But `tryPushRef` already calls `remote.Push` which would simply fail with a clean error if the local ref didn't exist. The pre-check adds a small redundant cost on every PrePush (small N, but multiplied by the number of refs).
+
+**Fix.** Either drop the pre-check and let `classifyPushFailure` (push_v2.go:37) handle "src refspec does not match any" as a silent skip, or keep the pre-check but combine with finding #6 so it uses the already-opened repo handle.
+
+---
+
+### Summary of priority fixes
+
+1. Thread `sessionIndex` from `WriteCompactOnly` into `WriteFullOnly` so v2-mode condensation stops re-flattening + re-parsing /main on every checkpoint. (#1)
+2. Combine the two resume fetches into one `git fetch` with two refspecs. (#2)
+3. Batch the v1.1 custom-ref pushes (and ideally v2 refs) into a single `pushV2RefsWithRecovery` call. (#3)
+4. Open the repo once per PrePush, thread `*git.Repository` through. (#6)
+5. Cache `FetchURL` per `CondenseSession`. (#7)
+6. Decide whether dead `GitStore.getMetadataTree()` is staged code or accidental — wire it up or remove it. (#8)
+
+The condensation hot path is acceptable in shape (compact transcript work is now genuinely required by the always-on compact ref), but the v2-mode session-index re-derivation in finding #1 is the single highest-impact win, since it converts an in-memory integer into a tree flatten + JSON parse on every commit-time condensation.</result>
+<usage><total_tokens>87618</total_tokens><tool_uses>39</tool_uses><duration_ms>228762</duration_ms></usage>
+</task-notification>

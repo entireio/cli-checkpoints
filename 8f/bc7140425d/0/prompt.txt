@@ -1,0 +1,362 @@
+let's push this and create a stacked PR (on which branch would we put it?)
+
+---
+
+in my open PRs, would we need to fix up more spots where test isolation is leaking?
+
+---
+
+<task-notification>
+<task-id>a3713333efd6b96a7</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-paul--claude-worktrees-cli-woolly-herding-scroll/688d98e0-f0a6-4240-acff-5f1100197cba/tasks/a3713333efd6b96a7.output</output-file>
+<status>completed</status>
+<summary>Agent "Audit PR 1404 test isolation" completed</summary>
+<result>Let me fetch the PR information directly and look at the changed test files from the diff that was provided.
+
+Based on my analysis of the PR #1404 diff provided, here are the test-related findings:
+
+## Audit Report: PR #1404 Test Config/Cache/Keyring Isolation
+
+**New/Modified Tests in the PR:**
+
+1. **`cmd/entire/cli/api/base_url_test.go::TestRejectRemovedAuthEnv`** (lines 157-181 in diff)
+   - **Verdict: FINE**
+   - Uses only `t.Setenv()` and calls pure function `RejectRemovedAuthEnv()` (no I/O, no subprocess spawning, no config/cache access)
+   - No readers/writers of real paths
+   - Fully isolated at unit level
+
+2. **`cmd/entire/cli/auth/client_test.go::TestNewClient_AllowInsecureHTTPPermitsNonLoopback`** (lines 101-110 in diff, modified)
+   - **Verdict: REAL LEAK TODAY**
+   - **Line 105 (old code):** `t.Setenv("ENTIRE_AUTH_BASE_URL", "http://devbox.internal:8787")` — this call was REMOVED in the diff
+   - **Line 106 (new code):** Now directly passes `"http://devbox.internal:8787"` as a parameter to `NewClient()`
+   - The old version read `ENTIRE_AUTH_BASE_URL` from the environment via `auth.NewClient()` → `api.AuthBaseURL()`, which would have been isolated
+   - **Current status after PR:** No env var set, pure parameter passing — CLEAN now
+
+3. **`cmd/entire/cli/auth/client_test.go::TestNewClient_LoopbackHTTPAlwaysPermitted`** (lines 112-118 in diff, modified)
+   - **Verdict: REAL LEAK TODAY (before this PR's fix)**
+   - **Line 113 (old code):** `t.Setenv("ENTIRE_AUTH_BASE_URL", "http://127.0.0.1:8787")` was REMOVED
+   - Now passes server directly to `NewClient("http://127.0.0.1:8787", ...)` — parameter instead of env
+   - After the PR change: CLEAN, no env-based auth base URL reading
+
+4. **`cmd/entire/cli/login_validate_test.go::TestParseLoginServer`** (lines 111-149 in diff)
+   - **Verdict: FINE**
+   - Pure validation function, no I/O, no config/cache/keyring access
+   - Unit tests only, all parallelizable
+   - No subprocess execution
+
+**Production Code Changes Affecting Config/Cache/Keyring:**
+
+- **`cmd/entire/cli/login.go::newLoginCmd()::RunE`** (lines 60-67 in diff)
+  - Calls `auth.NewClient(loginServer, nil, insecureHTTPAuth)` instead of reading `api.AuthBaseURL()` from env
+  - No new default paths introduced
+  - No new env vars the tests need to isolate
+  
+- **`cmd/entire/main.go`** (lines 56-64 in diff)
+  - Calls `api.RejectRemovedAuthEnv()` — checks and **rejects** (not reads) the old env var
+  - No readers/writers of config/cache; this is validation only
+  - Tests don't spawn the main binary with a login command that would hit this
+
+## Summary
+
+**No isolation gaps in PR #1404 itself.** The PR actually **improves** isolation by:
+- Removing reliance on `ENTIRE_AUTH_BASE_URL` environment variable in tests
+- Passing server URLs as parameters instead
+- Gating the old env var (RejectRemovedAuthEnv) before command execution
+
+The old tests that set `ENTIRE_AUTH_BASE_URL` had a latent config-isolation issue, but this PR fixes them by eliminating env var usage in those test paths. All new tests are pure unit tests with no real I/O paths.
+
+**Verdict: APPROVED for config isolation. No rebasing onto testdirs fallback required to fix these tests.**</result>
+<usage><subagent_tokens>22485</subagent_tokens><tool_uses>7</tool_uses><duration_ms>27816</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a583181f528b4a73b</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-paul--claude-worktrees-cli-woolly-herding-scroll/688d98e0-f0a6-4240-acff-5f1100197cba/tasks/a583181f528b4a73b.output</output-file>
+<status>completed</status>
+<summary>Agent "Audit PR 1410 test isolation" completed</summary>
+<result>Excellent. My analysis is correct. Now let me output the final comprehensive report:
+
+## AUDIT REPORT: PR #1410 TEST ISOLATION
+
+### EXECUTIVE SUMMARY
+
+**Overall Assessment: GREEN with MERGE COORDINATION WARNING**
+
+PR #1410 removes the legacy dual-write auth store system (store.go, store_filebackend.go, keyring_timeout.go) and consolidates all credential persistence to contexts.json + file-backed tokenstore. Test isolation is **functionally correct** and all subprocess tests have been properly updated with isolation env vars. However, the PR creates a **clean merge conflict** with PR #1411 (the testdirs fix) on two files, requiring manual resolution.
+
+---
+
+### 1. TEST ISOLATION: FILE-BY-FILE AUDIT
+
+#### A. IN-PROCESS TESTS (All Green)
+
+| Test File | Isolation Method | Status |
+|-----------|---|---|
+| auth/repo_token_test.go | sandboxRepoTokenStores(t): t.Setenv("ENTIRE_CONFIG_DIR") + tokenstore.UseFileBackendForTesting() | ✓ Auto-covered by PR #1411 fallback |
+| auth/contexts_test.go | t.Setenv("ENTIRE_CONFIG_DIR") + tokenstore.UseFileBackendForTesting() | ✓ Auto-covered |
+| auth/contexts_test.go (removed) | MigrateLegacyLoginContext tests deleted entirely | ✓ Legacy path gone |
+| login_validate_test.go | Unit tests, no subprocess/keyring | ✓ No isolation needed |
+| logout_test.go | Refactored to use in-process mocks instead of mockTokenStore | ✓ No disk/keyring access |
+| activity_cmd_test.go | tokenstore.UseFileBackendForTesting() | ✓ Auto-covered |
+| auth_context_test.go | t.Setenv("ENTIRE_CONFIG_DIR") + tokenstore.UseFileBackendForTesting() | ✓ Auto-covered |
+
+#### B. SUBPROCESS TESTS (All Green, but with Gap Analysis)
+
+**cmd/entire/cli/integration_test/login_test.go:197-217**
+
+```go
+cmd := execx.NonInteractive(context.Background(), getTestBinary(), "login", "--insecure-http-auth", "--server", apiBaseURL)
+cmd.Env = append(testutil.GitIsolatedEnv(),
+    "ENTIRE_CONFIG_DIR="+env.RepoDir,
+    "ENTIRE_TOKEN_STORE=file",
+    "ENTIRE_TOKEN_STORE_PATH="+filepath.Join(env.RepoDir, ".entire-test-tokens.json"),
+)
+```
+
+**Isolation Coverage:**
+- contexts.json write: ✓ Routed to env.RepoDir via ENTIRE_CONFIG_DIR (never touches ~/.config/entire)
+- Keyring token write: ✓ File backend via ENTIRE_TOKEN_STORE=file (never touches OS keychain)
+- Old ENTIRE_TEST_AUTH_STORE_FILE removed: ✓ Correct (store_filebackend.go deleted, so env var is unreadable)
+
+**Key Question: Does subprocess touch real config/keyring?**
+- No. The `entire login` subprocess writes ONLY to:
+  1. contexts.json via RecordLoginContext() → contexts.Modify(contexts.DefaultConfigDir())
+  2. Keyring slots via tokenstore.Set() with ENTIRE_TOKEN_STORE=file override
+- The legacy Store/NewStore() call path is gone (file deleted from auth/store.go)
+- Classication: **(a) Real leak today: NONE** — the code that would touch the legacy keyring doesn't exist.
+
+---
+
+### 2. MERGE CONFLICT ANALYSIS WITH PR #1411
+
+PR #1411 added test isolation via three mechanisms:
+1. `internal/testdirs` per-process fallback (in-process `go test` only)
+2. Env vars set in TestMain: ENTIRE_CONFIG_DIR, XDG_CACHE_HOME, ENTIRE_TOKEN_STORE, ENTIRE_TOKEN_STORE_PATH, **ENTIRE_TEST_AUTH_STORE_FILE**
+3. keyring.MockInit() wired into integration_test/setup_test.go and e2e/tests/main_test.go
+
+PR #1410 conflicts on:
+
+| Conflict Point | PR #1411 | PR #1410 | Status |
+|---|---|---|---|
+| cmd/entire/cli/integration_test/setup_test.go:25 | Adds `-tags=authfilestore` build flag | Removes it (`-tags=authfilestore` → "") | Clean git conflict; requires manual resolution |
+| e2e/tests/main_test.go:34 | Adds `os.Setenv("ENTIRE_TEST_AUTH_STORE_FILE", ...)` | Removes it | Clean git conflict; requires manual resolution |
+| cmd/entire/cli/auth/store_filebackend.go | (N/A) | **DELETED** | Semantic conflict: The env var that PR #1411 introduces becomes unreachable dead code |
+
+**Merge Order Impact:**
+
+If **PR #1411 lands first, then #1410**:
+- Git will produce clean conflicts on the two Setenv/build-tag lines
+- After manual merge resolution (keeping #1410's deletions), the functional end state is **correct**: 
+  - Subprocess uses ENTIRE_CONFIG_DIR + ENTIRE_TOKEN_STORE=file (both set)
+  - ENTIRE_TEST_AUTH_STORE_FILE sits unread (harmless env var)
+  - authfilestore build tag is absent (harmless, code doesn't need it)
+  - In-process testdirs fallback still works (PR #1411's core value)
+
+If **PR #1410 lands first, then #1411**:
+- PR #1411 re-adds authfilestore and ENTIRE_TEST_AUTH_STORE_FILE
+- But the code to read them is gone
+- PR #1411's documentation claims keyring.MockInit() is needed, but it never gets called because the code path is dead
+
+**Recommendation:** Merge PR #1411 first (the smaller, non-conflicting isolation foundation), then PR #1410's demolition. The final state is sound: subprocess env isolation is the only mechanism that works post-demolition, and both PRs set those vars correctly.
+
+---
+
+### 3. CONFLICT/OBSOLESCENCE DETAILS
+
+**Removed in PR #1410 (from PR #1411's additions):**
+- cmd/entire/cli/integration_test/setup_test.go:25 — buildCmd adds `-tags=authfilestore`
+  - Reason for removal: auth/store_filebackend.go deleted (gated on `//go:build authfilestore`), so tag is dead
+  - Merge note: "The build tag is no longer needed; subprocess tokens now route through ENTIRE_TOKEN_STORE=file only"
+
+- e2e/tests/main_test.go:34 (and login_test.go:209) — os.Setenv("ENTIRE_TEST_AUTH_STORE_FILE", ...)
+  - Reason for removal: auth/store_filebackend.go deleted (read ENTIRE_TEST_AUTH_STORE_FILE in its init()), so var is unread
+  - Merge note: "ENTIRE_TEST_AUTH_STORE_FILE is vestigial; subprocess token storage routes exclusively through ENTIRE_TOKEN_STORE=file"
+
+---
+
+### 4. NEW SURFACES INTRODUCED
+
+Audited for new env-resolved paths or on-disk files:
+
+| Change | Env-Resolved Path? | New Disk Files? | Notes |
+|---|---|---|---|
+| login.go: adds `--server` flag | No (flag-sourced, not env) | No | Server value is passed to auth.NewClient(), not persisted |
+| login.go: auth.NewClient(server, ...) signature | No | No | Server comes from validated flag, not env |
+| auth/contexts.go: RecordLoginContext() | No | No | iss/handle sourced from token claims, not env; writes to ENTIRE_CONFIG_DIR/contexts.json (env-isolated) |
+| api/base_url.go: RejectRemovedAuthEnv() | Yes (checks for ENTIRE_AUTH_BASE_URL) | No | Rejects the env var (anti-feature); doesn't create new surfaces |
+| auth/provider.go: Deleted | N/A | No | Removed: CurrentProvider(), SetProviderForTest(), ProviderVersionEnvVar, provider dispatch logic |
+| auth/store.go: Deleted | N/A | No | Removed: Store, NewStore(), SaveToken(), GetToken(), LookupCurrentToken() |
+| auth/keyring_timeout.go: Deleted | N/A | No | Removed: keyringTimeout(), ENTIRE_KEYRING_TIMEOUT env var handling |
+
+**Verdict: No new surfaces. Net reduction of 1 env var (ENTIRE_AUTH_BASE_URL rejected), 1 build tag, 1 legacy keyring concept.**
+
+---
+
+### 5. SUMMARY TABLE: FILE-BY-FILE ASSESSMENT
+
+| File/Function | Change | Classification | Real Leak? | Merge Issue? | Action |
+|---|---|---|---|---|---|
+| integration_test/login_test.go | Env isolation: ENTIRE_CONFIG_DIR + ENTIRE_TOKEN_STORE set | (b) Auto-covered | No—legacy Store gone | No | None |
+| integration_test/setup_test.go:25 | Build tag removed | (c) Gap, but safe | No—no code to call it | Yes—#1411 adds it back | Manual merge: keep deletion |
+| e2e/tests/main_test.go:34 | ENTIRE_TEST_AUTH_STORE_FILE removed | (c) Gap, but safe | No—store_filebackend.go gone | Yes—#1411 adds it back | Manual merge: keep deletion |
+| login_test.py:271-284 | loginTestJWT() helper added | (b) Auto-covered | No—in-process helper | No | None |
+| auth/contexts_test.go | MigrateLegacyLoginContext tests deleted | (b) Auto-covered | No—function deleted | No | None |
+| auth/repo_token_test.go | New tests, sandboxRepoTokenStores() | (b) Auto-covered | No—env isolation correct | No | None |
+| logout_test.go | Refactored to in-process mocks | (b) Auto-covered | No—no Store ref | No | None |
+| auth/provider.go | **Deleted** | (d) Obsolescence | N/A—code gone | No (clean delete) | None |
+| auth/store.go | **Deleted** | (d) Obsolescence | N/A—code gone | No (clean delete) | None |
+| auth/keyring_timeout.go | **Deleted** | (d) Obsolescence | N/A—code gone | No (clean delete) | None |
+| auth/store_filebackend.go | **Deleted** | (d) Obsolescence | N/A—code gone | Yes—semantic: ENTIRE_TEST_AUTH_STORE_FILE will be set but unread | Post-merge: Document that var is unused |
+
+---
+
+### FINAL VERDICT
+
+**TEST ISOLATION: PASS** ✓
+- All modified test functions correctly isolate config/cache/keyring via t.Setenv() or env list on subprocess.
+- No real leaks to ~/.config/entire, ~/.cache/entire, or OS keychain.
+- Subprocess tests use ENTIRE_CONFIG_DIR + ENTIRE_TOKEN_STORE=file, which are honored by the binary.
+
+**NEW SURFACES: PASS** ✓
+- No new env-resolved paths or disk files.
+- Net reduction of surfaces (removed ENTIRE_AUTH_BASE_URL, ENTIRE_KEYRING_TIMEOUT, legacy store).
+
+**MERGE COORDINATION: MANUAL RESOLUTION REQUIRED** ⚠️
+- PR #1411 and #1410 both touch setup_test.go and e2e/tests/main_test.go.
+- Conflicts are clean (build tag, env var) but require manual merge.
+- Functional end state after merge is **correct**: subprocess isolation works via env vars; legacy code is gone.
+- Recommend: Merge PR #1411 first (foundation), then PR #1410 (demolition). Final state is sound.
+
+---
+
+### CONFIDENCE LEVEL
+
+**Very High (95%+)**
+
+Reasoning:
+- All test files audited in detail
+- Merge conflict scopes identified precisely (specific lines)
+- Subprocess isolation validated against token write paths (RecordLoginContext + tokenstore)
+- No env-resolved path surprises (iss sourced from token claims, not env)
+- Classification rubric applied consistently</result>
+<usage><subagent_tokens>61173</subagent_tokens><tool_uses>21</tool_uses><duration_ms>106690</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ad337412fa0bddcb2</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-paul--claude-worktrees-cli-woolly-herding-scroll/688d98e0-f0a6-4240-acff-5f1100197cba/tasks/ad337412fa0bddcb2.output</output-file>
+<status>completed</status>
+<summary>Agent "Audit PR 1402 test isolation" completed</summary>
+<result>ANOTHER LEAK! Line 85 in data_api.go:
+```go
+_, _ = MigrateLegacyLoginContext() //nolint:errcheck
+```
+
+Same issue - calls MigrateLegacyLoginContext which hits the OS keyring.
+
+Now let me see if the data_api_test.go is properly isolating. Looking at the tests in data_api_test.go on lines 39-67, 71-85, 92-144:
+
+1. TestResolveDataAPIToken_FallbackWhenDiscoveryUnavailable: 
+   - Sets t.Setenv("ENTIRE_CONFIG_DIR", t.TempDir())
+   - Stubs the discovery seam
+   - Does NOT stub NewStore() so MigrateLegacyLoginContext will hit OS keyring!
+
+2. TestResolveDataAPIToken_SurfacesSelectionError:
+   - Sets t.Setenv("ENTIRE_CONFIG_DIR", t.TempDir())
+   - Stubs the discovery seam
+   - Does NOT stub NewStore() so will hit OS keyring!
+
+3. TestResolveDataAPIToken_ExchangesForDataHostOrigin:
+   - Sets t.Setenv("ENTIRE_CONFIG_DIR", t.TempDir())
+   - Stubs the discovery seam
+   - Does NOT stub NewStore() so will hit OS keyring!
+
+Now let me write up the complete audit findings:
+
+## AUDIT FINDINGS FOR PR #1402
+
+Based on examination of the production code changes and test isolation patterns, I've identified the following findings:
+
+### REAL LEAKS (Category A) - Hit OS keyring/real state today:
+
+**1. repo_token.go:76 - NewRepoTokenSource calls MigrateLegacyLoginContext()**
+- **File**: cmd/entire/cli/auth/repo_token.go, line 76
+- **Issue**: Calls `MigrateLegacyLoginContext()` which at auth/contexts.go:164 calls `NewStore().GetToken(api.AuthBaseURL())`. This hits the OS keyring unless authfilestore build tag is set.
+- **Test Impact**: Tests in repo_token_test.go (TestRepoScopedToken_InvalidTarget, TestRepoScopedToken_WireForm, TestRepoScopedToken_DiscoveryErrorSurfaces, TestRepoTokenSource_ReMintSkipsDiscovery) call seedRepoTokenContext which calls sandboxRepoTokenStores, which does NOT override the CLI's auth/Store backend.
+- **Subprocess/Env Gap**: No subprocess issue (in-process only), but the keyring access is not guarded by env vars.
+- **Coverage by testdirs**: NO - testdirs only covers contexts.DefaultConfigDir, discovery.DefaultCacheDir, and internal tokenstore, not the CLI's auth/Store keyring access.
+
+**2. data_api.go:85 - ResolveDataAPIToken calls MigrateLegacyLoginContext()**
+- **File**: cmd/entire/cli/auth/data_api.go, line 85
+- **Issue**: Same as above - calls `MigrateLegacyLoginContext()` which hits OS keyring.
+- **Test Impact**: Tests in data_api_test.go (TestResolveDataAPIToken_FallbackWhenDiscoveryUnavailable, TestResolveDataAPIToken_SurfacesSelectionError, TestResolveDataAPIToken_ExchangesForDataHostOrigin) set ENTIRE_CONFIG_DIR but do NOT override the auth/Store backend.
+- **Coverage by testdirs**: NO - same as above.
+
+### AUTO-COVERED AFTER TESTDIRS REBASE (Category B):
+
+**1. repo_token.go:80 - contexts.DefaultConfigDir() and discovery.DefaultCacheDir()**
+- **File**: cmd/entire/cli/auth/repo_token.go, line 80
+- **Issue**: Calls `contexts.DefaultConfigDir()` and `discovery.DefaultCacheDir()` without explicit env overrides.
+- **Tests**: seedRepoTokenContext sets ENTIRE_CONFIG_DIR, so already covered.
+- **After rebase**: Will be auto-covered by testdirs fallback for any test that doesn't set ENTIRE_CONFIG_DIR.
+
+**2. data_api.go:91 - contexts.DefaultConfigDir() and discovery.DefaultCacheDir()**
+- **File**: cmd/entire/cli/auth/data_api.go, line 91
+- **Issue**: Same as above.
+- **Tests**: All data_api_test.go tests set ENTIRE_CONFIG_DIR, so already covered.
+- **After rebase**: Will be auto-covered by testdirs fallback.
+
+### FINE (Category C):
+
+**1. repo_token_test.go - All test isolation**
+- Properly isolates:
+  - ENTIRE_CONFIG_DIR via t.Setenv (covers contexts.json reads for MigrateLegacyLoginContext at contexts.go:180)
+  - tokenstore via tokenstore.UseFileBackendForTesting (covers internal tokenstore access)
+  - resolveContextForCluster via stubResolveContextForCluster (avoids network/cache reads)
+  - HTTP transport via SetRepoExchangeTransportForTest
+- Exception: Does NOT isolate CLI's auth/Store backend (keyring access in MigrateLegacyLoginContext:164)
+
+**2. data_api_test.go - Test isolation**
+- Properly isolates:
+  - ENTIRE_CONFIG_DIR via t.Setenv
+  - tokenstore via tokenstore.UseFileBackendForTesting
+  - Discovery via stubResolveContextForAPI
+  - HTTP via mock httptest servers
+- Exception: Does NOT isolate CLI's auth/Store backend
+
+**3. repo_mirror_test.go::TestWaitForMirrorClone_TimeoutBoundsAuthorization**
+- Uses mock transport (failRoundTripper) and patches newRepoTokenSource
+- No disk or keyring access - FINE
+
+**4. oauth_test.go::TestPostOAuthToken_ErrorCode**
+- Uses httptest.NewServer for all network calls
+- No disk or keychain access - FINE
+
+### SUMMARY
+
+**Real leaks today**: 2 call sites (repo_token.go:76, data_api.go:85) in production code that call MigrateLegacyLoginContext() without isolating the CLI's auth/Store backend. The tests don't override the keyring access, so when run without the `authfilestore` build tag (which the default `test` task doesn't use), these will attempt to read from the OS keyring.
+
+**Auto-covered by testdirs rebase**: The directory-based config/cache calls (DefaultConfigDir, DefaultCacheDir) are already guarded by explicit env vars in tests and will get automatic fallback from testdirs for any missing ones.
+
+**Not covered by testdirs**: The CLI's auth/Store backend keyring access has no automatic fallback in testdirs. It requires either the `authfilestore` build tag + ENTIRE_TEST_AUTH_STORE_FILE env var, or explicit test setup to override chooseBackend.</result>
+<usage><subagent_tokens>66081</subagent_tokens><tool_uses>64</tool_uses><duration_ms>216013</duration_ms></usage>
+</task-notification>
+
+---
+
+there are some PR comments on https://github.com/entireio/cli/pull/1411.  They might be junk, let's consider them in turn.
+
+---
+
+okay, push and respond to the review comments - only one sentence each, with link to d1a2dd033d5 as appropriate.
+
+---
+
+okay, there are more comments, and i actually agree with them.

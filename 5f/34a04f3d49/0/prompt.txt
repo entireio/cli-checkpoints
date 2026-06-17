@@ -1,0 +1,399 @@
+I have the following use case:
+
+I start a claude session with a new branch to experiment. some commits are added but it's not done yet. Now I switch to something else and usually I have a few worktrees in parallel. But sometimes I'm not going to pick up what I left for a while. 
+
+Now "entire resume" easily let's me pickup a branch again but it means I need to remember which branch it was and what I worked on. I wonder if we could have some automated use case where I can list stoped sessions with `entire resume` and more easily switch to them (checking out the branch, giving me the right resume command)
+
+---
+
+<task-notification>
+<task-id>a32cbbe688c54e813</task-id>
+<tool-use-id>toolu_01H5FxJxHC1TFL526MAHzrqY</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/d7eb2c7b-65ce-4dbe-b20a-285326019897/tasks/a32cbbe688c54e813.output</output-file>
+<status>completed</status>
+<summary>Agent "Map session list and resume commands" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect! Now I have enough information. Let me create a comprehensive report with all the findings:
+
+## Session Management Investigation Report
+
+Based on my thorough investigation of the Entire CLI codebase, here are the detailed findings:
+
+---
+
+### 1. **`entire session resume` Command**
+
+**File:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/resume.go` (lines 30-66, 68-142)
+
+**Arguments:** Takes a single required argument: `&lt;branch&gt;` name
+
+**Behavior:**
+```go
+// Lines 36-49 from resume.go:
+Long: `Switch to a local branch and resume the agent session from its last commit.
+
+This command:
+1. Checks out the specified branch
+2. Finds the session ID from commits unique to this branch (not on main)
+3. Restores the session log if it doesn't exist locally
+4. Shows the command to resume the session
+
+If the branch doesn't exist locally but exists on origin, you'll be prompted
+to fetch it.
+
+If newer commits without checkpoints exist on the branch (e.g., after merging main
+or cherry-picking from elsewhere), this operation will reset your Git status to the
+most recent commit with a checkpoint.  You'll be prompted to confirm resuming in this case.`,
+```
+
+**What it does:**
+- Checks out the branch (with optional fetch from origin if needed, or skips with `--force`)
+- Finds the most recent checkpoint on branch-only commits (not inherited from main)
+- Restores the session log from checkpoint metadata (via `resumeSession()`)
+- Displays the command to continue the session with the agent
+- Distinguishes between "newer commits without checkpoints" (counted as branch work) and merge commits (not counted)
+
+**Key quote on session restoration** (lines 740-797):
+```go
+func resumeSession(ctx context.Context, w, errW io.Writer, metadata *strategy.CheckpointInfo, force bool) error {
+    // ...
+    // Use RestoreLogsOnly via LogsOnlyRestorer interface for multi-session support
+    // Create a logs-only rewind point with Agent populated (same as rewind)
+    point := strategy.RewindPoint{
+        IsLogsOnly:   true,
+        CheckpointID: checkpointID,
+        Agent:        metadata.Agent,
+    }
+    sessions, restoreErr := strat.RestoreLogsOnly(ctx, w, errW, point, force)
+```
+
+---
+
+### 2. **`entire session list` Command**
+
+**File:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/sessions.go` (lines 318-388)
+
+**What it lists:**
+- All sessions (both active and ended) across all worktrees
+- Sorted by `StartedAt` descending (newest first)
+- Returns `[]` empty array for no sessions
+
+**Output fields** (displayed in human-readable card format, lines 409-447):
+- **Line 1:** Agent name, model name (if set), worktree identifier, session ID, last checkpoint ID
+- **Line 2:** First prompt (truncated to 60 runes with "...")
+- **Line 3:** Status (phase label), started time, last activity time (if &gt; 1 minute), token count
+
+**JSON mode** (`--json` flag, lines 360-406):
+```go
+type sessionInfoJSON struct {
+    SessionID      string         `json:"session_id"`
+    Agent          string         `json:"agent"`
+    Model          string         `json:"model,omitempty"`
+    Status         string         `json:"status"`
+    WorktreeID     string         `json:"worktree_id,omitempty"`
+    WorktreePath   string         `json:"worktree_path,omitempty"`
+    StartedAt      time.Time      `json:"started_at"`
+    EndedAt        *time.Time     `json:"ended_at,omitempty"`
+    LastActive     *time.Time     `json:"last_active,omitempty"`
+    Turns          int            `json:"turns"`
+    Checkpoints    int            `json:"checkpoints"`
+    LastCheckpoint string         `json:"last_checkpoint_id,omitempty"`
+    Tokens         *tokenInfoJSON `json:"tokens,omitempty"`
+    LastPrompt     string         `json:"last_prompt,omitempty"`
+    FilesTouched   []string       `json:"files_touched,omitempty"`
+}
+```
+
+---
+
+### 3. **`entire session info` and `entire session current`**
+
+**File:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/sessions.go` (lines 461-533) and `session_current.go` (lines 12-56)
+
+**`session info &lt;session-id&gt;`:**
+- Shows detailed state for a specific session (active or ended)
+- Supports three output modes:
+  - Default: human-readable summary with all details (agent, model, status, worktree, timing, token usage, checkpoints, files touched)
+  - `--json`: metadata-only JSON envelope (same as `buildSessionInfoJSON`)
+  - `--transcript`: streams raw agent transcript bytes to stdout in agent's native format (JSONL for Claude/Cursor, JSON for Gemini)
+
+**`session current`:**
+- Shows the most recently active session for the current worktree
+- Uses `strategy.FindMostRecentSession(ctx)` which:
+  - Filters sessions to current worktree first
+  - Falls back to most recently started session if none match worktree
+  - Prefers sessions by `LastInteractionTime` over `StartedAt`
+- Supports same three output modes as `info`
+
+---
+
+### 4. **Session State Model**
+
+**Location:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/session/state.go` (lines 82-286)
+
+Session state is the struct `State` (aliased as `strategy.SessionState` in `manual_commit_types.go` line 29):
+
+```go
+// Lines 84-286 from session/state.go - key fields only:
+type State struct {
+    SessionID              string                    // Unique session identifier
+    BaseCommit             string                    // Current shadow branch base commit
+    AttributionBaseCommit  string                    // Reference point for attribution calculations
+    WorktreePath           string                    // Absolute path to worktree root
+    WorktreeID             string                    // Internal git worktree identifier (empty for main)
+    StartedAt              time.Time                 // When session started
+    EndedAt                *time.Time                // When session was closed (nil = still active/not cleanly closed)
+    Phase                  Phase                     // Lifecycle stage: "idle", "active", or "ended"
+    LastInteractionTime    *time.Time                // Last agent-interaction event timestamp
+    StepCount              int                       // Number of checkpoints created
+    AgentType              types.AgentType           // Agent identifier (e.g., "Claude Code", "Gemini CLI")
+    ModelName              string                    // LLM model name
+    LastPrompt             string                    // Most recent user prompt (truncated, ~100 runes)
+    LastCheckpointID       id.CheckpointID           // Most recent checkpoint ID
+    FilesTouched           []string                  // Files modified/created/deleted
+    TokenUsage             *agent.TokenUsage         // Input/output/cache token counts
+    SessionTurnCount       int                       // Number of prompts/turns in session
+    TranscriptPath         string                    // Path to live transcript file
+    // ... plus many more fields for state machine, attribution, compaction tracking
+}
+```
+
+**Key fields for your feature design:**
+- ✓ Stores **git branch** via periodic shadow branch naming (in `BaseCommit`, not directly)
+- ✓ Stores **worktree path** and **worktree ID** (lines 102-107)
+- ✓ Stores **last activity timestamp** (`LastInteractionTime`, line 167)
+- ✓ Stores **status/phase** (idle/active/ended) (line 118)
+- ✓ Stores **first/last prompt** (line 277, limited to ~100 runes)
+- ✓ Stores **agent type** (line 229)
+
+---
+
+### 5. **Stopped vs Active Sessions**
+
+**File:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/session/phase.go` (lines 15-22)
+
+Phase values:
+```go
+const (
+    PhaseActive Phase = "active"  // Agent is working on a turn
+    PhaseIdle   Phase = "idle"    // Session exists but no turn is active
+    PhaseEnded  Phase = "ended"   // Session has been explicitly closed
+)
+```
+
+**How system knows a session is "stopped":**
+
+1. **`session stop` command** marks session as ended by:
+   - Setting `Phase = "ended"` via state machine transition `EventSessionStop`
+   - Setting `EndedAt = time.Now()` (lines 1106 in lifecycle.go)
+   - Quote from `markSessionEnded()` (lifecycle.go lines 1096-1116):
+   ```go
+   func markSessionEnded(ctx context.Context, event *agent.Event, sessionID string) error {
+       mutErr := strategy.MutateSessionState(ctx, sessionID, func(state *strategy.SessionState) error {
+           if transErr := strategy.TransitionAndLog(ctx, state, session.EventSessionStop, ...); transErr != nil {
+               // ...
+           }
+           now := time.Now()
+           state.EndedAt = &amp;now
+           return nil
+       })
+   ```
+
+2. **Active detection** (sessions.go lines 279-290):
+   ```go
+   func filterActiveSessions(states []*strategy.SessionState) []*strategy.SessionState {
+       var active []*strategy.SessionState
+       for _, s := range states {
+           if s == nil { continue }
+           if s.Phase != session.PhaseEnded &amp;&amp; s.EndedAt == nil {
+               active = append(active, s)
+           }
+       }
+       return active
+   }
+   ```
+   A session is active if: `Phase != "ended"` AND `EndedAt == nil`
+
+---
+
+### 6. **Worktree Awareness**
+
+**Storage:** Session state is **shared across all worktrees** (line 30 in session_state.go):
+```go
+// This is stored in the git common dir so it's shared across all worktrees.
+func getSessionStateDir(ctx context.Context) (string, error) {
+    commonDir, err := GetGitCommonDir(ctx)  // .git/ (not .git/worktrees/&lt;name&gt;/)
+    if err != nil {
+        return "", err
+    }
+    return filepath.Join(commonDir, session.SessionStateDirName), nil
+}
+```
+Location: `.git/entire-sessions/{session-id}.json`
+
+**Per-session worktree tracking:**
+Each session record stores both:
+- `WorktreePath` (absolute path to worktree root)
+- `WorktreeID` (internal git worktree identifier, empty for main worktree)
+
+**Resume handling across worktrees** (session_state.go lines 134-178):
+```go
+func FindMostRecentSession(ctx context.Context) string {
+    states, err := ListSessionStates(ctx)
+    
+    // Scope to current worktree to prevent cross-worktree pollution.
+    worktreePath, wpErr := paths.WorktreeRoot(ctx)
+    if wpErr == nil &amp;&amp; worktreePath != "" {
+        var filtered []*SessionState
+        for _, s := range states {
+            if s.WorktreePath == worktreePath {  // Filter by current worktree
+                filtered = append(filtered, s)
+            }
+        }
+        if len(filtered) &gt; 0 {
+            states = filtered  // Use filtered list if matches exist
+        }
+        // If no sessions match the worktree, fall back to all sessions
+    }
+    
+    // Sort by LastInteractionTime, fall back to StartedAt
+    var best *SessionState
+    for _, s := range states {
+        if s.LastInteractionTime == nil { continue }
+        if best == nil || s.LastInteractionTime.After(*best.LastInteractionTime) {
+            best = s
+        }
+    }
+    if best != nil { return best.SessionID }
+    
+    // Fallback: return most recently started session
+    for _, s := range states {
+        if best == nil || s.StartedAt.After(best.StartedAt) {
+            best = s
+        }
+    }
+    if best != nil { return best.SessionID }
+    return ""
+}
+```
+
+**Resume logic** (resume.go lines 144-242):
+- When resuming from a branch, the user explicitly checks out that branch first
+- The session's `WorktreePath` is preserved in state (set during session init, line 321 in manual_commit_session.go)
+- Session logs are restored to the agent's canonical session directory in the **current worktree** (lines 764-772):
+  ```go
+  repoRoot, err := paths.WorktreeRoot(ctx)  // Current worktree root
+  sessionDir, err := ag.GetSessionDir(repoRoot)  // Agent's session dir in current worktree
+  if err := os.MkdirAll(sessionDir, 0o700); err != nil { ... }
+  ```
+
+This ensures resuming a session restores logs to the correct worktree's agent session directory, regardless of where the session was originally created.
+
+---
+
+**Summary:** Session state is globally shared (stored in `.git/`), but each session record stores its originating worktree path. The resume flow handles cross-worktree sessions by filtering to the current worktree first, falling back to most recent if no match, and restoring session logs to the current worktree's agent directory.</result>
+<usage><subagent_tokens>68798</subagent_tokens><tool_uses>35</tool_uses><duration_ms>105653</duration_ms></usage>
+</task-notification>
+
+---
+
+"go run cmd/entire/main.go resume" is not showing anything for over a minute wait time now, still running
+
+---
+
+is it now worktree aware?
+
+---
+
+there is this session I had before 4f5c58db-00cd-4a97-a1f6-80809fcfb00a it's not showing up, can you check?
+
+---
+
+or a clean shutdown that fires the stop hook
+
+if I type "exit" in claude, isn't that a clean shutdown?
+
+---
+
+prompt_input_exit <- what could this mean then it sounds like "exit"
+
+---
+
+<task-notification>
+<task-id>ad4e213bf6f3a640e</task-id>
+<tool-use-id>toolu_01YAhdcovtu8g2ZcATwicX9E</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/d7eb2c7b-65ce-4dbe-b20a-285326019897/tasks/ad4e213bf6f3a640e.output</output-file>
+<status>completed</status>
+<summary>Agent "Define prompt_input_exit reason" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect. I now have the authoritative answer from the official Claude Code documentation. Let me provide you with precise answers to each question:
+
+## Answers (Cited from Official Documentation)
+
+### 1. **What `prompt_input_exit` means**
+
+From the **hooks.md** documentation, `prompt_input_exit` is triggered when **the user exits the session through the prompt input interface** — specifically keyboard-initiated exits.
+
+### 2. **Does it correspond to keyboard exits (Ctrl-C/Ctrl-D)?**
+
+**Yes, explicitly.** According to the **interactive-mode.md** documentation:
+
+- **Ctrl+C** (when nothing is running): First press clears the prompt input; second press **exits Claude Code**
+- **Ctrl+D**: **Exit Claude Code session** (EOF signal)
+
+Both of these keyboard actions trigger `prompt_input_exit` in the SessionEnd hook.
+
+### 3. **Does typing the literal word "exit" or "quit" produce `prompt_input_exit`?**
+
+**No.** The documentation makes clear that:
+- Typing "exit" or "quit" as text would be **sent to the model as a normal prompt** — not a session termination
+- Only **keyboard signals** (Ctrl+C on the second press, or Ctrl+D) trigger `prompt_input_exit`
+- Typing the word "exit" produces no SessionEnd hook at all — it's just conversation text
+
+### 4. **Other `reason` values** (from hooks.md table):
+
+| Reason | Triggered By |
+|--------|--------------|
+| `clear` | User runs `/clear` command |
+| `resume` | User runs `--resume` or `--continue` flag, or `/resume` command |
+| `logout` | User logs out |
+| `bypass_permissions_disabled` | Bypass permissions mode is disabled |
+| `other` | Any other session termination reason |
+
+---
+
+## Summary
+
+**`prompt_input_exit` is definitively the keyboard quit signal** — Ctrl+C (second press) or Ctrl+D at the interactive prompt input box. Typing the word "exit" does not produce it; that's just a normal message sent to Claude.
+
+**Sources:**
+- [Claude Code hooks documentation](https://code.claude.com/docs/en/hooks.md)
+- [Claude Code interactive mode documentation](https://code.claude.com/docs/en/interactive-mode.md)</result>
+<usage><subagent_tokens>32151</subagent_tokens><tool_uses>2</tool_uses><duration_ms>13615</duration_ms></usage>
+</task-notification>
+
+---
+
+question: could we capture the pid in one of the hooks on a session and then when looking for active/idle session check if the pid is still active and is a claude code session (the same thing we would need for codex too)
+
+---
+
+What happens if I resume a session?
+
+---
+
+What happens if I resume a session? more specific the case: Session is idle, I type exit and resume it again. Will we update the pid time pair in this case?
+
+---
+
+I think we should pause on this and first commit what we have and maybe create a PR and then we can work on this approach on a new branch.
+
+---
+
+<task-notification>
+<task-id>b3f6uczld</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/d7eb2c7b-65ce-4dbe-b20a-285326019897/tasks/b3f6uczld.output</output-file>
+<status>completed</status>
+<summary>Background command "Run full pre-commit gate (fmt, lint, test:ci)" completed (exit code 0)</summary>
+</task-notification>

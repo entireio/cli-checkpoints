@@ -1,0 +1,152 @@
+can you review this branch / PR?
+
+---
+
+can you add this as a finding to the trail? "entire trail finding --help" should be all what you need, the trail id is 518
+
+---
+
+ok, on main branch now: can we take a look why --line/--start-line is not working?
+
+---
+
+The issue is a bit: Would I post a review when I'm not on that local checked out branch. But I guess we could add a safety check for that? Like if the branch for the trail matches local AND the file is not having uncommited changes, then we auto populate, otherwise we error?
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>aa3054ee88851ee78</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/5c82f63f-13eb-48d6-b5e8-778f0ee0540f/tasks/aa3054ee88851ee78.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Task: altitude review of the `selected_text` auto-read fix. I read the diff plus the existing `verifyTrailReviewHead`/`apply` flow, `startTrailReview`, and all callers. Four findings; one is a clear win, one is a judgment call, two are "altitude is fine / note only."
+
+---
+
+**1. Duplicated head-vs-local-HEAD mechanism (clear finding)**
+`trail_review_cmd.go:828` `verifyTrailHeadMatchesLocal` vs `:1053` `verifyTrailReviewHead`. Both do the identical mechanism: `strings.TrimSpace(stringPtrValue(headSHA))` → empty returns nil → `resolveGitRev(ctx,"HEAD")` → compare → format a mismatch error. The *only* differences are where the want-SHA comes from (`*string` arg vs `state.CodeVersion.HeadSHA`) and the error wording ("…before applying" vs "…pass --selected-text").
+- **Deeper form:** extract the shared plumbing, e.g. `compareLocalHead(ctx, want string) (got string, ok bool, err error)` (empty want ⇒ ok=true). Both callers keep their own SHA-extraction and tailored message but share the trim/resolve/compare. `verifyTrailReviewHead` becomes a 3-line wrapper.
+- **Cost of current shape:** head-resolution now lives in two places and can silently drift — any future change (detached-HEAD handling, abbreviated-SHA comparison, normalizing case) fixes one and misses the other. This is the one I'd apply.
+
+**2. `finalize` callback seam has a single caller (judgment call)**
+`trail_review_cmd.go:863` `createTrailReviewFinding` gained a higher-order `finalize func(api.TrailReviewStartResponse) (…)` solely so its **one** caller (`:344`) can run the head check and mutate captured `input.Location.SelectedText` between start and post. A closure that side-effects an outer struct is more indirection than the problem needs.
+- **Cleaner form:** expose the two primitives the function already composes — `startTrailReview` (exists) + a new `postTrailReviewFinding(ctx, client, trailID, reviewID, input)` — and let `runTrailReviewCommentAdd` orchestrate linearly: start → verify head → set selected text → post. Removes the callback type and the captured-mutable-`input` smell; reads top-to-bottom.
+- **Cost:** control flow for one logical "add" is split across a closure boundary, and the in-closure mutation of outer `input` is easy to misread. Pragmatic/medium — the callback is *defensible* (keeps start+post atomic), so skip if you prefer; but with a single caller the linear form is clearly simpler. Note: adopting this also dissolves finding #3 naturally.
+
+**3. Gate split across two call sites — altitude is appropriate (not a defect).**
+Pre-start local checks (branch/clean/read) + post-start head check reflects a *real* constraint: the trail head SHA is only known after `startTrailReview`. Running the local checks first so a misconfigured invocation fails fast without opening a review is correct, not accidental complexity.
+
+**4. Working-tree read vs committed blob — note only, do NOT apply under /simplify.**
+`readSelectedTextFromWorktree` uses `os.ReadFile` + a separate `fileHasUncommittedChanges` clean-check — two operations guarding one invariant ("the bytes I read equal the trail's committed bytes"). The deeper form is to read the blob directly at the verified head SHA (`git show &lt;headSHA&gt;:&lt;path&gt;`), which *is* those bytes by construction — eliminating both the clean-file check and the branch-match requirement (content-addressed by the head SHA, independent of checkout state). Strictly more correct and less restrictive. **But** that changes the gate's UX (no longer requires clean tree / matching branch), which is behavior the user deliberately chose — it's a redesign, not a cleanup. Record it as the deeper option if the gate's ergonomics ever chafe; don't change it now.
+
+`maxSelectedTextLen` mirroring a server constant is fine (commented). No reuse/dead-code issues otherwise.
+
+I made no code changes (review-only directive).</result>
+<usage><subagent_tokens>183367</subagent_tokens><tool_uses>4</tool_uses><duration_ms>73568</duration_ms></usage>
+</task-notification>
+
+---
+
+/simplify — resume: collect the 4 cleanup agent findings, dedup, apply fixes
+
+---
+
+/simplify — resume: collect the 4 cleanup agent findings, dedup, apply fixes
+
+---
+
+<task-notification>
+<task-id>a156068a16d325e95</task-id>
+<tool-use-id>toolu_0149jDH4chYgxmdwudojNMVx</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/5c82f63f-13eb-48d6-b5e8-778f0ee0540f/tasks/a156068a16d325e95.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Task: review the `--selected-text` / auto-read change for simplification issues only.
+
+Findings:
+
+**1. `verifyTrailHeadMatchesLocal` reimplements the existing `compareLocalHead` helper (trail_review_cmd.go, new helper block ~L800).** High confidence. The new function inlines TrimSpace → empty-check → `resolveGitRev(ctx,"HEAD")` → compare. That is exactly what `compareLocalHead(ctx, want) (got, matched, err)` already does (including the empty-want → matched=true case), and the sibling `verifyTrailReviewHead` already delegates to it. This is copy-paste-with-variation of canonical logic.
+Simpler form (mirrors `verifyTrailReviewHead`, behavior-preserving):
+```go
+func verifyTrailHeadMatchesLocal(ctx context.Context, headSHA *string) error {
+	want := strings.TrimSpace(stringPtrValue(headSHA))
+	got, matched, err := compareLocalHead(ctx, want)
+	if err != nil {
+		return err
+	}
+	if !matched {
+		return fmt.Errorf("cannot auto-read selected text: trail head is %s but local HEAD is %s; check out that commit or pass --selected-text", abbreviate12(want), abbreviate12(got))
+	}
+	return nil
+}
+```
+Cost of leaving it: ~8 lines of duplicated git-rev/compare logic and a second copy of the empty-SHA special case that can drift from `compareLocalHead`.
+
+**2. Pointless shadow-assign in `buildTrailReviewCommentLocation` (trail_review_cmd.go, in the `if line &gt; 0` branch).** Low confidence/trivial. `if selected := opts.SelectedText; selected != "" { loc.SelectedText = stringPtr(selected) }` — the init-statement local just aliases the field. Simpler: `if opts.SelectedText != "" { loc.SelectedText = stringPtr(opts.SelectedText) }`. Cost: marginal; one needless local.
+
+Checked and judged already-clean (no behavior-preserving simplification):
+
+- **Trailing-newline handling in `readSelectedTextFromWorktree`.** The `if n := len(lines); n&gt;0 &amp;&amp; lines[n-1]=="" { lines = lines[:n-1] }` idiom is correct and standard. The tempting `strings.TrimSuffix(data,"\n")` before Split is **not** equivalent — it yields `[""]` (len 1) for an empty file where the current code yields `[]` (len 0), changing the out-of-range message/behavior. Leave as-is.
+
+- **finalize-callback indirection on `createTrailReviewFinding`.** The split (read selectedText *before* `startTrailReview`, verify head *inside* the callback after start) is intentional: local checks fail before any network/review-session side effect, avoiding a dangling empty review. Collapsing read+verify into one post-start block would alter that behavior — do **not** do it. The only wart is the closure mutating captured `input`; an alternative linear shape (split into `startTrailReview` + a `postTrailReviewFinding`) is behavior-preserving but a larger refactor of roughly equal complexity. Judgment call — I'd leave it.
+
+- **`if loc.FilePath == nil || loc.StartLine == nil` guard in `readSelectedTextFromWorktree`.** Unreachable on valid inputs (only reached for line/range granularity, which the builder always populates), but it's cheap defensive code guarding an internal invariant. Acceptable; optional to drop.
+
+Net: one worthwhile fix (#1, reuse `compareLocalHead`), one trivial polish (#2). Rest is already clean.</result>
+<usage><subagent_tokens>182995</subagent_tokens><tool_uses>3</tool_uses><duration_ms>1177653</duration_ms></usage>
+</task-notification>
+
+---
+
+/simplify — resume: collect remaining reuse+simplification agent findings, dedup against already-applied fixes, apply anything new
+
+---
+
+<task-notification>
+<task-id>aec888bff4132538d</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/5c82f63f-13eb-48d6-b5e8-778f0ee0540f/tasks/aec888bff4132538d.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Reviewed the `--selected-text` / auto-read change for REUSE only. Two real findings, one optional.
+
+**1. (Strong) `verifyTrailHeadMatchesLocal` duplicates `compareLocalHead` — same file**
+- File: `cmd/entire/cli/trail_review_cmd.go:828`
+- Summary: The new function reimplements inline exactly what `compareLocalHead` (`:843`) already does: `strings.TrimSpace`, empty-want→skip, `resolveGitRev(ctx, "HEAD")`, equality compare.
+- Reuse instead: call `compareLocalHead`. The sibling `verifyTrailReviewHead` (`:1065`) is the template — it's literally `got, matched, err := compareLocalHead(ctx, want)` then a formatted error on `!matched`. The new function should be the same, only swapping in its own error message:
+  ```go
+  func verifyTrailHeadMatchesLocal(ctx context.Context, headSHA *string) error {
+      want := strings.TrimSpace(stringPtrValue(headSHA))
+      got, matched, err := compareLocalHead(ctx, want)
+      if err != nil {
+          return err
+      }
+      if !matched {
+          return fmt.Errorf("cannot auto-read selected text: trail head is %s but local HEAD is %s; check out that commit or pass --selected-text", abbreviate12(want), abbreviate12(got))
+      }
+      return nil
+  }
+  ```
+- Cost: ~10 duplicated lines and a second HEAD-comparison code path to keep in sync, in the same file where the canonical helper and an existing consumer already live.
+
+**2. (Minor) `fileHasUncommittedChanges` duplicates the porcelain dirty-check idiom**
+- File: `cmd/entire/cli/trail_review_cmd.go:859`
+- Summary: `git status --porcelain` + `TrimSpace` + non-empty is the exact idiom in `HasUncommittedChanges` (`git_operations.go:249`).
+- Reuse instead: `HasUncommittedChanges` is repo-wide (no path/root params), so this isn't a drop-in call — the clean fix is to generalize that helper to take an optional pathspec (and `-C root`), then call it here. `filterToUncommittedFiles` (`state.go:319`) *is* path-scoped but fails-open and uses go-git tree compare, so its semantics don't match a fail-closed gate — not a clean reuse.
+- Cost: a third copy of the porcelain-empty check; low severity since no existing helper is path-scoped today.
+
+**3. (Optional, likely skip) path resolution**
+- File: `cmd/entire/cli/trail_review_cmd.go:770` (the `filepath.Join(root, filepath.FromSlash(relPath))` in `readSelectedTextFromWorktree`)
+- `paths.AbsPath(ctx, relPath)` covers root+join, but it omits the `filepath.FromSlash` normalization and would re-resolve `WorktreeRoot` (the function already holds `root` for its `git -C root status` call). Marginal — I'd leave it.
+
+Not findings: the `maxSelectedTextLen` byte cap has no suitable existing helper — `truncateOneLine` (`:1575`) collapses newlines/whitespace and appends `…`, which would corrupt `selected_text`. Correctly hand-rolled.</result>
+<usage><subagent_tokens>190187</subagent_tokens><tool_uses>8</tool_uses><duration_ms>2341546</duration_ms></usage>
+</task-notification>

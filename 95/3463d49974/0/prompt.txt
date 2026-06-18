@@ -1,0 +1,480 @@
+/simplify
+
+---
+
+<task-notification>
+<task-id>a06db924cc43da694</task-id>
+<tool-use-id>toolu_01J1rbyY6QL9CsXurMpMsT6t</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/350abd8b-a17b-49b0-9fab-e171809a5e56/tasks/a06db924cc43da694.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect. Now let me examine what `areVSCodeHooksInstalled` does each time it's called:
+
+The key insight is in the `AreHooksInstalled` method (lines 249-279 of hooks.go). Let me trace the call flow:
+
+1. **Line 261**: First call to `areVSCodeHooksInstalled(worktreeRoot)` - when the main hooks file read fails
+2. **Line 267**: Second call to `areVSCodeHooksInstalled(worktreeRoot)` - when JSON parse fails  
+3. **Line 270**: Third call to `areVSCodeHooksInstalled(worktreeRoot)` - part of the success path `||` chain
+
+Each call to `areVSCodeHooksInstalled` (vscode_hooks.go line 137-153) does:
+- **Line 139**: `readVSCodeHooksFile(hooksPath)` - reads the entire-vscode.json file from disk
+- **Lines 143-150**: Iterates through `vsCodeManagedEvents` (2 items) and calls `parseVSCodeHookEvent` which unmarshals JSON for each event
+
+## Efficiency Review Findings
+
+Here's the code quality issue I found:
+
+**Finding 1: Multiple redundant reads of entire-vscode.json in the success path**
+
+- **Location**: `hooks.go` lines 270-278
+- **Issue**: `c.areVSCodeHooksInstalled(worktreeRoot)` is called on **line 270 at the start of the `||` chain**, and due to Go's short-circuit evaluation, this call happens every time the method succeeds (when the Copilot CLI file is readable and parseable). The subsequent checks on lines 271-278 examine the Copilot CLI file's hooks.
+- **What it does**: Each invocation re-reads and parses `entire-vscode.json` from disk via `readVSCodeHooksFile` (vscode_hooks.go:159), then unmarshals JSON for each of the 2 managed events (vscode_hooks.go:143-150).
+- **Cheaper alternative**: Read the VS Code file once at the top of `AreHooksInstalled`, cache the result, and check it inline instead of calling `areVSCodeHooksInstalled` three times.
+- **Does it matter**: **No, this is one-shot CLI code** (`entire enable`/`disable`). The overhead of a single file read + 2 JSON unmarshals is negligible compared to the overall CLI startup time. The three-call pattern only happens when the main hooks file is absent or unparseable, which is uncommon. In the success path (file exists and parses), the VS Code file is still only read once per invocation of `AreHooksInstalled`, so the actual cost is minimal.
+
+**Finding 2: No redundant file I/O in install/uninstall**
+
+- `installVSCodeHooks` (vscode_hooks.go:61-97): Reads once at line 64 via `readVSCodeHooksFile`, then writes once. Clean.
+- `uninstallVSCodeHooks` (vscode_hooks.go:102-133): Reads once at line 105, writes once. Clean.
+- No double-reads.
+
+**Finding 3: No redundant reads within a single operation**
+
+- Each of `readVSCodeHooksFile`, `parseVSCodeHookEvent`, and `marshalVSCodeHookEvent` reads/writes only the in-memory structures that were already loaded—they don't re-touch disk.
+
+## Summary
+
+The only inefficiency is that `AreHooksInstalled` **calls `areVSCodeHooksInstalled` up to three times** (error path, parse-error path, and success path), each re-reading the entire-vscode.json file. However:
+
+1. This only affects the uncommon case where checking happens (not installation/uninstall).
+2. It's one-shot CLI code with no performance requirement.
+3. The overhead is &lt;1ms in the typical case.
+4. The code is clear and maintainable as-is.
+
+**Honest assessment**: Not worth optimizing. The redundancy is trivial for this use case, and consolidating the three calls would complicate the control flow without meaningful benefit.</result>
+<usage><subagent_tokens>19620</subagent_tokens><tool_uses>4</tool_uses><duration_ms>17824</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a33af56ef1461d537</task-id>
+<tool-use-id>toolu_01Xj8Lbv2jUnHEetxBBSeU9b</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/350abd8b-a17b-49b0-9fab-e171809a5e56/tasks/a33af56ef1461d537.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect. Now I have all the information I need. Let me compile my findings.
+
+## Code Reuse Analysis: vscode_hooks.go vs hooks.go
+
+Based on my detailed analysis of the new `vscode_hooks.go` and the existing `hooks.go`, I've identified the following code duplication:
+
+### 1. **Generic Parse/Marshal Pattern (REAL DUPLICATION, but NOT worth unifying)**
+
+**Files &amp; Lines:**
+- `vscode_hooks.go:218-226` - `parseVSCodeHookEvent()`
+- `hooks.go:298-306` - `parseCopilotHookType()`
+
+**Finding:** These are functionally identical — both parse a JSON key from a raw message map into a typed slice. However, they **cannot be unified** because:
+- `parseCopilotHookType` unmarshals to `[]CopilotHookEntry` (has `Bash` field)
+- `parseVSCodeHookEvent` unmarshals to `[]VSCodeHookEntry` (has `Command` field)
+- Go's type system doesn't allow a single generic unmarshaler for these different struct types without `interface{}` and runtime reflection, which would obscure the actual types being used
+- The cost of unifying (using `interface{}` + reflection) exceeds the value of sharing 4 lines of code
+
+**Verdict:** Acceptable duplication due to structural differences. The `//nolint:dupl` pattern applies here.
+
+---
+
+### 2. **Marshal Helper Functions (REAL DUPLICATION, but NOT worth unifying)**
+
+**Files &amp; Lines:**
+- `vscode_hooks.go:230-241` - `marshalVSCodeHookEvent()`
+- `hooks.go:310-321` - `marshalCopilotHookType()`
+
+**Finding:** Again, functionally identical — both marshal a slice back into a raw message map, deleting the key if empty. Same issue as above: different struct types prevent generic solution without runtime reflection.
+
+**Cost of duplication:** ~12 lines per function, repeated once.
+
+**Verdict:** Shallow structural duplication, not worth the cost of generic indirection.
+
+---
+
+### 3. **Command/Bash Existence Check (DUPLICATION with different field names)**
+
+**Files &amp; Lines:**
+- `vscode_hooks.go:244-251` - `vsCodeCommandExists(entries []VSCodeHookEntry, command string)`
+- `hooks.go:324-331` - `hookBashExists(entries []CopilotHookEntry, bash string)`
+
+**Finding:** Identical logic, different field names (`Command` vs `Bash`). The 7-line loop is trivial and the semantic difference (command vs bash) is intentional. Not worth a generic helper.
+
+---
+
+### 4. **Entire Hook Detection Chain (REUSABLE LOGIC)**
+
+**Files &amp; Lines:**
+- `vscode_hooks.go:253-261` - `hasEntireVSCodeHook()` + uses `isEntireHook(entry.Command)`
+- `vscode_hooks.go:264-272` - `removeEntireVSCodeHooks()`
+- `hooks.go:333-357` - `isEntireHook()`, `hasEntireHook()`, `removeEntireHooks()`
+
+**Critical Finding:** Both files call `isEntireHook()` to detect Entire hooks. The function is defined in `hooks.go:333-336`:
+```go
+func isEntireHook(bash string) bool {
+    return agent.IsManagedHookCommand(bash, entireHookPrefixes)
+}
+```
+
+**VS Code code (line 256)** directly calls `isEntireHook(entry.Command)` — this is correct and demonstrates code reuse IS happening here. The `isEntireHook()` helper is properly shared.
+
+However, **`hasEntireVSCodeHook()` and `removeEntireVSCodeHooks()` are local wrappers** that iterate over their respective entry types. Because they operate on different struct types, they can't be unified without losing type specificity.
+
+**Verdict:** Core logic is shared (`isEntireHook`). The iteration wrappers are shallow duplication due to type constraints — acceptable.
+
+---
+
+### 5. **File I/O Pattern (SIGNIFICANT DUPLICATION, but SHALLOW)**
+
+**Files &amp; Lines:**
+- `vscode_hooks.go:159-184` - `readVSCodeHooksFile()`
+- `vscode_hooks.go:189-216` - `writeVSCodeHooksFile()`
+- `hooks.go:63-91` - inline read logic in `InstallHooks()`
+- `hooks.go:151-170` - inline write logic in `InstallHooks()`
+
+**Finding:** The file I/O patterns are nearly identical:
+1. Read JSON from file → unmarshal to raw maps → extract nested "hooks" field → ensure "version" key
+2. Write raw maps → marshal nested "hooks" field → MkdirAll → MarshalIndentWithNewline → WriteFile
+
+The **new code correctly extracts these into dedicated helpers** (`readVSCodeHooksFile`, `writeVSCodeHooksFile`), but the **old code (`hooks.go`) has this logic inlined in `InstallHooks`/`UninstallHooks`**.
+
+**Opportunity cost:** `hooks.go` could be refactored to also extract `readHooksFile()` and `writeHooksFile()` helpers, mirroring the new structure. This would improve the existing code and align patterns. However, the prompt says "do not propose changes that alter behavior."
+
+**Verdict:** No current violation (the new code has better structure). The old code is not refactored yet, so there's no active duplication — just asymmetrical organization.
+
+---
+
+### 6. **Hook Installation Flow (STRUCTURAL DUPLICATION)**
+
+**Files &amp; Lines:**
+- `vscode_hooks.go:61-97` - `installVSCodeHooks()`
+- `hooks.go:49-173` - `InstallHooks()`
+
+The logic flow is:
+1. Read file with raw maps
+2. Loop over managed events/hook types
+3. Parse entries for each event/type
+4. If `force`, remove Entire hooks
+5. Build command string; check if exists; append if missing
+6. Marshal back
+7. Write file
+
+The structures are **identical workflows on different file formats**. Because the JSON shapes differ (Copilot has a structured CopilotHooks object with specific fields; VS Code uses arbitrary event keys), and they operate on different entry types, unification would require significant abstraction.
+
+**Verdict:** Workflow duplication is structural and acceptable given the different file schemas.
+
+---
+
+## Summary of Findings
+
+| Function/Pattern | Location | Duplicated By | Status | Cost | Recommendation |
+|---|---|---|---|---|---|
+| `parseVSCodeHookEvent` | vscode_hooks.go:218 | `parseCopilotHookType` hooks.go:298 | Shallow (different struct types) | ~8 lines/function | Acceptable duplication; use `//nolint:dupl` |
+| `marshalVSCodeHookEvent` | vscode_hooks.go:230 | `marshalCopilotHookType` hooks.go:310 | Shallow (different struct types) | ~12 lines/function | Acceptable duplication; use `//nolint:dupl` |
+| `vsCodeCommandExists` | vscode_hooks.go:244 | `hookBashExists` hooks.go:324 | Shallow (different field names) | ~7 lines | Acceptable trivial duplication |
+| `isEntireHook` + hook detection | vscode_hooks.go:256 | Shared via `hooks.go:333` | **SHARED** | 0 | Already reuses via `agent.IsManagedHookCommand` ✓ |
+| `readVSCodeHooksFile` | vscode_hooks.go:159 | Inline in `hooks.go:InstallHooks` | Better structure in new code | — | Old code could extract helper, but no violation |
+| `writeVSCodeHooksFile` | vscode_hooks.go:189 | Inline in `hooks.go:InstallHooks` | Better structure in new code | — | Old code could extract helper, but no violation |
+| `jsonutil` helpers | Both files | `jsonutil.MarshalWithNoHTMLEscape`, `jsonutil.MarshalIndentWithNewline` | **SHARED** | 0 | Already properly reused ✓ |
+| `agent.WrapProductionSilentHookCommand` | vscode_hooks.go:55, hooks.go:125 | Shared via `agent` package | **SHARED** | 0 | Already reused correctly ✓ |
+
+**Conclusion:** The new code exhibits **NO actionable reuse violations**. The duplication is shallow and structural (different JSON shapes, different entry struct types). The code correctly reuses:
+- `agent.IsManagedHookCommand` for hook detection
+- `agent.WrapProductionSilentHookCommand` for command wrapping  
+- `jsonutil` helpers for marshaling
+
+The parse/marshal functions and entry-loop wrappers are acceptable duplications due to Go's lack of generic type marshaling (prior to 1.18+ generics, which don't apply to JSON unmarshaling into different concrete types).</result>
+<usage><subagent_tokens>27414</subagent_tokens><tool_uses>17</tool_uses><duration_ms>43172</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aefd73dc929a19fa4</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/350abd8b-a17b-49b0-9fab-e171809a5e56/tasks/aefd73dc929a19fa4.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I cannot create a file to output my analysis, but I can report my findings directly. Let me provide the complete analysis:
+
+## SIMPLIFICATION REVIEW OF vscode_hooks.go
+
+### **FINDING 1: DEAD CODE - Redundant nil-guard in `writeVSCodeHooksFile` (lines 190-191)**
+
+**File:Line:** `cmd/entire/cli/agent/copilotcli/vscode_hooks.go:190-191`
+
+**Summary:** The nil-check for `rawFile` will never execute—all callers ensure `rawFile` is non-nil before calling.
+
+**Current code:**
+```go
+func writeVSCodeHooksFile(hooksPath string, rawFile, rawHooks map[string]json.RawMessage) error {
+    if rawFile == nil {  // &lt;-- DEAD CODE
+        rawFile = map[string]json.RawMessage{"version": json.RawMessage(`1`)}
+    }
+    // ...
+}
+```
+
+**Call site analysis:**
+
+1. **`installVSCodeHooks` (line 96):** Calls `writeVSCodeHooksFile` after lines 68-69 guarantee `rawFile` is non-nil.
+2. **`uninstallVSCodeHooks` (line 132):** Calls `writeVSCodeHooksFile` only after the early return at line 110 (`if rawFile == nil { return nil }`), so `rawFile` is guaranteed non-nil.
+3. **Test file (line 137):** Passes `rawFile` returned from `readVSCodeHooksFile`, which either returns (nil,nil,nil) on missing file OR non-nil rawFile on file exists.
+
+**Simpler form:** Delete lines 190-191 entirely. The function signature becomes simpler if the caller pre-checks, which matches the actual usage pattern. Alternatively, document that this function assumes `rawFile` is non-nil.
+
+**Behavior impact:** ZERO—this code path is unreachable.
+
+---
+
+### **FINDING 2: Lines 180-182 in `readVSCodeHooksFile` are NOT dead code (contrary to concern)**
+
+**File:Line:** `cmd/entire/cli/agent/copilotcli/vscode_hooks.go:180-182`
+
+**Analysis:** The post-switch `if rawHooks == nil` block is reachable and necessary.
+
+**When it executes:**
+- File exists (line 162 branch taken)
+- File is valid JSON
+- File is missing the `"hooks"` key (line 166 condition is false, so the Unmarshal doesn't happen)
+- Then lines 180-182 initialize the empty `rawHooks` map
+
+**Behavior:** Correct and necessary for the case where the file exists but has no hooks yet.
+
+---
+
+### **FINDING 3: Lines 68-72 in `installVSCodeHooks` are correctly structured**
+
+**File:Line:** `cmd/entire/cli/agent/copilotcli/vscode_hooks.go:68-72`
+
+**Analysis:** These nil-checks are necessary and not redundant.
+
+- `readVSCodeHooksFile` returns `(nil, nil, nil)` only when the file is absent.
+- When the file is absent, neither `rawFile` nor `rawHooks` are initialized inside `readVSCodeHooksFile` (the initialization at line 180 is unreachable).
+- `installVSCodeHooks` must handle the missing-file case by initializing both maps (lines 68-72).
+
+**Verdict:** These guards are correct and essential—they're not defensive bloat but necessary initialization.
+
+---
+
+### **FINDING 4: Version field handling is consistent**
+
+**File:Lines:** `vscode_hooks.go:171-172` (read), `vscode_hooks.go:68-69` (install), `vscode_hooks.go:190-191` (write, but unreachable)
+
+**Analysis:**
+- When file exists: version is ensured by `readVSCodeHooksFile` (line 171-172)
+- When file is absent: version is ensured by `installVSCodeHooks` (line 68-69)
+- `writeVSCodeHooksFile` attempts to ensure it (line 190-191) but that code is unreachable
+
+**Verdict:** Consistent across reachable paths. The dead code in `writeVSCodeHooksFile` is the only inconsistency.
+
+---
+
+### **FINDING 5: `vsCodeManagedEvents` anonymous struct is appropriate**
+
+**File:Line:** `vscode_hooks.go:30-36`
+
+**Analysis:**
+- Only 2 entries, both used only within this file
+- Anonymous struct with clear field names (`Event`, `Verb`)
+- Not exported, not used across packages
+
+**Verdict:** The anonymous struct is the right choice here. Creating a named type would be over-engineering for a 2-entry table. The field names are unambiguous in context.
+
+---
+
+## **SUMMARY OF ACTIONABLE CHANGES**
+
+**ONE SIMPLIFICATION:**
+- **DELETE lines 190-191** from `writeVSCodeHooksFile` (the `if rawFile == nil` guard). This is dead code that can never execute given the call sites' control flow. Update the comment on line 186 if needed to reflect that the function expects non-nil `rawFile`.
+
+**NO CHANGES NEEDED:**
+- Lines 68-72 in `installVSCodeHooks` (correct)
+- Lines 180-182 in `readVSCodeHooksFile` (reachable, necessary)
+- Version field handling (consistent)
+- Anonymous struct for `vsCodeManagedEvents` (appropriate)</result>
+<usage><subagent_tokens>25843</subagent_tokens><tool_uses>9</tool_uses><duration_ms>33553</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ab0632adfe076a262</task-id>
+<tool-use-id>toolu_01CxKvoeFcHoMte8dcb3uVNy</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/350abd8b-a17b-49b0-9fab-e171809a5e56/tasks/ab0632adfe076a262.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Now I have enough information. Let me prepare my altitude-focused review:
+
+## Altitude Review: CopilotCLIAgent Hook File Refactoring
+
+Based on my analysis of the new `vscode_hooks.go` and changes to `hooks.go`, here are the altitude findings:
+
+### Finding 1: The VS Code file should be handled at the file-management level, not special-cased in the agent class
+**File: `hooks.go:44-59`** (InstallHooks calling installVSCodeHooks before the main hook installation)
+
+The current implementation treats VS Code hooks as a side effect tacked onto CopilotCLIAgent's InstallHooks. While this works, the deeper pattern would be a hook-file registry in the agent that says "manage these files in parallel":
+
+```go
+type HookFileSpec struct {
+  Name   string  // entire.json, entire-vscode.json
+  Events []struct { JSON key, Verb }
+  EntryType string  // "bash" vs "command"
+}
+
+// In agent:
+func (c *CopilotCLIAgent) HookFiles() []HookFileSpec { ... }
+```
+
+**Depth issue**: This is a bandaid pattern (two functions with duplicated logic paths), but it's **pragmatic for Preview**. The infrastructure currently assumes one file per agent. Generalizing it would introduce abstraction overhead for a single use case. The current approach is clear and testable.
+
+**Verdict**: ACCEPTABLE for Preview. Flag for refactoring if a third agent later needs multiple files.
+
+---
+
+### Finding 2: `vsCodeManagedEvents` and `vsCodeEventToHookNames` both encode VS Code↔verb mapping—they should be unified
+**Files: `vscode_hooks.go:30-36`, `compat.go:37-46`**
+
+Both tables define the VS Code event relationship:
+- `vsCodeManagedEvents`: pairs `VSCodeEventUserPromptSubmit` + `HookNameUserPromptSubmitted`, `VSCodeEventStop` + `HookNameAgentStop`
+- `vsCodeEventToHookNames`: maps `VSCodeEventUserPromptSubmit` → `[HookNameUserPromptSubmitted]`, etc.
+
+This is scattered knowledge. The unified source should be in `compat.go` (which already does event-to-hookname mapping):
+
+```go
+var vsCodeEventMapping = map[string]string{
+  VSCodeEventUserPromptSubmit: HookNameUserPromptSubmitted,
+  VSCodeEventStop: HookNameAgentStop,
+}
+
+// Then in vscode_hooks.go, iterate over the keys.
+```
+
+**Depth issue**: The duplication is small but creates a maintenance hazard (if you add an event, you must update two places). 
+
+**Verdict**: **FIX REQUIRED**. This is genuine code duplication at the same altitude. Move the mapping to `compat.go` and reference it from both places. ~10-line cleanup.
+
+---
+
+### Finding 3: `AreHooksInstalled` OR's in `areVSCodeHooksInstalled` correctly but at the wrong semantics
+**Files: `hooks.go:248-279`** (especially lines 257-261, 270)
+
+The logic is:
+```go
+return c.areVSCodeHooksInstalled(worktreeRoot) ||
+    hasEntireHook(hooksFile.Hooks.UserPromptSubmitted) || ...
+```
+
+This is **semantically correct** (at least one file has Entire hooks → installed). But it reads as "VS Code OR Copilot CLI" when the intent is "either file contains our hooks."
+
+The asymmetry: if `entire.json` is missing but `entire-vscode.json` exists, we still return true. This is intentional (Preview feature may only write VS Code file) but the branching logic obscures it:
+
+```go
+// Current (confusing fallthrough):
+if err != nil {
+  return c.areVSCodeHooksInstalled(worktreeRoot)  // Line 261
+}
+// ... then later, even on success:
+return c.areVSCodeHooksInstalled(worktreeRoot) ||  // Line 270
+    hasEntireHook(...) || ...
+```
+
+Better structure:
+```go
+cliHooksPresent := /* read entire.json and check */
+vsCodeHooksPresent := c.areVSCodeHooksInstalled(worktreeRoot)
+return cliHooksPresent || vsCodeHooksPresent
+```
+
+**Depth issue**: This is a minor readability problem, not a functional bug. The logic is correct because the fallback on parse failure (line 267) also checks VS Code. But it's harder than necessary to verify.
+
+**Verdict**: **ACCEPTABLE** as-is. Refactor if you're already touching this code; not critical.
+
+---
+
+### Finding 4: `vsCodeManagedEvents` hardcodes only 2 events instead of deriving from HookNames() or constants
+**File: `vscode_hooks.go:30-36`**
+
+The table says "only UserPromptSubmit and Stop are managed here" because "the others are already in entire.json." This is correct reasoning, but the implementation is fragile: if someone adds a new hook constant without understanding the VS Code file logic, `HookNames()` and the VS Code file will drift:
+
+```go
+// vscode_hooks.go
+var vsCodeManagedEvents = []struct {
+  Event string
+  Verb string
+}{
+  {VSCodeEventUserPromptSubmit, HookNameUserPromptSubmitted},
+  {VSCodeEventStop, HookNameAgentStop},
+  // Someone adds {VSCodeEventSessionStart, HookNameSessionStart}
+  // without realizing entire.json already covers it.
+}
+```
+
+**Depth issue**: This is a **documentation/design clarity issue**, not a bug. The comment at lines 22-29 explains why, but the code doesn't enforce it.
+
+Better: Assert or comment that these are the *only* events Entire manages in the VS Code file:
+```go
+// These are the only two turn hooks that don't round-trip from entire.json.
+// See AGENT.md for the full rationale.
+var vsCodeTurnEvents = []struct{ Event, Verb string }{
+  {VSCodeEventUserPromptSubmit, HookNameUserPromptSubmitted},
+  {VSCodeEventStop, HookNameAgentStop},
+}
+
+// And cross-check in a test:
+func TestVSCodeTurnEventsAreSubsetOfHookNames(t *testing.T) {
+  // Verify {VSCodeEventUserPromptSubmit, VSCodeEventStop} ⊂ HookNames()
+}
+```
+
+**Verdict**: **ACCEPTABLE** for Preview. The comment is clear. Add a test if this becomes a concern.
+
+---
+
+### Finding 5: `installVSCodeHooks` / `uninstallVSCodeHooks` / `areVSCodeHooksInstalled` aren't exported but should be structured as a cohesive "VS Code hooks" mixin
+**File: `vscode_hooks.go:61, 102, 137`**
+
+These three functions replicate the install/uninstall/check pattern perfectly, but they're private methods bolted onto CopilotCLIAgent. They're not reusable (can't be extracted to a helper). For a single agent, this is fine; if a second agent needs a second file, you'd copy-paste and create maintenance debt.
+
+Consider at the next milestone: a `HookFileManager` interface that agents can compose:
+```go
+type HookFileManager interface {
+  Install(root, file string, events []HookEventSpec, ...) error
+  Uninstall(root, file string, events []HookEventSpec) error
+  AreInstalled(root, file string) bool
+}
+```
+
+**Depth issue**: Over-engineering for the current scope. The three functions are perfectly fine as private methods.
+
+**Verdict**: **ACCEPTABLE**. Document this as a potential abstraction point for future multi-file agents (add a comment: "// If another agent needs multiple files, extract this to a helper interface").
+
+---
+
+### Summary
+
+**Genuine Issues (Fix):**
+1. **Unified event mapping** (Finding 2): Merge `vsCodeManagedEvents` and `vsCodeEventToHookNames` in `compat.go`. ~10 lines, removes duplication.
+
+**Minor Readability Issues (Optional):**
+- Finding 3: Refactor `AreHooksInstalled` for clarity (not critical).
+- Finding 4: Add a test asserting VS Code turn events are a subset of HookNames().
+
+**Architectural Notes (Document for Future):**
+- Finding 1: Note that this is a Preview bandaid; generalize if a third file is needed.
+- Finding 5: Flag the three VS Code methods as reusable interface material for future multi-file agents.
+
+**Current Altitude: ACCEPTABLE**. The implementation is appropriate for a Preview feature. The only genuine altitude problem is Finding 2—the duplicated event-mapping tables belong in one place.</result>
+<usage><subagent_tokens>50855</subagent_tokens><tool_uses>18</tool_uses><duration_ms>48157</duration_ms></usage>
+</task-notification>

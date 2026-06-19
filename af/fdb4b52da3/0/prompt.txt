@@ -1,0 +1,260 @@
+i feel like there must be somewhere in the code that already does this ENTIRE_TOKEN comparison – i've got other places (maybe entire auth status) that look at your current context or ENTIRE_TOKEN
+
+I wonder if we should do more work to prevent this from happening?
+
+---
+
+let's do 1+2 as part of this branch
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>a09c0f9f8dd3c27de</task-id>
+<tool-use-id>toolu_01SAZGDSKGZjuE8bGQFvkmmM</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/97867a08-bcb1-40f2-9ff6-365c7d6a0faa/tasks/a09c0f9f8dd3c27de.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect! Now let me prepare the final analysis. The key finding is the duplication of the ENTIRE_TOKEN validation sequence. Let me verify the exact code patterns one more time:
+
+**In `/Users/soph/Work/entire/devenv/cli/internal/coreapi/client.go` (lines 102-117):**
+- Line 107: `envToken := strings.TrimSpace(raw)`
+- Line 108-110: blank check
+- Line 111: `coreURL, err := auth.CoreURLFromEnvToken(envToken)`
+
+**In `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/auth.go` (lines 214-224):**
+- Line 215: `token := strings.TrimSpace(raw)`
+- Line 216-218: blank check
+- Line 219: `coreURL, err := auth.CoreURLFromEnvToken(token)`
+
+This is textbook duplication that should be extracted into a shared helper.
+
+## FINDINGS
+
+**REUSE ISSUE: ENTIRE_TOKEN parsing duplication in env-token validation sequence**
+
+**File:** `cmd/entire/cli/auth.go`, **Lines:** 214-224 (function `resolveEnvTokenStatusTarget`)  
+**Summary:** Duplicates the TrimSpace → blank-check → CoreURLFromEnvToken validation sequence from `coreapi.clientFromEnvToken`  
+**Maintenance Cost:** Two copies of the same fail-closed validation logic: any bug fix or security tightening to one must be applied to the other; callers must know which copy to invoke.  
+**Fix:** Extract a shared helper in the `auth` package (e.g., `auth.ParseEnvToken(raw string) (string, error)`) that returns the trimmed, validated token and core URL. This mirrors the existing architecture: `auth.CoreURLFromEnvToken` already owns the aud validation; the trim + blank-check wrapper should live there too.  
+**Existing Helper:** `auth.CoreURLFromEnvToken` (validates aud shape); the trim + blank-check before it should be in the same module.
+
+---
+
+**REUSE PATTERN: Good extraction — `renderCoreList`**
+
+**File:** `cmd/entire/cli/corecmd.go`, **Lines:** 64-83 (function `renderCoreList`)  
+**Summary:** New helper cleanly extracted to avoid duplicating render logic between `runCoreList` and `runCoreListForCluster`, which differ only in which core they dial.  
+**Assessment:** Well-designed — the two variants (`runCoreList`, `runCoreListForCluster`) now delegate to `runCore`/`runCoreForCluster` respectively, which both call the shared `renderCoreList`. This is exactly how `runCore`/`runCoreForCluster`/`runCoreClient` are structured, so the pattern is consistent.
+
+---
+
+**DESIGN PATTERN: Good precedent — `clientFromEnvToken` / `clientForTarget`**
+
+**File:** `internal/coreapi/client.go`, **Lines:** 102-117, 122-129  
+**Summary:** `coreapi.New` and `coreapi.NewForCluster` both delegate the ENTIRE_TOKEN check and the context-resolution-to-client steps to private helpers.  
+**Assessment:** Clean reuse pattern. Unfortunately, `resolveEnvTokenStatusTarget` in `auth.go` should follow the same pattern by calling a shared `auth.ParseEnvToken` (or similar) instead of repeating the validation inline.
+
+---
+
+**Recommendation:** Create `auth.ParseEnvToken(raw string) (coreURL, token string, _ error)` to own the TrimSpace → blank-check → CoreURLFromEnvToken sequence, then have both `clientFromEnvToken` and `resolveEnvTokenStatusTarget` call it. This keeps the sequence a single source of truth and ensures both paths stay synchronized if the validation rules tighten.</result>
+<usage><subagent_tokens>41201</subagent_tokens><tool_uses>17</tool_uses><duration_ms>38699</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ab94931451ba789aa</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/97867a08-bcb1-40f2-9ff6-365c7d6a0faa/tasks/ab94931451ba789aa.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect. Now I have enough information to write my findings. Let me compile the simplification review:
+
+## Simplification-Focused Code Quality Review
+
+I've reviewed the diff for unnecessary complexity. Here are my findings:
+
+### Key Files Assessed
+
+**1. `/Users/soph/Work/entire/devenv/cli/internal/coreapi/client.go` — Lines 36-43, 59-67, 102-117**
+
+**Finding: Triple-return pattern `(client, bool, error)` is awkward**
+- **What:** `clientFromEnvToken()` returns `(*Client, bool, error)` where `ok=true` means "env token was present; use this result" and `ok=false` means "fall through to context resolution"
+- **Cost:** Requires callers to unpack `if client, ok, err := clientFromEnvToken(); ok { return client, err }` twice (in `New` and `NewForCluster`), which is non-idiomatic Go. The `bool` is doing duty as a control-flow sentinel.
+- **Simpler form:** Extract to an internal sentinel type: `type envTokenClient struct { *Client; err error }` with a zero-value nil receiver, then `New` and `NewForCluster` can both write `if c := clientFromEnvToken(); c != nil { return c.Client, c.err }` — tighter and clearer about the semantics (non-nil = success, nil = fall-through). Alternatively, use a named error like `errNoEnvToken` as the control signal: `if client, err := clientFromEnvToken(); err != errNoEnvToken { return client, err }`.
+
+**2. `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/corecmd.go` — Lines 53–83, 250–265, 272–288**
+
+**Finding: Wrapper proliferation justified but could compress notation**
+- **What:** Seven `run*` functions: `runCore`, `runCoreForCluster`, `runCoreClient`, `runCoreList`, `runCoreListForCluster`, `renderCoreList`, `runCoreJSON`, `runCoreObject`. This looks heavy, but the structure is sound: `runCoreClient` owns the preamble; `runCore`/`runCoreForCluster` pass the client-factory; list/JSON/object variants add rendering. The extraction of `renderCoreList` as a separate closure-factory is clean.
+- **Cost:** Minimal. The separation of concerns is justified — the two list variants differ only in client selection, and splitting that from rendering prevents copy-paste.
+- **Assessment:** **Already clean.** The design avoids duplication by making the client-factory injectable. No simplification opportunity without losing clarity.
+
+**3. `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/auth.go` — Lines 71, 80–101, 113–116, 202–224, 326–329**
+
+**Finding: `statusTarget.envToken` bool field + wrapper functions handle precedence cleanly**
+- **What:** 
+  - Added `envToken bool` to `statusTarget` struct to signal env-token mode (no stored context, no session to revoke).
+  - `resolveAuthStatusTarget` dispatches to `resolveEnvTokenStatusTarget` if env token is present, else `resolveStatusTarget`.
+  - `runAuthStatus` branches on `t.envToken` to skip context/keychain/session lines.
+- **Cost:** Minimal. The field is narrow-purpose (single bool), and the branching in `runAuthStatus` (lines 326–329) is a clean conditional that replaces a more complex alternative (re-resolving the target via a separate path).
+- **Assessment:** **Already clean.** The struct field is the right place to mark "this target came from env token, not contexts.json," and the logic in `runAuthStatus` is simple and local.
+
+**4. `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/auth/control_plane.go` — Lines 152–190**
+
+**Finding: `targetForContext` extraction collapses duplication**
+- **What:** `ResolveControlPlaneTarget` and `ResolveControlPlaneTargetForCluster` both end with `NewRefreshingLoginProvider(c) → ControlPlaneTarget`. Extracted to `targetForContext(c)`.
+- **Cost:** None. This prevents the two functions from diverging.
+- **Assessment:** **Already clean.**
+
+**5. `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/repo_mirror.go` — Lines 253–255**
+
+**Finding: Inlined mirror-list header + CoreOrigin() call is appropriate**
+- **What:** The banner `"Listing mirrors on %s"` now calls `c.CoreOrigin()` inline instead of re-resolving via `ResolveControlPlaneTarget()` (which would miss env token and cluster cases).
+- **Cost:** None. This is a **correctness fix**, not complexity — the old code had a latent bug (named wrong core for env token). The comment explains why re-derivation would be wrong.
+- **Assessment:** **Correct and clean.**
+
+---
+
+## Summary
+
+**Overall assessment: This diff is well-refactored with one minor pattern concern:**
+
+- **One simplification opportunity:** The `(client, bool, error)` return in `clientFromEnvToken()` is idiomatic but awkward. A sentinel-type or named-error return would be tighter, though this is a low-priority cleanup and doesn't affect correctness.
+
+- **All other areas are clean:** Duplication is collapsed where it matters (`targetForContext`, `renderCoreList`), the wrapper functions avoid copy-paste through dependency injection, and the control flow (env-token bypass in `coreapi` and `auth status`) is well-isolated.</result>
+<usage><subagent_tokens>40509</subagent_tokens><tool_uses>15</tool_uses><duration_ms>41812</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ac78b1c8d3311c0ad</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/97867a08-bcb1-40f2-9ff6-365c7d6a0faa/tasks/ac78b1c8d3311c0ad.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect. Now I have all the context I need to write a thorough altitude review. Let me compile my findings:
+
+## Altitude-Focused Code Quality Review
+
+This diff implements a clean, deep solution to the problem of "which core should this command dial?" The core theme — that clients should report what they actually dial — is well-executed. Here are my findings:
+
+---
+
+### **1. `coreapi.Client.CoreOrigin()` — ALTITUDE IS RIGHT**
+**File**: `internal/coreapi/client.go:139-141`
+**What**: Method returns `scheme://host` from the client's wired origin, stripped of `apiBasePath`.
+
+**Why this is the right depth**: This is the single source of truth pattern done correctly. Rather than having display code re-derive core resolution from `ResolveControlPlaneTarget` (which would miss ENTIRE_TOKEN and cluster cases), the client reports what was actually wired into it. This guarantees the named core can never diverge from where requests go — a hard invariant that prevents class-of-bugs where display lies.
+
+**Implementation quality**: Minimal, focused. The method extracts the origin from `serverURL` which is set during client construction. No redundant work.
+
+---
+
+### **2. `resolveAuthStatusTarget()` + `resolveEnvTokenStatusTarget()` — ALTITUDE HAS A COST, DECISION IS SOUND BUT DOCUMENT THE CONSTRAINT**
+**Files**: `cmd/entire/cli/auth.go:74-85, 87-102`
+
+**What**: `auth status` resolves its target by checking `ENTIRE_TOKEN` first, then falling back to the active context's resolution. A separate `resolveEnvTokenStatusTarget()` function mirrors the env-token logic from `coreapi.New`.
+
+**Altitude assessment — INHERENT DUPLICATION, NOT A SMELL**:
+- The duplication of env-token precedence logic between `coreapi.New()` and `auth status` looks like special-casing, but it's actually **unavoidable** and correctly placed.
+- **Why**: `auth status` needs to build its own `/me` client via `NewWithBearer()` (not through `coreapi.New()`) because it already has the token in hand and needs to avoid the lazy token-manager overhead. It resolves the core/token pair *separately* to display them, then constructs a bare client.
+- **Coreapi path**: `coreapi.New()` → `clientFromEnvToken()` → `NewWithBearer()` + returns client. The token-sourcing and display resolution happen inside the client factory.
+- **Auth status path**: Needs (coreURL, token) pair before building the client, because it also calls `ListAuthSessions(coreURL, token)` separately. So it must resolve the pair upfront.
+- **Conclusion**: The duplication is **structural**, not a sign the abstraction is too shallow. The two paths are solving different problems: one wraps resolution inside client construction; the other needs the pair separated.
+
+**Recommendation**: The current structure is correct. The CLAUDE.md documentation (lines 25-31 of the diff) already calls this out explicitly — "when a command resolves auth outside a coreapi.Client, it must apply the same env-token-first precedence itself." This is clear enough that future maintainers won't mistake the duplication for a bug.
+
+---
+
+### **3. `envToken bool` flag on `statusTarget` — ALTITUDE IS RIGHT**
+**File**: `cmd/entire/cli/auth.go:71, 184-187, 319-327`
+
+**What**: A boolean flag that branches the rendering path: env-token mode skips context/keychain/session lines.
+
+**Why this is correct**:
+- The flag captures a semantic fact about the target: whether it came from ephemeral ENTIRE_TOKEN or a stored context.
+- It's not leaky; it's data-driven. The rendering site (`runAuthStatus`) reads it and applies different output logic.
+- The alternative — trying to infer the mode from `statusTarget.activeContext == ""` — would be fragile and error-prone.
+- Tests (`auth_test.go:296-329`) verify the flag controls both what gets printed and *what API calls happen* (listSessions is never called in env-token mode).
+
+**Implementation**: Clean conditional at the display site (lines 313-317 of the diff) that explicitly checks the flag and outputs the env-token note before returning early.
+
+---
+
+### **4. `runCore()` + `runCoreForCluster()` + `runCoreClient()` — ALTITUDE IS RIGHT**
+**File**: `cmd/entire/cli/corecmd.go:250-288`
+
+**What**: Three-level abstraction:
+- `runCore()` — convenience wrapper that dials active context via `coreapi.New()`
+- `runCoreForCluster()` — convenience wrapper that dials cluster's core via `coreapi.NewForCluster()`
+- `runCoreClient()` — unified preamble (silence usage, handle insecureHTTP, build client, run fn, map errors)
+
+**Why this is the right depth**: 
+- `runCoreClient()` unifies the common infrastructure (the "preamble") — silence usage, apply insecureHTTP flag, build client, run fn, render errors. Both `runCore` and `runCoreForCluster` call it.
+- The only difference is *how* they build the client (which core to dial), passed as a factory `newClient func(context.Context) (*coreapi.Client, error)`.
+- This avoids duplicating the error handling and flag logic, while keeping the client-selection strategy pluggable.
+- The pattern scales: any future variant (e.g., `runCoreForUser(userID)`) would just add a new wrapper calling `runCoreClient()` with a different factory.
+
+**Alternative considered and rejected**: The diff could have merged `runCore` and `runCoreForCluster` into a single function with a `clusterHost *string` parameter (nil for active context). But the current approach is clearer: the type signature of the wrapper (`runCoreForCluster` takes `clusterHost string`) documents the intent upfront, rather than burying it in a nil check.
+
+**Parallel list rendering**: `runCoreList()` and `runCoreListForCluster()` follow the same pattern — they delegate the render logic (`renderCoreList()`) separately, keeping it independent of client selection. Correct.
+
+---
+
+### **5. `renderCoreList()` extraction — ALTITUDE IS RIGHT**
+**File**: `cmd/entire/cli/corecmd.go:64-83`
+
+**What**: Factored the fetch-and-render logic into a returned func, so both `runCoreList` and `runCoreListForCluster` can reuse it.
+
+**Why this is right**: Avoids duplicating the table/JSON rendering logic. The two list variants differ *only* in which core they dial; everything else (headers, row mapping, table rendering) is shared.
+
+---
+
+### **6. `coreapi.New()` + `coreapi.NewForCluster()` + `clientFromEnvToken()` — ALTITUDE IS RIGHT**
+**File**: `internal/coreapi/client.go:35-67, 102-117, 122-129`
+
+**What**: 
+- `New()` — dials active context
+- `NewForCluster()` — dials cluster's core (discovered from /.well-known)
+- `clientFromEnvToken()` — shared ENTIRE_TOKEN bypass, checked first by both `New()` and `NewForCluster()`
+- `clientForTarget()` — shared client construction from a resolved target
+
+**Why this is deep, not layered special-casing**:
+- The ENTIRE_TOKEN bypass is **not** a special case bolted on top. It's a *precedence* layer that sits at the entry point to both paths.
+- Both `New()` and `NewForCluster()` follow the same pattern: (1) check ENTIRE_TOKEN, (2) resolve the context/cluster normally, (3) build client from target.
+- `clientFromEnvToken()` is extracted because the precedence logic is identical in both callers. No duplication.
+- `clientForTarget()` is extracted because the client construction is identical once a target is resolved. Shared path.
+
+**Test coverage validates this**: `client_test.go:TestNew_CoreOrigin_HonoursEnvToken` verifies that `New()` with ENTIRE_TOKEN set reports the token's aud, not a stale active context. The test would catch a regression where the two paths diverge.
+
+**Documentation**: The long comment in `clientFromEnvToken()` (lines 69-101 of the diff) explains why there is no trust gate on the aud claim. It's not a cop-out; it's a reasoned decision with security justification.
+
+---
+
+### **Summary: Altitude is Consistent**
+
+| Component | Altitude | Reasoning |
+|-----------|----------|-----------|
+| `CoreOrigin()` | ✓ Right | Single source of truth; prevents display/request divergence |
+| `resolveAuthStatusTarget()` duplication | ✓ Right | Structural; auth status needs (coreURL, token) pair separately for dual API calls |
+| `envToken` rendering flag | ✓ Right | Data-driven, not inference-based; controls both output and API call side effects |
+| `runCore`/`runCoreForCluster`/`runCoreClient` | ✓ Right | Client-selection strategy is pluggable; preamble is unified; scales to future variants |
+| `renderCoreList` extraction | ✓ Right | Decouples render logic from client selection; both list variants reuse it |
+| `New`/`NewForCluster`/`clientFromEnvToken` | ✓ Right | ENTIRE_TOKEN is a precedence layer, not a special case; extracted once at entry points |
+
+**No altitude issues found.** The diff implements core resolution as a **precedence-at-entry-points** pattern (check ENTIRE_TOKEN first, then context, then cluster), with shared helper functions (`clientFromEnvToken`, `clientForTarget`, `targetForContext`, `renderCoreList`) unified at the deepest level and specialized only where structurally necessary. The documentation in CLAUDE.md explicitly calls out the constraint (auth status must re-derive env-token precedence because it needs the pair separately), which prevents future maintainers from accidentally "fixing" the duplication by merging paths that can't be merged.</result>
+<usage><subagent_tokens>43395</subagent_tokens><tool_uses>16</tool_uses><duration_ms>57269</duration_ms></usage>
+</task-notification>
+
+---
+
+the other PR merge so we can open this against main and make a new branch and PR

@@ -1,0 +1,92 @@
+Following https://github.com/entireio/cli/pull/1510, instead of pointing metadata.json at the compact transcript.jsonl file, we actually want to update the metadata.json differently: just add a new field that says `has_compact_transcript: true` if it's available. Otherwise it can be omitted.
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>a09341a6c566175c1</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/785891a2-654d-4a24-a12d-38aa83dd327d/tasks/a09341a6c566175c1.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect. Now I have the complete picture. Let me verify the key insight: in `backfillTranscript`, does the root CheckpointSummary.Sessions array get rebuilt/refreshed, or does it only update tree entries?
+
+Key observation from line 1609 in `backfillTranscript`: it calls `s.spliceCheckpointSubtree(ctx, rootTreeHash, opts.CheckpointID, basePath, entries)`, then creates a new commit — but it **never calls `writeCheckpointSummary`** or reads/updates the root metadata.
+
+In contrast, `writeSession` → `writeStandardCheckpointEntries` → at line 359-367 reads existingSummary.Sessions, updates the array, then calls `writeCheckpointSummary` at line 391 which **rebuilds and writes the root metadata.json with the updated sessions array**.
+
+Now I can answer the question:
+
+## Findings
+
+**The altitude is INCORRECT. `HasCompactTranscript` introduces a special case that diverges from the existing `Transcript`/`ContentHash` lifecycle.**
+
+### Why it diverges:
+
+1. **Initial write (`writeSessionToSubdirectory`, lines 416-424):**
+   - `Transcript` pointer is set when `wroteTranscript` is true
+   - `ContentHash` pointer is set when `wroteTranscript` is true
+   - **`HasCompactTranscript` flag is set when the compact transcript tree entry exists**
+   - All three are bundled into the returned `SessionFilePaths` struct
+
+2. **Root metadata refresh (`writeCheckpointSummary`, lines 523-531):**
+   - `sessions[sessionIndex] = sessionFilePaths` — the array slot is directly assigned from the initial write result
+   - The root `CheckpointSummary` is written/persisted to git with these SessionFilePaths values
+
+3. **Backfill path (`backfillTranscript`, lines 1503-1626):**
+   - **Reads** the session from disk (line 1548) via `readMetadataFromBlob`
+   - **Updates** the session's tree entries: `entries[hashPath]` and `entries[sessionPath+paths.CompactTranscriptFileName]` (lines 1748-1764)
+   - **Does NOT touch the root metadata** — no `writeCheckpointSummary` call
+   - The root `CheckpointSummary.Sessions[i].Transcript` / `.ContentHash` pointers **remain stale** after backfill, pointing at the old content hashes
+
+   **`HasCompactTranscript` follows the same pattern: it is set at initial write (line 423), stored in the root metadata, and never refreshed by backfill.**
+
+### The deeper issue:
+
+The root `CheckpointSummary.Sessions` array is treated as **immutable after initial write**. Both `Transcript` and `ContentHash` pointers in that array don't get updated by `backfillTranscript`, because backfill only updates the **session-level metadata.json** (via `replaceSkillEvents`, not shown to rebuild `SessionFilePaths`), not the root.
+
+**`HasCompactTranscript` should follow this same immutable-after-initial-write pattern — and it does.** The flag is correctly set once at initial write and never needs refreshing because:
+- If a compact transcript was written initially, its existence in the tree at initial-write-time is permanent
+- Backfill regenerates `transcript.jsonl` but the tree entry existence matches the flag that was already persisted
+- The flag is a **write-time artifact**, not a runtime query of the tree
+
+### Conclusion:
+
+**The altitude is CORRECT.** Setting `HasCompactTranscript` only at initial write and not in backfill is consistent with the existing `Transcript`/`ContentHash` lifecycle — both are immutable pointers set once and persisted in the root `CheckpointSummary.Sessions` array. The new field does not introduce a special case; it follows the established pattern of write-once metadata.</result>
+<usage><subagent_tokens>39812</subagent_tokens><tool_uses>13</tool_uses><duration_ms>32516</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ae9ebbd974d7b4a03</task-id>
+<tool-use-id>toolu_01Np11xN28Wze4fYcScEa2sS</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/785891a2-654d-4a24-a12d-38aa83dd327d/tasks/ae9ebbd974d7b4a03.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect! The current code already uses the more idiomatic direct assignment pattern. The diff showed `if _, ok := entries[...]; ok { filePaths.HasCompactTranscript = true }` but the actual code is using the more concise idiomatic Go pattern: `_, filePaths.HasCompactTranscript = entries[key]`.
+
+Now let me verify there are no other patterns to check:
+
+**No findings to report.**
+
+The new code is already idiomatic and does not re-implement existing helpers:
+
+1. **Line 422 in persistent.go** — The pattern `_, filePaths.HasCompactTranscript = entries[sessionPath+paths.CompactTranscriptFileName]` uses the idiomatic Go direct map-lookup assignment (equivalent to `if _, ok := ...; ok { ... = true }`). This is consistent with the 10 other instances of entry-presence checking in the same file. There is no helper function to extract or reuse — direct map lookup is the established pattern throughout checkpoint/persistent.go.
+
+2. **Field-setting pattern** — `filePaths.Transcript`, `filePaths.ContentHash`, and `filePaths.Metadata` are all set via the same mechanism: conditionally append "/" + path and assign to the struct field. The new `HasCompactTranscript` boolean follows the same pattern.
+
+3. **No duplication** — The only existing boolean derived from entry presence elsewhere in the codebase would be in writeCheckpointSummary (lines 507, 514–519), but those check for root-level metadata entries, not file-presence flags for session files. The HasCompactTranscript approach is new and appropriate for signaling optional derived data.
+
+The code is correct and reuses the idiomatic patterns already established in the checkpoint package.</result>
+<usage><subagent_tokens>48609</subagent_tokens><tool_uses>31</tool_uses><duration_ms>68095</duration_ms></usage>
+</task-notification>
+
+---
+
+Push and open a draft PR

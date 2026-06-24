@@ -1,0 +1,1507 @@
+can you take a look at .entire/runners/trail-risk.json it has a prompt template but I feel the prompt is not fitting for a risk review on the cli repo, can you help me craft a better prompt? any suggestions?
+
+---
+
+I like it but can we condense it more, also should we look at the other ones in unison and update all of them?
+
+---
+
+hmm, now I wonder: in theory it would be good to look at session history in the repo, prs and issues, gather data and then based on that suggest the right content for those files. In some way as an onboarding but also refine ment flow. Like for repos without checkpoints issues/prs need to be sufficient, if checkpoints pull that in, if trails that too. Could be a new command on the trail subcommand. Can you give me some ideas and think a bit about it? The command would need to use a local agent like summarize in theory or it could output a prompt that the user pastes into his agent to kick off a proper sessions?
+
+---
+
+I like c too, let's do that
+
+1. It's fine, sensitive things should be redacted
+2. those files are in git, so I think overwriting is fine since git can be used to diff them and decide on commiting
+3. I'm fine doing an iterative step but I'd like to add 1-3 in the first version to be able to play around
+
+---
+
+<task-notification>
+<task-id>ae67cdc7ce91e6157</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/d70d405d-5421-4b68-beab-2e3bcaaf25a7/tasks/ae67cdc7ce91e6157.output</output-file>
+<status>completed</status>
+<summary>Agent "Map local agent launch infra" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect! Now I have all the information I need. Let me compile a comprehensive report.
+
+## Summary Report
+
+I've conducted a thorough investigation of the codebase. Here are the concrete findings:
+
+---
+
+### PART 1: LAUNCHING A LOCAL AGENT SESSION WITH A SEEDED PROMPT
+
+#### **Key Function Signatures &amp; Locations:**
+
+**1. Main Launch Entry Point:**
+- **Function**: `agentlaunch.LaunchFixAgent(ctx context.Context, agentName string, prompt string) error`
+- **Location**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/agentlaunch/launch.go:33-61`
+- **Contract**: Launches an interactive coding agent session (claude-code, codex, gemini) with a pre-seeded prompt. Strips `ENTIRE_REVIEW_*` and `ENTIRE_INVESTIGATE_*` env vars so the fix session is not tagged as review/investigate. Returns nil on clean exit, wrapped error on failure.
+
+**2. Per-Agent Reviewer Interface (required to implement):**
+- **Interface**: `reviewtypes.AgentReviewer`
+- **Location**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/review/types/reviewer.go:24-43`
+- **Methods**:
+  - `Name() string` — returns agent registry key (e.g., "claude-code")
+  - `Start(ctx context.Context, run RunConfig) (Process, error)` — spawns agent with config, returns event stream
+
+**3. Agent Launcher Discovery (how system knows which agent is launchable):**
+- **Function**: `agent.LauncherFor(name AgentName) (Launcher, bool)`
+- **Location**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/agent/registry.go:270-280`
+- **Contract**: Returns a `Launcher` interface for agents that support subprocess launching. Returns `(nil, false)` for non-launchable agents (cursor, opencode, factoryai-droid, copilot-cli).
+
+**4. Launcher Interface (what agents must implement to be spawnable):**
+- **Interface**: `agent.Launcher`
+- **Location**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/agent/agent.go:291-293`
+- **Method**:
+  - `LaunchCmd(ctx context.Context, initialPrompt string) (*exec.Cmd, error)` — builds an `exec.Cmd` ready to `Run()`, with stdin/stdout/stderr wired to caller's TTY.
+
+**5. Concrete Example: Claude Code Reviewer Implementation:**
+- **Function**: `claudecode.NewReviewer() *reviewtypes.ReviewerTemplate`
+- **Location**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/agent/claudecode/reviewer.go:28-34`
+- **Builds cmd via**: `buildReviewCmd(ctx context.Context, cfg reviewtypes.RunConfig) *exec.Cmd`
+  - **Argv shape**: `claude -p &lt;prompt&gt; --output-format stream-json --verbose`
+  - **Env setup**: Calls `review.AppendReviewEnv(os.Environ(), "claude-code", cfg, prompt)` to inject review session markers
+  - **Output parsing**: `parseClaudeOutput(r io.Reader) &lt;-chan reviewtypes.Event` parses JSONL stream into typed events
+
+#### **RunConfig Structure (what you pass to launch):**
+- **Location**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/review/types/reviewer.go:65-135`
+- **Key Fields**:
+  - `PromptOverride string` — the exact prompt to send (set this)
+  - `Skills []string` — skill invocations (e.g., `["/pr-review-toolkit:review-pr"]`) — serialized to JSON in env var
+  - `AlwaysPrompt string` — per-agent always-prompt from settings
+  - `PerRunPrompt string` — optional per-invocation prompt extension
+  - `ScopeBaseRef string` — git ref for scope (e.g., `origin/main`); scope clause auto-appended to prompt if set
+  - `StartingSHA string` — HEAD at invocation time; propagated to lifecycle hook via `ENTIRE_REVIEW_STARTING_SHA`
+  - `CheckpointContext string` — best-effort context from checkpoints; appended to generated prompts
+
+#### **Environment Variable Contract (the "handshake"):**
+- **Location**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/provenance/env.go`
+- **Constants**:
+  - `ENTIRE_REVIEW_SESSION=1` — marks it as a review session
+  - `ENTIRE_REVIEW_AGENT=&lt;agent-name&gt;` — e.g., "claude-code"
+  - `ENTIRE_REVIEW_SKILLS=&lt;json-array&gt;` — skill invocations (empty list: `"[]"`)
+  - `ENTIRE_REVIEW_PROMPT=&lt;text&gt;` — the full composed prompt
+  - `ENTIRE_REVIEW_STARTING_SHA=&lt;sha&gt;` — HEAD commit hash
+- **Function to inject**: `review.AppendReviewEnv(base []string, agentName string, cfg RunConfig, prompt string) []string`
+- **Location**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/review/env.go:59-91`
+- **Behavior**: Strips existing `ENTIRE_REVIEW_*` and `ENTIRE_INVESTIGATE_*` entries before appending new ones (handles nested invocations).
+
+#### **Prompt Composition (how the seeded prompt is built):**
+- **Function**: `review.ComposeReviewPrompt(cfg RunConfig) string`
+- **Location**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/review/prompt.go:25-60`
+- **Algorithm**:
+  1. If `cfg.PromptOverride` is set, return it verbatim (skip all composition)
+  2. Otherwise, join sections with `\n\n`:
+     - Skills (one per line)
+     - `AlwaysPrompt` (trimmed)
+     - `PerRunPrompt` (trimmed)
+     - **Scope clause** (if `ScopeBaseRef` non-empty): `"Scope: review the commits unique to this branch vs &lt;ScopeBaseRef&gt;, plus any uncommitted changes in the working tree. Ignore code outside this scope."`
+     - `CheckpointContext` (trimmed)
+
+#### **Example: How `entire review` Launches Agents**
+- **Entry**: `review.NewCommand(deps)` in `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/review/cmd.go:98-213`
+- **Key Path** (single-agent):
+  1. Load settings, resolve eligible agents
+  2. Call `reviewer.Start(ctx, cfg)` where `reviewer = deps.ReviewerFor(agentName)` (returns `AgentReviewer` for launchable agents)
+  3. Reviewer builds `exec.Cmd` via `buildReviewCmd()`, injects env vars, spawns process
+  4. Orchestrator consumes `Event` stream from `Process.Events()`, fans out to `Sink` observers
+  5. Calls `Process.Wait()` to block until exit
+- **Multi-agent path** (when 2+ launchable agents):
+  1. Shows picker, collects per-run prompt
+  2. Builds per-agent `reviewtypes.AgentReviewer` adapters
+  3. Calls `RunMulti(ctx, reviewers, cfg, sinks)` to launch all concurrently
+  4. Each agent spawned in its own goroutine with isolated `RunConfig`
+
+---
+
+### PART 2: NON-INTERACTIVE "PROMPT IN → TEXT OUT" PROVIDER
+
+#### **Yes, a reusable provider exists.**
+
+**Interface Definition:**
+- **Interface**: `agent.TextGenerator`
+- **Location**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/agent/agent.go:214-223`
+- **Single Method**:
+  ```go
+  GenerateText(ctx context.Context, prompt string, model string) (string, error)
+  ```
+  - `ctx` — context for cancellation
+  - `prompt` — the text prompt to send
+  - `model` — optional hint (e.g., "haiku", "sonnet"); implementations may ignore
+  - **Returns**: raw text response or error
+
+**How to Invoke Programmatically (non-interactive):**
+
+1. **Resolve the provider**:
+   ```go
+   ag, err := agent.Get(agentName)  // agent.AgentName("claude-code")
+   textGen, ok := agent.AsTextGenerator(ag)
+   if !ok {
+       // Agent does not support non-interactive text generation
+   }
+   ```
+
+2. **Call directly**:
+   ```go
+   result, err := textGen.GenerateText(ctx, prompt, model)
+   ```
+
+**Concrete Implementation for Claude Code:**
+- **Function**: `text_generator_cli.RunIsolatedTextGeneratorCLI(ctx, runner, binary, displayName, args, stdin) (string, error)`
+- **Location**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/agent/text_generator_cli.go:21-67`
+- **Behavior**:
+  - Runs CLI in isolated temp directory (isolated from repo hooks/context)
+  - Strips all `GIT_*` env vars
+  - Captures stdout (the response)
+  - Returns `(output string, error)` or error on non-zero exit
+  - CLI binary examples: `claude`, `codex`, `gemini` (mapped by agent type)
+
+**Higher-Level Wrapper (what the summarize system uses):**
+- **Struct**: `summarize.TextGeneratorAdapter`
+- **Location**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/summarize/text_generator.go`
+- **Method**: `Generate(ctx context.Context, input Input) (*checkpoint.Summary, error)`
+- **What it does**:
+  1. Takes a structured `Input` (transcript entries + files touched)
+  2. Formats as text via `FormatCondensedTranscript()`
+  3. Builds a summarization prompt via `buildSummarizationPrompt()`
+  4. Calls `textGen.GenerateText(ctx, prompt, model)`
+  5. Parses response via `parseSummaryText()` into structured `checkpoint.Summary`
+
+**Provider Selection Infrastructure:**
+- **Function**: `explain_summary_provider.resolveCheckpointSummaryProvider(ctx, w)`
+- **Location**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/explain_summary_provider.go:39-83`
+- **Behavior**:
+  1. Reads `settings.SummaryGeneration.Provider` (if set)
+  2. Falls back to auto-detection: discovers all agents, filters for `TextGenerator` capability
+  3. Single installed → auto-select; multiple → interactive prompt; none → error
+  4. Returns `*checkpointSummaryProvider` (wraps `TextGenerator + model`)
+
+**Settings Integration:**
+- **Config**: `settings.SummaryGenerationSettings`
+- **Fields**: `Provider` (agent name), `Model` (optional model hint)
+- **Persistence**: Saved to `settings.local.json` (machine-specific)
+- **CLI Check**: `agent.IsSummaryCLIAvailable(name AgentName) bool` — checks if binary is on PATH
+
+---
+
+### SUMMARY FOR YOUR COMMAND
+
+**To build your command that optionally launches a local agent OR prints a prompt:**
+
+**Option A: Launch Interactive Agent Session**
+1. Get launcher: `launcher, ok := agent.LauncherFor(agentName)`
+2. Build config: `cfg := reviewtypes.RunConfig{PromptOverride: yourPrompt, StartingSHA: sha, ...}`
+3. Compose prompt: `prompt := review.ComposeReviewPrompt(cfg)` (if you don't use `PromptOverride`)
+4. **Direct launch** (simplest for your use case):
+   ```go
+   cmd, err := launcher.LaunchCmd(ctx, prompt)
+   cmd.Env = review.AppendReviewEnv(os.Environ(), "claude-code", cfg, prompt)
+   err = cmd.Run()  // blocks until exit
+   ```
+5. **Or use review infrastructure** (if you need event streaming/sinks):
+   - Get reviewer: `reviewer := deps.ReviewerFor(agentName)`
+   - Call `review.Run(ctx, reviewer, cfg, sinks)` — returns `RunSummary` + error
+
+**Option B: Non-Interactive Text Generation (just print response)**
+1. Get provider: `ag, _ := agent.Get(agentName); textGen, _ := agent.AsTextGenerator(ag)`
+2. Call directly: `result, err := textGen.GenerateText(ctx, prompt, model)`
+3. Print: `fmt.Println(result)`
+
+---
+
+### KEY FILE REFERENCES (for deeper exploration)
+
+- **Agent discovery/selection**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/agent/registry.go`
+- **Review orchestrator**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/review/cmd.go` (entry point) + `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/review/run.go` (single-agent)
+- **Agent reviewer implementations**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/agent/{claudecode,codex,geminicli}/reviewer.go`
+- **Env-var contract**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/provenance/env.go` (names) + `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/review/env.go` (composition)
+- **Summarize/TextGenerator**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/summarize/text_generator.go` + `explain_summary_provider.go`</result>
+<usage><subagent_tokens>75720</subagent_tokens><tool_uses>32</tool_uses><duration_ms>105300</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a82aa264bb5a06df7</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/d70d405d-5421-4b68-beab-2e3bcaaf25a7/tasks/a82aa264bb5a06df7.output</output-file>
+<status>completed</status>
+<summary>Agent "Map trail subcommand + runner config" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect! Now I have comprehensive information. Let me create a final summary report of my findings:
+
+## REPORT: Trail Subcommand Structure &amp; Runner Configuration
+
+### 1. THE `trail` SUBCOMMAND STRUCTURE
+
+#### Root Command Registration
+
+**File**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_cmd.go` (lines 41-71)
+
+```go
+func newTrailCmd() *cobra.Command {
+	var insecureHTTPAuth bool
+
+	cmd := &amp;cobra.Command{
+		Use:    "trail",
+		Short:  "Manage trails for your branches",
+		Hidden: true,
+		Args:   cobra.NoArgs,
+		Long:   "A trail ties together the context for a branch. Use `entire trail` to view, create, update, or watch it.",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return cmd.Help()
+		},
+	}
+
+	cmd.PersistentFlags().BoolVar(&amp;insecureHTTPAuth, "insecure-http-auth", false,
+		"Allow API calls over plain HTTP (insecure, for local development only)")
+	if err := cmd.PersistentFlags().MarkHidden("insecure-http-auth"); err != nil {
+		panic(fmt.Sprintf("hide insecure-http-auth flag: %v", err))
+	}
+
+	cmd.AddCommand(newTrailShowCmd())
+	cmd.AddCommand(newTrailListCmd())
+	cmd.AddCommand(newTrailCreateCmd())
+	cmd.AddCommand(newTrailUpdateCmd())
+	cmd.AddCommand(newTrailCheckoutCmd())
+	cmd.AddCommand(newTrailDeleteCmd())
+	cmd.AddCommand(newTrailFindingCmd())
+	cmd.AddCommand(newTrailWatchCmd())
+
+	return cmd
+}
+```
+
+**Root integration** (`/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/root.go`):
+- Called via `cmd.AddCommand(newTrailCmd())`
+
+#### Subcommand Files Existing
+
+Located in `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/`:
+1. `trail_cmd.go` - Root trail command + show/list/create/update/checkout/delete subcommands
+2. `trail_review_cmd.go` - `trail finding` group + subcommands (list, add, show, update, apply, resolve, dismiss, reopen)
+3. `trail_watch_cmd.go` - `trail watch` command
+
+#### Subcommand Creation Pattern
+
+**Signature (from trail_checkout_cmd at line 1050-1082)**:
+
+```go
+func newTrailCheckoutCmd() *cobra.Command {
+	var trailSelector string
+	var force bool
+
+	cmd := &amp;cobra.Command{
+		Use:   "checkout [&lt;trail&gt;]",
+		Short: "Check out a trail's branch",
+		Long:  `... detailed help text ...`,
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			selector := trailSelector
+			if len(args) == 1 {
+				if cmd.Flags().Changed("trail") {
+					return errors.New("cannot combine a trail argument with --trail")
+				}
+				selector = args[0]
+			}
+			return runTrailCheckout(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), trailInsecureHTTP(cmd), selector, force)
+		},
+	}
+
+	cmd.Flags().StringVar(&amp;trailSelector, "trail", "", "Trail to check out ...")
+	cmd.Flags().BoolVarP(&amp;force, "force", "f", false, "Skip the prompt before fetching a remote-only branch")
+
+	return cmd
+}
+```
+
+**RunE signature convention** (from line 1084):
+
+```go
+func runTrailCheckout(ctx context.Context, w, errW io.Writer, insecureHTTP bool, selector string, force bool) error {
+	return runAuthenticatedDataAPI(ctx, errW, insecureHTTP, func(ctx context.Context, client *api.Client) error {
+		// command implementation
+	})
+}
+```
+
+#### Flag Declaration Conventions
+
+- **Positional args**: Via `cmd.Flags().` methods (StringVar, BoolVarP, IntVar, etc.)
+- **Changed tracking**: `cmd.Flags().Changed(flag_name)` for conditional logic
+- **Reading persistent flags** from parent: `trailInsecureHTTP(cmd)` helper (line 74-77)
+
+#### File Naming Convention
+
+- **Root command file**: `trail_cmd.go` - contains `newTrailCmd()` and multiple subcommand constructors
+- **Subcommand in same file**: When part of root (show, list, create, update, checkout, delete) - stays in main `trail_cmd.go`
+- **Group command file**: `trail_review_cmd.go` - contains `newTrailFindingCmd()` (parent) + subcommands (list, add, show, update, apply, status helpers)
+
+#### Group Command Pattern (for reference)
+
+Location: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/checkpoint_group.go`
+
+The pattern for group commands (noun commands with subcommands) is to use a `_group.go` suffix, like:
+- `checkpoint_group.go` for checkpoint
+- `agent_group.go` for agent
+- `plugin_group.go` for plugin
+
+**However, the trail command does NOT use this pattern** — `trail_cmd.go` serves as the root with inline subcommand factories + nested `trail_finding_cmd.go` for the "finding" group subcommand.
+
+---
+
+### 2. RUNNER CONFIG (.entire/runners/*.json)
+
+#### Known Runner Files
+
+Located in `/Users/soph/Work/entire/devenv/cli_experiments/.entire/runners/`:
+- `trail-summary.json`
+- `trail-drift.json`
+- `trail-review-focus.json`
+- `trail-security.json`
+- `trail-risk.json`
+- `trail-pr-review.json`
+- `trail-confidence.json`
+
+#### Runner JSON Structure (from examples)
+
+**trail-summary.json**:
+```json
+{
+  "id": "trail-summary",
+  "display_name": "Trail Summary",
+  "enabled": true,
+  "scope": "trail",
+  "runtime": {
+    "kind": "prompt_runner",
+    "agent": "claude",
+    "model": "haiku",
+    "timeout_ms": 300000,
+    "sandbox": {
+      "base_template": "claude",
+      "repo_token": "read"
+    }
+  },
+  "automation": {
+    "kind": "trail_prompt"
+  },
+  "prompt": {
+    "template": "You summarize code changes... {{branch}}... {{base_branch}}..."
+  },
+  "select": {
+    "trigger_types": ["api", "push"]
+  },
+  "output": {
+    "adapter": "markdown",
+    "result_type": "trail_summary",
+    "trail_field": "body"
+  }
+}
+```
+
+**trail-drift.json** (alternative output format):
+```json
+{
+  "id": "trail-drift",
+  "display_name": "Drift Eval",
+  "enabled": true,
+  "scope": "trail",
+  "runtime": {
+    "kind": "prompt_runner",
+    "agent": "claude",
+    "timeout_ms": 300000,
+    "sandbox": {...}
+  },
+  "automation": {
+    "kind": "trail_prompt"
+  },
+  "prompt": {
+    "template": "You are a code drift evaluator... {{branch}}... {{base_branch}}..."
+  },
+  "select": {
+    "trigger_types": ["api", "push"]
+  },
+  "output": {
+    "adapter": "last_json_line",
+    "result_type": "trail_monitor",
+    "trail_monitor": {
+      "key": "drift",
+      "label": "Drift",
+      "value_type": "percent",
+      "polarity": "lower_is_better"
+    }
+  }
+}
+```
+
+#### Runner JSON Fields Summary
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | string | Unique identifier (snake_case) |
+| `display_name` | string | Human-readable name |
+| `enabled` | boolean | Whether runner is active |
+| `scope` | string | "trail" for trail-scoped runners |
+| `runtime` | object | Execution config (kind: prompt_runner, agent, model, timeout_ms, sandbox) |
+| `automation` | object | Trigger config (kind: trail_prompt) |
+| `prompt` | object | Template config (template with {{branch}}, {{base_branch}}, {{previous_findings}}) |
+| `select` | object | Selection criteria (trigger_types: ["api", "push"]) |
+| `output` | object | Result handling (adapter, result_type, trail_field or trail_monitor) |
+
+#### Template Placeholder Substitution
+
+Found in prompt.template fields:
+- `{{branch}}` - Current branch name
+- `{{base_branch}}` - Base/target branch name
+- `{{previous_findings}}` - (inferred from task) - Previous findings from earlier runners
+
+**Note**: No direct evidence found in CLI codebase of where substitution occurs — likely handled by a separate runner orchestration service outside this CLI repo.
+
+#### Path Resolution &amp; Loading
+
+**Search Results**: No explicit loader found in `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/` that reads `.entire/runners/*.json`. The runners directory appears to be:
+- Part of repo versioning (stored in git)
+- Read by an external orchestration/automation system
+- Not directly loaded/parsed by this CLI code
+
+**Likely location**: Runners are read by a backend service or separate orchestration module (not in this CLI codebase).
+
+#### Read vs. Write
+
+**Evidence of write operations**: None found in codebase — runners appear to be static configuration files managed as repo artifacts.
+
+**Evidence of read operations**: None found in this CLI codebase, suggesting runners are consumed by an external system (agent orchestrator, CI/CD integration, etc.).
+
+---
+
+### 3. RECOMMENDED FILE FOR `entire trail tune`
+
+#### Suggested Filename
+
+`trail_tune_cmd.go` (keep alongside existing subcommand files in `cmd/entire/cli/`)
+
+#### Suggested Skeleton
+
+```go
+package cli
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+
+	"github.com/entireio/cli/cmd/entire/cli/api"
+	"github.com/spf13/cobra"
+)
+
+func newTrailTuneCmd() *cobra.Command {
+	// Flag variables
+	var (
+		param1 string
+		param2 bool
+	)
+
+	cmd := &amp;cobra.Command{
+		Use:   "tune [&lt;trail&gt;]",
+		Short: "Tune trail parameters or configuration",
+		Long: `Adjust trail configuration and parameters.
+
+If &lt;trail&gt; is omitted, tunes the trail for the current branch. Otherwise,
+&lt;trail&gt; may be a trail number, id, or branch in the current repo.`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			selector := ""
+			if len(args) == 1 {
+				selector = args[0]
+			}
+			return runTrailTune(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), trailInsecureHTTP(cmd), selector, param1, param2)
+		},
+	}
+
+	cmd.Flags().StringVar(&amp;param1, "option", "", "Configuration option to tune")
+	cmd.Flags().BoolVar(&amp;param2, "enable", false, "Enable the option")
+
+	return cmd
+}
+
+func runTrailTune(ctx context.Context, w, errW io.Writer, insecureHTTP bool, selector string, param1 string, param2 bool) error {
+	return runAuthenticatedDataAPI(ctx, errW, insecureHTTP, func(ctx context.Context, client *api.Client) error {
+		forge, owner, repo, err := resolveTrailRemote(ctx)
+		if err != nil {
+			return err
+		}
+
+		found, err := resolveTrailBySelector(ctx, client, forge, owner, repo, selector)
+		if err != nil {
+			return err
+		}
+
+		// Implementation: tune trail parameters
+		_ = found // use trail resource
+
+		fmt.Fprintf(w, "Tuned trail configuration\n")
+		return nil
+	})
+}
+```
+
+#### Integration into Root Command
+
+Add to `newTrailCmd()` in `trail_cmd.go` (around line 68):
+
+```go
+cmd.AddCommand(newTrailTuneCmd())
+```
+
+---
+
+## Summary of Key Files
+
+| Path | Purpose |
+|------|---------|
+| `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_cmd.go` | Root trail command + show/list/create/update/checkout/delete |
+| `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_review_cmd.go` | `trail finding` parent group + 7 subcommands |
+| `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_watch_cmd.go` | `trail watch` command (SSE streaming) |
+| `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail/trail.go` | Shared trail types (Status, Metadata, Priority, etc.) |
+| `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/root.go` | Root command registration |
+| `/Users/soph/Work/entire/devenv/cli_experiments/.entire/runners/trail-*.json` | Runner automation configs (7 files) |</result>
+<usage><subagent_tokens>76537</subagent_tokens><tool_uses>33</tool_uses><duration_ms>122807</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a084a6f64efbec9bc</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/d70d405d-5421-4b68-beab-2e3bcaaf25a7/tasks/a084a6f64efbec9bc.output</output-file>
+<status>completed</status>
+<summary>Agent "Map data sources for tuning" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect! Now I have comprehensive coverage. Let me write the final report:
+
+## COMPREHENSIVE REPORT: Programmatic Access to Repo Signal Sources
+
+Based on thorough investigation of the Go CLI codebase, here's what's programmatically accessible for each of the four data sources:
+
+---
+
+### 1. CHECKPOINT / SESSION HISTORY
+
+**Checkpoint JSON Output Shape** (`entire search --json`):
+- **File**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/search/search.go:42-113`
+- **Response structure**:
+  ```
+  {
+    "results": [
+      {
+        "type": "checkpoint|commit|session",
+        "data": { /* typed payload */ },
+        "searchMeta": {
+          "matchType": "...",
+          "score": 0.0,
+          "snippet": "...",
+          ...
+        }
+      }
+    ],
+    "total": &lt;int&gt;,
+    "counts": {
+      "checkpoint": &lt;int&gt;,
+      "commit": &lt;int&gt;,
+      "session": &lt;int&gt;
+    }
+  }
+  ```
+
+**CheckpointResult fields** (from search API):
+- `id`, `prompt`, `commitMessage`, `commitSHA`, `branch`, `org`, `repo`, `author`, `authorUsername`, `createdAt`, `filesTouched` (array)
+
+**Internal Go API for Checkpoints**:
+- **File**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/checkpoint/checkpoint.go:66-144`
+- **Key types**:
+  - `checkpoint.TemporaryStore` interface: 
+    - `ListTemporary(ctx, ...)` → `[]TemporaryInfo`
+    - `ListTemporaryCheckpoints(ctx, baseCommit, worktreeID, sessionID, limit)` → `[]TemporaryCheckpointInfo`
+    - `ListAllTemporaryCheckpoints(ctx, sessionID, limit)` → `[]TemporaryCheckpointInfo`
+    - `ListCheckpointsForBranch(ctx, branchName, sessionID, limit)` → `[]TemporaryCheckpointInfo`
+    - `GetTranscriptFromCommit(ctx, commitHash, metadataDir, agentType)` → `[]byte`
+    - `ShadowBranchExists(baseCommit, worktreeID)` → `bool`
+
+- `TemporaryCheckpointInfo` fields: `commitHash`, `message`, `sessionID`, `metadataDir`, `isTaskCheckpoint`, `toolUseID`, `timestamp`
+
+- `CommittedInfo` (committed checkpoints): `checkpointID`, `sessionID`, `createdAt`, `checkpointsCount`, `filesTouched`, `agent`, `isTask`, `toolUseID`, `sessionCount`, `sessionIDs`
+
+- `CommittedMetadata` (stored in metadata.json): `cliVersion`, `checkpointID`, `sessionID`, `strategy`, `createdAt`, `branch`, `checkpointsCount`, `saveStepCount`, `filesTouched`, `agent`, `model`, `tokenUsage`, `skillEvents`, `summary`, `initialAttribution`, `kind` (e.g., "agent_review")
+
+**Verdict**: Clean internal Go API exists. **No shell-out needed**. The checkpoint package provides storage-aware introspection through `TemporaryStore` interface, which is implemented by strategy internals. Checkpoints are stored on shadow branches (entire/&lt;hash&gt;) and the metadata orphan branch (entire/checkpoints/v1). Search API provides semantic/keyword matching but the internal API gives direct programmatic access to metadata and transcripts.
+
+---
+
+### 2. TRAIL HISTORY / EVAL RESULTS
+
+**Trail API Methods**:
+- **File**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/api/trails.go:19-29`
+- `TrailsEnabled(ctx, forge, owner, repo)` → `bool` - probe if trails are provisioned for the repo
+
+**TrailListResponse** (from GET /api/v1/trails/:org/:repo):
+- **File**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/api/trail_types.go:9-20`
+- Fields: `trails: []TrailResource`, `total`, `limit`, `offset`, `repoFullName`, `defaultBranch`, `updatedAt`
+
+**TrailResource fields**:
+- `id`, `number`, `branch`, `base`, `title`, `body`, `status`, `phase`, `author`, `assignees`, `labels`, `priority`, `type`, `reviewers`, `createdAt`, `updatedAt`, `mergedAt`, `commentCount`, `unresolvedCount`, `checkpointCount`, `commitsAhead`
+
+**Trail Review Comments** (findings from code review):
+- **File**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/api/trail_review_types.go:53-79`
+- `TrailReviewComment` fields: `id`, `trailID`, `repositoryID`, `reviewID`, `codeVersionID`, `title`, `body`, `severity`, `confidence` (float64), `status` ("open"|"resolved"|"dismissed"|"stale"), `statusReason`, `staleOutcome`, `staleCheckedAt`, `location` (file/line/column), `suggestedChanges[]`, `threadID`
+
+**Access Pattern**:
+- **CLI command**: `entire trail list` / `entire trail show`
+- **File**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_cmd.go:97-112`
+- Lists trails with filters: author, status (open/closed/merged/draft), limit
+- Reviews accessed via `trail_review_cmd.go` (separate subcommand)
+
+**Trail Identification**:
+- Repository scope: `forge` (github/gitlab/etc), `owner`, `repo` (parsed from origin remote)
+- Trail scope: `number` (human-facing), `id` (12-hex trail ID)
+- Branch association: `branch` field directly identifies which branch the trail covers
+
+**Verdict**: **Shell-out to data API** via `api.Client` (wrapper around HTTP). No direct language SDK for trail CRUD. To query past reviews/findings: make HTTP GET to `/api/v1/trails/{forge}/{owner}/{repo}` (list) or `/api/v1/trails/{trailID}/reviews/{reviewID}` (detail + comments). The CLI code authenticates via `api.Client` using an access token from `auth.ResolveDataAPIToken()`. Risk/confidence scores are in the `confidence` field of review comments (optional float64, range 0-1 implied).
+
+---
+
+### 3. ISSUES / PRs
+
+**GitHub Access Strategy**:
+- **File**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/setup_github.go:813-865`
+- The CLI **shells out to `gh` CLI** for GitHub operations (user availability, org enumeration, repo creation/existence checks)
+- Commands used: `gh api user`, `gh repo view`, `gh repo create`
+- No vendored GitHub SDK (go-github, octokit, etc.) in the CLI codebase
+
+**What's Available**:
+- GitHub App integration check: `api.ReportEnable()` (file: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/api/enable.go`) returns `EnableRepoResponse` with `connected` (bool), `installURL`, and basic repo metadata (`fullName`, `githubID`, `private`)
+- Repository enumeration: `api.ListRepositories()` (file: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/api/repositories.go:28-51`) - lists user's repos with `checkpointCount`, no PR/issue fields
+
+**Verdict**: **No clean internal API for PRs/issues**. To read merged PRs and issues:
+1. **Shell out to `gh` CLI** (e.g., `gh pr list --state merged`, `gh issue list`)
+2. **Or** make authenticated HTTP calls to GitHub GraphQL/REST API using a GitHub token (the CLI never does this directly; it defers to `gh`)
+3. **Identity for this repo**: Resolved via `strategy.OpenRepository(ctx)` (file: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/strategy/common.go:1011-1017`) which opens the git repo, then extract remote URLs and parse with `search.ParseGitHubRemote()` (file: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/search/github.go:17-33`) to get `owner` and `repo`
+
+---
+
+### 4. REPO STATIC CONTEXT
+
+**Repository Root Discovery**:
+- **File**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/paths/paths.go:65-101`
+- `paths.WorktreeRoot(ctx)` → worktree root via `git rev-parse --show-toplevel` (cached per cwd)
+- `strategy.OpenRepository(ctx)` → go-git Repository object
+- `strategy.GetMainRepoRoot(ctx)` → main repo root (handles worktrees)
+- `strategy.GetGitCommonDir(ctx)` → shared .git directory
+
+**Metadata File Locations**:
+- **Infrastructure dir**: `.entire/` (constant: `paths.EntireDir`)
+- **Checkpoint metadata branch**: `entire/checkpoints/v1` (orphan branch; constants: `paths.MetadataBranchName`)
+- **Trail metadata branch**: `entire/trails/v1` (orphan branch; constant: `paths.TrailsBranchName`)
+- **Checkpoint path structure**: `&lt;checkpoint-id[:2]&gt;/&lt;checkpoint-id[2:]&gt;/metadata.json` + session subdirs
+
+**ReadMe/Docs Discovery**:
+- **No built-in helper function** in the CLI to locate/read CLAUDE.md, AGENTS.md, README, go.mod, etc.
+- The search command does NOT index these files; it indexes checkpoints, commits, sessions
+- To discover repo structure: manually read files from `WorktreeRoot()` (e.g., look for README.md, go.mod, Makefile patterns)
+
+**Verdict**: **Go API exists for paths and git repo root**. No dedicated "describe repo" function. To gather static context:
+1. Call `paths.WorktreeRoot(ctx)` to get repo root
+2. Use `strategy.OpenRepository(ctx)` to open go-git repo (full tree/commit introspection available)
+3. Manually read target files (README, CLAUDE.md, go.mod, etc.) from the worktree root
+4. For committed checkpoint metadata, walk the `entire/checkpoints/v1` branch using git tree/object APIs
+
+---
+
+### IDENTIFICATION KEYS FOR EACH SOURCE
+
+| Source | Identifies "This Repo" | Identifies Specific Item |
+|--------|----------------------|-------------------------|
+| **Checkpoint** | `forge`, `owner`, `repo` (from remote URL) | Checkpoint `id` (12-hex) or commit SHA; session `sessionID` (date-prefixed) |
+| **Trail** | `forge`, `owner`, `repo` (from remote URL) | Trail `id` (12-hex) or `number` (integer); `branch` field links trail to working branch |
+| **PR/Issue** | `forge`, `owner`, `repo` (from remote URL) | GitHub PR/issue number (from `gh` CLI or GitHub API) |
+| **Static Context** | `WorktreeRoot()` (repo root path) | File path relative to repo root |
+
+---
+
+### SUMMARY TABLE
+
+| Source | Internal Go API | Shell-Out | HTTP/REST | Data Available | Notes |
+|--------|-----------------|-----------|-----------|-----------------|-------|
+| **Checkpoint/Session** | ✅ `checkpoint.TemporaryStore` + `checkpoint.Committed*` types | ❌ No | Via search service (not shell) | Metadata, transcripts, files touched, prompts, rewound state | Shadow branch storage; internal API preferred |
+| **Trail/Reviews** | ❌ Minimal (only `TrailsEnabled()`) | ❌ No | ✅ `/api/v1/trails/*` endpoint | Trail status, reviewers, review comments w/ risk/confidence | Must use data API client; CLI wraps HTTP |
+| **PR/Issue** | ❌ No | ✅ `gh` CLI | ❌ Not directly | Must shell out or call GitHub API | CLI never makes direct GitHub API calls |
+| **Repo Static** | ✅ `paths.WorktreeRoot()`, `strategy.OpenRepository()` | ✅ `git` commands | ❌ Not needed | Repo root, git metadata, manual file read | No dedicated "describe repo" function |</result>
+<usage><subagent_tokens>75044</subagent_tokens><tool_uses>54</tool_uses><duration_ms>118793</duration_ms></usage>
+</task-notification>
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>a67b8c7e0f4f900ab</task-id>
+<tool-use-id>toolu_01FwR34e5cgSnu1yNmu5oWc9</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/d70d405d-5421-4b68-beab-2e3bcaaf25a7/tasks/a67b8c7e0f4f900ab.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Now I'll analyze these files systematically for simplification opportunities.
+
+## Simplification Findings
+
+### 1. **Duplicate switch/loop blocks in `gatherPRsAndIssues` (trail_tune_gather.go, lines 160-193)**
+
+**File:** `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_gather.go`  
+**Lines:** 160–193  
+**Summary:** Two nearly identical switch-case patterns handle PR and issue listing with the same logic flow.
+
+**Current form:** 
+- Lines 166–178: PR switch with three cases (error, empty, default with loop)
+- Lines 180–190: Issue switch with identical structure, variable name only difference
+
+**Simpler form:** Extract to `gatherGHItems(ctx, kind, limit)` helper that returns formatted string. Eliminates ~20 lines of copy-paste code and makes the error handling and formatting consistent in one place.
+
+**Cost of current:** Cognitive load; if one switch's logic changes, the other must be updated separately; risk of drift.
+
+---
+
+### 2. **Duplicated label struct in `labelSuffix` parameter (trail_tune_gather.go, lines 217–228)**
+
+**File:** `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_gather.go`  
+**Lines:** 195–228  
+**Summary:** The `ghItem.Labels` field uses an anonymous struct `[]struct{Name string}`, which is redefined identically in the `labelSuffix(labels []struct{...})` signature.
+
+**Current form:**
+```go
+type ghItem struct {
+    Labels []struct {
+        Name string `json:"name"`
+    } `json:"labels"`
+}
+
+func labelSuffix(labels []struct {
+    Name string `json:"name"`
+}) string { ... }
+```
+
+**Simpler form:** Define a named type once:
+```go
+type ghLabel struct {
+    Name string `json:"name"`
+}
+```
+Then use `[]ghLabel` in both places. Reduces duplication, improves readability, and makes the type reusable.
+
+**Cost of current:** Duplication; the struct appears twice with no shared name; harder to refactor or understand the data model.
+
+---
+
+### 3. **Unused `limit` parameter in `gatherCheckpoints` (trail_tune_gather.go, line 275)**
+
+**File:** `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_gather.go`  
+**Line:** 275  
+**Summary:** `func gatherCheckpoints(ctx context.Context, limit int)` accepts `limit` but immediately marks it unused with `_ = limit`.
+
+**Current form:**
+```go
+func gatherCheckpoints(ctx context.Context, limit int) string {
+    // ... lots of code ...
+    _ = limit // checkpoint listing is already bounded by repo history
+```
+
+**Simpler form:** Remove the `limit` parameter entirely and update the call site in `gatherTuningContext` (line 84). If checkpoint listing is inherently bounded by repo history (as the comment states), the parameter serves no purpose.
+
+**Cost of current:** Dead parameter pollutes the signature; callers must pass a value they can't use; comment is needed to explain why it's there.
+
+---
+
+### 4. **`tuneSources` struct + `parseTuneSources` pattern (trail_tune_gather.go, lines 27–63)**
+
+**File:** `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_gather.go`  
+**Lines:** 27–63  
+**Summary:** `tuneSources` is a 4-bool struct; `parseTuneSources` parses a list into it.
+
+**Current form:**
+```go
+type tuneSources struct {
+    repo bool
+    prs bool
+    checkpoints bool
+    trails bool
+}
+
+func parseTuneSources(list []string) (tuneSources, error) {
+    // ... switch on strings ...
+    var s tuneSources
+    s.repo = true
+    // etc.
+}
+```
+
+**Simpler form (optional):** If the four fields always move together and never vary independently, consider a bitmask or enum instead. Alternatively, if composition isn't the issue, the current approach is reasonable — struct of bools is idiomatic Go. This is **borderline**: it's not obviously wrong, just a style choice. Keep if clarity is the priority; switch to bitmask only if you're passing these around in tight loops.
+
+**Cost of current:** Modest — struct of bools is clear but takes 4 bytes + padding. Bitmask saves space but reduces readability. Skip unless you're doing this 1000s of times.
+
+---
+
+### 5. **Repeated header + content + newline pattern in `gatherTuningContext` (trail_tune_gather.go, lines 69–91)**
+
+**File:** `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_gather.go`  
+**Lines:** 69–91  
+**Summary:** Five identical patterns: `WriteString(header) + WriteString(gatherX()) + WriteString("\n")` are hardcoded.
+
+**Current form:**
+```go
+if src.repo {
+    b.WriteString("### Repository (static)\n\n")
+    b.WriteString(gatherRepoStatics(repoRoot))
+    b.WriteString("\n")
+}
+if src.prs {
+    b.WriteString("### Merged PRs &amp; issues\n\n")
+    b.WriteString(gatherPRsAndIssues(ctx, limit))
+    b.WriteString("\n")
+}
+// ... repeat 3 more times
+```
+
+**Simpler form:** Table-driven loop:
+```go
+sections := []struct {
+    enabled bool
+    header string
+    gather func() string
+}{
+    {src.repo, "### Repository (static)\n\n", func() string { return gatherRepoStatics(repoRoot) }},
+    {src.prs, "### Merged PRs &amp; issues\n\n", func() string { return gatherPRsAndIssues(ctx, limit) }},
+    // ...
+}
+for _, s := range sections {
+    if s.enabled {
+        b.WriteString(s.header)
+        b.WriteString(s.gather())
+        b.WriteString("\n")
+    }
+}
+```
+
+**Cost of current:** Repetition makes it easy to miss updating all 5 copies if the pattern changes; ~15 lines of boilerplate could become ~10 with less visual noise.
+
+---
+
+### 6. **`joinCounts` and `topCounts` tight coupling (trail_tune_gather.go, lines 360–383)**
+
+**File:** `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_gather.go`  
+**Lines:** 360–383  
+**Summary:** `joinCounts(m, n)` calls `topCounts(m, n)`, then immediately reformats the result. They're always used together.
+
+**Current form:**
+```go
+func topCounts(m map[string]int, n int) []keyCount { ... }
+func joinCounts(m map[string]int, n int) string {
+    parts := make([]string, 0, n)
+    for _, fc := range topCounts(m, n) {  // &lt;-- always calls topCounts
+        parts = append(parts, fmt.Sprintf("%s=%d", fc.key, fc.n))
+    }
+    return strings.Join(parts, ", ")
+}
+```
+
+**Simpler form:** Inline `topCounts` logic into `joinCounts`. They're only called together; keeping them separate adds a layer of indirection. If `topCounts` is genuinely reused elsewhere (e.g., for rendering file counts), keep it; otherwise merge.
+
+**Grep to check:** `grep -n "topCounts\|joinCounts" /Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_gather.go` shows `topCounts` is called at lines 271, 343, 379 — **it is reused** (for files, top findings, joinCounts itself). Keep both functions.
+
+**Cost of current:** None — they're correctly factored.
+
+---
+
+### 7. **`buildTunePrompt` string concatenation (trail_tune_prompt.go, lines 92–129)**
+
+**File:** `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_prompt.go`  
+**Lines:** 92–129  
+**Summary:** Mixed use of `WriteString` and `Fprintf` with `strings.Builder`.
+
+**Current form:**
+```go
+b.WriteString(`You are tuning...`)
+b.WriteString("\n\n")
+b.WriteString("## Gathered repository signal\n\n")
+b.WriteString(strings.TrimSpace(brief))
+b.WriteString("\n\n")
+b.WriteString("## Current runner templates\n\n")
+for _, r := range runners {
+    fmt.Fprintf(&amp;b, "### %s\n\n", r.ID)
+    b.WriteString("```\n")
+    // ...
+}
+```
+
+**Simpler form:** Consistent use of `Fprintf` for all formatting (including plain strings), or restructure to larger blocks. The current mix works but is slightly inconsistent. Not a real complexity issue — the builder pattern is sound.
+
+**Cost of current:** Minor — slightly inconsistent style, but the code is clear and efficient.
+
+---
+
+### 8. **`oneLine` utility (trail_tune_gather.go, lines 385–392)**
+
+**File:** `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_gather.go`  
+**Lines:** 385–392  
+**Summary:** Small helper that normalizes error messages. Used 3 times (lines 170, 184, 233, 350).
+
+**Current form:**
+```go
+func oneLine(s string) string {
+    s = strings.ReplaceAll(s, "\n", " ")
+    s = strings.TrimSpace(s)
+    if len(s) &gt; 200 {
+        s = s[:200] + "…"
+    }
+    return s
+}
+```
+
+**Simpler form:** This is already well-factored. No simplification needed.
+
+**Cost of current:** None — appropriate level of abstraction.
+
+---
+
+### 9. **`keyCount` struct (trail_tune_gather.go, lines 355–358)**
+
+**File:** `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_gather.go`  
+**Lines:** 355–358  
+**Summary:** Small struct used only internally in `topCounts` and `joinCounts`.
+
+**Current form:**
+```go
+type keyCount struct {
+    key string
+    n   int
+}
+```
+
+**Simpler form:** Could be an anonymous struct in `topCounts` return type, but then sorting comparisons become harder to read. The named type is cleaner. No simplification needed.
+
+**Cost of current:** None — appropriate.
+
+---
+
+## Summary of High-Value Findings
+
+| Priority | File | Lines | Finding | Simplification |
+|----------|------|-------|---------|-----------------|
+| **High** | trail_tune_gather.go | 160–193 | Duplicate PR/issue switch blocks | Extract to `gatherGHItems(kind, limit)` helper |
+| **High** | trail_tune_gather.go | 217–228 | Duplicate label struct definition | Define named `ghLabel` type, reuse in `ghItem` and `labelSuffix` |
+| **Medium** | trail_tune_gather.go | 275 | Unused `limit` parameter in `gatherCheckpoints` | Remove parameter and update call site |
+| **Low** | trail_tune_gather.go | 69–91 | Repeated header+content+newline pattern | Table-driven loop if pattern evolves frequently |
+| **None** | trail_tune_gather.go | 360–383 | `joinCounts`/`topCounts` coupling | Keep as-is; `topCounts` has 3 call sites |</result>
+<usage><subagent_tokens>22205</subagent_tokens><tool_uses>4</tool_uses><duration_ms>35759</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a2d47b3fa06c6f499</task-id>
+<tool-use-id>toolu_01WHtrwF72swwMNVrvRJuuHk</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/d70d405d-5421-4b68-beab-2e3bcaaf25a7/tasks/a2d47b3fa06c6f499.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Now I have all the information I need. Let me compile my efficiency findings:
+
+## Efficiency Review: Trail Tune Go Code
+
+### Finding 1: Sequential Independent I/O in `gatherTuningContext`
+**File:** `trail_tune_gather.go:69-93`  
+**Lines:** 69-93 (gatherTuningContext function)  
+**Summary:** Four data tiers execute sequentially, but `gatherPRsAndIssues` (gh shell-out) and `gatherTrails` (HTTP API call) are independent I/O operations.  
+**Cheaper alternative:** Spawn these as concurrent goroutines with a WaitGroup. Repostat and checkpoints can stay sequential because they're fast local ops.  
+**Cost:** If gh pr+issue list takes 500ms and trails API takes 800ms, running sequentially costs ~1.3s vs. ~800ms concurrently. However, this is a one-shot interactive command where users expect moderate latency. **Judgment: Not critical, but cheap to fix.** Only worth doing if you expect users to run this repeatedly or with network lag.
+
+---
+
+### Finding 2: Sequential Per-Trail API Calls in `gatherTrails`
+**File:** `trail_tune_gather.go:312-327`  
+**Lines:** 312-327 (loop over scanned trails)  
+**Summary:** Loop over trails makes one `fetchAllTrailReviewComments` HTTP call per trail sequentially. Capped at `tuneMaxTrailsForFindings` (8 trails), so up to 8 serial HTTP round-trips.  
+**Cheaper alternative:** Fetch comments concurrently using a WaitGroup or bounded semaphore.  
+**Cost:** 8 sequential API calls at ~200-500ms each = 1.6-4s. Concurrent fetch of 8 would be ~500ms (network limited). However, continuing-on-error behavior (line 314) argues for serial safety. **Judgment: Consider concurrent fetch with error tolerance, but only if users report latency.**
+
+---
+
+### Finding 3: Redundant `topCounts` Call in `joinCounts`
+**File:** `trail_tune_gather.go:377-383`  
+**Lines:** 377-383 (joinCounts function)  
+**Summary:** `joinCounts` calls `topCounts(m, n)` to sort and slice the map, which allocates a slice, sorts it, then slices again. Called 4 times in `gatherTrails` (lines 334, 339, with implicit calls in lines 267, 271).  
+**Redundant passes:** `topCounts` does sort.Slice + slice truncation. No redundant computation within a single call, but the function is called multiple times on different maps—unavoidable.  
+**Cost:** Negligible. Each map has at most ~100 entries (severity/status/file counts from trail findings). **Judgment: Not a problem; topCounts is O(m log m) on small maps.**
+
+---
+
+### Finding 4: Double JSON Unmarshal in `replaceRunnerTemplate`
+**File:** `trail_tune_apply.go:61-92`  
+**Lines:** 63 (unmarshal raw to top), 71 (unmarshal promptRaw), then 89 (bytes.Count), 92 (bytes.Replace)  
+**Summary:** 
+- Line 63: Unmarshal raw bytes to extract "prompt" field (first unmarshal)
+- Line 71: Unmarshal that field again to extract "template" (second unmarshal)
+- Lines 89-92: bytes.Count + bytes.Replace on raw to surgically replace oldVal with newVal
+
+**Issue:** Two unmarshals to find the old template value, which could be computed once. However, the design choice is deliberate: preserve file formatting by doing bytes-level replacement rather than re-marshal. The second unmarshal is necessary to get oldVal (the original JSON-encoded template bytes, guaranteed to be a substring of raw).
+
+**Alternative:** Eliminate line 71's unmarshal by parsing "template" field from line 66's promptObj using json.RawMessage directly (already done—promptObj["template"] is a RawMessage). The oldVal is already extracted on line 76.  
+**Cost:** One unnecessary json.Unmarshal per runner file (~50-100µs per file, typically 1-3 runners). Not a bottleneck for this one-shot command.  
+**Judgment: Not a problem; the design is intentional to preserve formatting, and the extra unmarshal is negligible.**
+
+---
+
+### Finding 5: Full File Reads with Truncation in `readCapped`
+**File:** `trail_tune_gather.go:148-158`  
+**Lines:** 149 (os.ReadFile), then string slicing  
+**Summary:** `readCapped` reads the entire file into memory, then truncates to maxLen chars if needed. Called for CLAUDE.md (6000 char cap), AGENTS.md (6000), README.md (2000), and go.mod (400).  
+**Cost:** Small files typically, but still allocates full file buffer then discards tail. CLAUDE.md at 10KB could trigger a 10KB allocation for a 6KB result.  
+**Cheaper alternative:** Use `io.LimitReader(file, maxLen)` to cap the read upfront, then read into a sized buffer.  
+**Cost:** Saves re-allocation of file tail for large docs. **Judgment: Optimization exists but file sizes are plausible (6KB nominal), so negligible real impact. Only worth doing if repos have massive CLAUDE.md files.**
+
+---
+
+### Finding 6: `loadTuneRunners` Reads Each Runner File Twice
+**File:** `trail_tune_prompt.go:26-82`  
+**Lines:** 39 (os.ReadFile raw), 49 (json.Unmarshal for doc.ID extraction)  
+**Summary:** Raw bytes are read and stored in tuneRunner (line 58) for later byte-level replacement. Unmarshaling the same bytes on line 49 extracts the ID and Template.  
+**Not redundant within a single file:** This is the intended workflow—preserve raw for byte-level replacement, unmarshal once to extract metadata.  
+**Cost:** Two passes over one file per runner (1-3 runners typical). Negligible.  
+**Judgment: No issue; the pattern is intentional.**
+
+---
+
+## Summary
+
+**No critical efficiency issues found.** The code is well-designed for a one-shot interactive CLI command:
+- The only candidates for optimization (concurrent I/O in gather tiers, concurrent trail API calls) are only worth pursuing if users report actual latency complaints.
+- The JSON marshaling/unmarshaling is intentional to preserve file formatting.
+- File reads are appropriately sized for typical repo docs.
+- The redundant `topCounts` call within a single run is negligible on small cardinality maps.
+
+The code prioritizes correctness and maintainability over micro-optimizations, which is appropriate here.</result>
+<usage><subagent_tokens>24177</subagent_tokens><tool_uses>8</tool_uses><duration_ms>37403</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aff7b6f8c9c51de0f</task-id>
+<tool-use-id>toolu_017hxFTnQ5m4NtQ9yQtCtCG7</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/d70d405d-5421-4b68-beab-2e3bcaaf25a7/tasks/aff7b6f8c9c51de0f.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect. Now I have all the context I need. Let me write my review findings:
+
+## ALTITUDE CODE REVIEW: trail_tune_*.go
+
+### FINDING 1: Provider Re-Derivation in `applyTuneWithAgent`
+
+**File:** `trail_tune_cmd.go`, lines 105-123  
+**Issue:** After calling `resolveCheckpointSummaryProvider()` (which already wraps the TextGenerator in a checkpointSummaryProvider struct), the code then re-derives the raw TextGenerator by calling `agent.Get()` and `agent.AsTextGenerator()` again.
+
+**Current code:**
+```
+provider, err := resolveCheckpointSummaryProvider(ctx, errW)  // returns *checkpointSummaryProvider with Generator field
+...
+ag, err := agent.Get(provider.Name)                           // re-fetches the agent
+textGen, ok := agent.AsTextGenerator(ag)                      // re-extracts the TextGenerator
+out, err := textGen.GenerateText(ctx, prompt, provider.Model)
+```
+
+**The problem:** The provider struct already contains a `Generator` field (a `summarize.Generator` which wraps the TextGenerator). This is precisely what `explain.go` uses when it calls `generateCheckpointAISummary(ctx, scopedTranscript, cpSummary.FilesTouched, content.Metadata.Agent, provider.Generator, timeout)`. Instead, `trail_tune_cmd.go` ignores the Generator field and re-resolves the raw agent, duplicating the logic already inside `buildCheckpointSummaryProvider()`.
+
+**Right altitude:** Use the provided `provider.Generator` directly, or if raw TextGenerator is needed, have `buildCheckpointSummaryProvider` return it as a field alongside Generator. The current approach is fragile because:
+- It assumes `agent.Get()` is idempotent for the same name (reasonable but implicit dependency)
+- It duplicates null-checks and type assertions already done in buildCheckpointSummaryProvider
+- It diverges from the established pattern in explain.go that uses provider.Generator
+- Future changes to agent initialization could silently break here if the re-derived agent differs from the wrapped one
+
+**Recommendation:** Change to use `provider.Generator` (which is a TextGenerator-compatible interface). If a raw `TextGenerator` is needed, add it as a field to `checkpointSummaryProvider` in explain_summary_provider.go.
+
+---
+
+### FINDING 2: Hardcoded Document List in `gatherRepoStatics`
+
+**File:** `trail_tune_gather.go`, lines 123-130  
+**Issue:** The list of documents to embed—CLAUDE.md, AGENTS.md, README.md—is hardcoded as a literal array.
+
+**Current code:**
+```go
+for _, doc := range []struct {
+    name string
+    cap  int
+}{
+    {"CLAUDE.md", tuneDocCap},
+    {"AGENTS.md", tuneDocCap},
+    {"README.md", tuneReadmeCap},
+}
+```
+
+**Analysis:** For v1, this is defensible. These are the "standard" Entire documentation files users create. However, the hardcoding will limit this feature's extensibility if repos later add custom tuning docs or if the standard set changes.
+
+**Why it's not broken:** The files are repo-standard, the list is short, and skipping missing files is handled gracefully (lines 132-134). This is intentional filtering, not accidental brittleness.
+
+**Why it could be altitude-higher:** A small interface could make it user-configurable:
+```go
+type tuneDocSpec struct {
+    name string
+    cap  int
+}
+// In settings or config
+TuneDocuments: []tuneDocSpec{...}
+```
+
+**Recommendation for v1:** Keep the hardcoded list. The cost/benefit of parameterizing this now doesn't justify it. Revisit if users request custom docs. Flag only if this pattern spreads (e.g., if other tiers also hardcode assumptions about repo structure).
+
+---
+
+### FINDING 3: Tier Structure—Four Functions + Bool Struct vs. Interface/Slice
+
+**File:** `trail_tune_gather.go`, lines 27-94  
+**Issue:** The tier architecture uses a `tuneSources` bool struct (repo, prs, checkpoints, trails) paired with four separate `gatherX()` functions, invoked conditionally in `gatherTuningContext()`.
+
+**Current pattern:**
+```go
+type tuneSources struct {
+    repo bool
+    prs bool
+    checkpoints bool
+    trails bool
+}
+
+func gatherTuningContext(..., src tuneSources, ...) string {
+    if src.repo { b.WriteString(gatherRepoStatics(repoRoot)) }
+    if src.prs { b.WriteString(gatherPRsAndIssues(ctx, limit)) }
+    // ...
+}
+```
+
+**Analysis:** This is appropriate for v1. It's explicit, easy to reason about, and each tier has genuinely different signatures (repoRoot, ctx, ctx+errW, limit variations). An interface would over-abstract:
+```go
+type Tier interface { Gather(...) string }
+```
+would either:
+- Flatten the signatures (losing clarity about which tiers need what context), or
+- Require function closures/adapters (indirection without gain)
+
+**Why this is fine:** The four tiers are stable and unlikely to proliferate. The bool struct maps clearly to CLI flags (--sources repo,prs,all). Revisit only if tiers grow to 6+ or if there's dynamic tier registration.
+
+**Recommendation for v1:** Keep as-is. It's readable and not fragile. Flag only if the fourth or fifth tier is added without clear justification.
+
+---
+
+### FINDING 4: Runner-File Treatment as Opaque Text with Surgical Edits
+
+**File:** `trail_tune_apply.go`, lines 55-97 (replaceRunnerTemplate)  
+**Issue:** Runners are loaded as raw bytes and modified via byte-level string replacement on the JSON, rather than unmarshaling, mutating, and re-marshaling.
+
+**Current approach:**
+```go
+func replaceRunnerTemplate(raw []byte, newTemplate string) ([]byte, error) {
+    // Parse to find the old template value
+    var top map[string]json.RawMessage
+    if err := json.Unmarshal(raw, &amp;top); err != nil { ... }
+    // Get the raw bytes of the old template
+    oldVal, ok := promptObj["template"]  // This is json.RawMessage—the verbatim on-disk bytes
+    // Replace bytes
+    out := bytes.Replace(raw, oldVal, newVal, 1)
+    // Re-validate JSON
+    if !json.Valid(out) { ... }
+}
+```
+
+**Analysis:** This is intentional and correct for the use case. The design preserves unknown/backend-managed fields and minimizes git diffs (only the template string changes, not formatting). The CLI has no runner struct/loader—runners are opaque config files.
+
+**Why this is right altitude:** Unmarshaling and re-marshaling would:
+- Drop unknown fields (risk of data loss if runners evolve)
+- Reformat the entire JSON (noisy diffs, harder code review)
+- Require defining a runner struct that duplicates the on-disk schema
+
+The byte-level approach is appropriate for config-file surgery.
+
+**Potential fragility:** Line 89 asserts exactly one occurrence of the old template. This will fail (with a clear error) if:
+- The template string appears elsewhere in the runner (e.g., in a comment or example)
+- The template is used multiple times (legitimate but would require a different edit strategy)
+
+This is acceptable brittleness for v1—clear error reporting and the constraint is documented. Flag if non-unique templates become common.
+
+**Recommendation for v1:** This is good altitude. No change needed.
+
+---
+
+### FINDING 5: Error/Skip Handling—Inline `skip()` String Returns
+
+**File:** `trail_tune_gather.go`, lines 96, 162, 170, 184, 233, 236, 350  
+**Issue:** Tier gather functions return a `skip(reason)` string on error, which is a best-effort inline pattern.
+
+**Current code:**
+```go
+func skip(reason string) string { return "_skipped: " + reason + "_\n" }
+
+func gatherPRsAndIssues(ctx context.Context, limit int) string {
+    if _, err := exec.LookPath("gh"); err != nil {
+        return skip("gh CLI not on PATH")  // Inline error handling
+    }
+    // ...
+    if err != nil {
+        b.WriteString(skip("gh pr list failed: " + oneLine(err.Error())))
+    }
+}
+```
+
+**Analysis:** The design is intentional: every tier is best-effort, so returning markdown text (either data or a skip notice) is the right interface. However, there's a subtle issue:
+
+1. **Mixed error semantics:** Some skip reasons are early-exit (can't proceed with this tier at all), others are partial failure (e.g., lines 170, 184 where PR list fails but issue list might succeed). The pattern doesn't distinguish.
+
+2. **Error swallowing:** Line 315 in `gatherTrails` silently continues on fetch errors (`if err != nil { continue }`), treating trail-fetch failures as "this trail didn't contribute" rather than "this tier is broken." This works, but it's silent failure.
+
+**Why it's acceptable for v1:** The prompt still contains useful signal even with skipped/partial tiers. Users can see what data was collected. For a "play around" feature, this is fine.
+
+**Fragility:** If a tier's error should bubble up (e.g., "no checkpoints" should not be treated as success), the string-based approach obscures the distinction. A structured result would make this clearer:
+```go
+type TierResult struct {
+    Data string       // Markdown
+    Err  error        // nil = success, non-nil = full failure
+    Partial bool      // true = success but some data missing
+}
+```
+
+**Recommendation for v1:** Keep the string-based approach. It's adequate for "gather best-effort signal." Document in comments why skip() is inline. Revisit only if users report missing tiers being treated silently as empty data.
+
+---
+
+### FINDING 6: Command Wiring and Convention Adherence
+
+**File:** `trail_tune_cmd.go`, lines 25-72 and 73-100  
+**Issue:** Verify the command follows the established runE→run&lt;Verb&gt; convention and that insecureHTTP plumbing is consistent.
+
+**Pattern observed:**
+- `newTrailTuneCmd()` defines runE that calls `runTrailTune()` ✓
+- `runTrailTune()` is a public function that abstracts flag extraction ✓
+- `trailInsecureHTTP(cmd)` is called to plumb the persistent flag ✓
+
+This matches the trail_cmd.go pattern (e.g., newTrailShowCmd → runTrailShow).
+
+**Status:** No altitude issue here. Wiring is correct and consistent.
+
+---
+
+## SUMMARY TABLE
+
+| Finding | File | Lines | Severity | v1 Verdict |
+|---------|------|-------|----------|-----------|
+| Re-derivation of TextGenerator after resolveCheckpointSummaryProvider | trail_tune_cmd.go | 105-123 | Medium | Fix: Use provider.Generator directly |
+| Hardcoded document list (CLAUDE.md, AGENTS.md, README.md) | trail_tune_gather.go | 123-130 | Low | Accept: Reasonable for v1; revisit if customization requested |
+| Tier structure (4 funcs + bool struct) | trail_tune_gather.go | 27-94 | Low | Accept: Appropriate for v1; over-abstraction not warranted |
+| Byte-level runner template surgery | trail_tune_apply.go | 55-97 | Low | Accept: Right altitude; clear error on non-unique templates |
+| Inline skip() string returns for best-effort errors | trail_tune_gather.go | Multiple | Low | Accept: Adequate for v1; document intent, revisit if silent failures become issues |
+| Command wiring and insecureHTTP plumbing | trail_tune_cmd.go | 25-72, 49-60 | None | Accept: Correct and consistent |
+
+---
+
+## KEY ACTIONABLE RECOMMENDATIONS
+
+1. **High priority (real fragility):** In `trail_tune_cmd.go` line 110-120, replace the re-derivation of `textGen` with direct use of `provider.Generator`, or add the raw TextGenerator as a field to checkpointSummaryProvider if needed elsewhere. This diverges from explain.go's pattern and duplicates logic.
+
+2. **Document, don't change:** Add a comment in trail_tune_gather.go explaining that tiers are best-effort so the feature degrades gracefully when tools (gh, checkpoints, trails API) are unavailable, rather than failing the whole command.
+
+3. **Future-watch:** If a fifth tier is added or the hardcoded doc list is requested to be configurable, revisit the abstraction. For now, v1 is at the right altitude.</result>
+<usage><subagent_tokens>55085</subagent_tokens><tool_uses>26</tool_uses><duration_ms>93137</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>abdb8d444bdc6557b</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/d70d405d-5421-4b68-beab-2e3bcaaf25a7/tasks/abdb8d444bdc6557b.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect! Now let me create a comprehensive report of my findings.
+
+## REUSE ISSUES REVIEW: trail_tune_*.go Files
+
+Based on my thorough analysis of the codebase, here are the genuine reuse opportunities found in the newly-added Go code:
+
+---
+
+### **1. JSON Object Extraction — Duplicates existing patterns**
+
+**Files affected:**
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_apply.go` lines 29-52 (`extractJSONObject`, `stripCodeFences`)
+
+**Existing helper:**
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/summarize/claude.go` lines 128-152 (`extractJSONFromMarkdown`)
+
+**Summary:** Both functions extract a JSON object from markdown-wrapped or prose-wrapped text by finding the first `{` and last `}`. The `trail_tune_apply.go` implementation has `stripCodeFences` and `extractJSONObject` doing substantially the same work as `summarize/claude.go`'s `extractJSONFromMarkdown` (which strips code fences then extracts the JSON span). The logic is nearly identical:
+- Both trim whitespace
+- Both strip markdown code fences (```json, ```, etc.)
+- Both find first `{` and last `}`
+- Both return the span or empty string when not found
+
+**Cost:** Medium — consolidating into a shared helper in `summarize/claude.go` or a utility package would save ~25 lines of duplicated code and ensure consistent JSON extraction behavior across the codebase.
+
+**Recommendation:** Move `extractJSONFromMarkdown` to a shared location (e.g., `stringutil` package or new `jsonutil` package) and reuse it in both files.
+
+---
+
+### **2. String Truncation with Newline Collapsing — Uses wrong helper**
+
+**File affected:**
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_gather.go` lines 385-392 (`oneLine`)
+
+**Existing helper:**
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/stringutil/stringutil.go` line 17 (`CollapseWhitespace`)
+
+**Summary:** The `oneLine` function in `trail_tune_gather.go` collapses newlines and truncates at 200 chars. The codebase already has `stringutil.CollapseWhitespace` (which replaces all whitespace sequences including newlines with single spaces), but it doesn't truncate. The `oneLine` implementation is domain-specific enough (error messages limited to 200 chars) that a generic truncation function wasn't needed until now.
+
+**Better approach:** Use `stringutil.CollapseWhitespace(s)` for the newline collapsing, then use the existing `stringutil.TruncateRunes(s, 200, "…")` for truncation. This would replace the entire `oneLine` function with:
+```go
+stringutil.TruncateRunes(stringutil.CollapseWhitespace(s), 200, "…")
+```
+
+**Cost:** Low — `oneLine` is only ~7 lines, but reusing existing helpers makes the intent clearer.
+
+**Recommendation:** Replace `oneLine` calls with composed calls to `stringutil.CollapseWhitespace` + `stringutil.TruncateRunes`.
+
+---
+
+### **3. Map-to-sorted-slice with counts — Duplicates recap pattern**
+
+**File affected:**
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_gather.go` lines 355-375 (`keyCount` struct + `topCounts` function) and lines 377-383 (`joinCounts`)
+
+**Existing pattern (different, but related):**
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/recap/render_static.go` has a `topCount` function (returns single top item) but not a general top-N sorter
+
+**Summary:** `trail_tune_gather.go` implements a complete top-N sorter with a `keyCount` struct and `topCounts` function that:
+- Builds a slice from a map
+- Sorts by count (descending) then by key (ascending) for stability
+- Limits to top N items
+
+This is a general utility that doesn't exist elsewhere in the codebase in reusable form. While `recap/render_static.go` has a `topCount` function, it only returns the single best item and is not extracted to a utility. The new code in `trail_tune_gather.go` is valuable enough to become a shared helper.
+
+**Cost:** Medium — useful pattern, but fairly small (20 lines). However, it's used in two places within `trail_tune_gather.go` itself (lines 271 and 343), suggesting extraction into a dedicated utility would pay off if this pattern is needed elsewhere in future.
+
+**Recommendation:** This is defensible as-is since it's specialized to the tuning gather logic. However, if this becomes a pattern (e.g., for other digest/summary features), extract it to `stringutil` or a new `maputil` package.
+
+---
+
+### **4. gh CLI execution — Duplicates existing pattern but different scope**
+
+**File affected:**
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_gather.go` lines 203-215 (`runGHList`)
+
+**Existing pattern:**
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/investigate/issuelink.go` lines 79-99 (`runGhExec`) and related helpers; also `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/setup_github.go` (`ghCurrentUser`, `ghListOrgs` using the `bootstrapRunner` interface)
+
+**Summary:** The new `runGHList` function does the most basic shell-out to `gh list` and unmarshals JSON. The existing codebase has:
+1. **`investigate/issuelink.go`'s `runGhExec`:** Low-level exec wrapper with security-focused credential redaction in error messages and stderr capture.
+2. **`setup_github.go`'s `bootstrapRunner` interface:** A test-friendly abstraction that `execRunner` implements; used by `ghCurrentUser` and `ghListOrgs` which call `gh api` (not `gh list`).
+
+The new code does not follow the `bootstrapRunner` pattern (which would allow testing without shelling out). It directly uses `exec.CommandContext` with no abstraction, no error redaction, and no test-friendly interface.
+
+**Recommendation:** _Not a blocker._ `runGHList` is simple enough (12 lines) that duplication is acceptable for now. However, if there are future plans to make trail_tune tests work without shelling out to gh, this should be refactored to use a `bootstrapRunner`-style interface or call a higher-level gh wrapper. The current implementation is adequate for a user-facing CLI feature.
+
+---
+
+### **5. File reading with truncation — Minor duplication**
+
+**File affected:**
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_gather.go` lines 148-158 (`readCapped`)
+
+**Existing pattern:**
+- No exact match, but similar patterns exist in:
+  - `paths/transcript.go` has file-reading helpers (`GetLastTimestampFromFile`)
+  - Various checkpoint/review context readers use `os.ReadFile` directly
+
+**Summary:** `readCapped` is a small utility (11 lines) that reads a file and truncates to a max char count, appending a marker when cut. This is very specific to the tuning gather task and doesn't duplicate any existing helper. It's defensive code with good error handling.
+
+**Recommendation:** This is fine as-is. Not a reuse opportunity—it's a reasonable, lightweight utility for this feature.
+
+---
+
+## SUMMARY
+
+| Issue | File | Severity | Recommendation |
+|-------|------|----------|-----------------|
+| JSON extraction duplication | `trail_tune_apply.go:29-52` | **Medium** | Consolidate with `summarize/claude.go:128-152` |
+| String truncation | `trail_tune_gather.go:385-392` | **Low** | Use `stringutil.CollapseWhitespace` + `stringutil.TruncateRunes` |
+| Map-to-sorted-slice | `trail_tune_gather.go:355-375` | **Low** | Acceptable for now; extract to shared util if pattern repeats |
+| gh CLI wrapper | `trail_tune_gather.go:203-215` | **Low** | Acceptable; consider `bootstrapRunner` pattern if tests need it |
+| File read with truncation | `trail_tune_gather.go:148-158` | **None** | No duplication—keep as-is |</result>
+<usage><subagent_tokens>51927</subagent_tokens><tool_uses>40</tool_uses><duration_ms>146332</duration_ms></usage>
+</task-notification>
+
+---
+
+can you create a new branch and do meaningful commits
+
+---
+
+**Findings**
+- Medium: `--run` treats a valid no-change response as an error. The prompt says unchanged runners should be omitted, so `{}` is a valid “no changes” result, but `parseTuneOutput` rejects empty objects at [trail_tune_apply.go:23](/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_apply.go:23). That makes the “No runner changes proposed” path effectively unreachable for the cleanest no-op case. Allow `{}` and let `applyTuneWithAgent` report no changes.
+
+- Medium: `--insecure-http-auth` is wired into `trailTuneOptions` but never used. `gatherTrails` hardcodes `false` when creating the authenticated API client at [trail_tune_gather.go:273](/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_gather.go:273), so local-dev plain HTTP trails fail even when the user passes the parent flag. Pass `opts.insecureHTTP` through `gatherTuningContext` into `gatherTrails`.
+
+- Medium: `--run` writes any JSON string the model returns as a runner template, including `""` or a template that drops required placeholders / output contracts. The code applies the value directly at [trail_tune_cmd.go:146](/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_cmd.go:146), while the prompt only asks the model to preserve placeholders at [trail_tune_prompt.go:100](/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_prompt.go:100). Add validation before writing: non-empty, preserve all `{{...}}` placeholders from the old template, and probably reject obviously missing final output contracts.
+
+- Low: Trail review-comment fetch failures are silently ignored. If every `fetchAllTrailReviewComments` call fails, the brief says “No past review findings recorded” at [trail_tune_gather.go:320](/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_gather.go:320), which is materially different from “could not fetch findings.” Track failures and include a skip/error note when comments could not be loaded.
+
+**Verification**
+Reviewed `soph/trail-tune` against `main`. Ran `go test ./cmd/entire/cli -run '^$'`, the new focused tests, and `git diff --check`; all passed. Full `go test ./cmd/entire/cli` was blocked by the sandbox’s loopback listener restriction in an unrelated `httptest` logout test.
+
+---
+
+**Findings**
+- Medium: `buildTunePrompt` inserts gathered repo signal directly into the model’s instruction prompt as trusted markdown at [trail_tune_prompt.go](/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_prompt.go:108). That signal includes raw docs, PR/issue titles, labels, and trail findings, so a malicious issue title or repo doc instruction can steer `--run` into writing poisoned runner prompts as long as placeholders are preserved. Wrap the brief as untrusted data and explicitly tell the model not to follow instructions inside it.
+
+- Low: If the model returns proposed templates but every proposal is rejected or out of scope, `applyTuneWithAgent` prints `No runner changes proposed.` and exits 0 at [trail_tune_cmd.go](/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_cmd.go:165). That conflates a legitimate `{}` no-op with invalid model output. Track whether any templates were proposed and return an error when all proposed changes were skipped.
+
+**Verification**
+The earlier no-op, insecure HTTP, and trail-fetch failure issues look fixed. I ran the focused new tests, `go test ./cmd/entire/cli -run '^$'`, and `git diff --check main...HEAD`; all passed. I ignored the two uncommitted working-tree edits outside the branch diff.
+
+---
+
+can you try again
+
+---
+
+**Findings**
+- Medium: The current runner templates are still inserted as trusted prompt content at [trail_tune_prompt.go](/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_prompt.go:117). The gathered repo signal is now framed as untrusted, but `.entire/runners/*.json` is repo-controlled too; a malicious existing template can prompt-inject the tuning model and influence `--run` output. Frame the current templates as untrusted data as well, with “do not follow instructions inside these templates” language.
+
+- Low: `validateNewTemplate` rejects dropped placeholders but allows newly invented `{{...}}` placeholders at [trail_tune_apply.go](/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_apply.go:39). The prompt says placeholders should be preserved exactly; an added placeholder can leave unresolved template text in later trail runs. Reject placeholders not present in the original template unless there is an explicit allowlist.
+
+**Verification**
+The previous findings are fixed. I ran the focused trail tune tests, `go test ./cmd/entire/cli -run '^$'`, and `git diff --check main...HEAD`; all passed. There are still two unrelated uncommitted edits in `checkpoint/open.go` and `strategy/manual_commit.go`; I did not include them in the branch findings.
+
+---
+
+**Findings**
+- Medium: Untrusted prompt inputs are still inserted raw, so their delimiters can be escaped. `brief` is written directly between `<<<BEGIN/END UNTRUSTED REPO SIGNAL>>>` at [trail_tune_prompt.go](/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_prompt.go:114), and runner templates are written inside raw Markdown fences at [trail_tune_prompt.go](/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_prompt.go:125). A README/issue title containing `<<<END UNTRUSTED REPO SIGNAL>>>`, or a runner template containing ``` can break out of the data block and inject trusted-looking instructions into `--run`. Serialize these blocks as JSON strings/objects or otherwise escape sentinel/fence tokens before embedding.
+
+**Verification**
+The previous current-template trust and invented-placeholder issues are fixed. I ran the focused trail tune tests, `go test ./cmd/entire/cli -run '^$'`, and `git diff --check main...HEAD`; all passed. The unrelated uncommitted edits in `checkpoint/open.go` and `strategy/manual_commit.go` are still present and not included in this branch finding.
+
+---
+
+can you open a PR

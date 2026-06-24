@@ -1,0 +1,368 @@
+/simplify
+
+---
+
+<task-notification>
+<task-id>a0b31a89bfcf3a316</task-id>
+<tool-use-id>toolu_013WQyXj37qWFqv8FYH4Z3Be</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/b2607ff3-af8e-45e4-a27e-7252614e2a19/tasks/a0b31a89bfcf3a316.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Now I have a complete picture. Let me prepare my findings:
+
+## Simplification Review Findings
+
+**1. Line 1702-1718: Root metadata pointer update duplicates summary write pattern**
+
+The UpdateCommitted block manually re-marshals and re-blobs the entire `checkpointSummary` to update a single field (`Sessions[sessionIndex].Transcript`). This mirrors the pattern used in `writeCheckpointSummary` and `UpdateCheckpointSummary`, but is hand-coded inline.
+
+**Simpler form:** Create a helper that mutates a root summary blob in-place (parallel to `mutateSessionMetadata` at line 1770):
+
+```go
+// mutateRootSummary reads the checkpoint summary at rootMetadataPath from entries,
+// applies fn to it, and writes the re-marshaled blob back into entries.
+func (s *GitStore) mutateRootSummary(rootMetadataPath string, entries map[string]object.TreeEntry, fn func(*CheckpointSummary)) error {
+    entry, exists := entries[rootMetadataPath]
+    if !exists {
+        return fmt.Errorf("checkpoint summary not found at %s", rootMetadataPath)
+    }
+    summary, err := s.readSummaryFromBlob(entry.Hash)
+    if err != nil {
+        return fmt.Errorf("read checkpoint summary: %w", err)
+    }
+    fn(summary)
+    summaryJSON, err := jsonutil.MarshalIndentWithNewline(summary, "", "  ")
+    if err != nil {
+        return fmt.Errorf("marshal checkpoint summary: %w", err)
+    }
+    summaryHash, err := CreateBlobFromContent(s.repo, summaryJSON)
+    if err != nil {
+        return err
+    }
+    entries[rootMetadataPath] = object.TreeEntry{
+        Name: rootMetadataPath,
+        Mode: filemode.Regular,
+        Hash: summaryHash,
+    }
+    return nil
+}
+```
+
+Then UpdateCommitted becomes (line 1702-1718):
+```go
+if newPointer := transcriptPointer(sessionPath, entries); newPointer != "" &amp;&amp;
+    checkpointSummary.Sessions[sessionIndex].Transcript != newPointer {
+    if err := s.mutateRootSummary(rootMetadataPath, entries, func(summary *CheckpointSummary) {
+        summary.Sessions[sessionIndex].Transcript = newPointer
+    }); err != nil {
+        return fmt.Errorf("failed to update checkpoint summary: %w", err)
+    }
+}
+```
+
+---
+
+**2. Line 1689-1695: Conditional metadata update is minimal given the guard**
+
+The code reads metadata, updates `CompactTranscriptStart`, and writes it back only when `regenerated` is true. This is correct and necessary — the guard avoids unneeded updates when transcripts match. **No simplification needed here** — the `regenerated` bool is essential to avoid spurious metadata rewrites when short-circuiting.
+
+---
+
+**3. Lines 943-964: `compactStartOffset` computes by differential compaction**
+
+The function compacts twice (full and scoped) to compute an offset. This is the documented approach and is minimal given the semantics — checkpoint boundaries are prompt-aligned, so `full[offset:] == scoped` holds. **No simplification needed** — this is the correct algorithm.
+
+---
+
+**4. Line 968-970: `countLines` is a one-liner helper**
+
+Pure utility. **Minimal and appropriate.**
+
+---
+
+**Summary:** One structural simplification available: lines 1702-1718 should use a `mutateRootSummary` helper to deduplicate the summary marshal-and-blob pattern. The `regenerated` guard and `compactStartOffset` logic are already minimal. The return value threading through `writeTranscript`, `writeCompactTranscript`, and `replaceTranscript` is necessary for the compact offset to flow correctly.</result>
+<usage><subagent_tokens>36409</subagent_tokens><tool_uses>9</tool_uses><duration_ms>28447</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aae8dc422122de7ba</task-id>
+<tool-use-id>toolu_01EtYBZjqx8p2oN341GtUD16</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/b2607ff3-af8e-45e4-a27e-7252614e2a19/tasks/aae8dc422122de7ba.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Good, no circular import issues. Now let me create my final summary. Based on my investigation:
+
+## REUSE REVIEW FINDINGS
+
+**Finding 1: `countLines` helper duplicates logic from existing implementation**
+
+- **Location:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/checkpoint/committed.go`, lines 966-970
+- **Summary:** New `countLines` counts newline-terminated lines using `bytes.Count(b, []byte{'\n'})`
+- **Duplicate:** `pijsonl.CountLines` exists at `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/agent/pi/pijsonl/pijsonl.go`, lines 44-52
+- **Cost:** Code duplication - simple line-counting logic
+- **Call instead:** `pijsonl.CountLines(b)` 
+- **Caveat:** `pijsonl.CountLines` has broader semantics (counts unterminated final lines). The new `countLines` is narrower and appropriate for compact output (which always terminates every line per `appendLine` in compact.go:286). The semantics differ: `pijsonl.CountLines` would return different values for unterminated final lines. **This is intentional and correct** — the narrow version is needed specifically because compact output guarantees newline termination. No consolidation recommended; keeping separate is appropriate for clarity.
+
+**Finding 2: `mutateSessionMetadata` extracts existing read-modify-write pattern**
+
+- **Location:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/checkpoint/committed.go`, lines 1768-1796
+- **Summary:** New helper refactors the original `replaceSkillEvents` pattern (read blob → unmarshal → mutate → marshal → write blob) into a generic callback-based mutator
+- **Original:** `replaceSkillEvents` (lines 1761-1767) had this pattern inlined
+- **Refactoring:** The new `mutateSessionMetadata` is a genuine extraction, not duplication. It removes code, not adds it. `replaceSkillEvents` now delegates to it (line 1762-1766). This is a good simplification.
+- **No reuse finding:** This is refactoring within the file, not duplication of external code.
+
+**Finding 3: `transcriptPointer` is new logic, no duplicate**
+
+- **Location:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/checkpoint/committed.go`, lines 67-91
+- **Summary:** Helper that reads tree entries and prefers compact transcript over full transcript
+- **Duplicate?** Searched for similar tree-entry preference patterns — no existing helper implements this specific "prefer X, fallback to Y" logic for transcripts across the codebase.
+- **No reuse finding.**
+
+**Finding 4: `compactStartOffset` compacts twice but appropriately**
+
+- **Location:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/checkpoint/committed.go`, lines 937-964
+- **Summary:** Compacts the full transcript (StartLine: 0) and compacts the scoped portion (StartLine: startLine), then subtracts line counts to derive the offset
+- **Design note:** Comments state this approach is correct — checkpoint boundaries fall on user-prompt boundaries where compaction does not merge across the boundary, so `full[offset:] == scoped`. The double-compaction is intentional to compute the offset accurately.
+- **No duplication:** The logic is specific to computing compact-transcript start offsets and does not duplicate existing compact-scoping logic.
+
+---
+
+**Conclusion:** 
+
+One minor observation on `countLines`: While `pijsonl.CountLines` exists and uses `bytes.Count`, the new narrower version is intentionally simpler and correctly tailored for compact output (which always terminates lines). Keeping them separate is appropriate because their semantics differ in how they handle unterminated final lines. The refactoring of `mutateSessionMetadata` is a genuine simplification, not duplication. No actionable reuse opportunities found.</result>
+<usage><subagent_tokens>52329</subagent_tokens><tool_uses>32</tool_uses><duration_ms>68346</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>af078b1484b73db93</task-id>
+<tool-use-id>toolu_011kbarPmeUqQFA1KhqAhnFF</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/b2607ff3-af8e-45e4-a27e-7252614e2a19/tasks/af078b1484b73db93.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Now I have enough context. Let me create a comprehensive analysis document.
+
+## ALTITUDE REVIEW: `compact_transcript_start` Offset Computation
+
+Based on my analysis, here are the findings:
+
+---
+
+### **FINDING 1: Offset Computation at Wrong Depth**
+
+**Location:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/checkpoint/committed.go`, lines 943–969 (`compactStartOffset` function)
+
+**Issue:** The offset is computed **outside** the `transcript/compact` package by calling `Compact` twice (full + scoped) and subtracting line counts. This duplicates the compaction work and fragments the offset computation from the actual slicing logic.
+
+**Why it's fragile:**
+- **Implicit assumption:** The code assumes checkpoint boundaries fall on user-prompt boundaries, so `full[offset:] == scoped` after compaction. This is stated in a comment (line 947–948) but is never enforced by the package.
+- **Duplicated compaction:** Every write path calls `Compact(full, StartLine=0)` then `Compact(full, StartLine=startLine)` separately. If future changes to `Compact` merge/drop lines differently at boundary detection or alter how `StartLine` is handled, the subtraction will diverge.
+- **Unmapped line counts:** `countLines()` counts newlines; if `Compact` ever adds/removes trailing newlines or changes its output format (e.g., a future agent adds JSON arrays), the count won't match the slice.
+- **No type safety:** The offset is raw `int`; there's no checkpoint-scoped type that proves the offset came from the right portion of the file.
+
+**What the current implementation does:**
+```go
+fullCompacted := Compact(transcript, StartLine: 0)              // Full output
+scoped := Compact(transcript, StartLine: startLine)             // Scoped output
+offset := countLines(fullCompacted) - countLines(scoped)        // Line subtraction
+```
+
+**More robust approach:** The offset computation should happen **inside** `transcript/compact/compact.go` as a new return value. `Compact` already knows:
+1. How many lines it output for the full transcript
+2. How many lines it output for the scoped transcript  
+3. The exact slicing boundary (where `scoped` began in `full`)
+
+Returning `(compactedOutput []byte, compactStartOffset int, error)` from `Compact` avoids:
+- Calling `Compact` twice per checkpoint
+- Recomputing the offset outside the slicing logic
+- Assuming boundary semantics without enforcing them
+- Fragility to future `Compact` changes
+
+---
+
+### **FINDING 2: Inconsistent Sync Between Two Write Paths**
+
+**Location:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/checkpoint/committed.go`  
+- **Path 1 (initial write):** `writeSessionToSubdirectory` (lines 95–130), calls `writeTranscript` → `writeCompactTranscript` → `compactStartOffset`  
+- **Path 2 (deferred finalization):** `UpdateCommitted` (lines 1677–1760), calls `replaceTranscript` → `writeCompactTranscript` → `compactStartOffset`
+
+**Issue:** Both paths compute `compactStartOffset` identically but independently. If either path needs to change (e.g., error handling, sanitization parity verification, logging), the other path could drift.
+
+**Why it's fragile:**
+- **Duplicated logic:** `compactStartOffset` is called in two places with identical arguments. If a bug is fixed in one path (e.g., a sanitization issue), the other path won't get the fix automatically.
+- **Test divergence:** The test for finalization (`TestUpdateCommitted_CodexCompactSanitizedLikeInitialWrite`) and the test for initial write are separate, so a regression in one path might not be caught.
+- **Offset not memoized:** If an offset is computed once (in initial write) and the transcript hasn't changed (short-circuit in finalization), the offset should be reused, not recomputed. Currently, `replaceTranscript` returns `(0, false, nil)` on short-circuit (line 1838), which discards any offset information.
+
+**More robust approach:** Extract offset computation into a single `computeCompactStartOffset` function (analogous to existing `compactStartOffset`) that both paths call. Better yet, return the offset from `writeCompactTranscript` and always store it:
+```go
+// Single source of truth for offset computation
+compactStart := s.writeCompactTranscript(ctx, agentType, startLine, compactBytes, sessionPath, entries)
+
+// Both paths use the same value
+mutateSessionMetadata(sessionPath, entries, func(m *CommittedMetadata) {
+    m.CompactTranscriptStart = compactStart
+})
+```
+This is mostly what the code does now, but the **short-circuit in `replaceTranscript` returns `(0, false)` without updating the offset**, creating an inconsistency if a deferred finalize short-circuits.
+
+---
+
+### **FINDING 3: Metadata Home Is Appropriate, But Generalization Could Help**
+
+**Location:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/checkpoint/checkpoint.go`, line 31 (`CompactTranscriptStart` field)
+
+**Issue:** `CompactTranscriptStart` is stored as a parallel field to `CheckpointTranscriptStart`. This is correct, but the pattern could generalize to avoid future duplication if other normalized transcripts are added.
+
+**Why it's not fragile (sufficient):**
+- The offset is appropriate in `CommittedMetadata` because it's checkpoint-scoped (mirrors `CheckpointTranscriptStart`).
+- The two offsets are documented as distinct (raw vs. compacted line counts).
+- Consumers are explicit: `compact_transcript_start` indexes `transcript.jsonl`; `checkpoint_transcript_start` indexes `full.jsonl`.
+
+**Minor generalization opportunity:** If another transcript format is added (e.g., `deep_transcript.jsonl`), the pattern would repeat. A future refactor could introduce a `TranscriptVariant` enum or helper:
+```go
+type TranscriptVariant struct {
+    Filename string
+    StartLine int
+}
+```
+But this is not required now; `compact_transcript_start` is fine as-is.
+
+---
+
+### **FINDING 4: Unsafe Assumption About StartLine Semantics**
+
+**Location:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/checkpoint/committed.go`, line 947–948
+
+**Issue:** The comment states: "Checkpoint boundaries fall on user-prompt boundaries, where compaction does not merge across the boundary, so `full[offset:] == scoped`."
+
+This assumption is **not validated** and could break if:
+1. A future agent's compaction merges across checkpoint boundaries.
+2. The `StartLine` semantics change (e.g., from line offset to message index for new agents).
+3. The assumption is violated in an edge case (e.g., empty lines, malformed JSON at the boundary).
+
+**Why it's fragile:**
+- The assumption is documented in a comment but not asserted in code.
+- Tests verify the offset works for specific agents (Claude, Codex) but don't generically verify the boundary property holds.
+- A regression test should assert `full[compactStartOffset:] == scoped` to catch violations early.
+
+**More robust approach:** Add a validation function in `transcript/compact/compact.go`:
+```go
+// ValidateCompactStartOffset asserts that slicing the full compact at the
+// computed offset produces the scoped compact. Best-effort: used in tests
+// and debug logging to catch boundary assumption violations.
+func ValidateCompactStartOffset(fullCompacted, scopedCompacted []byte, computedOffset int) bool {
+    lines := countLines(fullCompacted) - computedOffset
+    return countLines(scopedCompacted) == lines
+}
+```
+Call this in tests (especially multi-agent tests) to verify the assumption holds.
+
+---
+
+## SUMMARY
+
+| Finding | Severity | Location | Recommendation |
+|---------|----------|----------|-----------------|
+| **Offset computation duplicates `Compact` calls** | Medium | `compactStartOffset` (line 943) | Move offset return into `Compact` signature → `([]byte, int, error)` |
+| **Two write paths compute offset independently** | Medium | `writeTranscript` (line 109) + `replaceTranscript` (line 1908) | Ensure both paths update metadata; validate short-circuit behavior |
+| **Boundary assumption not validated** | Low | Line 947 comment | Add assertion/test to verify `full[offset:] == scoped` |
+| **Metadata field design** | Low | `CompactTranscriptStart` | Appropriate; minor generalization opportunity if new variants added |
+
+The **deepest issue** is that `Compact` should own the offset computation and return it as a first-class value, rather than checkpoint code computing it externally via line subtraction. This eliminates duplicated work, fragments the coupling, and makes the relationship between output and offset explicit in the package contract.</result>
+<usage><subagent_tokens>51185</subagent_tokens><tool_uses>11</tool_uses><duration_ms>41514</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a16c314a035a08c0d</task-id>
+<tool-use-id>toolu_01VxXwHeGB2eBsGmwfJSGwVT</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/b2607ff3-af8e-45e4-a27e-7252614e2a19/tasks/a16c314a035a08c0d.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect. Now I have all the data I need. Let me create a comprehensive report on the efficiency issues:
+
+## EFFICIENCY REVIEW FINDINGS
+
+### Finding 1: Double Compaction Per Checkpoint
+**File:** `/Users/ninawork/entire/devenv/cli/checkpoint/committed.go`  
+**Lines:** 889-893 (first compaction) + 947-951 (second compaction)  
+**Issue Summary:** Each checkpoint's `writeCompactTranscript` compacts the full transcript twice—once to write it (StartLine: 0) and again in `compactStartOffset` to count lines.
+
+**Concrete Wasted Work:**
+- Line 889: `transcriptcompact.Compact(..., StartLine: 0)` → produces full compact (all lines)
+- Line 947: `transcriptcompact.Compact(..., StartLine: startLine)` → produces scoped compact (subset of lines)
+- Then subtracts line counts (line 959) to compute the offset
+
+For a turn with **N checkpoints sharing one transcript**, this runs `2×N` compaction passes for identical full content. The full compaction (StartLine: 0) is identical across all N checkpoints but is recomputed each time.
+
+**Cheaper Alternative:**
+The `Compact` function could return both the compacted content AND the line count in a single pass, eliminating the second compaction. Then `writeCompactTranscript` could:
+1. Call `Compact(StartLine: 0)` once → get `(fullCompacted, fullLineCount)`
+2. Call `Compact(StartLine: startLine)` → get `(scoped, scopedLineCount)`  
+3. Compute `offset = fullLineCount - scopedLineCount`
+
+However, the CLEANEST alternative given the current architecture is to **cache the full compaction** (line 889's result) across all checkpoints in a turn, similar to how `PrecomputedTranscriptBlobs` pre-computes chunk hashes once and reuses them. This would require threading a `compactedTranscriptCache` through the condensation loop (in `manual_commit_condensation.go`'s PostCommit/CondenseSession path) and passing it into `writeCompactTranscript`. The cost is O(1) additional parameter passing; the win is N-1 fewer redundant compactions per turn.
+
+---
+
+### Finding 2: No Short-Circuit for StartLine == 0
+**File:** `/Users/ninawork/entire/devenv/cli/checkpoint/committed.go`  
+**Lines:** 944-946  
+**Issue Summary:** `compactStartOffset` checks `if startLine &lt;= 0` and returns 0 immediately, skipping the second compaction. This is good.
+
+**Verdict:** ✅ **Already optimized.** The check at line 944-946 short-circuits the second compaction when startLine is 0 (the first checkpoint in a turn). No improvement needed here.
+
+---
+
+### Finding 3: Redundant Metadata Marshaling in UpdateCommitted
+**File:** `/Users/ninawork/entire/devenv/cli/checkpoint/committed.go`  
+**Lines:** 1690-1694 + 1702-1718 (potential double-write of session metadata)
+
+**Concrete Wasted Work:**
+When `regenerated=true` (line 1689), the code does:
+1. Line 1690-1694: Call `mutateSessionMetadata` → reads, mutates `CompactTranscriptStart`, marshals, writes session metadata blob
+2. Line 1702-1718: If transcript pointer changed, read root metadata, update pointer, marshal root metadata, write root metadata blob
+
+This is **not redundant**—they're different files (session-level vs. root-level). However, there IS a subtle inefficiency: both the full `CheckpointSummary` and its nested `SessionFilePaths` arrays are re-marshaled even when only the root pointer needs updating. The `mutateSessionMetadata` helper (line 1770-1794) is clean and reusable.
+
+But line 1705 re-marshals the entire `CheckpointSummary` just to update `Sessions[sessionIndex].Transcript`. This is acceptable for a single checkpoint update, but consider:
+- **In a loop of multiple UpdateCommitted calls (one per checkpoint in a turn)**, each call independently re-reads and re-marshals the root metadata. This is acceptable because each update is independent and likely infrequent (only at turn end, not per-checkpoint).
+
+**Verdict:** ✅ **Acceptable.** The code is correct and re-marshaling the summary per-update is a negligible cost compared to disk I/O and git object creation. No improvement needed unless profiling shows this is a bottleneck, which is unlikely given it runs once per turn at finalization time, not per-checkpoint-write.
+
+---
+
+### Finding 4: Update Loop Efficiency Check
+**Context:** In `manual_commit_hooks.go` line 993-1014, PostCommit loops over sessions and calls `CondenseSession` (which calls `WriteCommitted`) for each. In `manual_commit_condensation.go` line 291-299, a single `CondenseSession` writes one checkpoint via `WriteCommitted`.
+
+**Question:** Is there a loop that writes N checkpoints to the same checkpoint ID?
+
+**Answer:** No. Each `CondenseSession` write is for one **session** at one **checkpoint ID**. The loop in PostCommit is per-session, not per-checkpoint-per-session. One checkpoint ID may have multiple sessions (e.g., Claude Code + Gemini in same turn), but each session's `CondenseSession` is called once. The full-compaction redundancy happens **across multiple turns/checkpoints**, not within a single `CondenseSession` call.
+
+**Verdict:** ✅ **No issue here.** The code doesn't write N checkpoints in a loop that could benefit from caching the compaction.
+
+---
+
+## SUMMARY
+
+| Finding | Severity | Cost | Recommendation |
+|---------|----------|------|-----------------|
+| Double compaction in `compactStartOffset` | Medium | **Per turn**: ~1-2 extra compaction passes for every N≥2 checkpoints sharing a transcript | **Cache full compaction** across checkpoints in a turn (thread through `CondenseSession` loop) OR **modify Compact to return line count**, eliminating the second pass. Start with profiling to confirm compaction cost. |
+| Short-circuit at startLine==0 | N/A | Already optimized | ✅ No change needed |
+| Redundant metadata marshaling | Low | Negligible (one per turn at finalization) | ✅ Acceptable; defer unless profiling shows bottleneck |
+
+The **primary inefficiency is Finding 1**: wasted `transcriptcompact.Compact` calls. The cost is proportional to transcript size and agent parsing complexity. **For a clean fix without changing `transcriptcompact.Compact`'s signature**, cache the full compaction once per turn and pass it to each checkpoint's `writeCompactTranscript`.</result>
+<usage><subagent_tokens>70364</subagent_tokens><tool_uses>16</tool_uses><duration_ms>52402</duration_ms></usage>
+</task-notification>
+
+---
+
+continue

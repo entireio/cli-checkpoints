@@ -1,0 +1,213 @@
+Review https://github.com/entireio/cli/pull/1507
+
+---
+
+<task-notification>
+<task-id>adec44fd0fec251de</task-id>
+<tool-use-id>toolu_01JgLucBoKN2PRY45RM8A7c8</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/897809d4-ecab-4dc6-aa21-97661cb62607/tasks/adec44fd0fec251de.output</output-file>
+<status>completed</status>
+<summary>Agent "Clean Go review of PR 1507" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect. Now let me finalize my findings with proper file:line references:
+
+## Findings
+
+**Severity: MEDIUM** | **Category: Clean-Go / Error Handling Style**
+
+### No-op `fmt.Errorf("%w", err)` wraps around formatted errors
+
+**Problem:** The code wraps `unsupportedVersionError` (which is a fully-formatted error with its own `Error()` method) with `fmt.Errorf("%w", err)` without adding context. This is redundant wrapping that doesn't improve the error message.
+
+**Locations (6 instances):**
+1. `cmd/entire/cli/explain.go:760` — returns `fmt.Errorf("%w", err)`
+2. `cmd/entire/cli/explain_export.go:270` — returns `fmt.Errorf("%w", err)`
+3. `cmd/entire/cli/explain_export.go:366` — returns `fmt.Errorf("%w", err)`
+4. `cmd/entire/cli/resume.go:371` — returns `fmt.Errorf("%w", err)`
+5. `cmd/entire/cli/rewind.go:737` — returns `fmt.Errorf("%w", err)`
+6. `cmd/entire/cli/strategy/manual_commit_rewind.go:655` — returns `fmt.Errorf("%w", err)`
+
+**Pattern:**
+```go
+if err := checkpointpolicy.EnsureCanReadVersion(cpID.String(), summary.CheckpointVersion); err != nil {
+    return nil, nil, fmt.Errorf("%w", err)  // ← No-op wrap
+}
+```
+
+**Clean-Go Perspective:** `unsupportedVersionError` already implements `Error()` and `Unwrap()`, so the error is fully formatted and context-preserving. Wrapping with `fmt.Errorf("%w", err)` without adding a message string is idiomatic only when the result IS a context message. Here, the returned error doesn't add context.
+
+**Suggested Fix:** Return the error directly:
+```go
+if err := checkpointpolicy.EnsureCanReadVersion(cpID.String(), summary.CheckpointVersion); err != nil {
+    return nil, nil, err  // Direct return; unsupportedVersionError is already formatted
+}
+```
+
+This is a style issue (not a bug), but modern Go practice favors minimal error wrapping.
+
+---
+
+**Other Notes:**
+- Error interface implementation is correct (value receivers on `unsupportedVersionError` work fine with pointer creation + `errors.As`)
+- Maps with `bool` values for set semantics are idiomatic in Go
+- Function signature change to `resolveLatestCheckpoint(...) (*strategy.CheckpointInfo, bool, error)` improves error handling by distinguishing "no metadata" from "metadata read error"
+- Tests are well-structured with proper `t.Parallel()` usage and good coverage of the new policy checks</result>
+<usage><subagent_tokens>43441</subagent_tokens><tool_uses>30</tool_uses><duration_ms>181804</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ac40bde459202d37f</task-id>
+<tool-use-id>toolu_01AsYar16D7iYLYyCLtDGz3Z</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/897809d4-ecab-4dc6-aa21-97661cb62607/tasks/ac40bde459202d37f.output</output-file>
+<status>completed</status>
+<summary>Agent "Correctness review of PR 1507" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>The test only verifies that an unsupported version error is returned, not which source it came from. The inconsistency in precedence (unconditional overwrite at 777 vs conditional at 794) is a potential issue, but it might not cause a bug in practice if the precedence is intentional.
+
+However, I found the real bug: **In resumeSession (line 902-905), if RestoreLogsOnly returns an unsupported version error, it should NOT fall back to resumeSingleSession.**
+
+Let me verify this is the only critical issue by checking all the places where errors from checkpoint policy functions are handled:
+
+1. resume.go line 218: `resumeByCheckpointID` - checks and returns unsupported version ✓
+2. resume.go line 315: `resumeFromCurrentBranch` - checks and returns unsupported version ✓
+3. resume.go line 905: `resumeSession` - DOES NOT check, falls back to resumeSingleSession ✗
+4. rewind.go line 338: `runRewindInteractive` - checks and returns unsupported version ✓
+5. rewind.go line 544: `runRewindToInternal` - checks and returns unsupported version ✓
+6. explain.go line 759: `loadCheckpointForExplain` - checks and returns unsupported version ✓
+7. explain_export.go line 269: `runExplainStreamTranscript` - checks and returns unsupported version ✓
+8. explain_export.go line 366: `runExplainCheckpointJSON` - checks and returns unsupported version ✓
+
+So the issue is specifically at line 905 in resume.go where `RestoreLogsOnly` can return an unsupported version error but the code falls back instead of returning it.
+
+Let me now create my final report:
+
+## Findings
+
+**REQUIRED - High Severity:**
+
+**File:** cmd/entire/cli/resume.go
+**Line:** 902-905
+**Issue:** Unsupported checkpoint version errors from `RestoreLogsOnly` are not detected and are instead treated as non-fatal errors that trigger a fallback to `resumeSingleSession`.
+
+```go
+sessions, restoreErr := strat.RestoreLogsOnly(ctx, w, errW, point, force)
+if restoreErr != nil || len(sessions) == 0 {
+    // Fall back to single-session restore (e.g., old checkpoints without agent metadata)
+    return resumeSingleSession(ctx, w, errW, ag, sessionID, checkpointID, repoRoot, force)
+}
+```
+
+When `RestoreLogsOnly` returns an `unsupportedVersionError` (wrapped in `fmt.Errorf`), the code falls back to `resumeSingleSession`. However, unsupported checkpoint versions should fail fast with a clear error, not silently fall back. All other read commands (explain, rewind, explain_export) correctly detect and return unsupported version errors immediately.
+
+**Consequence:** Users attempting to resume a multi-session checkpoint with an unsupported version will fall back to the single-session restore path, which may mask the actual problem (unsupported checkpoint version) with a different error from `resumeSingleSession`.
+
+**Fix:** Add an unsupported version check before falling back:
+```go
+sessions, restoreErr := strat.RestoreLogsOnly(ctx, w, errW, point, force)
+if restoreErr != nil {
+    if checkpointpolicy.IsUnsupportedVersion(restoreErr) {
+        return restoreErr
+    }
+    if len(sessions) == 0 {
+        // Fall back to single-session restore...
+        return resumeSingleSession(...)
+    }
+}
+```
+
+---
+
+**IMPROVEMENT - Low Severity:**
+
+**File:** cmd/entire/cli/resume.go
+**Lines:** 751-752, 776-778, 794-796
+**Issue:** Inconsistent precedence logic when accumulating unsupported version errors across multiple fetch attempts in `checkRemoteMetadata`. 
+
+Line 777 unconditionally overwrites `unsupportedVersionErr`, while line 794 only sets it if `unsupportedVersionErr == nil`. This means:
+- Error from checkpoint_remote (line 752) is overwritten by remote-tracking error (line 777)
+- Error from remote-tracking is kept (not overwritten by origin at line 794)
+
+The resulting error returned is from the remote-tracking source, not the first source encountered. If the intent is to preserve the first error, the logic should be consistent:
+
+```go
+if checkpointpolicy.IsUnsupportedVersion(metadataErr) &amp;&amp; unsupportedVersionErr == nil {
+    unsupportedVersionErr = metadataErr
+}
+```
+
+**Consequence:** The user sees an error message about the remote-tracking source even if the original problem was in the checkpoint_remote source. This is a minor UX issue since both indicate "unsupported version" clearly, but the source attribution is incorrect.</result>
+<usage><subagent_tokens>53381</subagent_tokens><tool_uses>45</tool_uses><duration_ms>229929</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>abdc0684cb8591057</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/897809d4-ecab-4dc6-aa21-97661cb62607/tasks/abdc0684cb8591057.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review of PR 1507" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect. Now let me write my findings report:
+
+## Review Findings
+
+**Severity: Medium - Efficiency Issue**
+
+### 1. Redundant Checkpoint Reads in Two Call Sites
+
+**Files:** `cmd/entire/cli/resume.go` (line 970-976) and `cmd/entire/cli/rewind.go` (line 732-740)
+
+**Problem:** Both `resumeSingleSession()` and `restoreSessionTranscriptFromStrategy()` call `checkpoint.ReadCheckpoint()` followed by `checkpoint.ReadRawSessionLogForCheckpoint()`. The second function internally calls `ReadCheckpoint()` again (see `api/checkpoint/interfaces.go:125`), resulting in duplicate reads of the checkpoint metadata from storage.
+
+**Example - resumeSingleSession:**
+```go
+summary, err := checkpoint.ReadCheckpoint(ctx, stores.Persistent, checkpointID)  // Read 1
+if err == nil {
+    err = checkpointpolicy.EnsureCanReadVersion(checkpointID.String(), summary.CheckpointVersion)
+}
+if err == nil {
+    logContent, _, err = checkpoint.ReadRawSessionLogForCheckpoint(ctx, stores.Persistent, checkpointID)  // Calls ReadCheckpoint again internally
+}
+```
+
+**Suggested Simplification:** Move the version check into a helper that integrates with the read logic, or skip the separate `ReadCheckpoint()` call and extract the version check into the error handling path after `ReadRawSessionLogForCheckpoint()` returns. The version is available in the summary returned by `ReadRawSessionLogForCheckpoint()` (via its internal `ReadCheckpoint()` call), though extracting it would require refactoring the API.
+
+**Impact:** Does not break behavior. Only affects storage I/O efficiency. The error handling and control flow remain correct since both versions of the checkpoint are identical.
+
+---
+
+### 2. Unused Exports in `checkpointpolicy` Package
+
+**Files:** `cmd/entire/cli/checkpointpolicy/format.go`
+
+**Problems:**
+- `CheckpointFamilyRefs` constant (line 13) is defined but only used in tests. It's exported (capitalized) but serves no purpose for non-test code. If future support for `refs-v*` formats is planned, this is fine; otherwise it's dead code.
+- `CheckpointFormat.String()` method (line 40-45) is only called in tests; it's not used anywhere in production code.
+- `knownFamilies` map (line 51-54) is private, used only internally for validation in `ParseFormat()`, which is correct.
+
+**Suggested Simplification:** 
+- If `refs-v*` formats are not supported yet, consider making `CheckpointFamilyRefs` unexported (`checkpointFamilyRefs`) since it only documents future intent. The test can still reference it via `checkpointpolicy.CheckpointFormat{Family: checkpointpolicy.CheckpointFamilyBranch, ...}` if needed, or mock the validation.
+- The `String()` method appears to be defensive/convenience code. If truly not needed outside tests, consider removing it, or document it as a future utility for logging/debugging.
+
+**Impact:** No behavioral impact. These are purely cosmetic—unexported symbols would simply be internal.
+
+---
+
+### 3. `fmt.Errorf("%w", err)` Wrapping is Necessary (NOT an issue)
+
+The pattern of wrapping `EnsureCanReadVersion()` errors with `fmt.Errorf("%w", err)` is **correct and required**. The callers use `checkpointpolicy.IsUnsupportedVersion(err)` which relies on `errors.As()` traversing the error chain created by `fmt.Errorf("%w", ...)`. Removing these wraps would break error type checks. This is not redundant indirection.
+
+---
+
+### Summary
+
+**High-confidence findings:**
+- **Redundant checkpoint reads** (2 call sites): Medium efficiency issue, no behavior breakage
+- **Unused exports** (CheckpointFamilyRefs, String() method): Optional cleanup if future formats won't be supported
+
+**No findings on:** Error wrapping patterns, code duplication in EnsureCanReadVersion usage, or other structural issues.</result>
+<usage><subagent_tokens>49565</subagent_tokens><tool_uses>40</tool_uses><duration_ms>2662552</duration_ms></usage>
+</task-notification>

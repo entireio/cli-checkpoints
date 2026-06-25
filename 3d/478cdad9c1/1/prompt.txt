@@ -1,0 +1,2987 @@
+When someone runs entire enable and they have existing claude projects corresponding to the repo they enabled entire in, entire should prompt them to see if they want to import their existing claude context. 
+
+More detail is in https://github.com/entireio/cli/issues/1336.
+
+Ideally if Claude co-authored commits, we could attach these new checkpoints to those commits, but that's not necessary for a first pass.
+
+The only caveat I'd like to discuss is what these "orphaned" checkpoints are like otherwise since they won't be attached to any commits. There may be some gaps in the code that need to be inspected
+
+---
+
+<task-notification>
+<task-id>ad291152bfec2200c</task-id>
+<tool-use-id>toolu_01FQjH79o5bybAwwEyuwfyMG</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/b1e13e56-e9ae-469a-a30d-7c57d70e2f1f/tasks/ad291152bfec2200c.output</output-file>
+<status>completed</status>
+<summary>Agent "Map entire enable flow" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect! Now I have enough information. Let me compile the comprehensive response:
+
+---
+
+# `entire enable` Command Analysis
+
+## 1. File Paths &amp; Functions
+
+**Main implementation file:**
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/setup.go`
+
+**Key functions:**
+- `newEnableCmd()` — lines 753–935 (command constructor)
+- `runSetupFlow()` — lines 384–401 (initial setup for fresh repos)
+- `runEnableInteractive()` — lines 1054–1187 (interactive enable with agent selection + settings)
+- `runManageAgents()` — lines 414–518 (agent selection/management)
+- `detectOrSelectAgent()` — lines 1382–1534 (agent auto-detection + user selection)
+- `promptTelemetryConsent()` — lines 1871–1909 (telemetry consent prompt)
+- `maybePromptVercelDeploymentDisable()` — lines 1911–1993 (Vercel deployment prompt)
+- `setupEntireDirectory()` — lines 1708–1733 (creates `.entire` dir + `.gitignore`)
+- `runEnable()` — lines 1200–1215 (lightweight re-enable for already-enabled repos)
+
+**Supporting packages:**
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/paths/paths.go` — `WorktreeRoot()` at line 70
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/interactive/interactive.go` — `CanPromptInteractively()` at line 34
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/utils.go` — `NewAccessibleForm()` at line 26
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/config.go` — `IsEnabled()` at line 58, `LoadEntireSettings()` at line 32
+
+---
+
+## 2. Step-by-Step Flow of `entire enable`
+
+### Entry Point (line 770–893)
+The `enable` command's `RunE` function performs these steps:
+
+1. **Bootstrap Detection** (lines 793–829)
+   - Checks if current directory is a git repository via `paths.WorktreeRoot(ctx)`
+   - If not a git repo and user hasn't declined (`--no-init-repo`), offers bootstrap flow (init git + optional GitHub repo creation)
+   - Bootstrap runs in two phases: phase 1 (git init + identity) before agent setup, phase 2 (commit + push) after
+
+2. **Validate Flags** (line 831)
+   - Ensures `--local` and `--project` aren't both specified
+
+3. **External Agent Discovery** (lines 835–838)
+   - Calls `external.DiscoverAndRegisterAlways(ctx)` to find external agents on `$PATH`
+
+4. **Non-interactive Agent Setup** (lines 840–856)
+   - If `--agent &lt;name&gt;` flag provided: validates agent name, then calls `setupAgentHooksNonInteractive()` and returns
+   - Skips the interactive flow entirely
+
+5. **Re-enable Path for Already-Setup Repos** (lines 860–889)
+   - If `settings.IsSetUpAny(ctx)` returns true (Entire already configured):
+     - Checks if any setup-mutating flags were used (via `enableUsesSetupFlow()`)
+     - If flags present: updates settings/agents as needed via `updateStrategyOptions()` or `runManageAgents()`
+     - If just re-enabling: calls lightweight `runEnable()` to toggle `.Enabled` flag
+     - Displays enabled status
+
+6. **Fresh Repo Setup** (lines 891–892)
+   - Calls `runSetupFlow()` for interactive full setup
+
+### Full Setup Flow (Fresh Repos) — `runSetupFlow()` (lines 384–401)
+
+1. Discovers external agents
+2. Calls `detectOrSelectAgent()` to prompt for agent selection (or auto-detect single agent)
+3. Calls `runEnableInteractive()` with selected agents
+
+### Interactive Enable — `runEnableInteractive()` (lines 1054–1187)
+
+**Sequence:**
+1. **Remove deselected agents** (lines 1056–1058)
+   - Uninstalls hooks for any agents that were previously installed but are not in the selected list
+
+2. **Set up agent hooks** (lines 1061–1065)
+   - For each selected agent: `setupAgentHooks()` → calls `ag.InstallHooks(ctx, localDev, forceHooks)`
+   - Scaffolds search subagent if needed
+   - Prints results
+
+3. **Create `.entire` directory** (lines 1068–1070)
+   - Calls `setupEntireDirectory()` → creates `.entire/` folder + `.gitignore`
+
+4. **Load or create settings** (lines 1072–1095)
+   - Loads existing settings (or creates empty `EntireSettings{}`)
+   - Sets `Enabled = true`
+   - Applies flags: `LocalDev`, `AbsoluteGitHookPath`
+   - Auto-enables `ExternalAgents` if any selected agent is external
+   - Applies strategy options from flags
+
+5. **Determine settings file target** (lines 1097–1108)
+   - If settings.json exists but we're doing first setup: redirects to settings.local.json with notification
+   - Otherwise: writes to settings.json
+
+6. **Save settings** (lines 1110–1120)
+   - Calls `saveSettingsToTarget()` → writes to chosen file (JSON format)
+
+7. **Install git hook** (lines 1122–1128)
+   - Calls `strategy.InstallGitHook(ctx, true, settings.LocalDev, settings.AbsoluteGitHookPath)`
+   - Warns about hook managers if needed (e.g., pre-commit framework)
+
+8. **Prompt for Vercel deployment disable** (lines 1137–1143)
+   - If `vercel.json` or `.vercel/` detected: offers to update settings to block Vercel deploys on metadata branch
+   - `maybePromptVercelDeploymentDisable()` — see prompting pattern below
+
+9. **Prompt for telemetry consent** (lines 1145–1162)
+   - If `--yes` flag: auto-sets based on `--telemetry=false` or env var `ENTIRE_TELEMETRY_OPTOUT`
+   - Otherwise: calls `promptTelemetryConsent()` for interactive form
+   - Saves settings again after consent
+
+10. **Ensure strategy setup** (lines 1164–1166)
+    - Calls `strategy.EnsureSetup(ctx)` to create necessary session state dirs
+
+11. **Print done message** (lines 1168–1184)
+    - Prints "Ready." (unless `SuppressDoneMessage` set by bootstrap)
+    - Checks if repo is empty and prints note about needing commits
+
+---
+
+## 3. Interactive Prompt Patterns &amp; Code Excerpts
+
+### Pattern 1: Agent Selection (Multi-Select Form)
+
+**Location:** `detectOrSelectAgent()` lines 1499–1517 (re-enable path) and lines 1382–1534 (main agent selector)
+
+```go
+form := NewAccessibleForm(
+    huh.NewGroup(
+        huh.NewMultiSelect[string]().
+            Title("Select the agents you want to use").
+            Description("Use space to select, enter to confirm.").
+            Options(options...).
+            Validate(func(selected []string) error {
+                if len(selected) == 0 {
+                    return errors.New("please select at least one agent")
+                }
+                return nil
+            }).
+            Value(&amp;selectedAgentNames),
+    ),
+)
+if err := form.Run(); err != nil {
+    return nil, fmt.Errorf("agent selection cancelled: %w", err)
+}
+```
+
+**How it works:**
+- `NewAccessibleForm()` wraps `huh.NewForm()` and auto-detects `ACCESSIBLE=1` env var (via `uiform.New()`)
+- Multi-select allows space to toggle items, Enter to confirm
+- Pre-selected agents are marked with `.Selected(true)` before form creation (lines 1471–1475)
+- Non-interactive fallback: if `selectFn` provided (e.g., `--yes`), skips the form and calls `selectFn(availableNames)` instead
+
+**Detection of agents:**
+```go
+agentNames := agent.List()  // Get registered agent names
+for _, name := range agentNames {
+    ag, err := agent.Get(name)
+    // Filter: only hook-supporting agents, skip test-only agents
+    if _, ok := agent.AsHookSupport(ag); !ok {
+        continue
+    }
+    if to, ok := ag.(agent.TestOnly); ok &amp;&amp; to.IsTestOnly() {
+        continue
+    }
+    // Build huh.Option from each agent
+}
+```
+
+Available agents (from agent package registrations): `claude-code`, `codex`, `cursor`, `copilot-cli`, `factoryaidroid`, `geminicli`, plus external agents discovered via `external.DiscoverAndRegisterAlways()`
+
+### Pattern 2: Telemetry Consent (Confirm Form)
+
+**Location:** `promptTelemetryConsent()` lines 1891–1909
+
+```go
+consent := true  // Default to Yes
+form := NewAccessibleForm(
+    huh.NewGroup(
+        huh.NewConfirm().
+            Title("Help improve Entire CLI?").
+            Description("Share anonymous usage data. No code or personal info collected.").
+            Affirmative("Yes").
+            Negative("No").
+            Value(&amp;consent),
+    ),
+)
+
+if err := form.Run(); err != nil {
+    return fmt.Errorf("telemetry prompt: %w", err)
+}
+
+settings.Telemetry = &amp;consent  // Store boolean pointer
+```
+
+**Skipped if:**
+- `--telemetry=false` flag provided (line 1873)
+- Settings already have `Telemetry != nil` (line 1880)
+- `ENTIRE_TELEMETRY_OPTOUT` env var set (line 1885)
+- `--yes` flag used (auto-sets based on flag + env var; see line 1148–1154)
+
+### Pattern 3: Vercel Deployment Disable (Confirm Form)
+
+**Location:** `promptVercelDeploymentDisable()` lines 1995–2013
+
+```go
+disableDeployments := true  // Default to Yes
+form := NewAccessibleForm(
+    huh.NewGroup(
+        huh.NewConfirm().
+            Title("Disable Vercel deployments for Entire metadata branch?").
+            Description("This automatically creates a vercel.json in the Entire metadata branch.").
+            Affirmative("Yes").
+            Negative("No").
+            Value(&amp;disableDeployments),
+    ),
+)
+
+if err := form.Run(); err != nil {
+    return false, fmt.Errorf("run vercel deployment disable form: %w", err)
+}
+
+return disableDeployments, nil
+```
+
+**Triggered by:** `maybePromptVercelDeploymentDisable()` (line 1911) detects `vercel.json` or `.vercel/` directory and prompts
+
+**Skipped if:**
+- Non-interactive mode detected (line 1968): `interactive.CanPromptInteractively()` returns false
+- `promptFn` function override provided (line 1967)
+
+### Pattern 4: Shell Completion (Select Form)
+
+**Location:** `promptShellCompletion()` lines 1808–1837
+
+```go
+var selected string
+form := NewAccessibleForm(
+    huh.NewGroup(
+        huh.NewSelect[string]().
+            Title(fmt.Sprintf("Enable shell completion? (detected: %s)", shellName)).
+            Options(
+                huh.NewOption("Yes", "yes"),
+                huh.NewOption("No", "no"),
+            ).
+            Value(&amp;selected),
+    ),
+)
+
+if err := form.Run(); err != nil {
+    return nil
+}
+
+if selected != "yes" {
+    return nil
+}
+```
+
+---
+
+## 4. Repo Root &amp; Agent Detection
+
+### Repo Root Detection
+
+**Via `paths.WorktreeRoot(ctx context.Context)` (line 70 of paths.go):**
+```go
+cmd := exec.CommandContext(ctx, "git", "rev-parse", "--show-toplevel")
+output, err := cmd.Output()
+if err != nil {
+    return "", fmt.Errorf("failed to get git worktree root: %w", err)
+}
+root := strings.TrimSpace(string(output))
+// Cached per working directory
+```
+
+**Used in enable command:**
+- Line 793: `if _, err := paths.WorktreeRoot(ctx); err == nil` — checks if in a git repo
+- Passed as context throughout to resolve relative paths like `.entire/settings.json`
+- Handles git worktrees correctly (returns worktree root, not main repo root)
+
+### Agent Configuration
+
+**Detection:**
+1. `agent.List()` — returns all registered agent names (lines 1456, 1448)
+2. `agent.Get(name)` — retrieves agent instance
+3. `agent.DetectAll(ctx)` — auto-detects agents present in `$PATH` (line 1388)
+4. `external.IsExternal(ag)` — checks if agent is external (line 1537, 1089, 1449)
+5. `agent.AsHookSupport(ag)` — filters to hook-supporting agents only (line 1464, 455)
+
+**Auto-enable external_agents:**
+- Lines 1087–1092: If any selected agent is external, auto-sets `settings.ExternalAgents = true`
+- External agents discovered via `external.DiscoverAndRegisterAlways(ctx)` (line 388, 445, 838)
+
+---
+
+## 5. Non-Interactive Detection
+
+### Conditions for Non-Interactive Mode
+
+1. **`--agent &lt;name&gt;` flag** (lines 840–856)
+   - Single targeted agent setup
+   - No agent selection form, no telemetry prompt, no Vercel prompt
+   - Calls `setupAgentHooksNonInteractive()`
+
+2. **`--yes` flag** (line 908)
+   - Accepts all defaults
+   - Sets `opts.Yes = true`
+   - Affects:
+     - Agent selection: calls `selectAllAgents()` instead of form (line 391, 405)
+     - Telemetry prompt: auto-answers Yes (unless `--telemetry=false` or env var; line 1148–1154)
+     - Vercel prompt: passed `vercelPromptFn = func() (bool, error) { return true, nil }` (line 1139)
+
+3. **TTY Detection** (via `interactive.CanPromptInteractively()`, line 34 of interactive.go)
+   - Checks in order:
+     1. `ENTIRE_TEST_TTY=1` (force interactive ON) or any other value (force OFF)
+     2. `testing.Testing()` — false in tests to prevent hanging
+     3. Agent subprocess env vars: `GEMINI_CLI`, `COPILOT_CLI`, `PI_CODING_AGENT`, `GIT_TERMINAL_PROMPT=0`
+     4. `CI` env var set to non-empty, non-`false` value
+     5. `/dev/tty` probe — attempts to open `/dev/tty`
+   - Returns `true` if user can be prompted, `false` otherwise
+
+4. **No TTY in Already-Setup Path** (lines 1415–1437)
+   - If Entire already enabled and `CanPromptInteractively() == false`:
+     - Agent selection keeps currently installed agents (line 1416–1426)
+     - Or falls back to auto-detected agents (line 1428–1429)
+     - Or uses default agent (line 1431–1436)
+
+5. **Bootstrap Non-Interactive** (line 794, 908)
+   - `--yes` flag propagates to `bootstrapOpts.Yes`
+   - Bootstrap can initialize git repo non-interactively
+
+---
+
+## Recommended Location for New Interactive Prompt
+
+**Best placement: End of `runEnableInteractive()`, after telemetry prompt and before the "Ready." message**
+
+**Suggested lines: Between line 1162 (telemetry save) and line 1174 (print "Ready.")**
+
+```go
+// After line 1162: saveSettings() for telemetry
+// NEW PROMPT HERE:
+
+if err := promptImportClaudeContext(ctx, w, opts); err != nil {
+    return err
+}
+
+// Before line 1174: print "Ready."
+```
+
+**Implementation template:**
+
+```go
+// promptImportClaudeContext asks if the user wants to import existing Claude context.
+func promptImportClaudeContext(ctx context.Context, w io.Writer, opts EnableOptions) error {
+    // Skip in --yes mode (auto-accept default)
+    if opts.Yes {
+        return nil  // Or auto-set to true/false as needed
+    }
+
+    // Skip in non-interactive mode
+    if !interactive.CanPromptInteractively() {
+        fmt.Fprintln(w, "Skipping Claude context import prompt (non-interactive mode).")
+        return nil
+    }
+
+    importContext := false  // Default to No
+    form := NewAccessibleForm(
+        huh.NewGroup(
+            huh.NewConfirm().
+                Title("Import existing Claude context?").
+                Description("Copy Claude IDE session state and settings from .claude/ if available.").
+                Affirmative("Yes").
+                Negative("No").
+                Value(&amp;importContext),
+        ),
+    )
+
+    if err := form.Run(); err != nil {
+        return fmt.Errorf("Claude context import prompt: %w", err)
+    }
+
+    if importContext {
+        // Perform import logic here
+        fmt.Fprintln(w, "✓ Imported Claude context")
+    }
+    return nil
+}
+```
+
+**Key patterns to follow:**
+- Respect `opts.Yes` flag (auto-accept or skip)
+- Check `interactive.CanPromptInteractively()` before showing form
+- Use `NewAccessibleForm()` for accessibility support
+- Handle form cancellation with `.Run()` error check
+- Print status messages to writer `w`
+- Return errors for caller to propagate
+
+---
+
+## Summary Table
+
+| Aspect | Details |
+|--------|---------|
+| **Main file** | `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/setup.go` |
+| **Command constructor** | `newEnableCmd()` at line 753 |
+| **Entry point** | `RunE` closure at line 770 |
+| **Fresh repo flow** | `runSetupFlow()` → `detectOrSelectAgent()` → `runEnableInteractive()` |
+| **Re-enable path** | `runEnable()` (lightweight toggle) at line 1200 |
+| **Repo root detection** | `paths.WorktreeRoot(ctx)` using `git rev-parse --show-toplevel` |
+| **Agent selection** | `detectOrSelectAgent()` with `NewAccessibleForm() + huh.MultiSelect` |
+| **Interactive detection** | `interactive.CanPromptInteractively()` (TTY probe + CI/agent env detection) |
+| **Non-interactive modes** | `--agent &lt;name&gt;`, `--yes`, CI env, agent subprocess env |
+| **Telemetry prompt** | `promptTelemetryConsent()` at line 1871; skipped if `--yes`, `--telemetry=false`, or `ENTIRE_TELEMETRY_OPTOUT` |
+| **Vercel prompt** | `maybePromptVercelDeploymentDisable()` at line 1911; triggered if `vercel.json` exists |
+| **Accessibility** | `ACCESSIBLE=1` env var → `NewAccessibleForm()` auto-switches to text prompts |
+| **Settings file** | Writes to `.entire/settings.json` (project) or `.entire/settings.local.json` (local) |
+| **Git hook installation** | `strategy.InstallGitHook(ctx, true, localDev, absolutePath)` at line 1124 |
+| **Final message** | "Ready." printed at line 1174 (unless `opts.SuppressDoneMessage` set by bootstrap) |</result>
+<usage><subagent_tokens>63535</subagent_tokens><tool_uses>24</tool_uses><duration_ms>88583</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ac06cbf7bc0ed62d8</task-id>
+<tool-use-id>toolu_01D5LiusPN6xqhSiAzzafCho</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/b1e13e56-e9ae-469a-a30d-7c57d70e2f1f/tasks/ac06cbf7bc0ed62d8.output</output-file>
+<status>completed</status>
+<summary>Agent "Map Claude transcript discovery &amp; parsing" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Excellent! Now I have a comprehensive picture. Let me compile my findings into a detailed response with file references and snippets:
+
+## Summary
+
+I've thoroughly explored how the Entire CLI locates and parses Claude Code agent transcripts, including the architecture for splitting transcripts into per-turn checkpoints and handling subagent token rollups. Here are the concrete findings:
+
+---
+
+### 1. **Repo Root → Claude Projects Directory Mapping**
+
+**Key Function: `SanitizePathForClaude` (file:line)**
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/agent/claudecode/claude.go:265-267`
+
+```go
+func SanitizePathForClaude(path string) string {
+	return nonAlphanumericRegex.ReplaceAllString(path, "-")
+}
+```
+
+**Location Resolution (`GetSessionDir`)**
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/agent/claudecode/claude.go:95-108`
+
+```go
+// GetSessionDir returns the directory where Claude stores session transcripts.
+func (c *ClaudeCodeAgent) GetSessionDir(repoPath string) (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("failed to get home directory: %w", err)
+	}
+
+	projectDir := SanitizePathForClaude(repoPath)
+	return filepath.Join(homeDir, ".claude", "projects", projectDir), nil
+}
+```
+
+**Session File Resolution (`ResolveSessionFile`)**
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/agent/claudecode/claude.go:87-89`
+
+```go
+// ResolveSessionFile returns the path to a Claude session file.
+// Claude names files directly as &lt;id&gt;.jsonl.
+func (c *ClaudeCodeAgent) ResolveSessionFile(sessionDir, agentSessionID string) string {
+	return filepath.Join(sessionDir, agentSessionID+".jsonl")
+}
+```
+
+**Example Path**: `~/.claude/projects/Users-ninawork-entire-devenv-cli/&lt;session-id&gt;.jsonl`
+
+---
+
+### 2. **Transcript Parsing (.jsonl Format)**
+
+**Core Types (`transcript.Line`)**
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/transcript/types.go:19-27`
+
+```go
+// Line represents a single line in a Claude Code or Cursor JSONL transcript.
+type Line struct {
+	Type    string          `json:"type"`
+	Role    string          `json:"role,omitempty"`
+	UUID    string          `json:"uuid"`
+	Message json.RawMessage `json:"message"`
+}
+```
+
+**Parse Functions**
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/transcript/parse.go:17-46` — `ParseFromBytes()` for in-memory parsing
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/transcript/parse.go:49-98` — `ParseFromFileAtLine()` for file-based incremental parsing starting from a line offset
+
+**Turn/Message Structure** (`AssistantMessage`)
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/transcript/types.go:34-46`
+
+```go
+type AssistantMessage struct {
+	Content []ContentBlock `json:"content"`
+}
+
+type ContentBlock struct {
+	Type  string          `json:"type"`
+	ID    string          `json:"id,omitempty"`
+	Text  string          `json:"text,omitempty"`
+	Name  string          `json:"name,omitempty"`
+	Input json.RawMessage `json:"input,omitempty"`
+}
+```
+
+**Token Usage Extraction** (`CalculateTokenUsage`)
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/agent/claudecode/transcript.go:140-183`
+
+Token usage deduplication by `message.id` (handles streaming):
+
+```go
+type messageWithUsage struct {
+	ID    string       `json:"id"`
+	Usage messageUsage `json:"usage"`
+}
+
+type messageUsage struct {
+	InputTokens              int `json:"input_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+}
+```
+
+**Timestamp Extraction**
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/paths/transcript.go:48-67` — `ParseTimestampFromJSONL()` extracts `timestamp` field from JSONL
+
+**Slice by Line Offset**
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/transcript/parse.go:110-143` — `SliceFromLine(content, startLine)` returns checkpoint-specific portion starting at line N
+
+---
+
+### 3. **Subagent Token Rollups**
+
+**Subagent ID Extraction** (`ExtractSpawnedAgentIDs`)
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/agent/claudecode/transcript.go:200-269`
+
+Subagent IDs are found in `tool_result` blocks with pattern `agentId: &lt;id&gt;`. Path validation ensures safety:
+
+```go
+// Look for agentId in the text. Drop any ID that isn't path-safe:
+if agentID := extractAgentIDFromText(textContent); agentID != "" &amp;&amp; validation.ValidateAgentID(agentID) == nil {
+	agentIDs[agentID] = block.ToolUseID
+}
+```
+
+**Total Token Usage with Subagents** (`CalculateTotalTokenUsage`)
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/agent/claudecode/transcript.go:383-423`
+
+```go
+// Extract spawned agent IDs from the parsed transcript
+agentIDs := ExtractSpawnedAgentIDs(parsed)
+
+// Calculate subagent token usage (skip when subagentsDir is empty)
+if len(agentIDs) &gt; 0 &amp;&amp; subagentsDir != "" {
+	subagentUsage := &amp;agent.TokenUsage{}
+	for agentID := range agentIDs {
+		agentPath := filepath.Join(subagentsDir, fmt.Sprintf("agent-%s.jsonl", agentID))
+		agentUsage, err := CalculateTokenUsageFromFile(agentPath, 0)
+		// ... accumulate subagentUsage
+	}
+}
+```
+
+**Subagent File Storage** (from lifecycle.go)
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/lifecycle.go` (line ~930)
+
+Subagent transcripts stored at: `&lt;session-dir&gt;/&lt;session-id&gt;/subagents/agent-&lt;id&gt;.jsonl`
+
+---
+
+### 4. **Checkpoint Transcript Slicing &amp; Per-Turn Granularity**
+
+**Session State Tracks Start Offset** (`SessionState.CheckpointTranscriptStart`)
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/session_state.go`
+
+This is the 0-indexed line number at which the current checkpoint's transcript data begins.
+
+**Checkpoint Metadata** (`CheckpointTranscriptStart`)
+- `/Users/ninawork/entire/devenv/cli/api/checkpoint/metadata.go:99` — also called `TranscriptLinesAtStart` for backward compat
+
+```go
+CheckpointTranscriptStart int    // Transcript line offset at start of this checkpoint's data
+```
+
+**Slice Calculation During Finalization** (`finalizeAllTurnCheckpoints`)
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/manual_commit_hooks.go:2729-2880`
+
+```go
+// Slice to the relevant portion of the full transcript
+sliced := transcript.SliceFromLine(transcriptData, startLine)
+parsed, err := transcript.ParseFromBytes(sliced)
+```
+
+**Per-Turn Checkpoint Creation**
+- Checkpoints are created one per user-prompt turn (via `PrepareCommitMsg` hook adding `Entire-Checkpoint-ID` trailer)
+- Each `TurnCheckpointID` stored in `SessionState.TurnCheckpointIDs` (list of checkpoint IDs from mid-turn commits)
+- On session stop, `finalizeAllTurnCheckpoints()` updates all turn checkpoints with the full transcript
+
+**Compact Transcript Format** (optional pre-sliced version)
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/transcript/compact/parse.go`
+- Compact transcript is a condensed format written alongside full transcript
+- **Key Insight**: metadata also carries `compact_transcript_start` offset (when compact was generated) so external readers can slice `transcript.jsonl` rather than reading a separate compact file
+- See `/Users/ninawork/entire/devenv/cli/api/checkpoint/metadata.go` — the `compact_transcript` path is optional (omitted if no compact was generated)
+
+---
+
+### 5. **Agent Abstraction &amp; Transcript Parsing Interface**
+
+**Core `Agent` Interface**
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/agent/agent.go:14-88`
+
+Agents implement:
+- `ReadSession(input *HookInput) (*AgentSession, error)` — returns `NativeData` (raw JSONL bytes)
+- `ReadTranscript(sessionRef string) ([]byte, error)` — raw transcript read
+
+**Optional `TranscriptAnalyzer` Interface** (richer parsing)
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/agent/agent.go:151-168`
+
+```go
+type TranscriptAnalyzer interface {
+	Agent
+	GetTranscriptPosition(path string) (int, error)
+	ExtractModifiedFilesFromOffset(path string, startOffset int) (files []string, currentPosition int, err error)
+}
+```
+
+**Optional `SubagentAwareExtractor` Interface**
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/agent/agent.go:341-353`
+
+```go
+type SubagentAwareExtractor interface {
+	Agent
+	ExtractAllModifiedFiles(transcriptData []byte, fromOffset int, subagentsDir string) ([]string, error)
+	CalculateTotalTokenUsage(transcriptData []byte, fromOffset int, subagentsDir string) (*TokenUsage, error)
+}
+```
+
+**Claude Code Implementation** implements all three:
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/agent/claudecode/claude.go:121-148` — `ReadSession()`
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/agent/claudecode/claude.go:276-308` — `GetTranscriptPosition()`
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/agent/claudecode/transcript.go:383-473` — subagent-aware methods
+
+---
+
+### 6. **Is There Existing Import/Backfill Code?**
+
+**No historical import from Claude's native projects exists in this repo**, but there is **backfill infrastructure** for incomplete checkpoints:
+
+**Transcript Backfill** (post-hoc writes)
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/checkpoint/persistent_write.go` — `backfillTranscript()`
+- Called when a checkpoint's transcript data is missing but other metadata exists
+
+**Prompt Backfill** (from transcript)
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/lifecycle.go` (line ~520+) — reads `prompt.txt`, falls back to extracting prompts from transcript if missing
+
+**Attribution Backfill** (post-commit via `CheckpointAttribution`)
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/checkpoint/persistent_write.go` — `backfillAttribution()`
+
+**No "import all pre-existing Claude Code transcripts" command exists**, but the architecture already supports:
+- Reading `.claude/projects/&lt;slug&gt;/*.jsonl` files (via `SanitizePathForClaude` + `GetSessionDir`)
+- Parsing them with the standard `transcript.ParseFromBytes()` + `CalculateTokenUsage()`
+- Splitting by turn (via `CheckpointTranscriptStart` offset + `SliceFromLine()`)
+- Extracting metadata (files, prompts, tokens, skill events, subagents)
+
+---
+
+### Key References Summary
+
+| Aspect | File | Function/Lines |
+|--------|------|-----------------|
+| Path Sanitization | `claudecode/claude.go` | `SanitizePathForClaude:265-267` |
+| Session Dir Resolution | `claudecode/claude.go` | `GetSessionDir:95-108` |
+| Session File Resolution | `claudecode/claude.go` | `ResolveSessionFile:87-89` |
+| Transcript Parsing (bytes) | `transcript/parse.go` | `ParseFromBytes:17-46` |
+| Transcript Parsing (file+offset) | `transcript/parse.go` | `ParseFromFileAtLine:49-98` |
+| Token Usage Extraction | `claudecode/transcript.go` | `CalculateTokenUsage:140-183` |
+| Token Usage (with subagents) | `claudecode/transcript.go` | `CalculateTotalTokenUsage:383-423` |
+| Subagent ID Extraction | `claudecode/transcript.go` | `ExtractSpawnedAgentIDs:200-269` |
+| Subagent File Paths | `lifecycle.go` | `subagentsDir := filepath.Join(..., "subagents")` (~line 930) |
+| Slice by Line Offset | `transcript/parse.go` | `SliceFromLine:110-143` |
+| Checkpoint Start Tracking | `strategy/manual_commit_hooks.go` | `finalizeAllTurnCheckpoints:2729-2880` |
+| Compact Transcript Schema | `transcript/compact/parse.go` | Types + `BuildCondensedEntries:46-114` |
+| Agent Interface | `agent/agent.go` | `Agent:14-88`, `TranscriptAnalyzer:151-168`, `SubagentAwareExtractor:341-353` |
+
+---
+
+This architecture is ready for import: you'd iterate over `~/.claude/projects/&lt;slug&gt;/*.jsonl`, parse each as per the Claude Code transcript format, extract metadata (tokens, files, prompts), and split by turn using the existing utilities—no new parsing logic needed.</result>
+<usage><subagent_tokens>72604</subagent_tokens><tool_uses>33</tool_uses><duration_ms>89418</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a132fd723fa489e14</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/b1e13e56-e9ae-469a-a30d-7c57d70e2f1f/tasks/a132fd723fa489e14.output</output-file>
+<status>completed</status>
+<summary>Agent "Map checkpoint storage &amp; commit attachment" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Now let me write up the comprehensive findings. I have all the information I need:
+
+## Comprehensive Checkpoint/Session Storage Model - Exploration Report
+
+Based on my thorough exploration of the checkpoint and session storage architecture in `/Users/ninawork/entire/devenv/cli`, here are the findings on how the manual-commit strategy manages checkpoints and the critical assumptions about commit linkage.
+
+---
+
+## 1. On-Disk / On-Branch Layout
+
+### `entire/checkpoints/v1` Branch Structure
+
+This is the **permanent checkpoint branch** (an orphan with no merge base). It stores condensed session logs after user commits.
+
+```
+entire/checkpoints/v1 (orphan branch, no merge history)
+├── &lt;checkpoint-id[:2]&gt;/          # Shard directory (first 2 hex chars, 256 max)
+│   └── &lt;checkpoint-id[2:]&gt;/      # Full checkpoint directory
+│       ├── metadata.json         # CheckpointSummary (aggregated, root-level)
+│       ├── 0/                    # First session (0-based indexing)
+│       │   ├── metadata.json     # Session-specific Metadata
+│       │   ├── full.jsonl        # Raw agent transcript
+│       │   ├── transcript.jsonl  # Compact transcript (pre-sliced to checkpoint portion)
+│       │   ├── prompt.txt        # User prompts for this checkpoint
+│       │   └── content_hash.txt  # sha256 hash of full.jsonl
+│       ├── 1/                    # Second session (concurrent)
+│       └── 2/                    # Third session...
+```
+
+**Key file: `/api/checkpoint/metadata.go`** (lines 394-439) defines `CheckpointSummary`:
+```go
+type CheckpointSummary struct {
+    CheckpointID        id.CheckpointID
+    CheckpointVersion   string
+    Strategy            string
+    Branch              string
+    CheckpointsCount    int
+    FilesTouched        []string
+    Sessions            []SessionFilePaths  // Maps session IDs to file paths
+    TokenUsage          *types.TokenUsage
+    CombinedAttribution *Attribution
+}
+```
+
+**Session-level metadata** (`Metadata`, lines 286-366) lives in `&lt;session-index&gt;/metadata.json`:
+```go
+type Metadata struct {
+    CheckpointID        id.CheckpointID
+    SessionID           string
+    Strategy            string
+    CreatedAt           time.Time
+    Branch              string
+    CheckpointsCount    int
+    SaveStepCount       int          // Number of shadow-branch SaveStep commits (0 = no real work)
+    FilesTouched        []string
+    Agent               types.AgentType
+    Model               string
+    TurnID              string
+    IsTask              bool
+    ToolUseID           string
+    CheckpointTranscriptStart int  // Offset into full.jsonl
+    // ... token usage, skill events, attribution, summary, kind, review/investigation fields
+}
+```
+
+### Shadow Branches (Ephemeral)
+
+```
+refs/heads/entire/&lt;base-commit[:7]&gt;-&lt;worktree-hash[:6]&gt;
+├── (full worktree files)
+└── .entire/metadata/
+    ├── &lt;session-id-1&gt;/
+    │   ├── full.jsonl
+    │   ├── prompt.txt
+    │   └── tasks/&lt;tool-use-id&gt;/
+    │       ├── checkpoint.json
+    │       └── incremental/
+    │           ├── 001-TodoWrite.json
+    │           ├── 002-Edit.json
+    │           └── ...
+    └── &lt;session-id-2&gt;/          # Multiple concurrent sessions
+        ├── full.jsonl
+        └── ...
+```
+
+**Pattern:** `entire/&lt;commit[:7+]&gt;(-&lt;worktree-hash[:6]&gt;)?` (7+ hex chars for commit, optional 6-char worktree suffix)
+
+**File:** `/cmd/entire/cli/strategy/cleanup.go` (line 62):
+```go
+var shadowBranchPattern = regexp.MustCompile(`^entire/[0-9a-fA-F]{7,}(-[0-9a-fA-F]{6})?$`)
+```
+
+---
+
+## 2. Lifecycle: How Sessions Attach to Commits
+
+### Phase 1: Live Session (No Commit Yet)
+
+A session starts in `.git/entire-sessions/&lt;session-id&gt;.json` with state:
+- **`BaseCommit`**: Initial HEAD (used for shadow branch naming)
+- **`WorktreeID`**: Worktree identifier (empty for main worktree)
+- **Shadow branch created**: `entire/&lt;BaseCommit[:7]&gt;-&lt;WorktreeID[:6]&gt;` on first `SaveStep`
+
+**File:** `/cmd/entire/cli/strategy/session.go` (lines 85-101):
+```go
+type State struct {
+    SessionID string
+    BaseCommit string         // Initial HEAD; used for shadow branch naming
+    WorktreeID string         // Worktree ID (empty for main worktree)
+    Phase Phase              // Lifecycle stage (Idle → Active → Ended)
+    // ...
+}
+```
+
+### Phase 2: Prepare Commit Message Hook
+
+**Hook:** `prepare-commit-msg` (source: "" | "message" | "template" | "commit" for amend)
+
+**File:** `/cmd/entire/cli/strategy/manual_commit_hooks.go` (lines 356-555)
+
+**Flow:**
+1. Check if there's an active session with content to condense
+2. Generate a fresh **12-hex checkpoint ID** (or preserve if amending)
+3. Add `Entire-Checkpoint: &lt;12-hex-id&gt;` trailer to commit message
+4. User can remove the trailer (breaks the link) or keep it
+
+**Critical code:** Lines 465-472:
+```go
+checkpointID, err := id.Generate()  // Fresh 12-hex ID
+// ...
+message = addCheckpointTrailer(message, checkpointID)  // Adds "Entire-Checkpoint: abc123def456"
+```
+
+**Trailer format:** `/cmd/entire/cli/trailers/trailers.go` (lines 38-41, 227):
+```go
+const CheckpointTrailerKey = "Entire-Checkpoint"
+
+// Appended as:
+fmt.Sprintf("%s\n\n%s: %s\n", message, CheckpointTrailerKey, cpID.String())
+```
+
+### Phase 3: Post Commit Hook (Condensation)
+
+**Hook:** `post-commit`
+
+**File:** `/cmd/entire/cli/strategy/manual_commit_hooks.go` (lines 878-1040)
+
+**Flow:**
+1. Extract `Entire-Checkpoint: &lt;id&gt;` trailer from HEAD commit message
+2. If trailer **absent**: update `BaseCommit` only, skip condensation
+3. If trailer **present**:
+   - Find active sessions for the worktree
+   - For each session:
+     - **Condense** shadow branch → persistent `entire/checkpoints/v1` branch
+     - Store metadata at `&lt;id[:2]&gt;/&lt;id[2:]&gt;/` path
+     - Clean up shadow branch after condensation
+
+**Critical section:** Lines 905-914:
+```go
+checkpointID, found := trailers.ParseCheckpoint(commit.Message)
+
+if !found {
+    // No trailer — user removed it or it was never added
+    // Still update BaseCommit for active sessions so future commits can match
+    s.postCommitUpdateBaseCommitOnly(ctx, head)
+    return nil
+}
+// ... condensation happens here
+```
+
+### Condensation Process
+
+**File:** `/cmd/entire/cli/strategy/manual_commit_condensation.go` (lines 135-328)
+
+**Method:** `CondenseSession()`
+
+```go
+func (s *ManualCommitStrategy) CondenseSession(
+    ctx context.Context,
+    repo *git.Repository,
+    checkpointID id.CheckpointID,    // From Entire-Checkpoint trailer
+    state *SessionState,
+) (*CondenseResult, error)
+```
+
+**Steps:**
+1. **Extract shadow branch data**: Read from `entire/&lt;BaseCommit&gt;-&lt;WorktreeID&gt;`
+2. **Build WriteOptions** (lines 258-289):
+   ```go
+   writeOpts := cpkg.WriteOptions{
+       CheckpointID:        checkpointID,      // The 12-hex ID from trailer
+       SessionID:           state.SessionID,
+       EphemeralBranch:     shadowBranchName,  // Records shadow branch for provenance
+       Strategy:            "manual-commit",
+       Transcript:          redactedTranscript,
+       // ... token usage, attribution, summary, skill events ...
+   }
+   ```
+3. **Write to persistent store** (line 293):
+   ```go
+   if err := store.Write(writeCtx, cpkg.Session(writeOpts)); err != nil { ... }
+   ```
+   This writes to `entire/checkpoints/v1:&lt;id[:2]&gt;/&lt;id[2:]&gt;/` path
+
+4. **Clean up shadow branch** (lines 1025-1035):
+   ```go
+   for shadowBranchName := range shadowBranchesToDelete {
+       if uncondensedActiveOnBranch[shadowBranchName] {
+           // Protect it if other sessions still need it
+       } else {
+           // Delete the shadow branch after condensation
+       }
+   }
+   ```
+
+### Amend/Rebase Tracking
+
+**Hook:** `post-rewrite` (for amend/rebase)
+
+**File:** `/cmd/entire/cli/strategy/manual_commit_hooks.go` (lines 189-248)
+
+**Purpose:** Keep session linkage aligned when commits are rewritten
+
+- Reads stdin pairs: `&lt;old-sha&gt; &lt;new-sha&gt;`
+- Remaps `state.BaseCommit` to new hash
+- Migrates shadow branch to new base commit
+
+---
+
+## 3. CRITICAL: Where Code Assumes Commit Linkage
+
+These are the locations where an **orphaned** (commit-less) checkpoint would break or behave unexpectedly:
+
+### A. Shadow Branch Naming &amp; Resolution
+
+**File:** `/cmd/entire/cli/strategy/manual_commit_hooks.go`
+
+- **Line 1194**: `shadowBranchName := getShadowBranchNameForCommit(state.BaseCommit, state.WorktreeID)`
+  - **ASSUMES**: `BaseCommit` is a valid git object hash
+  - **BREAKS IF**: `BaseCommit` is empty or a fake ID
+
+- **Line 1387**: `state.BaseCommit = newHead`
+  - Updates `BaseCommit` on every commit (amend, post-commit)
+  - **ASSUMES**: Session is tied to a working commit
+
+**File:** `/cmd/entire/cli/strategy/manual_commit_session.go`
+
+- **Line 216**: `if state.BaseCommit == baseCommitSHA { ... }`
+  - Finds sessions by matching `BaseCommit` to current HEAD
+  - **BREAKS IF**: Session has no commit to match against
+
+- **Line 67**: `store.ListCheckpoints(ctx, state.BaseCommit, state.WorktreeID, ...)`
+  - Lists shadow branch checkpoints by `BaseCommit`
+  - **BREAKS IF**: `BaseCommit` doesn't correspond to a real shadow branch
+
+### B. Rewind Operations
+
+**File:** `/cmd/entire/cli/strategy/manual_commit_rewind.go`
+
+- **Lines 54-92** (`GetRewindPoints`): Searches for sessions by matching `state.BaseCommit == headHash`
+  - **ASSUMES**: Session's base commit exists in git history
+  - **BREAKS IF**: Checkpoint has no associated commit
+
+- **Lines 133-210** (`GetLogsOnlyRewindPoints`): Scans commit history for `Entire-Checkpoint` trailers
+  - **ASSUMES**: Every persistent checkpoint was created by a commit with a trailer
+  - **DEPENDS ON**: The link from commit → checkpoint ID
+  - **BREAKS IF**: Checkpoint exists with no commit trailer
+
+- **Lines 488-499** (`resetShadowBranchToCheckpoint`):
+  ```go
+  shadowBranchName := getShadowBranchNameForCommit(state.BaseCommit, state.WorktreeID)
+  ```
+  - **ASSUMES**: `BaseCommit` is a real git object
+  - **BREAKS IF**: Session/checkpoint has no associated commit
+
+### C. Post-Rewrite Hook (Amend/Rebase)
+
+**File:** `/cmd/entire/cli/strategy/manual_commit_hooks.go`
+
+- **Lines 189-248** (`PostRewrite`):
+  ```go
+  newBaseCommit, baseChanged := remapRewriteSHA(state.BaseCommit, rewrites)
+  ```
+  - **ASSUMES**: `BaseCommit` appears in the rewrite pairs
+  - **BREAKS IF**: Checkpoint not tied to rewritable commits
+
+### D. Cleanup Logic
+
+**File:** `/cmd/entire/cli/strategy/cleanup.go`
+
+- **Lines 243-248** (`protectedShadowBranchForSession`):
+  ```go
+  return getShadowBranchNameForCommit(s.BaseCommit, s.WorktreeID), true
+  ```
+  - **ASSUMES**: Every active session has a valid `BaseCommit`
+  - **BREAKS IF**: Checkpoint imported without `BaseCommit`
+
+- **Lines 154-196** (`CleanupPushedShadowBranches`):
+  - Only deletes shadow branches for sessions where `Phase == PhaseEnded &amp;&amp; FullyCondensed`
+  - **ASSUMES**: Sessions have a lifecycle tied to commits
+  - **BREAKS IF**: Orphaned checkpoints exist outside the state machine
+
+### E. Session State Queries
+
+**File:** `/cmd/entire/cli/strategy/manual_commit_logs.go`
+
+- **Lines 24-66** (`GetSessionInfo`):
+  ```go
+  sessions, err := s.findSessionsForCommit(ctx, head.Hash().String())
+  shadowBranchName := getShadowBranchNameForCommit(state.BaseCommit, state.WorktreeID)
+  ```
+  - **ASSUMES**: All sessions are tied to commits in history
+  - **BREAKS IF**: Imported checkpoint has no session state or wrong `BaseCommit`
+
+### F. Commit History Scanning
+
+**File:** `/cmd/entire/cli/strategy/manual_commit_rewind.go`
+
+- **Lines 179-210** (`GetLogsOnlyRewindPoints`):
+  ```go
+  iter, err := repo.Log(&amp;git.LogOptions{From: head.Hash(), Order: git.LogOrderCommitterTime})
+  err = iter.ForEach(func(c *object.Commit) error {
+      checkpointID, found := trailers.ParseCheckpoint(c.Message)  // Extract trailer
+      if !found { continue }
+      // Match persistent checkpoint by ID
+      if info, ok := checkpointInfoMap[checkpointID]; ok { ... }
+  })
+  ```
+  - **ASSUMES**: Every rewindable persistent checkpoint has a corresponding commit with `Entire-Checkpoint` trailer
+  - **BREAKS IF**: Checkpoint exists on `v1` branch but no commit references it
+  - **Problem**: No way to rewind to commit-less checkpoints this way
+
+### G. Session List / Explain Commands
+
+**File:** `/cmd/entire/cli/strategy/common.go`
+
+- **Lines 297-317** (`ListCheckpoints`):
+  ```go
+  store, err := s.getPersistentStore(ctx, repo)
+  committed, err := store.List(ctx)
+  return checkpointInfosFromCommitted(committed), nil
+  ```
+  - **Works OK**: Persistent checkpoints on `v1` don't require commits
+  - **But**: Listing also includes "logs-only" points (lines 134-231 in `GetRewindPoints`)
+    - Those scan commit history and require `Entire-Checkpoint` trailers
+    - **BREAKS IF**: Checkpoint exists but is never committed to a rewindable branch
+
+### H. Post-Commit Attribution Updates
+
+**File:** `/cmd/entire/cli/strategy/manual_commit_hooks.go`
+
+- **Lines 1017-1021** (`updateCombinedAttributionForCheckpoint`):
+  ```go
+  if err := s.updateCombinedAttributionForCheckpoint(ctx, repo, checkpointID, headTree, parentTree, worktreePath)
+  ```
+  - **ASSUMES**: Checkpoint is tied to HEAD commit tree
+  - **BREAKS IF**: Checkpoint not tied to a commit tree
+
+---
+
+## 4. Checkpoint Identification &amp; Linking
+
+### Checkpoint ID Format
+
+**Type:** 12-hex random identifier (e.g., `a3b2c4d5e6f7`)
+
+**Generated:** During `prepare-commit-msg` hook (lines 467-472 in `manual_commit_hooks.go`)
+
+**File:** `/cmd/entire/cli/checkpoint/id/id.go`
+
+### Commit ↔ Checkpoint Linkage
+
+The link is **one-way but critical**:
+
+1. **Commit → Checkpoint** (via trailer):
+   - Commit message contains: `Entire-Checkpoint: abc123def456`
+   - `post-commit` hook reads the trailer and creates metadata
+   - **File:** `trailers.ParseCheckpoint(commitMessage)` (lines 116-130)
+
+2. **Checkpoint → Commit** (via metadata):
+   - Persistent metadata stored at `entire/checkpoints/v1:&lt;id[:2]&gt;/&lt;id[2:]&gt;/`
+   - Does **NOT** record commit hash (only branch name, strategy, files)
+   - **File:** `/api/checkpoint/metadata.go` (Metadata struct, no CommitHash field)
+
+3. **Session ↔ Commit** (via trailer):
+   - Shadow branch commits have `Entire-Session: &lt;session-id&gt;` trailer
+   - Used to identify which session a checkpoint belongs to
+   - **File:** `trailers.ParseSession()` (for parsing)
+
+**Critical insight:** Metadata has NO explicit commit hash field. The link is implicit:
+- The trailer exists → the checkpoint **must have** been created by that commit
+- `GetLogsOnlyRewindPoints` relies on scanning commits to find checkpoints
+
+---
+
+## 5. Listing &amp; Display Assumptions
+
+### `entire checkpoint list`
+
+**File:** `/cmd/entire/cli/strategy/common.go` (lines 297-317)
+
+```go
+func ListCheckpoints(ctx context.Context) ([]CheckpointInfo, error) {
+    stores, err := checkpoint.Open(ctx, repo, checkpoint.OpenOptions{})
+    committed, err := stores.Persistent.List(ctx)
+    return checkpointInfosFromCommitted(committed), nil
+}
+```
+
+- **Works on:** Committed checkpoints on `entire/checkpoints/v1`
+- **Sorts by:** `CreatedAt` from metadata
+- **Does NOT require:** Any commit to exist
+- **Renders OK:** Without commit hash (doesn't display commit SHA anyway)
+
+### `entire session list`
+
+Lists **active sessions** from `.git/entire-sessions/`:
+
+**File:** `/cmd/entire/cli/strategy/session_state.go`
+
+- **Works on:** Session state files
+- **Requires:** Valid `BaseCommit`, `WorktreeID`
+- **BREAKS IF:** `BaseCommit` is missing or fake (shadow branch can't be named)
+
+### `entire checkpoint explain`
+
+**File:** `/cmd/entire/cli/strategy/manual_commit_logs.go` (lines 24-66, `GetSessionInfo`)
+
+- **Finds sessions** by matching `BaseCommit` to current HEAD
+- **BREAKS IF:** Checkpoint not tied to worktree sessions
+
+---
+
+## 6. Summary: Critical Assumptions for Commit-Less Checkpoints
+
+If you import historical agent transcripts as **orphaned checkpoints** (no git commit), the code will break at these points:
+
+| Location | Issue | Severity |
+|----------|-------|----------|
+| Shadow branch naming (manual_commit_hooks.go:1194) | Requires valid `BaseCommit` hash | **CRITICAL** |
+| Session list (manual_commit_logs.go:24-66) | Can't find sessions without `BaseCommit` | **CRITICAL** |
+| Rewind (manual_commit_rewind.go:54-92) | Session lookup by `BaseCommit` fails | **HIGH** |
+| Rewind logs-only (manual_commit_rewind.go:179-210) | No commit trailer = not findable | **HIGH** |
+| Cleanup (cleanup.go:243-248) | Can't name shadow branch without `BaseCommit` | **HIGH** |
+| Post-rewrite (manual_commit_hooks.go:189-248) | No commits to remap | **LOW** |
+| Checkpoint list (common.go:297-317) | **Works fine** - no commit needed | N/A |
+| Checkpoint explain (manual_commit_logs.go:98-105) | **Works fine** - reads from persistent store | N/A |
+
+### What Would Work for Commit-Less Checkpoints
+
+- **Reading** checkpoints (explain, list)
+- **Searching** committed metadata
+- **Token usage** queries
+- **Listing rewind points** in the committed store (if you bypass the logs-only scan)
+
+### What Would Break
+
+- **Rewinding** (no shadow branch to restore to, no worktree-linked session)
+- **Session lifecycle** (no `BaseCommit` = no shadow branch naming)
+- **Cleanup** (can't determine which branches to delete)
+- **Amend/rebase** linkage (no commits to remap)
+
+---
+
+## Architecture Implication for Import Feature
+
+To support **import without commits**, you'd need:
+
+1. **Fake/synthetic BaseCommit**: Generate a stable hash (e.g., SHA-1 of checkpoint metadata) so shadow branches can be named
+   - Or: Store checkpoints with `BaseCommit == null` and skip shadow-branch operations entirely
+
+2. **Separate import state machine**: Don't reuse session state files; store imported metadata in a read-only import directory (`entire/imports/`)
+
+3. **Bypass session matching**: When rewind/explain is requested for an imported checkpoint, fetch directly from persistent store, not via session lookup
+
+4. **Mark checkpoints as importable**: Add a `Kind` field or new field to distinguish imported checkpoints from normal ones
+
+5. **Read-only rewind**: Restore files from persistent checkpoint tree (like logs-only points do), skip shadow-branch reset
+
+6. **No cleanup concern**: Imported checkpoints live only on v1 branch; no shadow branches to clean up
+
+This approach would let you import transcripts while keeping them visually and functionally separate from agent-created checkpoints.</result>
+<usage><subagent_tokens>81829</subagent_tokens><tool_uses>30</tool_uses><duration_ms>106141</duration_ms></usage>
+</task-notification>
+
+---
+
+Looks good
+
+---
+
+The command should prompt the user to ask if they want to push up the checkpoints. The command should also specify that when it found N claude sessions, it should be "for the past month" (the timespan should be a one month lookback for now). Ensure there are no issues with list or explain. They should filter out Kind: imported if they're unsupported.
+
+---
+
+The command should specify that when it found N claude sessions, it should be "for the past month" (the timespan should be a one month lookback for now). Ensure there are no issues with list or explain. They should filter out Kind: imported if they're unsupported.
+
+Eventually, push up will be an option, but for first pass, it's local-only. We shouldn't engineer ourselves into a box on this: it should be flexible enough to allow pushing up.
+
+---
+
+We don't need `--since` for now. What do you mean "no box"?
+
+---
+
+What does `--force` entail here? I think we can remove that
+
+---
+
+Implementation plan yes
+
+---
+
+<task-notification>
+<task-id>a6d51aff08382492f</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/b1e13e56-e9ae-469a-a30d-7c57d70e2f1f/tasks/a6d51aff08382492f.output</output-file>
+<status>completed</status>
+<summary>Agent "Extract checkpoint store + metadata API" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect! Now let me compile all the verbatim code blocks for the user:
+
+## EXACT VERBATIM SIGNATURES AND STRUCT DEFINITIONS
+
+### 1. Checkpoint Persistent Store API
+
+**cmd/entire/cli/checkpoint/open.go: lines 9-62**
+```go
+// OpenOptions configures Open. The zero value uses the default committed-ref
+// topology and attaches no blob fetcher.
+type OpenOptions struct {
+	// BlobFetcher is the CLI-level on-demand blob fetcher. The checkpoint
+	// package cannot resolve it itself, so the CLI layer injects it here and
+	// Open attaches it to the constructed store(s). nil leaves on-demand
+	// fetching off.
+	BlobFetcher BlobFetchFunc
+
+	// Refs overrides the default committed-ref topology. A non-nil value wins,
+	// e.g. attach pins reads to Primary via PrimaryAsRead().
+	Refs *PersistentRefs
+}
+
+// Stores is the facade returned by Open: the persistent store plus the git-only
+// ephemeral (shadow-branch) capability and resolved committed-ref topology.
+type Stores struct {
+	// Persistent is the committed store that serves permanent reads and writes.
+	Persistent PersistentStore
+
+	ephemeral EphemeralStore
+	refs      PersistentRefs
+}
+
+// Open resolves the checkpoint storage topology and constructs the backing
+// store. It keeps ref resolution and blob-fetcher wiring in one place.
+//
+//nolint:unparam // Callers treat store construction as fallible at this boundary; the git backend has no fallible setup today.
+func Open(ctx context.Context, repo *git.Repository, opts OpenOptions) (*Stores, error) {
+	refs := resolveOpenRefs(ctx, opts)
+	store := NewGitStore(repo, refs)
+	if opts.BlobFetcher != nil {
+		store.SetBlobFetcher(opts.BlobFetcher)
+	}
+	return &amp;Stores{
+		Persistent: store,
+		ephemeral:  newEphemeralStore(repo, refs),
+		refs:       refs,
+	}, nil
+}
+
+// Refs returns the resolved committed-ref topology.
+func (s *Stores) Refs() PersistentRefs { return s.refs }
+```
+
+**cmd/entire/cli/checkpoint/store.go: lines 48-53**
+```go
+// NewGitStore creates a checkpoint store backed by the given git repository
+// and committed-metadata topology. Pass DefaultV1Refs() for the v1-only default
+// or ResolveRefs(ctx) in code paths that honor settings.
+func NewGitStore(repo *git.Repository, refs PersistentRefs) *GitStore {
+	return &amp;GitStore{repo: repo, refs: refs}
+}
+```
+
+**cmd/entire/cli/checkpoint/persistent_refs.go: lines 12-26**
+```go
+// PersistentRefs is the committed-metadata ref topology.
+type PersistentRefs struct {
+	Primary plumbing.ReferenceName
+	Read    plumbing.ReferenceName
+	Push    []plumbing.ReferenceName
+}
+
+// DefaultV1Refs returns the v1-only topology.
+func DefaultV1Refs() PersistentRefs {
+	v1Branch := plumbing.NewBranchReferenceName(paths.MetadataBranchName)
+	return PersistentRefs{
+		Primary: v1Branch,
+		Read:    v1Branch,
+		Push:    []plumbing.ReferenceName{v1Branch},
+	}
+}
+```
+
+**cmd/entire/cli/checkpoint/persistent_write.go: lines 8-25**
+```go
+// Write dispatches a persistent write request to the matching git operation.
+// The request types and Writer interface are defined in the api/checkpoint
+// contract (re-exported here via aliases). Unknown request types are a
+// programmer error, surfaced rather than ignored.
+func (s *GitStore) Write(ctx context.Context, req WriteRequest) error {
+	switch r := req.(type) {
+	case Session:
+		return s.writeSession(ctx, WriteOptions(r))
+	case SessionTranscript:
+		return s.backfillTranscript(ctx, UpdateOptions(r))
+	case SessionSummary:
+		return s.backfillSummary(ctx, r.CheckpointID, r.Summary)
+	case CheckpointAttribution:
+		return s.backfillAttribution(ctx, r.CheckpointID, r.Attribution)
+	default:
+		return fmt.Errorf("checkpoint: unsupported write request %T", req)
+	}
+}
+```
+
+### 2. WriteOptions and Metadata API
+
+**api/checkpoint/metadata.go: lines 14-168**
+```go
+// WriteOptions contains options for writing a persistent checkpoint.
+type WriteOptions struct {
+	// CheckpointID is the stable 12-hex-char identifier
+	CheckpointID id.CheckpointID
+
+	// SessionID is the session identifier
+	SessionID string
+
+	// CreatedAt is when the checkpoint was originally created.
+	// When zero, writers use the current time.
+	CreatedAt time.Time
+
+	// Strategy is the name of the strategy that created this checkpoint
+	Strategy string
+
+	// Branch is the branch name where the checkpoint was created (empty if detached HEAD)
+	Branch string
+
+	// Transcript is the session transcript content (full.jsonl).
+	// Must be pre-redacted (via redact.JSONLBytes or redact.AlreadyRedacted for trusted sources).
+	Transcript redact.RedactedBytes
+
+	// Prompts contains the raw user prompts from the session. Run through
+	// redactedJoinedPrompts before persisting — the writer does this
+	// inside writeSessionToSubdirectory.
+	Prompts []string
+
+	// FilesTouched are files modified during the session
+	FilesTouched []string
+
+	// CheckpointsCount is the displayed "steps" count for this session: the number
+	// of user prompts attributed to this checkpoint (floored at 1). Despite the
+	// historical name/JSON tag, it is no longer a count of checkpoints.
+	CheckpointsCount int
+
+	// SaveStepCount is the number of SaveStep-recorded steps (shadow-branch
+	// commits) for this session. Distinct from CheckpointsCount (the displayed
+	// prompt count): this is the honest "did real checkpoint work happen" signal
+	// used to gate combined attribution. 0 means a commit-only / fallback session.
+	SaveStepCount int
+
+	// EphemeralBranch is the shadow branch name (for manual-commit strategy)
+	EphemeralBranch string
+
+	// AuthorName is the name to use for commits
+	AuthorName string
+
+	// AuthorEmail is the email to use for commits
+	AuthorEmail string
+
+	// MetadataDir is a directory containing additional metadata files to copy
+	// If set, all files in this directory will be copied to the checkpoint path
+	// This is useful for copying task metadata files, subagent transcripts, etc.
+	MetadataDir string
+
+	// Task checkpoint fields (for task/subagent checkpoints)
+	IsTask    bool   // Whether this is a task checkpoint
+	ToolUseID string // Tool use ID for task checkpoints
+
+	// Additional task checkpoint fields for subagent checkpoints
+	AgentID                string // Subagent identifier
+	CheckpointUUID         string // UUID for transcript truncation when rewinding
+	TranscriptPath         string // Path to session transcript file (alternative to in-memory Transcript)
+	SubagentTranscriptPath string // Path to subagent's transcript file
+
+	// Incremental checkpoint fields
+	IsIncremental       bool   // Whether this is an incremental checkpoint
+	IncrementalSequence int    // Checkpoint sequence number
+	IncrementalType     string // Tool type that triggered this checkpoint
+	IncrementalData     []byte // Tool input payload for this checkpoint
+
+	// Commit message fields (used for task checkpoints)
+	CommitSubject string // Subject line for the metadata commit (overrides default)
+
+	// Agent identifies the agent that created this checkpoint (e.g., "Claude Code", "Cursor")
+	Agent types.AgentType
+
+	// Model is the LLM model used during the session (e.g., "claude-sonnet-4-20250514")
+	Model string
+
+	// TurnID correlates checkpoints from the same agent turn.
+	TurnID string
+
+	// Transcript position at checkpoint start - tracks what was added during this checkpoint
+	TranscriptIdentifierAtStart string // Last identifier when checkpoint started (UUID for Claude, message ID for Gemini)
+	CheckpointTranscriptStart   int    // Transcript line offset at start of this checkpoint's data
+
+	// CheckpointTranscriptStart is written to both Metadata.CheckpointTranscriptStart
+	// and the deprecated Metadata.TranscriptLinesAtStart for backward compatibility.
+
+	// TokenUsage contains the token usage for this checkpoint
+	TokenUsage *types.TokenUsage
+
+	// SkillEvents records explicit native skill signals observed in this session.
+	SkillEvents []types.SkillEvent
+
+	// SessionMetrics contains hook-provided session metrics (duration, turns, context usage)
+	SessionMetrics *SessionMetrics
+
+	// Attribution is line-level attribution calculated at commit time
+	// comparing checkpoint tree (agent work) to committed tree (may include human edits)
+	Attribution *Attribution
+
+	// PromptAttributionsJSON is the raw PromptAttributions data, JSON-encoded.
+	// Persisted for diagnostic purposes — shows exactly which prompt recorded
+	// which "user" lines, enabling root cause analysis of attribution bugs.
+	// Uses json.RawMessage to avoid importing session package.
+	PromptAttributionsJSON json.RawMessage
+
+	// CombinedAttribution is holistic attribution across all sessions.
+	// Used during migration to preserve v1 root summary attribution.
+	// During normal condensation this is nil (computed post-commit via a CheckpointAttribution write).
+	CombinedAttribution *Attribution
+
+	// Summary is an optional AI-generated summary for this checkpoint.
+	// This field may be nil when:
+	//   - summarization is disabled in settings
+	//   - summary generation failed (non-blocking, logged as warning)
+	//   - the transcript was empty or too short to summarize
+	//   - the checkpoint predates the summarization feature
+	Summary *Summary
+
+	// Kind identifies the session purpose (e.g., "agent_review"). Empty for normal sessions.
+	Kind string
+
+	// ReviewSkills is the snapshot of skills used (only meaningful when Kind is a review kind).
+	// May be empty when a review is attached post-hoc without declared skills.
+	ReviewSkills []string
+
+	// ReviewPrompt is the actual text of the review request (composed prompt
+	// for spawn, first user prompt for attach). Only meaningful when Kind is
+	// a review kind.
+	ReviewPrompt string
+
+	// HasReview is set by the caller when this session should mark its
+	// checkpoint as reviewed. The caller computes this (e.g. via
+	// session.Kind.IsReview) because checkpoint can't import session
+	// — the session package imports checkpoint, creating a cycle.
+	HasReview bool
+
+	// InvestigateRunID is the 12-hex-char ID of the parent investigation
+	// run (only meaningful when Kind is an investigate kind).
+	InvestigateRunID string
+
+	// InvestigateTopic is the human-readable topic the investigation was
+	// asked to investigate (only meaningful when Kind is an investigate
+	// kind).
+	InvestigateTopic string
+
+	// HasInvestigation is set by the caller when this session should mark
+	// its checkpoint as part of an investigation. The caller computes this
+	// (e.g. via session.Kind.IsInvestigate) because checkpoint can't import
+	// session — the session package imports checkpoint, creating a cycle.
+	HasInvestigation bool
+}
+```
+
+**api/checkpoint/metadata.go: lines 286-366**
+```go
+// Metadata contains the metadata stored in metadata.json for each checkpoint.
+type Metadata struct {
+	CLIVersion       string          `json:"cli_version,omitempty"`
+	CheckpointID     id.CheckpointID `json:"checkpoint_id"`
+	SessionID        string          `json:"session_id"`
+	Strategy         string          `json:"strategy"`
+	CreatedAt        time.Time       `json:"created_at"`
+	Branch           string          `json:"branch,omitempty"` // Branch where checkpoint was created (empty if detached HEAD)
+	CheckpointsCount int             `json:"checkpoints_count"`
+	// SaveStepCount is the number of SaveStep-recorded steps for this session.
+	// Honest "real checkpoint work happened" signal (0 = commit-only/fallback
+	// session), kept separate from the displayed CheckpointsCount prompt count.
+	// Added after CheckpointsCount stopped being a reliable did-SaveStep-run signal.
+	SaveStepCount int      `json:"save_step_count,omitempty"`
+	FilesTouched  []string `json:"files_touched"`
+
+	// Agent identifies the agent that created this checkpoint (e.g., "Claude Code", "Cursor")
+	Agent types.AgentType `json:"agent,omitempty"`
+
+	// Model is the LLM model used during the session (e.g., "claude-sonnet-4-20250514").
+	// Always written to metadata (empty string when unknown) so consumers can rely on the field's presence.
+	Model string `json:"model"`
+
+	// TurnID correlates checkpoints from the same agent turn.
+	// When a turn's work spans multiple commits, each gets its own checkpoint
+	// but they share the same TurnID for future aggregation/deduplication.
+	TurnID string `json:"turn_id,omitempty"`
+
+	// Task checkpoint fields (only populated for task checkpoints)
+	IsTask    bool   `json:"is_task,omitempty"`
+	ToolUseID string `json:"tool_use_id,omitempty"`
+
+	// Transcript position at checkpoint start - tracks what was added during this checkpoint
+	TranscriptIdentifierAtStart string `json:"transcript_identifier_at_start,omitempty"` // Last identifier when checkpoint started (UUID for Claude, message ID for Gemini)
+	CheckpointTranscriptStart   int    `json:"checkpoint_transcript_start,omitempty"`    // Transcript line offset at start of this checkpoint's data
+
+	// Deprecated: Use CheckpointTranscriptStart instead. Written for backward compatibility with older CLI versions.
+	TranscriptLinesAtStart int `json:"transcript_lines_at_start,omitempty"`
+
+	// Token usage for this checkpoint
+	TokenUsage *types.TokenUsage `json:"token_usage,omitempty"`
+
+	// SkillEvents records explicit native skill signals observed in this session.
+	// Consumers use these anchors to collapse skill-related raw transcript events.
+	SkillEventsVersion int                `json:"skill_events_version,omitempty"`
+	SkillEvents        []types.SkillEvent `json:"skill_events,omitempty"`
+
+	// SessionMetrics contains hook-provided session metrics (duration, turns, context usage).
+	// Populated for agents that provide these metrics via hooks (e.g., Cursor).
+	SessionMetrics *SessionMetrics `json:"session_metrics,omitempty"`
+
+	// AI-generated summary of the checkpoint
+	Summary *Summary `json:"summary,omitempty"`
+
+	// Attribution is line-level attribution calculated at commit time
+	Attribution *Attribution `json:"initial_attribution,omitempty"`
+
+	// PromptAttributions is the raw per-prompt attribution data used to compute Attribution.
+	// Diagnostic field — shows which prompt recorded which "user" lines.
+	PromptAttributions json.RawMessage `json:"prompt_attributions,omitempty"`
+
+	// Kind identifies the session purpose (e.g., "agent_review"). Empty for normal sessions.
+	Kind string `json:"kind,omitempty"`
+
+	// ReviewSkills lists the review skills that were run (only set when Kind is a review kind).
+	// May be empty when a review was attached post-hoc without declared skills.
+	ReviewSkills []string `json:"review_skills,omitempty"`
+
+	// ReviewPrompt is the actual text of the review request (composed prompt
+	// for spawn, first user prompt for attach). Only set when Kind is a
+	// review kind.
+	ReviewPrompt string `json:"review_prompt,omitempty"`
+
+	// InvestigateRunID is the 12-hex-char ID of the parent investigation
+	// run. Only set when Kind is an investigate kind.
+	InvestigateRunID string `json:"investigate_run_id,omitempty"`
+
+	// InvestigateTopic is the human-readable topic the investigation was
+	// asked to investigate. Only set when Kind is an investigate kind.
+	InvestigateTopic string `json:"investigate_topic,omitempty"`
+}
+```
+
+**api/checkpoint/metadata.go: lines 378-392**
+```go
+// SessionFilePaths contains the absolute paths to session files from the git tree root.
+// Paths include the full checkpoint path prefix (e.g., "/a1/b2c3d4e5f6/1/metadata.json").
+// Used in CheckpointSummary.Sessions to map session IDs to their file locations.
+type SessionFilePaths struct {
+	Metadata string `json:"metadata"`
+	// Transcript points at the raw full.jsonl, which CLI read paths
+	// (rewind/resume/explain) resolve by filename.
+	Transcript string `json:"transcript,omitempty"`
+	// CompactTranscript points at the compact transcript.jsonl when one was
+	// generated alongside full.jsonl. Omitted otherwise (non-compactable,
+	// empty, or oversized transcripts, and older CLI versions).
+	CompactTranscript string `json:"compact_transcript,omitempty"`
+	ContentHash       string `json:"content_hash,omitempty"`
+	Prompt            string `json:"prompt"`
+}
+```
+
+**api/checkpoint/metadata.go: lines 413-439**
+```go
+type CheckpointSummary struct {
+	CLIVersion          string             `json:"cli_version,omitempty"`
+	CheckpointVersion   string             `json:"checkpoint_version,omitempty"`
+	CheckpointID        id.CheckpointID    `json:"checkpoint_id"`
+	Strategy            string             `json:"strategy"`
+	Branch              string             `json:"branch,omitempty"`
+	CheckpointsCount    int                `json:"checkpoints_count"`
+	FilesTouched        []string           `json:"files_touched"`
+	Sessions            []SessionFilePaths `json:"sessions"`
+	TokenUsage          *types.TokenUsage  `json:"token_usage,omitempty"`
+	CombinedAttribution *Attribution       `json:"combined_attribution,omitempty"`
+
+	// HasReview is the umbrella "any review happened" flag: true when at least
+	// one session in this checkpoint has a review-kind Kind (currently
+	// "agent_review"). When new review kinds are introduced they should also
+	// cause this flag to be set so callers can keep asking "was this reviewed
+	// in any way?" without caring about the variant.
+	HasReview bool `json:"has_review,omitempty"`
+
+	// HasInvestigation is the umbrella "any investigation happened" flag:
+	// true when at least one session in this checkpoint has an
+	// investigate-kind Kind (currently "agent_investigate"). When new
+	// investigate kinds are introduced they should also cause this flag to
+	// be set so callers can keep asking "was this investigated in any way?"
+	// without caring about the variant.
+	HasInvestigation bool `json:"has_investigation,omitempty"`
+}
+```
+
+**api/checkpoint/metadata.go: lines 232-265**
+```go
+type CheckpointInfo struct {
+	// CheckpointID is the stable 12-hex-char identifier
+	CheckpointID id.CheckpointID
+
+	// SessionID is the session identifier (most recent session for multi-session checkpoints)
+	SessionID string
+
+	// CreatedAt is when the checkpoint was created
+	CreatedAt time.Time
+
+	// CheckpointsCount is the aggregate displayed "steps" count across sessions:
+	// the sum of per-session prompt-window counts. Despite the historical name,
+	// it is not a count of checkpoint records.
+	CheckpointsCount int
+
+	// FilesTouched are files modified during all sessions
+	FilesTouched []string
+
+	// Agent identifies the agent that created this checkpoint
+	Agent types.AgentType
+
+	// IsTask indicates if this is a task checkpoint
+	IsTask bool
+
+	// ToolUseID is the tool use ID for task checkpoints
+	ToolUseID string
+
+	// Multi-session support
+	SessionCount int      // Number of sessions (1 if single session)
+	SessionIDs   []string // All session IDs that contributed
+}
+```
+
+### 3. Kind Constants (Session Purpose)
+
+**cmd/entire/cli/session/state.go: lines 38-61**
+```go
+// Kind identifies the purpose of a session. Empty means "normal" (legacy
+// sessions + every session that isn't a review). Callers must not rely on
+// Kind being set unless they specifically want to branch on it.
+//
+// Kind is a discriminator — it distinguishes review variants at a per-session
+// granularity. The checkpoint-level HasReview flag remains an umbrella that
+// any review-kind session should set (so future review kinds like manual
+// review can be added without changing summary-shape).
+type Kind string
+
+const (
+	// KindAgentReview tags a session created by `entire review` (agent-driven
+	// review). Future review kinds (e.g., manual review) should be defined as
+	// distinct Kind values AND added to Kind.IsReview so the checkpoint's
+	// HasReview umbrella flag keeps covering them.
+	KindAgentReview Kind = "agent_review"
+
+	// KindAgentInvestigate tags a session created by `entire investigate`
+	// (agent-driven investigation). A session is review OR investigate, not
+	// both — Kind is single-valued. Future investigate kinds should be added
+	// to Kind.IsInvestigate so the checkpoint's HasInvestigation umbrella
+	// flag keeps covering them.
+	KindAgentInvestigate Kind = "agent_investigate"
+)
+```
+
+### 4. Attribution and TokenUsage Types
+
+**api/checkpoint/metadata.go: lines 475-496**
+```go
+// Attribution captures line-level attribution metrics at commit time.
+// This is a point-in-time snapshot comparing the checkpoint tree (agent work)
+// against the committed tree (may include human edits).
+//
+// Attribution Metrics:
+//   - TotalCommitted keeps the historical "net additions" view for compatibility
+//   - TotalLinesChanged measures total committed line changes (adds + modifies + removes)
+//   - AgentPercentage represents "of the lines changed in this commit, what percentage came from the agent"
+//   - AgentRemoved tracks committed deletions performed by the agent
+type Attribution struct {
+	CalculatedAt      time.Time `json:"calculated_at"`
+	AgentLines        int       `json:"agent_lines"`              // Lines added by agent that remain in the commit
+	AgentRemoved      int       `json:"agent_removed"`            // Lines removed by agent that remain removed in the commit
+	HumanAdded        int       `json:"human_added"`              // Lines added by human (excluding modifications)
+	HumanModified     int       `json:"human_modified"`           // Lines modified by human (estimate: min(added, removed))
+	HumanRemoved      int       `json:"human_removed"`            // Lines removed by human (excluding modifications)
+	TotalCommitted    int       `json:"total_committed"`          // Net additions in commit (legacy additions-focused metric)
+	TotalLinesChanged int       `json:"total_lines_changed"`      // Total committed line changes (adds + modifies + removes)
+	AgentPercentage   float64   `json:"agent_percentage"`         // (agent_lines + agent_removed) / total_lines_changed * 100
+	MetricVersion     int       `json:"metric_version,omitempty"` // 0/absent = legacy (additions-only %), 2 = changed-lines %
+}
+```
+
+(TokenUsage is in `cmd/entire/cli/agent/types`, not in the checkpoint package directly)
+
+### 5. Strategy Package CheckpointInfo
+
+**cmd/entire/cli/strategy/manual_commit_types.go: lines 34-47**
+```go
+// CheckpointInfo represents checkpoint metadata stored on the sessions branch.
+// Metadata is stored at sharded path: &lt;checkpoint_id[:2]&gt;/&lt;checkpoint_id[2:]&gt;/
+type CheckpointInfo struct {
+	CheckpointID     id.CheckpointID `json:"checkpoint_id"` // 12-hex-char from Entire-Checkpoint trailer, used as directory path
+	SessionID        string          `json:"session_id"`
+	CreatedAt        time.Time       `json:"created_at"`
+	CheckpointsCount int             `json:"checkpoints_count"`
+	FilesTouched     []string        `json:"files_touched"`
+	Agent            types.AgentType `json:"agent,omitempty"` // Human-readable agent name (e.g., "Claude Code")
+	IsTask           bool            `json:"is_task,omitempty"`
+	ToolUseID        string          `json:"tool_use_id,omitempty"`
+	SessionCount     int             `json:"session_count,omitempty"` // Number of sessions (1 if omitted)
+	SessionIDs       []string        `json:"session_ids,omitempty"`   // All session IDs in this checkpoint
+}
+```
+
+**cmd/entire/cli/strategy/common.go: lines 297-339**
+```go
+// ListCheckpoints returns all checkpoints from committed checkpoint storage.
+func ListCheckpoints(ctx context.Context) ([]CheckpointInfo, error) {
+	repo, err := OpenRepository(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open git repository: %w", err)
+	}
+	defer repo.Close()
+
+	// Warn (once per process) if metadata branches are disconnected
+	WarnIfMetadataDisconnected()
+
+	stores, err := checkpoint.Open(ctx, repo, checkpoint.OpenOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("open checkpoint store: %w", err)
+	}
+	committed, err := stores.Persistent.List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list committed checkpoints: %w", err)
+	}
+	return checkpointInfosFromCommitted(committed), nil
+}
+
+func checkpointInfosFromCommitted(committed []checkpoint.CheckpointInfo) []CheckpointInfo {
+	result := make([]CheckpointInfo, 0, len(committed))
+	for _, c := range committed {
+		result = append(result, CheckpointInfo{
+			CheckpointID:     c.CheckpointID,
+			SessionID:        c.SessionID,
+			CreatedAt:        c.CreatedAt,
+			CheckpointsCount: c.CheckpointsCount,
+			FilesTouched:     c.FilesTouched,
+			Agent:            c.Agent,
+			IsTask:           c.IsTask,
+			ToolUseID:        c.ToolUseID,
+			SessionCount:     c.SessionCount,
+			SessionIDs:       c.SessionIDs,
+		})
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].CreatedAt.After(result[j].CreatedAt)
+	})
+	return result
+}
+```
+
+### 6. Paths Constants
+
+**cmd/entire/cli/paths/paths.go: lines 29-42**
+```go
+	PromptFileName           = "prompt.txt"
+	TranscriptFileName       = "full.jsonl"
+	TranscriptFileNameLegacy = "full.log"
+	// CompactTranscriptFileName is the compact transcript stored alongside
+	// full.jsonl for each session. Not all checkpoints have a compact transcript.
+	CompactTranscriptFileName = "transcript.jsonl"
+	MetadataFileName          = "metadata.json"
+
+	ContentHashFileName       = "content_hash.txt"
+
+// MetadataBranchName is the orphan branch used by manual-commit strategy to store metadata
+const MetadataBranchName = "entire/checkpoints/v1"
+```</result>
+<usage><subagent_tokens>72000</subagent_tokens><tool_uses>23</tool_uses><duration_ms>105210</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a983d82e95724d450</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/b1e13e56-e9ae-469a-a30d-7c57d70e2f1f/tasks/a983d82e95724d450.output</output-file>
+<status>completed</status>
+<summary>Agent "Extract transcript parsing + redaction API" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect! Now I have everything I need. Let me compile the final report with all exact verbatim signatures and code excerpts:
+
+---
+
+## EXACT VERBATIM SIGNATURES &amp; CODE EXCERPTS
+
+### 1. Claude Code Agent Session Management
+
+**File: `cmd/entire/cli/agent/claudecode/claude.go`**
+
+```go
+// Lines 265-267
+func SanitizePathForClaude(path string) string {
+	return nonAlphanumericRegex.ReplaceAllString(path, "-")
+}
+```
+
+```go
+// Lines 94-108
+func (c *ClaudeCodeAgent) GetSessionDir(repoPath string) (string, error) {
+	// Check for test environment override
+	if override := os.Getenv("ENTIRE_TEST_CLAUDE_PROJECT_DIR"); override != "" {
+		return override, nil
+	}
+
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("failed to get home directory: %w", err)
+	}
+
+	projectDir := SanitizePathForClaude(repoPath)
+	return filepath.Join(homeDir, ".claude", "projects", projectDir), nil
+}
+```
+
+```go
+// Lines 87-89
+func (c *ClaudeCodeAgent) ResolveSessionFile(sessionDir, agentSessionID string) string {
+	return filepath.Join(sessionDir, agentSessionID+".jsonl")
+}
+```
+
+---
+
+### 2. Transcript Parsing
+
+**File: `cmd/entire/cli/transcript/parse.go`**
+
+```go
+// Lines 15-47
+// ParseFromBytes parses transcript content from a byte slice.
+// Uses bufio.Reader to handle arbitrarily long lines.
+func ParseFromBytes(content []byte) ([]Line, error) {
+	var lines []Line
+	reader := bufio.NewReader(bytes.NewReader(content))
+
+	for {
+		lineBytes, err := reader.ReadBytes('\n')
+		if err != nil &amp;&amp; err != io.EOF {
+			return nil, fmt.Errorf("failed to read transcript: %w", err)
+		}
+
+		// Handle empty line or EOF without content
+		if len(lineBytes) == 0 {
+			if err == io.EOF {
+				break
+			}
+			continue
+		}
+
+		var line Line
+		if err := json.Unmarshal(lineBytes, &amp;line); err == nil {
+			normalizeLineType(&amp;line)
+			lines = append(lines, line)
+		}
+
+		if err == io.EOF {
+			break
+		}
+	}
+
+	return lines, nil
+}
+```
+
+```go
+// Lines 114-143
+// SliceFromLine returns the content starting from line number `startLine` (0-indexed).
+// This is used to extract only the checkpoint-specific portion of a cumulative transcript.
+// For example, if startLine is 2, lines 0 and 1 are skipped and the result starts at line 2.
+// Returns empty slice if startLine exceeds the number of lines.
+func SliceFromLine(content []byte, startLine int) []byte {
+	if len(content) == 0 || startLine &lt;= 0 {
+		return content
+	}
+
+	// Find the byte offset where startLine begins
+	lineCount := 0
+	offset := 0
+	for i, b := range content {
+		if b == '\n' {
+			lineCount++
+			if lineCount == startLine {
+				offset = i + 1
+				break
+			}
+		}
+	}
+
+	// If we didn't find enough lines, return empty
+	if lineCount &lt; startLine {
+		return nil
+	}
+
+	// If offset is beyond content, return empty
+	if offset &gt;= len(content) {
+		return nil
+	}
+
+	return content[offset:]
+}
+```
+
+**File: `cmd/entire/cli/transcript/types.go`**
+
+```go
+// Lines 19-27
+// Line represents a single line in a Claude Code or Cursor JSONL transcript.
+// Claude Code uses "type" to distinguish user/assistant messages.
+// Cursor uses "role" for the same purpose.
+type Line struct {
+	Type    string          `json:"type"`
+	Role    string          `json:"role,omitempty"`
+	UUID    string          `json:"uuid"`
+	Message json.RawMessage `json:"message"`
+}
+```
+
+**User prompts detected by checking:**
+- `line.Type == "user"` (normalized from `role` field if `type` is empty, see `normalizeLineType` at line 104-108 of parse.go)
+- Extract content via `ExtractUserContent(line.Message)` (lines 149-178 of parse.go)
+
+---
+
+### 3. Token Usage &amp; Spawned Agents
+
+**File: `cmd/entire/cli/agent/claudecode/transcript.go`**
+
+```go
+// Lines 140-183
+// CalculateTokenUsage calculates token usage from a Claude Code transcript.
+// This is specific to Claude/Anthropic's API format where each assistant message
+// contains a usage object with input_tokens, output_tokens, and cache tokens.
+//
+// Due to streaming, multiple transcript rows may share the same message.id.
+// We deduplicate by taking the row with the highest output_tokens for each message.id.
+func CalculateTokenUsage(transcript []TranscriptLine) *agent.TokenUsage {
+	// Map from message.id to the usage with highest output_tokens
+	usageByMessageID := make(map[string]messageUsage)
+
+	for _, line := range transcript {
+		if line.Type != envelopeTypeAssistant {
+			continue
+		}
+
+		var msg messageWithUsage
+		if err := json.Unmarshal(line.Message, &amp;msg); err != nil {
+			continue
+		}
+
+		if msg.ID == "" {
+			continue
+		}
+
+		// Keep the entry with highest output_tokens (final streaming state)
+		existing, exists := usageByMessageID[msg.ID]
+		if !exists || msg.Usage.OutputTokens &gt; existing.OutputTokens {
+			usageByMessageID[msg.ID] = msg.Usage
+		}
+	}
+
+	// Sum up all unique messages
+	usage := &amp;agent.TokenUsage{
+		APICallCount: len(usageByMessageID),
+	}
+	for _, u := range usageByMessageID {
+		usage.InputTokens += u.InputTokens
+		usage.CacheCreationTokens += u.CacheCreationInputTokens
+		usage.CacheReadTokens += u.CacheReadInputTokens
+		usage.OutputTokens += u.OutputTokens
+	}
+
+	return usage
+}
+```
+
+```go
+// Lines 185-198
+// CalculateTokenUsageFromFile calculates token usage from a Claude Code transcript file.
+// If startLine &gt; 0, only considers lines from startLine onwards.
+func CalculateTokenUsageFromFile(path string, startLine int) (*agent.TokenUsage, error) {
+	if path == "" {
+		return &amp;agent.TokenUsage{}, nil
+	}
+
+	lines, err := transcript.ParseFromFileAtLine(path, startLine)
+	if err != nil {
+		return nil, err //nolint:wrapcheck // caller adds context
+	}
+
+	return CalculateTokenUsage(lines), nil
+}
+```
+
+```go
+// Lines 200-269
+// ExtractSpawnedAgentIDs extracts agent IDs from Task tool results in a transcript.
+// When a Task tool completes, the tool_result contains "agentId: &lt;id&gt;" in its content.
+// Returns a map of agentID -&gt; toolUseID for all spawned agents.
+func ExtractSpawnedAgentIDs(transcript []TranscriptLine) map[string]string {
+	agentIDs := make(map[string]string)
+
+	for _, line := range transcript {
+		if line.Type != "user" {
+			continue
+		}
+
+		// Parse as array of content blocks (tool results)
+		var contentBlocks []struct {
+			Type      string          `json:"type"`
+			ToolUseID string          `json:"tool_use_id"`
+			Content   json.RawMessage `json:"content"`
+		}
+
+		var msg struct {
+			Content json.RawMessage `json:"content"`
+		}
+		if err := json.Unmarshal(line.Message, &amp;msg); err != nil {
+			continue
+		}
+
+		if err := json.Unmarshal(msg.Content, &amp;contentBlocks); err != nil {
+			continue
+		}
+
+		for _, block := range contentBlocks {
+			if block.Type != "tool_result" {
+				continue
+			}
+
+			// Content can be a string or array of text blocks
+			var textContent string
+
+			// Try as array of text blocks first
+			var textBlocks []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			}
+			if err := json.Unmarshal(block.Content, &amp;textBlocks); err == nil {
+				var textContentSb361 strings.Builder
+				for _, tb := range textBlocks {
+					if tb.Type == "text" {
+						textContentSb361.WriteString(tb.Text + "\n")
+					}
+				}
+				textContent += textContentSb361.String()
+			} else {
+				// Try as plain string
+				var str string
+				if err := json.Unmarshal(block.Content, &amp;str); err == nil {
+					textContent = str
+				}
+			}
+
+			// Look for agentId in the text. Drop any ID that isn't path-safe:
+			// callers build agent-&lt;id&gt;.jsonl from it and read that file, so this
+			// is the choke point that keeps the path inside subagentsDir,
+			// independent of extractAgentIDFromText's character handling.
+			if agentID := extractAgentIDFromText(textContent); agentID != "" &amp;&amp; validation.ValidateAgentID(agentID) == nil {
+				agentIDs[agentID] = block.ToolUseID
+			}
+		}
+	}
+
+	return agentIDs
+}
+```
+
+```go
+// Lines 383-423
+func (c *ClaudeCodeAgent) CalculateTotalTokenUsage(transcriptData []byte, startLine int, subagentsDir string) (*agent.TokenUsage, error) {
+	if len(transcriptData) == 0 {
+		return &amp;agent.TokenUsage{}, nil
+	}
+
+	// Slice to the relevant portion and parse
+	sliced := transcript.SliceFromLine(transcriptData, startLine)
+	parsed, err := transcript.ParseFromBytes(sliced)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse transcript: %w", err)
+	}
+
+	// Calculate token usage from parsed transcript
+	mainUsage := CalculateTokenUsage(parsed)
+
+	// Extract spawned agent IDs from the same parsed transcript
+	agentIDs := ExtractSpawnedAgentIDs(parsed)
+
+	// Calculate subagent token usage (skip when subagentsDir is empty to avoid reading from cwd)
+	if len(agentIDs) &gt; 0 &amp;&amp; subagentsDir != "" {
+		subagentUsage := &amp;agent.TokenUsage{}
+		for agentID := range agentIDs {
+			agentPath := filepath.Join(subagentsDir, fmt.Sprintf("agent-%s.jsonl", agentID))
+			agentUsage, err := CalculateTokenUsageFromFile(agentPath, 0)
+			if err != nil {
+				// Agent transcript may not exist yet or may have been cleaned up
+				continue
+			}
+			subagentUsage.InputTokens += agentUsage.InputTokens
+			subagentUsage.CacheCreationTokens += agentUsage.CacheCreationTokens
+			subagentUsage.CacheReadTokens += agentUsage.CacheReadTokens
+			subagentUsage.OutputTokens += agentUsage.OutputTokens
+			subagentUsage.APICallCount += agentUsage.APICallCount
+		}
+		if subagentUsage.APICallCount &gt; 0 {
+			mainUsage.SubagentTokens = subagentUsage
+		}
+	}
+
+	return mainUsage, nil
+}
+```
+
+**File: `cmd/entire/cli/agent/types/token_usage.go`**
+
+```go
+// Lines 3-18
+// TokenUsage represents aggregated token usage for a checkpoint.
+// This is agent-agnostic and can be populated by any agent that tracks token usage.
+type TokenUsage struct {
+	// InputTokens is the number of input tokens (fresh, not from cache)
+	InputTokens int `json:"input_tokens"`
+	// CacheCreationTokens is tokens written to cache (billable at cache write rate)
+	CacheCreationTokens int `json:"cache_creation_tokens"`
+	// CacheReadTokens is tokens read from cache (discounted rate)
+	CacheReadTokens int `json:"cache_read_tokens"`
+	// OutputTokens is the number of output tokens generated
+	OutputTokens int `json:"output_tokens"`
+	// APICallCount is the number of API calls made
+	APICallCount int `json:"api_call_count"`
+	// SubagentTokens contains token usage from spawned subagents (if any)
+	SubagentTokens *TokenUsage `json:"subagent_tokens,omitempty"`
+}
+```
+
+---
+
+### 4. Timestamp &amp; Prompt Extraction
+
+**File: `cmd/entire/cli/paths/transcript.go`**
+
+```go
+// Lines 48-67
+// ParseTimestampFromJSONL extracts the timestamp from a JSONL line.
+// Returns zero time if the line is empty or doesn't contain a valid timestamp.
+func ParseTimestampFromJSONL(line string) time.Time {
+	if line == "" {
+		return time.Time{}
+	}
+
+	var entry struct {
+		Timestamp string `json:"timestamp"`
+	}
+	if err := json.Unmarshal([]byte(line), &amp;entry); err != nil {
+		return time.Time{}
+	}
+
+	t, err := time.Parse(time.RFC3339, entry.Timestamp)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+```
+
+**Prompt extraction in strategy code — File: `cmd/entire/cli/strategy/manual_commit_condensation.go`**
+
+```go
+// Lines 1008-1088 (excerpt showing user prompt extraction)
+// extractUserPrompts extracts all user prompts from transcript content.
+// Returns prompts with IDE context tags stripped (e.g., &lt;ide_opened_file&gt;).
+func extractUserPrompts(agentType types.AgentType, content string) []string {
+	// ... handles multiple agent types ...
+	// For Claude Code and other JSONL-based agents:
+	return extractUserPromptsFromLines(strings.Split(content, "\n"))
+}
+
+// extractUserPromptsFromLines extracts user prompts from JSONL transcript lines.
+// IDE-injected context tags (like &lt;ide_opened_file&gt;) are stripped from the results.
+func extractUserPromptsFromLines(lines []string) []string {
+	var prompts []string
+	// ... uses transcript.Line parsing with Type=="user" check ...
+}
+```
+
+---
+
+### 5. Redaction Pipeline
+
+**File: `redact/redact.go`**
+
+Redaction entry point for JSONL transcripts (lines 503-515):
+
+```go
+// Lines 503-515
+// JSONLBytes redacts secrets in JSONL-formatted byte content and returns
+// the result as RedactedBytes, certifying the output has been through redaction.
+func JSONLBytes(b []byte) (RedactedBytes, error) {
+	s := string(b)
+	redacted, err := JSONLContent(s)
+	if err != nil {
+		return RedactedBytes{}, err
+	}
+	if redacted == s {
+		return RedactedBytes{data: b}, nil
+	}
+	return RedactedBytes{data: []byte(redacted)}, nil
+}
+```
+
+**File: `cmd/entire/cli/strategy/manual_commit_condensation.go`**
+
+Redaction is called at lines 382 within `redactSessionTranscript`:
+
+```go
+// Lines 370-388
+// redactSessionTranscript redacts the transcript once for use by both the compact
+// package and the checkpoint stores. Returns the redacted bytes and the duration
+// of the redaction operation for perf logging.
+func redactSessionTranscript(ctx context.Context, transcript []byte) (redact.RedactedBytes, time.Duration, error) {
+	start := time.Now()
+	_, span := perf.Start(ctx, "redact_transcript")
+	defer span.End()
+
+	if len(transcript) == 0 {
+		return redact.RedactedBytes{}, time.Since(start), nil
+	}
+
+	redacted, err := redactSessionJSONLBytes(ctx, transcript)
+	if err != nil {
+		span.RecordError(err)
+		return redact.RedactedBytes{}, time.Since(start), fmt.Errorf("failed to redact transcript secrets: %w", err)
+	}
+	return redacted, time.Since(start), nil
+}
+```
+
+The module-level var `redactSessionJSONLBytes` (line 117):
+
+```go
+var redactSessionJSONLBytes = func(_ context.Context, b []byte) (redact.RedactedBytes, error) {
+	return redact.JSONLBytes(b)
+}
+```
+
+---
+
+### 6. Compact Transcript Builder
+
+**File: `cmd/entire/cli/transcript/compact/compact.go`**
+
+```go
+// Lines 71-120
+// Compact converts a full.jsonl transcript into the condensed transcript.jsonl format.
+// The input must be pre-redacted (via redact.JSONLBytes or
+// redact.AlreadyRedacted for trusted sources).
+//
+// The output format puts version, agent, and cli_version on every line,
+// merges streaming assistant fragments with the same message ID, and inlines
+// tool results into the preceding assistant's tool_use blocks:
+//
+//	{"v":1,"agent":"claude-code","cli_version":"0.42.0","type":"user","ts":"...","content":"..."}
+//	{"v":1,"agent":"claude-code","cli_version":"0.42.0","type":"assistant","ts":"...","id":"msg_xxx","content":[{"type":"text","text":"..."},{"type":"tool_use","id":"...","name":"...","input":{...},"result":{"output":"...","status":"..."}}]}
+func Compact(redacted redact.RedactedBytes, opts MetadataFields) ([]byte, error) {
+	content := redacted.Bytes()
+
+	// Formats that need detection on raw content before line truncation:
+	// - Single-object formats (OpenCode, Gemini): SliceFromLine would cut
+	//   a JSON object mid-value. They handle StartLine as a message-index offset.
+	// - Codex: session_meta header is only on the first line. Codex handles
+	//   StartLine as a response_item index offset.
+	if isOpenCodeFormat(content) {
+		return compactOpenCode(content, opts)
+	}
+
+	if isGeminiFormat(content) {
+		return compactGemini(content, opts)
+	}
+
+	// pi: detect on the raw header line. compactPi handles StartLine itself.
+	if isPiFormat(content) {
+		return compactPi(content, opts)
+	}
+
+	if isCodexFormat(content) {
+		return compactCodex(content, opts)
+	}
+
+	truncated := transcript.SliceFromLine(content, opts.StartLine)
+	if truncated == nil {
+		truncated = []byte{}
+	}
+
+	if isCopilotFormat(truncated) {
+		return compactCopilot(truncated, opts)
+	}
+
+	if isDroidFormat(truncated) {
+		return compactDroid(truncated, opts)
+	}
+
+	return compactJSONL(truncated, opts)
+}
+```
+
+---
+
+### 7. Subagents Directory Location
+
+**File: `cmd/entire/cli/strategy/manual_commit_hooks.go`**
+
+Line 1915 shows how subagents dir is constructed for a Claude Code session:
+
+```go
+// Line 1915
+subagentsDir := filepath.Join(filepath.Dir(state.TranscriptPath), state.SessionID, "subagents")
+```
+
+Context (lines 1910-1946):
+
+```go
+var modifiedFiles []string
+
+// For Claude Code, use ExtractAllModifiedFiles which parses the main transcript
+// AND subagent transcripts in a single pass, avoiding redundant parsing.
+if state.AgentType == agent.AgentTypeClaudeCode {
+	subagentsDir := filepath.Join(filepath.Dir(state.TranscriptPath), state.SessionID, "subagents")
+	transcriptData, readErr := os.ReadFile(state.TranscriptPath)
+	if readErr != nil {
+		logging.Debug(logCtx, "extractModifiedFilesFromLiveTranscript: failed to read transcript",
+			slog.String("session_id", state.SessionID),
+			slog.String("error", readErr.Error()),
+		)
+	} else {
+		// TODO: fix when we refactor this area.
+		// rather than instantiating claude specifically, we should iterate agents.
+		c := &amp;claudecode.ClaudeCodeAgent{}
+		allFiles, extractErr := c.ExtractAllModifiedFiles(transcriptData, offset, subagentsDir)
+		if extractErr != nil {
+			logging.Debug(logCtx, "extractModifiedFilesFromLiveTranscript: extraction failed",
+				slog.String("session_id", state.SessionID),
+				slog.String("error", extractErr.Error()),
+			)
+		} else {
+			modifiedFiles = allFiles
+		}
+	}
+}
+```
+
+---
+
+### 8. Session Data Extraction Container
+
+**File: `cmd/entire/cli/strategy/manual_commit_types.go`**
+
+```go
+// Lines 62-69
+type ExtractedSessionData struct {
+	Transcript          []byte   // Full transcript content for the session
+	FullTranscriptLines int      // Total line count in full transcript
+	Prompts             []string // User prompts from the current checkpoint portion
+	FilesTouched        []string
+	TokenUsage          *agent.TokenUsage  // Token usage calculated from transcript (since CheckpointTranscriptStart)
+	SkillEvents         []agent.SkillEvent // Skill events detected from transcript data
+}
+```
+
+---</result>
+<usage><subagent_tokens>64464</subagent_tokens><tool_uses>39</tool_uses><duration_ms>118704</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ab421c8a35ccd3e81</task-id>
+<tool-use-id>toolu_01UQ4tb4v2sK4yvgDpkykYVE</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/b1e13e56-e9ae-469a-a30d-7c57d70e2f1f/tasks/ab421c8a35ccd3e81.output</output-file>
+<status>completed</status>
+<summary>Agent "Extract enable flow + command registration + read commands" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect! Now I have all the information needed. Let me compile the verbatim code excerpts with exact file:line references.
+
+## VERBATIM CODE EXCERPTS FOR IMPLEMENTATION PLAN
+
+### 1. Enable Interactive Flow
+
+**cmd/entire/cli/setup.go:1054-1174** — `runEnableInteractive` signature and telemetry prompt section:
+
+```go
+// cmd/entire/cli/setup.go:1054-1174
+func runEnableInteractive(ctx context.Context, w io.Writer, agents []agent.Agent, opts EnableOptions) error {
+	// Uninstall hooks for agents that were previously active but are no longer selected
+	if err := uninstallDeselectedAgentHooks(ctx, w, agents); err != nil {
+		return fmt.Errorf("failed to clean up deselected agents: %w", err)
+	}
+
+	// Setup agent hooks for all selected agents
+	for _, ag := range agents {
+		if _, err := setupAgentHooks(ctx, w, ag, opts.LocalDev, opts.ForceHooks); err != nil {
+			return fmt.Errorf("failed to setup %s hooks: %w", ag.Type(), err)
+		}
+	}
+
+	// Setup .entire directory
+	if _, err := setupEntireDirectory(ctx); err != nil {
+		return fmt.Errorf("failed to setup .entire directory: %w", err)
+	}
+
+	// Load existing settings to preserve other options (like strategy_options.push)
+	settings, err := LoadEntireSettings(ctx)
+	if err != nil {
+		// If we can't load, start with defaults
+		settings = &amp;EntireSettings{}
+	}
+	// Update the specific fields
+	settings.Enabled = true
+	if opts.LocalDev {
+		settings.LocalDev = true
+	}
+	if opts.AbsoluteGitHookPath {
+		settings.AbsoluteGitHookPath = true
+	}
+
+	// Auto-enable external_agents if any selected agent is external.
+	for _, ag := range agents {
+		if external.IsExternal(ag) {
+			settings.ExternalAgents = true
+			break
+		}
+	}
+
+	opts.applyStrategyOptions(settings)
+
+	// Determine which settings file to write to
+	// First run always creates settings.json (no prompt)
+	entireDirAbs, err := paths.AbsPath(ctx, paths.EntireDir)
+	if err != nil {
+		entireDirAbs = paths.EntireDir // Fallback to relative
+	}
+	shouldUseLocal, showNotification := determineSettingsTarget(entireDirAbs, opts.UseLocalSettings, opts.UseProjectSettings)
+
+	if showNotification {
+		fmt.Fprintln(w, "Info: Project settings exist. Saving to settings.local.json instead.")
+		fmt.Fprintln(w, "  Use --project to update the project settings file.")
+	}
+
+	// Save settings to the appropriate file.
+	targetFile := EntireSettingsFile
+	if shouldUseLocal {
+		targetFile = EntireSettingsLocalFile
+	}
+	saveSettings := func() error {
+		return saveSettingsToTarget(ctx, settings, targetFile)
+	}
+	if err := saveSettings(); err != nil {
+		return fmt.Errorf("failed to save settings: %w", err)
+	}
+
+	// Use settings values (merged from existing config + flags) for hook installation
+	// This ensures re-running `entire enable` without flags preserves existing settings
+	if _, err := strategy.InstallGitHook(ctx, true, settings.LocalDev, settings.AbsoluteGitHookPath); err != nil {
+		return fmt.Errorf("failed to install git hooks: %w", err)
+	}
+	strategy.CheckAndWarnHookManagers(ctx, w, settings.LocalDev, settings.AbsoluteGitHookPath)
+	fmt.Fprintln(w, "  ✓ Installed hooks")
+
+	configDisplay := configDisplayProject
+	if shouldUseLocal {
+		configDisplay = configDisplayLocal
+	}
+	fmt.Fprintln(w, "  ✓ Configured project")
+	fmt.Fprintf(w, "    %s\n", configDisplay)
+
+	var vercelPromptFn func() (bool, error)
+	if opts.Yes {
+		vercelPromptFn = func() (bool, error) { return true, nil }
+	}
+	if _, err := maybePromptVercelDeploymentDisable(ctx, w, targetFile, vercelPromptFn); err != nil {
+		return err
+	}
+
+	// Ask about telemetry consent (only if not already asked).
+	// --yes skips the interactive prompt but still respects --telemetry=false
+	// and ENTIRE_TELEMETRY_OPTOUT — it only auto-answers the interactive question.
+	if opts.Yes {
+		if !opts.Telemetry || os.Getenv("ENTIRE_TELEMETRY_OPTOUT") != "" {
+			f := false
+			settings.Telemetry = &amp;f
+		} else if settings.Telemetry == nil {
+			t := true
+			settings.Telemetry = &amp;t
+		}
+	} else if err := promptTelemetryConsent(settings, opts.Telemetry); err != nil {
+		return fmt.Errorf("telemetry consent: %w", err)
+	}
+	// Save again to persist telemetry choice
+	if err := saveSettings(); err != nil {
+		return fmt.Errorf("failed to save settings: %w", err)
+	}
+
+	if err := strategy.EnsureSetup(ctx); err != nil {
+		return fmt.Errorf("failed to setup strategy: %w", err)
+	}
+
+	if opts.SuppressDoneMessage {
+		// Bootstrap finalize will print its own completion summary after
+		// making the initial commit and pushing.
+		return nil
+	}
+
+	fmt.Fprintln(w, "\nReady.")
+
+	// Note about empty repos at the end, after setup is complete
+	if repo, err := strategy.OpenRepository(ctx); err == nil {
+		defer repo.Close()
+		if strategy.IsEmptyRepository(repo) {
+			fmt.Fprintln(w)
+			fmt.Fprintln(w, "Note: Session checkpoints require at least one commit. To get started,")
+			fmt.Fprintln(w, "commit the configuration files (e.g. .entire/, .claude/).")
+		}
+	}
+
+	return nil
+}
+```
+
+**cmd/entire/cli/setup.go:1868-1909** — `promptTelemetryConsent` pattern:
+
+```go
+// cmd/entire/cli/setup.go:1868-1909
+func promptTelemetryConsent(settings *EntireSettings, telemetryFlag bool) error {
+	// Handle --telemetry=false flag first (always overrides existing setting)
+	if !telemetryFlag {
+		f := false
+		settings.Telemetry = &amp;f
+		return nil
+	}
+
+	// Skip if already asked
+	if settings.Telemetry != nil {
+		return nil
+	}
+
+	// Skip if env var disables telemetry (record as disabled)
+	if os.Getenv("ENTIRE_TELEMETRY_OPTOUT") != "" {
+		f := false
+		settings.Telemetry = &amp;f
+		return nil
+	}
+
+	consent := true // Default to Yes
+	form := NewAccessibleForm(
+		huh.NewGroup(
+			huh.NewConfirm().
+				Title("Help improve Entire CLI?").
+				Description("Share anonymous usage data. No code or personal info collected.").
+				Affirmative("Yes").
+				Negative("No").
+				Value(&amp;consent),
+		),
+	)
+
+	if err := form.Run(); err != nil {
+		return fmt.Errorf("telemetry prompt: %w", err)
+	}
+
+	settings.Telemetry = &amp;consent
+	return nil
+}
+```
+
+**cmd/entire/cli/setup.go:57-73** — `EnableOptions` struct with `Yes` field:
+
+```go
+// cmd/entire/cli/setup.go:57-73
+type EnableOptions struct {
+	LocalDev            bool
+	UseLocalSettings    bool
+	UseProjectSettings  bool
+	ForceHooks          bool
+	SkipPushSessions    bool
+	CheckpointRemote    string
+	Telemetry           bool
+	AbsoluteGitHookPath bool
+	// SuppressDoneMessage tells `runEnableInteractive` to skip its final
+	// "Ready." line and the "commit the configuration files" hint. Set
+	// when the caller is running the bootstrap flow, which takes over
+	// presentation of the final state (commit, push, done).
+	SuppressDoneMessage bool
+	Yes                 bool
+}
+```
+
+### 2. Form/Interactive Helpers
+
+**cmd/entire/cli/utils.go:24-28** — `NewAccessibleForm` signature:
+
+```go
+// cmd/entire/cli/utils.go:24-28
+// NewAccessibleForm creates a new huh form with Entire's standard theme,
+// switching to accessibility mode when ACCESSIBLE is set.
+func NewAccessibleForm(groups ...*huh.Group) *huh.Form {
+	return uiform.New(groups...)
+}
+```
+
+**cmd/entire/cli/interactive/interactive.go:21-59** — `CanPromptInteractively` signature and full function:
+
+```go
+// cmd/entire/cli/interactive/interactive.go:21-59
+// CanPromptInteractively reports whether interactive confirmation prompts
+// (huh forms, yes/no questions, etc.) can be shown. Returns false in CI,
+// agent subprocesses that inherit a TTY but can't respond to prompts,
+// and other environments without a controlling TTY.
+//
+// Precedence (first match wins):
+//  1. EnvTestTTY=1 forces interactive ON; any other non-empty value forces OFF.
+//  2. testing.Testing() — `go test` runs default to OFF so in-process tests
+//     don't hang on developer terminals that happen to have a real /dev/tty.
+//     Subprocess tests must spawn via execx.NonInteractive (or set EnvTestTTY).
+//  3. Agent sentinels — vendor-set by agent subprocesses.
+//  4. CI=&lt;non-empty-non-false&gt; — de-facto CI convention.
+//  5. /dev/tty probe.
+func CanPromptInteractively() bool {
+	if v := os.Getenv(EnvTestTTY); v != "" {
+		return v == "1"
+	}
+	if testing.Testing() {
+		return false
+	}
+	if isAgentSubprocessEnv() {
+		return false
+	}
+	// CI=&lt;non-empty&gt; is the de-facto CI-provider convention (GitHub Actions,
+	// CircleCI, GitLab, Travis, Buildkite). Self-hosted runners expose /dev/tty,
+	// so the probe below isn't enough — an interactive prompt on CI hangs.
+	// CI=false is the `is-ci` escape hatch for developers who need to override
+	// an inherited value.
+	if v := os.Getenv("CI"); v != "" &amp;&amp; v != "false" {
+		return false
+	}
+
+	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err != nil {
+		return false
+	}
+	_ = tty.Close()
+	return true
+}
+```
+
+### 3. Hidden/Labs Command Registration
+
+**cmd/entire/cli/labs.go:70-90** — `newLabsCmd` constructor:
+
+```go
+// cmd/entire/cli/labs.go:70-90
+func newLabsCmd() *cobra.Command {
+	cmd := &amp;cobra.Command{
+		Use:   "labs",
+		Short: "Explore experimental Entire workflows",
+		Long:  labsOverview(),
+		Args: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 0 {
+				return nil
+			}
+			err := fmt.Errorf("unknown labs topic %q", args[0])
+			fmt.Fprintf(cmd.ErrOrStderr(),
+				"%v\n\nRun `entire labs` to see available experimental commands, or run `entire review --help` for command-specific help.\n",
+				err)
+			return NewSilentError(err)
+		},
+		Run: func(cmd *cobra.Command, _ []string) {
+			fmt.Fprint(cmd.OutOrStdout(), labsOverview())
+		},
+	}
+	return cmd
+}
+```
+
+**cmd/entire/cli/root.go:84-91** — Command registration (labs added to root):
+
+```go
+// cmd/entire/cli/root.go:84-91
+	// Noun groups (canonical homes for subcommands).
+	cmd.AddCommand(newSessionsCmd())        // 'session' (with 'sessions' as Cobra alias)
+	cmd.AddCommand(newCheckpointGroupCmd()) // 'checkpoint' / 'cp' / 'checkpoints'
+	cmd.AddCommand(newTokensGroupCmd())     // 'tokens'
+	cmd.AddCommand(newAgentGroupCmd())      // 'agent'
+	cmd.AddCommand(newAuthCmd())            // 'auth'
+	cmd.AddCommand(newDoctorCmd())          // 'doctor' (group: trace/logs/bundle)
+	cmd.AddCommand(newLabsCmd())            // 'labs' (experimental workflow discovery)
+	cmd.AddCommand(newPluginGroupCmd())     // 'plugin' (managed install/list/remove)
+```
+
+**cmd/entire/cli/tokens_profile.go:52-72** — `newTokensGroupCmd` (parent group) that adds profile subcommand:
+
+```go
+// cmd/entire/cli/tokens_profile.go:52-72
+func newTokensGroupCmd() *cobra.Command {
+	cmd := &amp;cobra.Command{
+		Use:    "tokens",
+		Short:  "Analyze token usage across sessions and checkpoints",
+		Hidden: true,
+		Long: `Analyze token usage across sessions and checkpoints.
+
+Commands:
+  profile  Aggregate token usage across committed checkpoints
+
+Examples:
+  entire tokens profile
+  entire tokens profile --json`,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return cmd.Help()
+		},
+	}
+
+	cmd.AddCommand(newTokensProfileCmd())
+	return cmd
+}
+```
+
+**cmd/entire/cli/tokens_profile.go:74-105** — `newTokensProfileCmd` (hidden subcommand):
+
+```go
+// cmd/entire/cli/tokens_profile.go:74-105
+func newTokensProfileCmd() *cobra.Command {
+	var jsonFlag bool
+	var limitFlag int
+	var allFlag bool
+
+	cmd := &amp;cobra.Command{
+		Use:   "profile",
+		Short: "Aggregate token usage and recommendations across checkpoint history",
+		Long: `Aggregate token usage and recommendations across committed checkpoint history.
+
+The profile reads committed checkpoint metadata only. It does not inspect
+transcripts or source files, so it is deterministic and avoids adding token
+cost while diagnosing token usage. By default it scans the latest 50 committed
+checkpoints; use --limit or --all to change the scope.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			limit := limitFlag
+			if allFlag {
+				limit = 0
+			} else if limit &lt;= 0 {
+				return errors.New("--limit must be positive unless --all is used")
+			}
+			return runTokensProfile(cmd.Context(), cmd, jsonFlag, limit)
+		},
+	}
+
+	cmd.Flags().BoolVar(&amp;jsonFlag, "json", false, "Output as JSON")
+	cmd.Flags().IntVar(&amp;limitFlag, "limit", 50, "Maximum committed checkpoints to analyze")
+	cmd.Flags().BoolVar(&amp;allFlag, "all", false, "Analyze all committed checkpoints")
+	cmd.MarkFlagsMutuallyExclusive("limit", "all")
+	return cmd
+}
+```
+
+**cmd/entire/cli/aliascmd.go:5-12** — `hideAsAlias` helper for hidden shortcuts:
+
+```go
+// cmd/entire/cli/aliascmd.go:5-12
+// hideAsAlias marks cmd as a hidden top-level shortcut that prints a one-line
+// hint pointing at the canonical command. Cobra's Deprecated field renders the
+// hint to stderr on every invocation while keeping the command functional.
+func hideAsAlias(cmd *cobra.Command, canonical string) *cobra.Command {
+	cmd.Hidden = true
+	cmd.Deprecated = "use '" + canonical + "' instead"
+	return cmd
+}
+```
+
+### 4. Checkpoint Read Commands
+
+**cmd/entire/cli/checkpoint_group.go:54-75** — `newCheckpointListCmd` (calls `runExplainBranchWithFilter`):
+
+```go
+// cmd/entire/cli/checkpoint_group.go:54-75
+// newCheckpointListCmd wraps the existing branch-default list view.
+func newCheckpointListCmd() *cobra.Command {
+	var sessionFlag string
+	var noPagerFlag bool
+
+	cmd := &amp;cobra.Command{
+		Use:   "list",
+		Short: "List checkpoints on the current branch",
+		Long: `List checkpoints on the current branch.
+
+Optionally filter by session ID with --session.`,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if checkDisabledGuard(cmd.Context(), cmd.OutOrStdout()) {
+				return nil
+			}
+			return runExplainBranchWithFilter(cmd.Context(), cmd.OutOrStdout(), noPagerFlag, sessionFlag)
+		},
+	}
+
+	cmd.Flags().StringVar(&amp;sessionFlag, "session", "", "Filter checkpoints by session ID (or prefix)")
+	cmd.Flags().BoolVar(&amp;noPagerFlag, "no-pager", false, "Disable pager output")
+	return cmd
+}
+```
+
+**cmd/entire/cli/explain.go:2038-2068** — `getBranchCheckpoints` that calls `store.List(ctx)`:
+
+```go
+// cmd/entire/cli/explain.go:2038-2068
+func getBranchCheckpoints(ctx context.Context, repo *git.Repository, limit int) ([]strategy.RewindPoint, error) {
+	// Warn (once per process) if metadata branches are disconnected
+	strategy.WarnIfMetadataDisconnected()
+
+	stores, err := checkpoint.Open(ctx, repo, checkpoint.OpenOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("open checkpoint store: %w", err)
+	}
+	store := stores.Persistent
+
+	// Get all committed checkpoints for lookup.
+	committedInfos, err := store.List(ctx)
+	if err != nil {
+		committedInfos = nil // Continue without committed checkpoints
+	}
+
+	// Build map of checkpoint ID -&gt; committed info
+	committedByID := make(map[id.CheckpointID]checkpoint.CheckpointInfo)
+	for _, info := range committedInfos {
+		if !info.CheckpointID.IsEmpty() {
+			committedByID[info.CheckpointID] = info
+		}
+	}
+
+	head, err := repo.Head()
+	if err != nil {
+		// Unborn HEAD (no commits yet) - return empty list instead of erroring
+		if errors.Is(err, plumbing.ErrReferenceNotFound) {
+			return []strategy.RewindPoint{}, nil
+		}
+		return nil, fmt.Errorf("failed to get HEAD: %w", err)
+	}
+```
+
+**cmd/entire/cli/tokens_profile.go:107-133** — `runTokensProfile` that calls `store.List(ctx)`:
+
+```go
+// cmd/entire/cli/tokens_profile.go:107-133
+func runTokensProfile(ctx context.Context, cmd *cobra.Command, jsonOutput bool, limit int) error {
+	repo, err := openRepository(ctx)
+	if err != nil {
+		cmd.SilenceUsage = true
+		fmt.Fprintln(cmd.ErrOrStderr(), "Not a git repository.")
+		return NewSilentError(err)
+	}
+	defer repo.Close()
+
+	store := checkpoint.NewGitStore(repo, checkpoint.ResolveRefs(ctx))
+	store.SetBlobFetcher(FetchBlobsByHash)
+	infos, err := store.List(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to list checkpoints: %w", err)
+	}
+
+	report, err := buildTokensProfileReport(ctx, store, infos, limit)
+	if err != nil {
+		return err
+	}
+
+	if jsonOutput {
+		return writeTokensProfileJSON(cmd.OutOrStdout(), report)
+	}
+	writeTokensProfileText(cmd.OutOrStdout(), report)
+	return nil
+}
+```
+
+**cmd/entire/cli/search_cmd.go:34-200** — `newSearchCmd` (search reads from API, not local checkpoint store directly, but registered as hidden):
+
+```go
+// cmd/entire/cli/search_cmd.go:34-200
+	cmd := &amp;cobra.Command{
+		Use:   "search [query]",
+		Short: "Search checkpoints, commits, and sessions using semantic and keyword matching",
+		Long: `Search checkpoints, commits, and sessions using hybrid search (semantic + keyword),
+powered by the Entire search service.
+
+Requires authentication via 'entire login' (GitHub device flow).
+
+By default, results are scoped to the current repository. Use --all-repos to
+search across all accessible repos.
+
+Run without arguments to open an interactive search. Results are
+displayed in an interactive table. Use --json for machine-readable output.
+
+CLI queries also support inline filters like author:&lt;name&gt;, date:&lt;week|month&gt;,
+branch:&lt;name&gt;, repo:&lt;owner/name&gt;, and repo:* to search all accessible repos.`,
+		Args:   cobra.ArbitraryArgs,
+		Hidden: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// ... rest of implementation
+		},
+	}
+```
+
+**cmd/entire/cli/strategy/cleanup.go:314-332** — `cpStores.Persistent.List(ctx)` call (unsupported consumer that must filter imported checkpoints):
+
+```go
+// cmd/entire/cli/strategy/cleanup.go:314-332
+	// Get all committed checkpoints from the configured read ref to find which sessions have checkpoints
+	cpStores, err := checkpoint.Open(ctx, repo, checkpoint.OpenOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("open checkpoint store: %w", err)
+	}
+
+	sessionsWithCheckpoints := make(map[string]bool)
+	checkpoints, listErr := cpStores.Persistent.List(ctx)
+	if listErr == nil {
+		for _, cp := range checkpoints {
+			// cp.SessionID is the most-recent session in a multi-session checkpoint;
+			// cp.SessionIDs lists every session that contributed. Track all of them so
+			// archived sessions of condensed checkpoints aren't flagged as orphaned.
+			sessionsWithCheckpoints[cp.SessionID] = true
+			for _, sid := range cp.SessionIDs {
+				sessionsWithCheckpoints[sid] = true
+			}
+		}
+	}
+```</result>
+<usage><subagent_tokens>70244</subagent_tokens><tool_uses>30</tool_uses><duration_ms>107934</duration_ms></usage>
+</task-notification>

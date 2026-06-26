@@ -1,0 +1,429 @@
+yeah let's do 2
+
+---
+
+<task-notification>
+<task-id>aacf965542e77a7f4</task-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/6852b33a-0d22-4364-aa6c-8de706ecc215/tasks/aacf965542e77a7f4.output</output-file>
+<status>failed</status>
+<summary>Background agent "Implement gitRefsStore + treeWriter" was running when the previous Claude Code process exited and did not complete. Its in-process state was lost. Check its worktree/output for partial work before assuming the task landed.</summary>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aae3431c7f240e772</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/68fc4cd3-542e-47f4-812e-c60eaecaaeed/tasks/aae3431c7f240e772.output</output-file>
+<status>completed</status>
+<summary>Agent "Finish gitRefsStore on committed base" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>PR 2 complete. Worker fork report follows.
+
+---
+
+**Task:** Finish PR 2 of the per-checkpoint git-ref checkpoint store on `feat/checkpoint-refs-resolver` — extract the shared subtree core, route git-branch through it (no tree-output change), add `gitRefsStore`, register it, test.
+
+**Commits (on top of the committed foundation `acad3b43b9`):**
+- `959f8f95d4` — Route git-branch writes through shared treeWriter core (no tree-output change)
+- `7aabf09715` — Add git-refs per-checkpoint checkpoint backend
+- `3ca8f0d36e` — Test git-refs store: unit + git-refs-primary/git-branch-mirror seam
+
+**What landed:**
+- **Shared core on `*treeWriter`** (`persistent.go`): `subtreeObjAt` / `flattenExisting` / `buildCheckpointSubtree` + four backing-independent appliers (`applySessionWrite`, `applyTranscriptBackfill`, `applySummaryBackfill`, `applyAttributionBackfill`). `writeCheckpointSummary` now takes the checkpoint-version to stamp. GitStore's four write methods route through the appliers and keep the v1 sharded `basePath`, so the **v1 tree output is byte-identical** (stored `/&lt;shard&gt;/&lt;id&gt;/&lt;n&gt;/…` pointers unchanged). `spliceCheckpointSubtree` reduced to the shard tree-surgery step. Read helpers extracted to free functions over `*FetchingTree` (`readSummaryFromCheckpointTree`, `readSession*FromTree`) and shared by both stores.
+- **`gitRefsStore`** (`refs_store.go`, 332 lines): full `PersistentStore` + `AuthorReader`, one commit per `refs/entire/checkpoints/&lt;shard&gt;/&lt;id&gt;` whose tree root is the checkpoint contents; orphan-then-parented per-checkpoint history; stamps `refs-1`; no Vercel merge; `List` enumerates local refs.
+- **Registered** `git-refs` in the built-in registry with `gitBacked: true`.
+- **Tests**: 8 unit tests + a seam test driving `primary: git-refs, mirror: git-branch` through `checkpoint.Open`.
+
+**Acceptance:** `mise run fmt` clean; `mise run lint` **0 issues** (`dupl` did not fire); `mise run test` **6903 tests pass**; `mise run test:integration` **375 tests pass**. (e2e not run, per instructions.)
+
+**Deviation / finding:** the ULID store-level round-trip the directive requested isn't possible yet — `id.CheckpointID.UnmarshalJSON` accepts **12-hex only**, so a ULID written into `metadata.json` fails to parse on read-back. The ref-naming/sharding layer is ULID-ready (asserted naming-only here + in PR 1's `refs_naming_test`); **end-to-end ULID storage needs `id.Validate`/`UnmarshalJSON` loosened, which belongs with the deferred ULID-generation switch** (touches the `Entire-Checkpoint` trailer regex too). Scoped the test to legacy-hex storage + a ULID naming assertion and documented it in the commit message.
+
+**Out of scope (as planned):** PR 3 (config-driven topology: `ResolveRefs`/push awareness + push-discovery queue + on-demand ref fetch). Until then, selecting `git-refs` as primary writes/reads refs locally but they aren't pushed (`PrePush` still resolves the static v1 topology). OPF remains fully descoped per your earlier call.</result>
+<usage><subagent_tokens>370677</subagent_tokens><tool_uses>68</tool_uses><duration_ms>1677948</duration_ms></usage>
+</task-notification>
+
+---
+
+let's continue, will review then end2end
+
+---
+
+<task-notification>
+<task-id>abe6914a0791e6ade</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/68fc4cd3-542e-47f4-812e-c60eaecaaeed/tasks/abe6914a0791e6ade.output</output-file>
+<status>completed</status>
+<summary>Agent "Map push/fetch/remote machinery" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect! Now I have enough information. Let me compile the comprehensive report:
+
+---
+
+## PUSH/FETCH MACHINERY MAPPING — ENTIRE CLI
+
+### 1. **PrePush Flow** — `cmd/entire/cli/strategy/manual_commit_push.go`
+
+**Function signature (lines 33–124):**
+```go
+func (s *ManualCommitStrategy) PrePush(ctx context.Context, remote string) error
+```
+
+**Full body flow:**
+1. **Lines 38–40:** `resolvePushSettings(ctx, remote)` — resolves push config once (remote name, checkpoint URL, push_disabled flag)
+2. **Lines 42–44:** Early return if `pushDisabled` flag is true (skips all push work)
+3. **Line 46:** `checkpoint.ResolveRefs(ctx)` — returns committed metadata ref topology (`PersistentRefs{Primary, Read, Push}`)
+4. **Lines 53–95:** OPF rewrite path (if enabled) — invokes `RewriteUnpushedV1WithOPF(ctx, repo, ps.pushTarget())` to redact unpushed v1 commits before push
+5. **Lines 99–107:** Core push loop over `refs.Push` (array of `plumbing.ReferenceName`):
+   - For each ref, calls `pushRefIfNeeded(pushCtx, ps.pushTarget(), ref)`
+   - Records errors on perf span, returns on first error
+6. **Lines 113–121:** Post-push cleanup — calls `CleanupPushedShadowBranches(ctx)` only after all refs succeed (non-fatal failures logged)
+
+**`resolvePushSettings` signature (lines 55–96 in `checkpoint_remote.go`):**
+```go
+func resolvePushSettings(ctx context.Context, pushRemoteName string) pushSettings
+```
+
+Returns `pushSettings` struct with:
+- `remote` — git remote name (e.g., "origin")
+- `checkpointURL` — derived URL from `remote.PushURL()` if checkpoint_remote configured
+- `pushDisabled` — true if `push_sessions` set to false
+
+**Push target resolution:**
+- `pushSettings.pushTarget()` (line 35–40 in `checkpoint_remote.go`): Returns `checkpointURL` if set, else `remote` name
+- Calls `remote.PushURL(ctx, pushRemoteName)` (in `checkpoint/remote/util.go`, lines 140–240) to derive checkpoint URL from push remote's protocol when `checkpoint_remote` is configured
+
+**`checkpoint.ResolveRefs` (lines 47–49 in `checkpoint/persistent_refs.go`):**
+```go
+func ResolveRefs(_ context.Context) PersistentRefs {
+    return DefaultV1Refs()
+}
+```
+Returns hardcoded v1 topology:
+```go
+type PersistentRefs struct {
+    Primary plumbing.ReferenceName  // branch: "refs/heads/entire/checkpoints/v1"
+    Read    plumbing.ReferenceName  // same as Primary
+    Push    []plumbing.ReferenceName // [Primary]
+}
+```
+
+---
+
+### 2. **Per-Ref Push Helpers** — `cmd/entire/cli/strategy/push_common.go`
+
+**`pushRefIfNeeded` signature (lines 31–52):**
+```go
+func pushRefIfNeeded(ctx context.Context, target string, ref plumbing.ReferenceName) error
+```
+
+**Behavior:**
+1. Opens repo, gets local ref hash
+2. If local ref doesn't exist, returns nil (nothing to push)
+3. For branch refs (and non-URL targets): calls `hasUnpushedBranchRef()` to check `refs/remotes/&lt;remoteName&gt;/&lt;branch&gt;` tracking ref
+   - If local == remote, skips push (no-op)
+4. Calls `doPushRef(ctx, target, ref)` to actually push
+
+**`doPushRef` signature (lines 84–140):**
+```go
+func doPushRef(ctx context.Context, target string, ref plumbing.ReferenceName) error
+```
+
+**Behavior with timeout:**
+```go
+ctx, cancel := context.WithTimeout(ctx, checkpointPushBudget)  // 2-minute shared budget
+defer cancel()
+```
+
+1. **Lines 91–99:** Prints progress, calls `tryPushRefCommon()` for initial push
+2. **Lines 102–107:** If protected ref error (`GH013`, branch protection), prints block message, returns nil (non-fatal)
+3. **Lines 109–125:** On non-fast-forward, attempts fetch+rebase recovery:
+   - Calls `fetchAndRebaseRefCommon(ctx, target, ref)` (lines 345–474)
+   - Retries push after rebase
+4. **Lines 126–139:** Returns nil on success or non-fatal failure (warnings only)
+
+**`tryPushRefCommon` signature (lines 239–261):**
+```go
+func tryPushRefCommon(ctx context.Context, remoteName string, ref plumbing.ReferenceName) (pushResult, error)
+```
+
+**Git push invocation (lines 240–252):**
+- **Refspec construction:**
+  - **Branch ref:** `refSpec := ref.Short()` — e.g., `"entire/checkpoints/v1"`
+  - **Non-branch ref:** `refSpec := "+" + ref.String() + ":" + ref.String()` — e.g., `"+refs/entire/checkpoints/shard/id:refs/entire/checkpoints/shard/id"` (force, no remote-tracking shadow)
+- **Remote call (line 251):**
+  ```go
+  result, err := remote.Push(ctx, remoteName, refSpec)
+  ```
+  This invokes `git push --no-verify --porcelain &lt;remote&gt; &lt;refSpec&gt;`
+
+**`fetchAndRebaseRefCommon` signature (lines 345–474):**
+```go
+func fetchAndRebaseRefCommon(ctx context.Context, target string, ref plumbing.ReferenceName) error
+```
+
+**Behavior:**
+1. **Lines 347–365:** Resolves fetch target, determines refspec:
+   - For URL targets or non-branch refs: fetches into temp ref `refs/entire-fetch-tmp/&lt;ref&gt;`
+   - For named remotes + branch refs: fetches into `refs/remotes/&lt;remote&gt;/&lt;branch&gt;` (standard tracking ref)
+2. **Lines 376–383:** Calls `remote.Fetch(ctx, FetchOptions{...})` with:
+   - `Remote: fetchTarget`
+   - `RefSpecs: []string{refSpec}`  — e.g., `"+refs/heads/entire/checkpoints/v1:refs/remotes/origin/entire/checkpoints/v1"`
+   - `NoTags: true`
+3. **Lines 400–402:** Reconciles disconnected metadata branches via `ReconcileDisconnectedMetadataRef()`
+4. **Lines 427–473:** Computes cherry-pick rebase of local-only commits onto remote tip:
+   - Uses `collectCommitsSince()` (lines 502–535) to enumerate non-merge commits local..remote
+   - Calls `cherryPickOnto()` to replay them
+
+---
+
+### 3. **Remote Package Primitives** — `cmd/entire/cli/checkpoint/remote/git.go` + `util.go`
+
+**Fetch primitives:**
+
+**`Fetch` signature (lines 68–98 in `git.go`):**
+```go
+func Fetch(ctx context.Context, opts FetchOptions) ([]byte, error)
+```
+
+**Constructs:**
+```bash
+git fetch --no-auto-gc [--no-tags] [--depth=&lt;N&gt; | --unshallow | --depth=1] [--filter=blob:none] &lt;remote&gt; &lt;refSpec...&gt;
+```
+
+**FetchOptions fields:**
+- `Remote: string` — remote name or URL
+- `RefSpecs: []string` — refspecs (e.g., `"+refs/heads/entire/checkpoints/v1:refs/remotes/origin/entire/checkpoints/v1"`)
+- `NoTags: bool`, `Shallow: bool`, `Unshallow: bool`, `Depth: int`, `NoFilter: bool`
+- `ExtraArgs: []string`
+
+**`FetchBlobs` signature (lines 110–126):**
+```go
+func FetchBlobs(ctx context.Context, remote string, hashes []string) error
+```
+
+Uses `git fetch-pack` (plumbing, not porcelain) to fetch specific objects by hash:
+```bash
+git fetch-pack &lt;remote&gt; &lt;hash1&gt; &lt;hash2&gt; ...
+```
+
+**Push primitives:**
+
+**`Push` signature (lines 261–266):**
+```go
+func Push(ctx context.Context, remote, refSpec string) (PushResult, error)
+```
+
+Delegates to `PushWithOptions()`.
+
+**`PushWithOptions` signature (lines 270–291):**
+```go
+func PushWithOptions(ctx context.Context, opts PushOptions) (PushResult, error)
+```
+
+**Constructs:**
+```bash
+git push --no-verify --porcelain &lt;target&gt; &lt;refSpec...&gt;
+```
+
+Where `target` is resolved via `resolvePushCommandTarget()` (lines 537–550):
+- If already URL or local path, use as-is
+- If remote name, calls `PushURL(ctx, target)` to get derived checkpoint URL or fallback
+
+**No batch push:** Each ref is pushed individually in a separate `git push` invocation (line 251 in `push_common.go`).
+
+**Token injection:**
+- All Fetch/Push commands created via `newCommand()` (lines 360–404 in `git.go`)
+- If `ENTIRE_CHECKPOINT_TOKEN` env var set:
+  - Converts SSH targets to HTTPS via `resolveTargetForTokenAuth()`
+  - Injects `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_*`, `GIT_CONFIG_VALUE_*` env vars with `Authorization: Basic &lt;base64(x-access-token:&lt;token&gt;)&gt;` header
+
+---
+
+### 4. **Read Bootstrap / Blob Fetch Wiring** — `cmd/entire/cli/checkpoint/open.go` + `git_operations.go`
+
+**`checkpoint.Open` signature (lines 50–74 in `open.go`):**
+```go
+func Open(ctx context.Context, repo *git.Repository, opts OpenOptions) (*Stores, error)
+```
+
+**OpenOptions (lines 13–25):**
+```go
+type OpenOptions struct {
+    BlobFetcher BlobFetchFunc  // nil leaves fetching off
+    Refs        *PersistentRefs // nil uses DefaultV1Refs()
+}
+```
+
+**BlobFetcher wiring (lines 126–127, 140–141):**
+- Both git-branch and git-refs backends call `store.SetBlobFetcher(env.BlobFetcher)` if `env.BlobFetcher != nil`
+- BlobFetcher is used by `FetchingTree` (lines 45–51 in `fetching_tree.go`):
+  ```go
+  func NewFetchingTree(ctx context.Context, tree *object.Tree, s storer.EncodedObjectStorer, fetch BlobFetchFunc) *FetchingTree
+  ```
+
+**Caller injection (lines 206, 277, 411 in `resume.go`):**
+```go
+stores, err := checkpoint.Open(ctx, repo, checkpoint.OpenOptions{BlobFetcher: FetchBlobsByHash})
+```
+
+**`FetchBlobsByHash` (lines 546–577 in `git_operations.go`):**
+```go
+func FetchBlobsByHash(ctx context.Context, hashes []plumbing.Hash) error
+```
+
+1. **Line 554:** Resolves fetch target via `resolveCheckpointFetchTarget(ctx)` — defers to `remote.FetchURL()` for checkpoint remote URL
+2. **Line 561:** Calls `remote.FetchBlobs(ctx, fetchTarget, hashStrs)` to fetch by hash
+3. **Lines 568–572:** On failure, falls back to:
+   - `FetchMetadataFromCheckpointRemote(ctx)` (full metadata from checkpoint remote)
+   - Then `FetchMetadataBranch(ctx)` (full metadata from origin)
+
+**Bootstrap fetch for reads (lines 212–214, 284–286 in `resume.go`):**
+```go
+if refs.ReadBootstrappableFromOrigin() {
+    promoteRemoteTrackingPrimary(ctx, repo, refs)
+}
+```
+
+**`ReadBootstrappableFromOrigin()` definition (lines 34–38 in `persistent_refs.go`):**
+```go
+func (r PersistentRefs) ReadBootstrappableFromOrigin() bool {
+    return r.Read == r.Primary &amp;&amp; r.PrimaryFetchableFromOrigin()
+}
+```
+
+Returns true when:
+- Read ref == Primary ref (default: both point to `refs/heads/entire/checkpoints/v1`)
+- Primary is a branch with a remote-tracking ref (`refs/remotes/origin/entire/checkpoints/v1`)
+
+When true, `promoteRemoteTrackingPrimary()` makes missing committed ref fetchable from origin by updating local ref to remote-tracking ref if missing.
+
+---
+
+### 5. **Git Common Dir Helper** — `cmd/entire/cli/session/state.go` + `strategy/common.go`
+
+**Function name + signature (lines 705–707 in `session/state.go`):**
+```go
+func GetGitCommonDir(ctx context.Context) (string, error)
+```
+
+**Wrapper delegates to (lines 713–748):**
+```go
+func getGitCommonDir(ctx context.Context) (string, error) {
+    // Cached per working directory
+    cmd := exec.CommandContext(ctx, "git", "rev-parse", "--git-common-dir")
+    cmd.Dir = "."
+    output, err := cmd.Output()
+    // ... returns .git (or .git/worktrees/..main .git for regular repos, shared .git for worktrees
+    return filepath.Clean(commonDir), nil
+}
+```
+
+**Also in `strategy/common.go` (lines 1079–1096):**
+```go
+func GetGitCommonDir(ctx context.Context) (string, error)
+```
+
+Same implementation (uncached version).
+
+**Existing flock helper** — `cmd/entire/cli/internal/flock/flock_unix.go`:
+
+**Function signature (lines 20–30):**
+```go
+func Acquire(path string) (release func(), err error)
+```
+
+**Behavior:**
+1. Opens file (creates if missing, mode 0o600)
+2. Acquires exclusive advisory lock via `syscall.Flock(..., LOCK_EX)`
+3. Returns cleanup function that closes file (drops lock)
+
+**Usage example (lines 145–147 in `checkpoint/shadow_ref.go`):**
+```go
+release, err := flock.Acquire(path)
+// ... do work with lock held
+release()
+```
+
+Also used in `settings/settings.go` (line 727) for atomic settings writes.
+
+---
+
+### 6. **PrePush Registration** — `cmd/entire/cli/hooks_git_cmd.go`
+
+**Hook entrypoint (lines 230–272):**
+```go
+func newHooksGitPrePushCmd() *cobra.Command {
+    return &amp;cobra.Command{
+        Use:   "pre-push &lt;remote&gt;",
+        Short: "Handle pre-push git hook",
+        Args:  cobra.ExactArgs(1),
+        RunE: func(cmd *cobra.Command, args []string) error {
+            // ...
+            hookErr := g.strategy.PrePush(g.ctx, remote)  // Line 253
+            // ...
+            return fmt.Errorf("pre-push: %w", hookErr)
+        },
+    }
+}
+```
+
+**Git hook command registration (line 130 in `hooks_git_cmd.go`):**
+```go
+cmd.AddCommand(newHooksGitPrePushCmd())
+```
+
+**Hook script generation (lines 234–240 in `strategy/hooks.go`):**
+```go
+{
+    name: "pre-push",
+    content: fmt.Sprintf(`#!/bin/sh
+# %s
+# Pre-push hook: push session logs alongside user's push
+# $1 is the remote name (e.g., "origin")
+%s
+`, entireHookMarker, prePushCmd),
+}
+```
+
+Where `prePushCmd` is constructed as (line 199):
+```go
+prePushCmd := gitHookCommand(cmdPrefix, `pre-push "$1"`, false)
+```
+
+**Full hook invocation chain:**
+1. Git calls `.git/hooks/pre-push &lt;remote_name&gt;`
+2. Hook script invokes: `entire hooks git pre-push "$1"`
+3. Cobra routes to `newHooksGitPrePushCmd().RunE()`
+4. Calls `g.strategy.PrePush(g.ctx, remote)` where `remote = args[0]`
+
+**Error handling (lines 256–269):**
+- PrePush privacy-critical errors (OPF rewrite failures) are propagated as non-zero exit
+- Transient checkpoint-push failures are logged and swallowed (return nil from PrePush)
+
+---
+
+## Summary: File Locations + Key Signatures
+
+| Component | File | Signature/Line |
+|-----------|------|---------|
+| **PrePush** | `strategy/manual_commit_push.go` | `PrePush(ctx, remote) error` @ lines 33–124 |
+| **resolvePushSettings** | `strategy/checkpoint_remote.go` | `resolvePushSettings(ctx, pushRemoteName) pushSettings` @ lines 55–96 |
+| **ResolveRefs** | `checkpoint/persistent_refs.go` | `ResolveRefs(ctx) PersistentRefs` @ lines 47–49 |
+| **pushRefIfNeeded** | `strategy/push_common.go` | `pushRefIfNeeded(ctx, target, ref) error` @ lines 31–52 |
+| **doPushRef** | `strategy/push_common.go` | `doPushRef(ctx, target, ref) error` @ lines 84–140 |
+| **tryPushRefCommon** | `strategy/push_common.go` | `tryPushRefCommon(ctx, remoteName, ref) (pushResult, error)` @ lines 239–261 |
+| **fetchAndRebaseRefCommon** | `strategy/push_common.go` | `fetchAndRebaseRefCommon(ctx, target, ref) error` @ lines 345–474 |
+| **remote.Push** | `checkpoint/remote/git.go` | `Push(ctx, remote, refSpec) (PushResult, error)` @ lines 261–266 |
+| **remote.PushWithOptions** | `checkpoint/remote/git.go` | `PushWithOptions(ctx, opts PushOptions) (PushResult, error)` @ lines 270–291 |
+| **remote.Fetch** | `checkpoint/remote/git.go` | `Fetch(ctx, opts FetchOptions) ([]byte, error)` @ lines 68–98 |
+| **remote.FetchBlobs** | `checkpoint/remote/git.go` | `FetchBlobs(ctx, remote, hashes) error` @ lines 110–126 |
+| **remote.PushURL** | `checkpoint/remote/util.go` | `PushURL(ctx, pushRemoteName) (string, bool, error)` @ lines 140–240 |
+| **checkpoint.Open** | `checkpoint/open.go` | `Open(ctx, repo, opts OpenOptions) (*Stores, error)` @ lines 50–74 |
+| **BlobFetchFunc** | `checkpoint/fetching_tree.go` | Type alias @ line 18 |
+| **FetchBlobsByHash** | `git_operations.go` | `FetchBlobsByHash(ctx, hashes) error` @ lines 546–577 |
+| **GetGitCommonDir** | `session/state.go` | `GetGitCommonDir(ctx) (string, error)` @ lines 705–707 |
+| **flock.Acquire** | `internal/flock/flock_unix.go` | `Acquire(path) (release func(), err error)` @ lines 20–30 |
+| **newHooksGitPrePushCmd** | `hooks_git_cmd.go` | `newHooksGitPrePushCmd() *cobra.Command` @ lines 230–272 |</result>
+<usage><subagent_tokens>66662</subagent_tokens><tool_uses>33</tool_uses><duration_ms>92855</duration_ms></usage>
+</task-notification>

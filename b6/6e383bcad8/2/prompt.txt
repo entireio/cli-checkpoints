@@ -1,0 +1,716 @@
+Following work done in https://github.com/entireio/cli/pull/1527, we want to extend the import capabilities to detect the other agents we support, including gemini, opencode, codex etc. Use existing paths/patterns in the code for finding where those sessions are located and build support for importing those agent sessions
+
+---
+
+<task-notification>
+<task-id>aeddf501d268e83c8</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/65bd6f32-b465-4fea-807f-040f6d9ac558/tasks/aeddf501d268e83c8.output</output-file>
+<status>completed</status>
+<summary>Agent "Research codex + pi transcript formats" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect! Now I have all the information I need. Let me create a comprehensive report:
+
+## Structured Per-Agent Report: Codex and Pi Agents
+
+---
+
+### **CODEX AGENT** (`cmd/entire/cli/agent/codex/`)
+
+#### 1. **Session Directory Resolution**
+
+**GetSessionDir Method:**
+- **File:** `codex/codex.go:76-87`
+- **Signature:** `func (c *CodexAgent) GetSessionDir(_ string) (string, error)`
+- **Behavior:** 
+  - Ignores `repoPath` parameter (underscore), resolving to Codex's global home directory structure
+  - Returns path pattern: `CODEX_HOME/sessions/` where `CODEX_HOME` is:
+    - `CODEX_HOME` env var if set, else `~/.codex`
+  - Supports test override via `ENTIRE_TEST_CODEX_SESSION_DIR` env var (checked first)
+  
+**ResolveSessionFile Method:**
+- **File:** `codex/codex.go:93-104`
+- **Signature:** `func (c *CodexAgent) ResolveSessionFile(sessionDir, agentSessionID string) string`
+- **Behavior:**
+  - If `agentSessionID` is an absolute path, returns it verbatim (Codex provides absolute paths in hook payloads)
+  - Otherwise, globs for `rollout-*-&lt;sessionID&gt;.jsonl` in `sessionDir` and nested `YYYY/MM/DD/` subdirs
+  - Falls back to `sessionDir/&lt;sessionID&gt;.jsonl` if no glob match
+  - Returns `agentSessionID` verbatim if both paths are empty (no-op fallback)
+
+**No GetSessionBaseDir:** Codex does NOT implement `SessionBaseDirProvider` — it has a flat home directory, not per-project subdirectories.
+
+---
+
+#### 2. **Transcript File Format**
+
+**Format:** JSONL (one JSON object per line)
+- **File:** `codex/codex.go:200-212`
+- **Filename Pattern:** Codex provides absolute paths directly in hook payloads. Restored sessions use `rollout-YYYY-MM-DDTHH-mm-ss-&lt;sessionID&gt;.jsonl` (see `codex.go:214-224`)
+- **Session ID Derivation:** Extracted from hook input (`SessionID` field in hook payload), not from filename
+
+**JSONL Line Structure (`rolloutLine`):**
+- **File:** `codex/transcript.go:27-32`
+- **Fields:**
+  ```go
+  type rolloutLine struct {
+    Timestamp string          `json:"timestamp"`
+    Type      string          `json:"type"` // "session_meta", "response_item", "event_msg", "turn_context"
+    Payload   json.RawMessage `json:"payload"`
+  }
+  ```
+
+**Line Types:**
+- `session_meta` (first line): Contains session ID and start timestamp
+- `event_msg`: Metadata events (token_count, task_started, task_complete, user_message, agent_message)
+- `response_item`: User/assistant messages and tool calls (apply_patch, shell, MCP, etc.)
+- `turn_context`: Turn-related context
+
+---
+
+#### 3. **Identifying User-Prompt Turns**
+
+**How to identify user prompts:**
+- **Type:** `response_item` with payload.Type == `"message"`
+- **Role:** payload.Role == `"user"`
+- **Text extraction:** Payload has `content` field (json.RawMessage) containing an array of content items
+  
+**Content Item Structure:**
+- **File:** `codex/transcript.go:51-55`
+- **Fields:**
+  ```go
+  type contentItem struct {
+    Type string `json:"type"` // "input_text", "output_text"
+    Text string `json:"text"`
+  }
+  ```
+- User prompts use `type: "input_text"` (assistant responses use `output_text`)
+
+**Extraction Method:**
+- **File:** `codex/transcript.go:332-383`
+- **Method:** `ExtractPrompts(sessionRef string, fromOffset int) ([]string, error)`
+- **Behavior:** Returns user-message text from offset onward, one prompt per message
+
+---
+
+#### 4. **Model Extraction**
+
+**Codex DOES NOT implement ModelExtractor:**
+- The agent interface check shows `TokenCalculator` and `TranscriptAnalyzer` only (no `ModelExtractor`)
+- **File:** `codex/transcript.go:19-25`
+- **Model source:** Hook payloads (`sessionStartRaw`, `userPromptSubmitRaw`, `postToolUseRaw`, `stopRaw` all carry `.Model` field)
+- **File:** `codex/types.go:33-85`
+- Model is available from hook events (TurnStart, SessionStart, etc.) but NOT parsed from transcript
+
+---
+
+#### 5. **Token Usage Calculation**
+
+**Implements:** `TokenCalculator` interface (non-subagent-aware)
+- **File:** `codex/transcript.go:266-330`
+- **Method:** `CalculateTokenUsage(transcriptData []byte, fromOffset int) (*TokenUsage, error)`
+- **Signature:** Takes JSONL bytes and line offset
+
+**Offset Semantics:**
+- `fromOffset` is a **line number** (1-indexed)
+- Method scans `event_msg` lines with type `token_count`
+- Computes delta between last token_count at/before offset and last token_count after offset
+- Codex reports cumulative `total_token_usage`, so subtraction is needed for deltas
+
+**Token Fields Extracted:**
+- **File:** `codex/transcript.go:64-75`
+- **tokenUsageData:**
+  ```go
+  type tokenUsageData struct {
+    InputTokens           int
+    CachedInputTokens     int
+    OutputTokens          int
+    ReasoningOutputTokens int
+    TotalTokens           int
+  }
+  ```
+- Returns `InputTokens` (fresh), `CacheReadTokens` (cached), `OutputTokens`, `APICallCount`
+
+---
+
+#### 6. **Subagents**
+
+**Does NOT support subagents:** Codex does not implement `SubagentAwareExtractor`. No subagent directory concept.
+
+---
+
+---
+
+### **PI AGENT** (`cmd/entire/cli/agent/pi/`)
+
+#### 1. **Session Directory Resolution**
+
+**GetSessionDir Method:**
+- **File:** `pi/pi.go:140-149`
+- **Signature:** `func (a *PiAgent) GetSessionDir(repoPath string) (string, error)`
+- **Behavior:**
+  - Returns `&lt;piHome&gt;/sessions/&lt;encoded-repoPath&gt;/` where repoPath is **required** (uses it to build per-project subdirectories)
+  - `piHome` resolution order:
+    1. `ENTIRE_TEST_PI_SESSION_DIR` env var (test override, no encoding applied)
+    2. `PI_CODING_AGENT_DIR` env var (Pi's own override; encoding still applies)
+    3. `~/.pi/agent` (default)
+  - `encodeRepoPathForPi()` converts `/Users/foo/repo` → `--Users-foo-repo--` (replaces `/` and `\` with `-`, wraps with `--`)
+
+**GetSessionBaseDir Method:**
+- **File:** `pi/pi.go:155-161`
+- **Signature:** `func (a *PiAgent) GetSessionBaseDir() (string, error)`
+- **Returns:** `&lt;piHome&gt;/sessions/` (base for cross-project session search)
+- **Implements:** `SessionBaseDirProvider` interface for attach's cross-project fallback
+
+**ResolveSessionFile Method:**
+- **File:** `pi/pi.go:172-183`
+- **Signature:** `func (a *PiAgent) ResolveSessionFile(sessionDir, agentSessionID string) string`
+- **Behavior:**
+  - If `agentSessionID` is absolute, returns it verbatim (Pi hook payloads provide absolute paths)
+  - Otherwise, globs `sessionDir/*_&lt;agentSessionID&gt;.jsonl` and returns lexicographically latest (most recent timestamp)
+  - Falls back to `sessionDir/&lt;agentSessionID&gt;.jsonl` if no match
+  - Returns `agentSessionID` verbatim if sessionDir is empty
+
+---
+
+#### 2. **Transcript File Format**
+
+**Format:** JSONL (one JSON object per line)
+- **Filename Pattern:** `&lt;timestamp&gt;_&lt;uuid&gt;.jsonl` (example: `2026-03-27T21-00-00-000Z_test-uuid-123.jsonl`)
+- **Session ID Derivation:** Extracted from filename (`_&lt;uuid&gt;` suffix) via `extractSessionIDFromPath()` in lifecycle.go:355-365
+
+**JSONL Entry Structure (`pijsonl.Entry`):**
+- **File:** `pi/pijsonl/pijsonl.go:72-90`
+- **Fields:**
+  ```go
+  type Entry struct {
+    Type      string  `json:"type"`     // "session", "model_change", "message"
+    ID        string  `json:"id"`
+    Timestamp string  `json:"timestamp"`
+    Message   Message `json:"message"`  // only when type=="message"
+  }
+  
+  type Message struct {
+    Role       string          `json:"role"`     // "user", "assistant", "toolResult"
+    Content    json.RawMessage `json:"content"`
+    Usage      *Usage          `json:"usage,omitempty"`
+    Model      string          `json:"model,omitempty"`
+    StopReason string          `json:"stopReason,omitempty"`
+    ToolCallID string          `json:"toolCallId,omitempty"`
+    ToolName   string          `json:"toolName,omitempty"`
+    IsError    bool            `json:"isError,omitempty"`
+  }
+  ```
+
+**Entry Types:**
+- `session`: Header entry (first line)
+- `model_change`: Model switch event (not a message, no role/content)
+- `message`: Conversational entry (user, assistant, toolResult)
+
+---
+
+#### 3. **Identifying User-Prompt Turns**
+
+**How to identify user prompts:**
+- **Type:** Entry with `type == "message"`
+- **Role:** `Message.Role == "user"` (constant `RoleUser = "user"`)
+- **Content extraction:** `Message.Content` is `json.RawMessage` — can be either:
+  - Plain string: decoded via `pijsonl.DecodeStringContent()`
+  - Array of content items: unmarshaled as `[]ContentItem`
+
+**Content Item Structure:**
+- **File:** `pi/pijsonl/pijsonl.go:100-107`
+- **Fields:**
+  ```go
+  type ContentItem struct {
+    Type      string          `json:"type"`     // "text", "toolCall"
+    Text      string          `json:"text,omitempty"`
+    Name      string          `json:"name,omitempty"`
+    ID        string          `json:"id,omitempty"`
+    Arguments json.RawMessage `json:"arguments,omitempty"`
+  }
+  ```
+- User prompts use `type: "text"` items; assistant tool calls use `type: "toolCall"` items
+
+**Extraction Method:**
+- **File:** `pi/transcript.go:132-166`
+- **Method:** `ExtractPrompts(sessionRef string, fromOffset int) ([]string, error)`
+- **Behavior:** Returns user-message text from offset onward, branch-aware (active branch only)
+
+**Branch Awareness:**
+- Pi sessions can fork/branch mid-conversation (tree structure via `parentId` pointers)
+- `ForEachActiveMessage()` calls `ResolveActiveBranch()` to filter out abandoned branches
+- **File:** `pi/pijsonl/pijsonl.go:161-206`
+- Active branch = path from most-recent message ID back to root via parentId chain
+
+---
+
+#### 4. **Model Extraction**
+
+**Pi DOES implement ModelExtractor:**
+- **File:** `pi/transcript.go:42-59`
+- **Method:** `ExtractModel(transcriptData []byte) (string, error)`
+- **Behavior:** Returns model identifier from the most recent assistant message on the active branch
+- **Model field:** `Message.Model` field (e.g., `"gpt-5.5"`) recorded on every assistant message
+- **Branch-aware:** Uses `ForEachActiveMessage()` so abandoned branches don't influence the result
+
+---
+
+#### 5. **Token Usage Calculation**
+
+**Implements:** `TokenCalculator` interface (non-subagent-aware)
+- **File:** `pi/transcript.go:20-40`
+- **Method:** `CalculateTokenUsage(transcriptData []byte, fromOffset int) (*TokenUsage, error)`
+- **Signature:** Takes JSONL bytes and line offset
+
+**Offset Semantics:**
+- `fromOffset` is a **line number** (0-indexed or 1-indexed — see `pijsonl.CountLines()` for semantics)
+- Method scans assistant messages from offset onward and sums per-message token usage
+- Only active-branch messages contribute (branch-aware via `ForEachActiveMessage()`)
+
+**Token Fields Extracted:**
+- **File:** `pi/pijsonl/pijsonl.go:92-98`
+- **Usage:**
+  ```go
+  type Usage struct {
+    Input      int `json:"input"`
+    Output     int `json:"output"`
+    CacheRead  int `json:"cacheRead"`
+    CacheWrite int `json:"cacheWrite"`
+  }
+  ```
+- Returns `InputTokens`, `OutputTokens`, `CacheReadTokens`, `CacheCreationTokens`, `APICallCount`
+
+---
+
+#### 6. **Subagents**
+
+**Does NOT support subagents:** Pi does not implement `SubagentAwareExtractor`. No subagent directory concept.
+
+---
+
+## Summary Table
+
+| Aspect | **Codex** | **Pi** |
+|--------|-----------|--------|
+| **Session Dir** | Global `CODEX_HOME/sessions/`, ignores repoPath | Per-project `&lt;piHome&gt;/sessions/&lt;encoded-repo&gt;/` |
+| **GetSessionBaseDir** | Not implemented | Implemented (SessionBaseDirProvider) |
+| **Transcript Format** | JSONL (`response_item`/`event_msg` lines) | JSONL (`message`/`model_change` lines) |
+| **Filename Pattern** | `rollout-YYYY-MM-DDTHH-mm-ss-&lt;id&gt;.jsonl` | `YYYY-MM-DDTHH-mm-ssZ_&lt;uuid&gt;.jsonl` |
+| **User Prompt Identifier** | `response_item` + role=`"user"` + content type=`"input_text"` | `message` + role=`"user"` |
+| **Model Extraction** | Hook payload only (no transcript parsing) | Implements `ExtractModel()` from `message.model` field |
+| **Token Calculator** | `CalculateTokenUsage()` (line-based offset, cumulative delta) | `CalculateTokenUsage()` (line-based offset, per-message sum) |
+| **Branch Awareness** | N/A (flat structure) | Yes — filters abandoned branches via `parentId` chain |
+| **Subagents** | Not supported | Not supported |
+| **Absolute Path Passthrough** | Yes (agent hook payloads provide absolute paths) | Yes (agent hook payloads provide absolute paths) |</result>
+<usage><subagent_tokens>66426</subagent_tokens><tool_uses>21</tool_uses><duration_ms>62960</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>acace670da2706e9a</task-id>
+<tool-use-id>toolu_01TongV9gZPgef8L9RQNtaoG</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/65bd6f32-b465-4fea-807f-040f6d9ac558/tasks/acace670da2706e9a.output</output-file>
+<status>completed</status>
+<summary>Agent "Research gemini + opencode transcript formats" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect! Now I have all the information needed. Let me compile a comprehensive report.
+
+---
+
+## STRUCTURED PER-AGENT REPORT
+
+### GEMINI CLI AGENT
+
+**File References:** 
+- Primary: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/agent/geminicli/`
+- Core files: `gemini.go`, `transcript.go`, `lifecycle.go`, `types.go`
+
+#### 1. Session Dir Resolution
+
+**Method:** `GetSessionDir(repoPath string) (string, error)` — `gemini.go:113–127`
+
+```go
+func (g *GeminiCLIAgent) GetSessionDir(repoPath string) (string, error) {
+	if override := os.Getenv("ENTIRE_TEST_GEMINI_PROJECT_DIR"); override != "" {
+		return override, nil
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("failed to get home directory: %w", err)
+	}
+	projectDir := GetProjectHash(repoPath)
+	return filepath.Join(homeDir, ".gemini", "tmp", projectDir, "chats"), nil
+}
+```
+
+**Directory Pattern:** `~/.gemini/tmp/&lt;project-hash&gt;/chats/`
+- `&lt;project-hash&gt;` is SHA256 of the repo path (hex-encoded)
+- Env override: `ENTIRE_TEST_GEMINI_PROJECT_DIR` — single test override pointing to specific project dir
+
+**Base Dir Method:** `GetSessionBaseDir() (string, error)` — `gemini.go:132–138`
+- Returns: `~/.gemini/tmp` (base containing all per-project subdirectories)
+- Does NOT use `ENTIRE_TEST_GEMINI_PROJECT_DIR` because that override points to a specific project, not the base
+
+---
+
+#### 2. Transcript File Format
+
+**Format:** Single JSON document (NOT JSONL)
+- Top-level structure: `{"messages": [...]}`
+- Defined in `GeminiTranscript` — `transcript.go:19–22`
+
+**Filename Pattern:** `session-&lt;date&gt;-&lt;shortid&gt;.json`
+- Date format: `2006-01-02T15-04` (UTC timestamp)
+- `shortid`: first 8 characters of session UUID
+- **Lookup:** `ResolveSessionFile()` — `gemini.go:91–109` — glob-matches `session-*-&lt;first8chars&gt;.json`, returns most recent (last alphabetically by date)
+
+**Session ID Derivation:**
+- Source: Hook input (passed directly)
+- Used in filename: first 8 chars of full session UUID
+
+---
+
+#### 3. Identifying User-Prompt Turns
+
+**Message Type Field:** `type` field in `GeminiMessage` — `transcript.go:24–30`
+
+```go
+type GeminiMessage struct {
+	ID        string           `json:"id,omitempty"`
+	Type      string           `json:"type"`         // MessageTypeUser or MessageTypeGemini
+	Content   string           `json:"content,omitempty"`
+	ToolCalls []GeminiToolCall `json:"toolCalls,omitempty"`
+}
+```
+
+**Constants:** — `transcript.go:14–17`
+```go
+const (
+	MessageTypeUser   = "user"
+	MessageTypeGemini = "gemini"
+)
+```
+
+**Content Format Handling:** Dual format support via `UnmarshalJSON()` — `transcript.go:35–79`
+- **User messages:** `"content": [{"text": "..."}]` (array of objects with `text` field)
+- **Gemini messages:** `"content": "response text"` (plain string)
+- `UnmarshalJSON()` normalizes both to a single `Content` string field
+
+**Extracting User Prompts:** 
+- Package function: `ExtractAllUserPromptsFromTranscript(transcript)` — `transcript.go:165–173`
+- Filters: `msg.Type == MessageTypeUser &amp;&amp; msg.Content != ""`
+- Returns list of all user message contents
+
+---
+
+#### 4. Model Extraction
+
+**Mechanism:** Captured via hook, NOT extracted from transcript
+- Hook: `BeforeModel` — fires before each LLM call
+- Hook payload structure: `beforeModelRaw` — `types.go:68–74`
+
+```go
+type beforeModelRaw struct {
+	SessionID      string `json:"session_id"`
+	TranscriptPath string `json:"transcript_path"`
+	LLMRequest     struct {
+		Model string `json:"model"`
+	} `json:"llm_request"`
+}
+```
+
+- Parsed in: `parseBeforeModel()` — `lifecycle.go:201–216`
+- Returns `agent.Event` with `Model` field populated
+- **No `ExtractModel()` method** — model must come from `BeforeModel` hook events, not transcript parsing
+
+---
+
+#### 5. Token Usage
+
+**Method:** `CalculateTokenUsage(transcriptData []byte, fromOffset int) (*agent.TokenUsage, error)` — `lifecycle.go:111–144`
+
+**Signature:**
+```go
+func (g *GeminiCLIAgent) CalculateTokenUsage(transcriptData []byte, fromOffset int) (*agent.TokenUsage, error)
+```
+
+**Semantics:**
+- `fromOffset` is a **message index** (integer position in the messages array)
+- Iterates from `fromOffset` to end of messages
+- Counts only `MessageTypeGemini` (assistant) messages with non-nil `Tokens` field
+- Returns `*agent.TokenUsage` with:
+  - `APICallCount`: number of gemini messages processed
+  - `InputTokens`: sum of `msg.Tokens.Input`
+  - `OutputTokens`: sum of `msg.Tokens.Output`
+  - `CacheReadTokens`: sum of `msg.Tokens.Cached` (mapped from `Cached` field)
+
+**Token Data Structure:** `geminiMessageWithTokens` — `types.go:108–112`
+```go
+type geminiMessageWithTokens struct {
+	ID     string               `json:"id"`
+	Type   string               `json:"type"`
+	Tokens *geminiMessageTokens `json:"tokens,omitempty"`
+}
+```
+
+**Interface Implementation:** `TokenCalculator` — `lifecycle.go:16–17`
+```go
+var (
+	_ agent.TranscriptAnalyzer = (*GeminiCLIAgent)(nil)
+	_ agent.TokenCalculator    = (*GeminiCLIAgent)(nil)
+	// ...
+)
+```
+
+---
+
+#### 6. Subagents
+
+**No subagent support.** Gemini CLI does not implement `SubagentAwareExtractor` interface. Token usage and file extraction are single-agent only.
+
+---
+
+### OPENCODE AGENT
+
+**File References:**
+- Primary: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/agent/opencode/`
+- Core files: `opencode.go`, `transcript.go`, `lifecycle.go`, `types.go`
+
+#### 1. Session Dir Resolution
+
+**Method:** `GetSessionDir(repoPath string) (string, error)` — `opencode.go:173–181`
+
+```go
+func (a *OpenCodeAgent) GetSessionDir(repoPath string) (string, error) {
+	if override := os.Getenv("ENTIRE_TEST_OPENCODE_PROJECT_DIR"); override != "" {
+		return override, nil
+	}
+	projectDir := SanitizePathForOpenCode(repoPath)
+	return filepath.Join(os.TempDir(), "entire-opencode", projectDir), nil
+}
+```
+
+**Directory Pattern:** `&lt;os.TempDir()&gt;/entire-opencode/&lt;sanitized-path&gt;/`
+- `&lt;sanitized-path&gt;`: repo path with non-alphanumeric chars replaced by dashes (via `regexp.MustCompile(`[^a-zA-Z0-9]`)`)
+- Location: **Ephemeral** (temp dir, not home dir)
+- Reason: Avoids squatting on OpenCode's own directories (`~/.opencode` is project-level)
+- Env override: `ENTIRE_TEST_OPENCODE_PROJECT_DIR`
+
+**No `GetSessionBaseDir()` method** — OpenCode stores transcripts ephemerally in temp, not in per-project home-dir structure.
+
+---
+
+#### 2. Transcript File Format
+
+**Format:** Single JSON document (NOT JSONL)
+- Top-level structure: `{"info": {...}, "messages": [...]}`
+- Defined in `ExportSession` — `types.go:27–30`
+
+```go
+type ExportSession struct {
+	Info     SessionInfo     `json:"info"`
+	Messages []ExportMessage `json:"messages"`
+}
+```
+
+**Filename Pattern:** `&lt;sessionID&gt;.json`
+- Simple basename matching session ID
+- **Lookup:** `ResolveSessionFile(sessionDir, agentSessionID string)` — `opencode.go:183–185`
+
+```go
+func (a *OpenCodeAgent) ResolveSessionFile(sessionDir, agentSessionID string) string {
+	return filepath.Join(sessionDir, agentSessionID+".json")
+}
+```
+
+**Session ID Derivation:** From hook input (passed directly; OpenCode generates opaque IDs)
+
+---
+
+#### 3. Identifying User-Prompt Turns
+
+**Message Role Field:** `role` field in `MessageInfo` — `types.go:48–54`
+
+```go
+type MessageInfo struct {
+	ID        string  `json:"id"`
+	SessionID string  `json:"sessionID,omitempty"`
+	Role      string  `json:"role"` // "user" or "assistant"
+	Time      Time    `json:"time"`
+	Tokens    *Tokens `json:"tokens,omitempty"`
+	Cost      float64 `json:"cost,omitempty"`
+}
+```
+
+**Constants:** — `types.go:57–61`
+```go
+const (
+	roleAssistant = "assistant"
+	roleUser      = "user"
+)
+```
+
+**Message Structure:** `ExportMessage` — `types.go:42–45`
+```go
+type ExportMessage struct {
+	Info  MessageInfo `json:"info"`
+	Parts []Part      `json:"parts"`
+}
+```
+
+**Content Extraction:** Text comes from message `Parts` array
+- **Part Type Field:** `type` field in `Part` — `types.go:84–91`
+- Text parts: `part.Type == "text"` with `part.Text` field
+- **Helper:** `ExtractTextFromParts(parts []Part)` — `transcript.go:202–211`
+
+```go
+func ExtractTextFromParts(parts []Part) string {
+	var texts []string
+	for _, part := range parts {
+		if part.Type == "text" &amp;&amp; part.Text != "" {
+			texts = append(texts, part.Text)
+		}
+	}
+	return strings.Join(texts, "\n")
+}
+```
+
+**Extracting User Prompts:**
+- Package function: `ExtractAllUserPrompts(data []byte)` — `transcript.go:255–282`
+- Filters:
+  - `msg.Info.Role == roleUser`
+  - Text content non-empty
+  - **Special handling:** Strips `&lt;system-reminder&gt;...&lt;/system-reminder&gt;` tags (from oh-my-opencode orchestration)
+    - Helper: `stripSystemReminders(content)` — `transcript.go:234–249`
+    - Helper: `isSystemReminderOnly(content)` — `transcript.go:224–229`
+  - Excludes messages that are entirely system-reminder blocks
+
+---
+
+#### 4. Model Extraction
+
+**Mechanism:** Captured via hook, NOT extracted from transcript
+- Hook: `turn-start` — fires when user submits prompt
+- Hook payload structure: `turnStartRaw` — `types.go:10–14`
+
+```go
+type turnStartRaw struct {
+	SessionID string `json:"session_id"`
+	Prompt    string `json:"prompt"`
+	Model     string `json:"model"`
+}
+```
+
+- Parsed in: `ParseHookEvent()` case `HookNameTurnStart` — `lifecycle.go:79–95`
+- Returns `agent.Event` with `Model` field populated from `raw.Model`
+- **No `ExtractModel()` method** — model must come from `turn-start` hook events
+
+---
+
+#### 5. Token Usage
+
+**Method:** `CalculateTokenUsage(transcriptData []byte, fromOffset int) (*agent.TokenUsage, error)` — `transcript.go:305–328`
+
+**Signature:**
+```go
+func (a *OpenCodeAgent) CalculateTokenUsage(transcriptData []byte, fromOffset int) (*agent.TokenUsage, error)
+```
+
+**Semantics:**
+- `fromOffset` is a **message index** (integer position in the messages array)
+- Iterates from `fromOffset` to end of messages
+- Counts only `roleAssistant` (assistant) messages with non-nil `Tokens` field
+- Returns `*agent.TokenUsage` with:
+  - `APICallCount`: number of assistant messages processed
+  - `InputTokens`: sum of `msg.Info.Tokens.Input`
+  - `OutputTokens`: sum of `msg.Info.Tokens.Output`
+  - `CacheReadTokens`: sum of `msg.Info.Tokens.Cache.Read`
+  - `CacheCreationTokens`: sum of `msg.Info.Tokens.Cache.Write`
+
+**Token Data Structure:** `Tokens` — `types.go:70–81`
+```go
+type Tokens struct {
+	Input     int   `json:"input"`
+	Output    int   `json:"output"`
+	Reasoning int   `json:"reasoning"`
+	Cache     Cache `json:"cache"`
+}
+
+type Cache struct {
+	Read  int `json:"read"`
+	Write int `json:"write"`
+}
+```
+
+**Interface Implementation:** `TokenCalculator` — `transcript.go:15–19`
+```go
+var (
+	_ agent.TranscriptAnalyzer = (*OpenCodeAgent)(nil)
+	_ agent.TranscriptPreparer = (*OpenCodeAgent)(nil)
+	_ agent.PromptExtractor    = (*OpenCodeAgent)(nil)
+	_ agent.TokenCalculator    = (*OpenCodeAgent)(nil)
+)
+```
+
+---
+
+#### 6. Subagents
+
+**No subagent support.** OpenCode does not implement `SubagentAwareExtractor` interface. Token usage and file extraction are single-agent only.
+
+---
+
+## SHARED TRANSCRIPT UTILITIES
+
+**Location:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/transcript/`
+
+**Core Types** (`types.go:19–62`):
+- `Line` — represents a single JSONL line (used by Claude Code &amp; Cursor, NOT Gemini/OpenCode)
+- `UserMessage`, `AssistantMessage`, `ContentBlock` — Claude/Cursor message structures
+- NOT applicable to Gemini CLI or OpenCode (both use single JSON documents, not JSONL)
+
+**Helper Functions** (`parse.go`):
+- `ExtractUserContent` — NOT used by Gemini/OpenCode
+- `SliceFromLine` — for JSONL format, NOT applicable
+
+**Agent-Specific Helpers (IN each agent's package, not shared):**
+- Gemini CLI: `SliceFromMessage()` — `geminicli/transcript.go:309–332` — scopes by message index
+- OpenCode: `SliceFromMessage()` — `opencode/transcript.go:49–76` — scopes by message index
+- Both have identical semantics but separate implementations (format-specific)
+
+---
+
+## KEY INTERFACE IMPLEMENTATIONS SUMMARY
+
+| Interface | Gemini CLI | OpenCode | Notes |
+|-----------|-----------|----------|-------|
+| `Agent` | ✓ | ✓ | Core interface |
+| `HookSupport` | ✓ | ✓ | Both install/parse hooks |
+| `TranscriptAnalyzer` | ✓ | ✓ | Position &amp; file extraction |
+| `TokenCalculator` | ✓ (lifecycle.go:111) | ✓ (transcript.go:305) | fromOffset = message index |
+| `PromptExtractor` | ✗ | ✓ (transcript.go:286) | Only OpenCode implements |
+| `TranscriptPreparer` | ✗ | ✓ (lifecycle.go:146) | Only OpenCode; calls `opencode export` |
+| `ModelExtractor` | ✗ | ✗ | Neither; both use hook events |
+| `SubagentAwareExtractor` | ✗ | ✗ | Neither supports subagents |
+| `ContextInjector` | ✓ (lifecycle.go:46) | ✓ (lifecycle.go:28) | Both inject at TurnStart |
+
+---
+
+## TURN EXTRACTION FOR IMPORTERS
+
+**Gemini CLI:** User turn = message with `type == "user"`. Access content via `message.Content` string.
+
+**OpenCode:** User turn = message with `info.role == "user"`. Extract text via `ExtractTextFromParts(msg.Parts)` helper.
+
+Both use **message index** as offset (0-based position in message array), not line numbers.</result>
+<usage><subagent_tokens>64151</subagent_tokens><tool_uses>31</tool_uses><duration_ms>82922</duration_ms></usage>
+</task-notification>
+
+---
+
+I don't think we should refactor anything, and i don't understand why these imported sessions would need to be handled any differently than sessions following `entire enable`
+
+---
+
+explain how the import command supports the additional agents (the command / required params etc)

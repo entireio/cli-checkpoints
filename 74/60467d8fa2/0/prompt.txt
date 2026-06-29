@@ -1,0 +1,64 @@
+Spec 1 — Enrich --json session summary (highest value)
+
+Goal: --json should expose the full persisted summary, not a 2-field subset. Prose output renders Friction etc. (explain.go:1892) but --json silently drops them, so scripts/dashboards can't see them.
+
+Evidence: checkpointSessionSummary (explain_export.go:343-346) has only Intent/Outcome. sessionMetadataToJSON (:467-472) copies only those two. But meta.Summary is apicheckpoint.Summary = {Intent, Outcome, Learnings LearningsSummary, Friction []string, OpenItems []string} — already fully loaded in meta.
+
+Change:
+- Extend checkpointSessionSummary (explain_export.go:343) with Learnings, Friction, OpenItems (mirror the upstream json tags: learnings, friction, open_items, all omitempty). For Learnings, add a nested struct matching LearningsSummary (repo/workflow/code).
+- In sessionMetadataToJSON (:467), populate the new fields from meta.Summary.
+
+Edge cases: all omitempty so empty summaries stay clean; redaction already applied upstream (RedactSummary, persistent.go:940) so no new privacy surface.
+
+Tests: explain_export_test.go — extend the existing buildCheckpointJSONEnvelope/sessionMetadataToJSON cases with a summary carrying friction/open_items/learnings; assert they serialize. (No store needed — sessionMetadataToJSON is pure.)
+
+Effort: S · Impact: Med–High · Out of scope: provider/model/generated_at (not persisted).
+
+---
+Spec 2 — Truncation visibility for the list view
+
+Goal: Don't silently hide checkpoints. Two gaps:
+
+1. Prose branch list silently caps at 100 with no note. runExplainBranchWithFilter calls getBranchCheckpoints(ctx, repo, branchCheckpointsLimit) (explain.go:2372, const = 100 at :1945) → formatBranchCheckpoints → no truncation indication anywhere. It also ignores --limit (flag help at :427 says "Only meaningful with --json").
+2. JSON note overpromises clarity but is fine; just align wording. explain_export.go:556-558 already notes truncation by probing limit+1.
+
+Change:
+- In runExplainBranchWithFilter (explain.go:~2372): probe branchCheckpointsLimit+1, detect len > limit, slice to limit, and after outputExplainContent print to stderr: note: showing first 100 checkpoints; pass --json --limit <N> for more. Match the JSON path's pattern (explain_export.go:511-525,556).
+- Keep the JSON note (:557) as-is or reword to showing first N (more exist); rerun with --limit <N>.
+
+Honesty constraint: the limit+1 probe only proves "≥1 more exists" — do not claim an exact remaining count (would require listing everything). Word it as "more exist," not "347 more."
+
+Tests: integration test asserting the stderr note appears when >100 checkpoints exist (or unit-test a small extracted helper with an injected lister).
+
+Effort: S · Impact: Low–Med.
+
+---
+Spec 3 — Reject --generate on imported checkpoints before the expensive load
+
+Goal: Fail fast without fetching transcript blobs for a guaranteed rejection.
+
+Evidence: Currently the imported guard (explain.go:685-688) runs after loadCheckpointForExplain (:678) has already read session content (transcript bytes). summary.Imported only needs the metadata, not the content.
+
+Change: Before the full load at :678, when generate is set, do a metadata-only read of the checkpoint summary (e.g. checkpoint.ReadCheckpoint like runExplainCheckpointJSON does at explain_export.go:362) and return the existing "imported history is read-only" error if summary.Imported. Then proceed to the existing load for the non-imported path.
+
+Caveat — be honest about payoff: this saves the transcript fetch only on the imported---generate path, which is rare. It's correctness-neutral polish, not a hot path. Consider it only if touching this area anyway.
+
+Tests: existing imported-checkpoint test should still pass; add one asserting no content read occurs (or just that the error is returned) for imported + --generate.
+
+Effort: XS · Impact: Low.
+
+---
+Spec 4 — Clearer no-trailer message
+
+Goal: Make entire explain <commit> on a non-Entire commit unambiguous.
+
+Evidence: printNoTrailerMessage (explain.go:120-129) renders hint "this commit was not created during an Entire session, / or the trailer was removed". It's decent but doesn't tell the user the commit was found (vs. "commit not found").
+
+Change: Adjust the rows (:122-126) so the distinction is explicit, e.g. keep reason: no Entire-Checkpoint trailer and change the hint to the commit exists but was not created during an Entire session (or its trailer was removed). Pure string change in []explainRow.
+
+Tests: if there's a golden/snapshot test for this block, update it; otherwise none needed (cosmetic).
+
+Effort: XS · Impact: Low.
+
+---
+Recommended order: Spec 1 (real value), then Spec 2 (visible correctness gap), then 3–4 as polish.

@@ -1,0 +1,57 @@
+Spec 1 — Warn on a transcript that parses to nothing (highest value)
+
+Goal: Don't silently produce a contentless checkpoint. extractTranscriptMetadata (attach_transcript.go:20-56) can return an all-zero meta (no user turns, no first prompt, no model). Attach then proceeds: attachPrompts returns nil (:194-199), attachStepCount floors the count to 1 (:187-189), and the checkpoint is written and reported as success (:380-393) with no prompt/title.
+
+Change: After meta := extractTranscriptMetadata(transcriptData) (attach.go:288), if meta.FirstPrompt == "" && meta.TurnCount == 0, emit a warning to stderr (cmd.ErrOrStderr(), threaded in — not stdout) like: warning: no user prompts were parsed from this transcript; the checkpoint will have no recorded prompt. Verify the --agent value (got %q) and session ID. Then continue (still write the checkpoint).
+
+Critical constraint — must be a warning, not a hard error. extractTranscriptMetadata only understands generic JSONL + Gemini JSON. Agents whose user-content shape isn't matched by transcript.ExtractUserContent (codex/copilot/pi/factory formats) can legitimately yield an empty meta while the transcript is valid and agent.CalculateTokenUsage (:342, agent-specific) still works. A hard failure would regress attach for those agents. Warn only.
+
+--review note: when opts.Review and the prompt is empty, reviewPromptForAttach (:604-609) records an empty review prompt — call that out specifically in the warning when opts.Review is set, since the review prompt is the point of --review.
+
+Plumbing: runAttach currently takes only w io.Writer (stdout). Add an errW io.Writer param (or pass cmd.ErrOrStderr() through runAttachSurfaceReviewErrors/runAttach) so the warning lands on stderr, not interleaved with the success lines on stdout.
+
+Tests: add to attach_test.go — a transcript that extracts to empty produces the warning on stderr and still writes the checkpoint (assert both). Use testutil.InitRepo per the git-isolation rule.
+
+Effort: S · Impact: High.
+
+---
+Spec 2 — Post-attach summary footer
+
+Goal: Confirm what was captured. Today success prints only Attached session X + Created/Added … checkpoint Y (:380-386); entire session info shows richer stats but attach gives none.
+
+Change: In runAttach, after the Attached session %s line (:380) on the real-attach path, print a one-line summary from data already in scope: meta.TurnCount (turns), meta.Model (model), and tokenUsage (*agent.TokenUsage, :342). Example:   Captured: 12 turns · claude-opus-4-8 · 1.3k tokens. Guard each field: skip turns if 0, skip model if empty, skip tokens if tokenUsage == nil.
+
+Scope note: only the actual-attach path (reaches :380) has meta. The "session already has checkpoint" early return (:237-256) runs before meta is computed — leave it as-is (no footer there).
+
+Tests: extend the existing happy-path attach test to assert the footer renders with turns/model; add a case with tokenUsage == nil to confirm the token segment is omitted.
+
+Effort: S · Impact: Med.
+
+---
+Spec 3 — Surface the amend-failure reason to the user
+
+Goal: When --amend fails, tell the user why on screen. Currently promptAmendCommit returns the wrapped git error (:771), but the caller logs it via logging.Warn (:389, :252) — which writes to .entire/logs/, not the terminal (attach calls logging.Init at :203). The user sees the fallback trailer (:390) but no indication the amend was attempted and failed.
+
+Change: At the two call sites (:388-391 and :251-254), in addition to the existing logging.Warn, print a brief stderr note before the fallback trailer: Could not amend the commit automatically (%v). Keep the full error in the log; keep the existing "Copy to your commit message…" fallback. Use the errW writer added in Spec 1.
+
+Caveat — honest payoff: the recovery path already works (the trailer is printed and attach returns nil). This only improves diagnosability; it's polish, not a correctness fix. Bundle it with Spec 1 since both need the stderr writer.
+
+Tests: there's currently no test for the amend-decline / amend-fail branches (:757-764, :769-772). Add one for the decline path (assert the fallback trailer prints) and, if feasible with a stubbed git, the fail path.
+
+Effort: S (with Spec 1's plumbing) · Impact: Low.
+
+---
+Spec 4 — Help-text accuracy (doc-only)
+
+Goal: Two true behaviors aren't documented.
+
+Changes:
+1. --force flag help (:145) — append that the amend is best-effort: …amend the last commit (best-effort; if the amend fails the checkpoint is still created and the trailer is printed for manual paste). (matches :388-391).
+2. Long help (:84-99) — add a sentence: If --agent doesn't locate a transcript, Entire auto-detects the agent from the transcript and prints the detected agent name. (matches :645-654).
+
+Tests: none (cosmetic). Optionally a golden-help assertion if one exists.
+
+Effort: XS · Impact: Low–Med (reduces "transcript not found" dead-ends).
+
+---
+Recommended order: Spec 1 (real value) bundled with Spec 3 (shared stderr plumbing), then Spec 2, then Spec 4. Specs 1+2+4 are the ones worth doing on their own merits.

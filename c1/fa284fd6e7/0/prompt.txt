@@ -1,0 +1,268 @@
+Don't do any of these
+
+---
+
+/pfleidi:review
+
+---
+
+<task-notification>
+<task-id>aca7e09514738e4b3</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-checkpoint-policy-telemetry/59674bd8-9edc-47fc-adae-9e93955ab9af/tasks/aca7e09514738e4b3.output</output-file>
+<status>completed</status>
+<summary>Agent "Security review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>All six emit sites in the `cli` package route through `emitCheckpointPolicyBlocked`, which enforces the `settings.Telemetry == true` opt-in before calling `TrackCheckpointPolicyBlocked`. The exported `TrackCheckpointPolicyBlocked` itself does not check `settings.Telemetry` (only `ENTIRE_TELEMETRY_OPTOUT`), but that mirrors the existing tracker pattern in this package and the only production callers are gated. The opt-out env var is also honored at the tracker level as a defense-in-depth backstop.
+
+I've confirmed everything needed. The review is clean.
+
+## Security review: checkpoint_policy_blocked telemetry — CLEAN
+
+No confirmed findings. Details on the threats reviewed:
+
+**Secrets / credential leakage** — None. `distinct_id` is a hashed machine ID (`machineid.ProtectedID`). Properties carry only operational metadata; no tokens, env, or auth material reaches the payload.
+
+**User-content / PII logging** — None. The only non-constant property values are:
+- `agent` — a bounded `types.AgentName` enum value (e.g. `claude-code`).
+- `hook` / `hook_type` / `reason` / `outcome` — all hardcoded string literals (`newGitHookContext` callers pass fixed names; `agentWriteHookLabel` returns one of three fixed labels at `hook_registry.go:297`).
+- `checkpoint_version` / `checkpoint_min_version` — admin-set policy version strings, operational metadata by design.
+
+No prompts, file contents, commit messages, file paths, branch names, or repo identifiers are included. The `policy` read error is logged via `logging.Warn` (existing behavior, not telemetry) and never placed into the payload.
+
+**Injection via property values** — Not exploitable. The payload is `json.Marshal`-ed (`checkpoint_policy.go:86`) and passed as a single argv element to `exec.CommandContext(executable, "__send_analytics", payloadJSON)` (`detached_unix.go:22`) — no shell, no interpolation. Even an adversarial admin-set version string is JSON-escaped data, never executed, and lands in PostHog as a property value.
+
+**Opt-in / opt-out gating** — Sound. All six production emit sites (`hook_registry.go`, `hooks_git_cmd.go`) route through `emitCheckpointPolicyBlocked` (`checkpoint_policy_telemetry.go:13`), which returns early unless `s.Telemetry != nil &amp;&amp; *s.Telemetry`. A settings-load failure suppresses the event (fail-closed). `TrackCheckpointPolicyBlocked` additionally honors `ENTIRE_TELEMETRY_OPTOUT` as a backstop (`checkpoint_policy.go:77`). The exported tracker does not itself re-check `settings.Telemetry`, but that matches the package's established pattern and has no unguarded production caller — not a bypass.
+
+**Reachability note:** All `hookName` values feeding the `hook` property are compile-time literals; `agentName` is a typed enum. There is no path by which user-controlled free text reaches a telemetry property.
+
+Relevant files:
+- `/Users/pfleidi/entire/cli/.worktrees/checkpoint-policy-telemetry/cmd/entire/cli/telemetry/checkpoint_policy.go`
+- `/Users/pfleidi/entire/cli/.worktrees/checkpoint-policy-telemetry/cmd/entire/cli/checkpoint_policy_telemetry.go`
+- `/Users/pfleidi/entire/cli/.worktrees/checkpoint-policy-telemetry/cmd/entire/cli/hook_registry.go`
+- `/Users/pfleidi/entire/cli/.worktrees/checkpoint-policy-telemetry/cmd/entire/cli/hooks_git_cmd.go`</result>
+<usage><subagent_tokens>59671</subagent_tokens><tool_uses>10</tool_uses><duration_ms>56548</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ac6a919bd3041eed7</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-checkpoint-policy-telemetry/59674bd8-9edc-47fc-adae-9e93955ab9af/tasks/ac6a919bd3041eed7.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>This confirms the two "read failed" branches were already a duplicated pair (logging.Warn + Fprintf, identical). The branch's change extends that existing duplication by adding an identical `emitCheckpointPolicyBlocked` block to each. The duplication predates this branch and follows the existing local style. Flagging it would be an unrelated refactor of pre-existing code.
+
+Now let me assess the core question the prompt asks: should the new telemetry functions reuse `detached.go` structure?
+
+Comparing `BuildCheckpointPolicyBlockedPayload`/`TrackCheckpointPolicyBlocked` against `BuildEventPayload`/`TrackCommandDetached` and `BuildPluginEventPayload`/`TrackPluginDetached`: the new pair mirrors the established Build*/Track* pattern exactly — each event type already has its own Build/Track pair in detached.go. The new one fits that pattern rather than introducing a new abstraction. Sharing further (e.g. a generic builder) would not match how the existing three coexist. This is consistent, not duplicative.
+
+Now the comments. Per the user's strong "comments default to zero / no WHAT comments" rules, let me scrutinize the new comments.
+
+- `checkpoint_policy.go` line 12 `// Property values for the checkpoint_policy_blocked event.` — labels a const block; mild but factual/helpful.
+- Lines 24-26, 37-38, 72-75 — doc comments on exported symbols stating contract (omitted-when-empty, returns nil, gating responsibility). These are caller-oriented and non-obvious. Acceptable per the rules.
+- `checkpoint_policy_telemetry.go` 10-12 — exported-ish helper doc, states the gating contract. Acceptable.
+
+No clear WHAT-narration comment to flag.
+
+Let me double check `agentWriteHookLabel` for dead branches against `hookWritesCheckpointData`.
+
+`hookWritesCheckpointData` returns true for `claudePostTodoCheckpointHook`, `TurnEnd`, or `SubagentEnd`. So when `agentWriteHookLabel` is reached (only inside that branch), the `default` arm correctly maps `TurnEnd` to "turn-end". All three arms reachable. No dead code.
+
+Let me verify there's no unused exported symbol — `BuildCheckpointPolicyBlockedPayload` is used by tests, `TrackCheckpointPolicyBlocked` by the helper. The const values are all used across git/agent sites. No dead code.
+
+One more: confirm `emitCheckpointPolicyBlocked` gates on `settings.Telemetry` while `TrackCheckpointPolicyBlocked` also checks `ENTIRE_TELEMETRY_OPTOUT` — consistent with the other trackers (each Track* checks OPTOUT; the command path gates on settings elsewhere). No redundant double-work issue.
+
+## Review findings
+
+Scope reviewed against `origin/main...HEAD` (merge-base): the five in-scope files plus `telemetry/detached.go` for reuse comparison and `hook_registry.go` call sites.
+
+**No confirmed findings. The branch is clean on simplification/efficiency grounds.**
+
+Details on the specific things flagged for review in the prompt:
+
+- **Reuse of detached.go helpers** — `BuildCheckpointPolicyBlockedPayload`/`TrackCheckpointPolicyBlocked` correctly mirror the *existing* per-event Build/Track pattern already established by `BuildEventPayload`/`TrackCommandDetached` and `BuildPluginEventPayload`/`TrackPluginDetached`. Each event type in `detached.go` already has its own dedicated pair; the new pair fits that convention rather than inventing a new abstraction. Forcing a shared generic builder would diverge from the established structure. Not a finding.
+
+- **Repeated `emitCheckpointPolicyBlocked` event-struct literals** — Acceptable. The two git-side "unreadable" literals (`hooks_git_cmd.go:79` and `:96`) are identical, but they sit in a pre-existing duplicated error-branch pair: `origin/main` already duplicated the `logging.Warn` + `Fprintf` between those same two branches. The telemetry block just extends that existing local pattern. The 4 agent-side literals (`hook_registry.go`) genuinely differ by `Outcome` (skipped vs blocked) and by reason/version fields, so they are not copy-paste-with-variation worth extracting. Collapsing any of these would be an unrelated refactor of code outside this change's intent.
+
+- **`agentWriteHookLabel` (`hook_registry.go:297`)** — No dead branches. All three arms (post-todo / subagent-end / turn-end) are reachable given `hookWritesCheckpointData`'s gating. Maps labels correctly.
+
+- **Comments** — The new comments are all exported-symbol doc blocks stating non-obvious caller contracts (omitted-when-empty fields, nil-on-failure, caller-owns-the-opt-in-gate) plus one factual const-block label. None are WHAT-narration of control flow. Within the project's comment rules.
+
+- **Dead code / redundant work** — None. All new exported symbols and constants have live callers (helper + tests + 7 emit sites). Opt-out/gating layering matches the other trackers; no double-gating bug.
+
+No code changes recommended.</result>
+<usage><subagent_tokens>68779</subagent_tokens><tool_uses>9</tool_uses><duration_ms>55149</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aa309f171bb077401</task-id>
+<tool-use-id>toolu_01Mdc9wap9UXZYNKwmtwKe4S</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-checkpoint-policy-telemetry/59674bd8-9edc-47fc-adae-9e93955ab9af/tasks/aa309f171bb077401.output</output-file>
+<status>completed</status>
+<summary>Agent "Readability &amp; Go idioms review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have a full picture. The code is clean and well-factored. Let me finalize my assessment against the specific questions asked.
+
+## Review: `checkpoint_policy_blocked` telemetry
+
+Scope confirmed via `git diff origin/main...HEAD` (5 files, +247/-4). Overall the change is clean, idiomatic, and well-tested. I have no Required findings. Below are the specific assessments you asked for, plus one minor Improvement.
+
+### (a) Raw string hook labels vs typed constants
+The labels `"session-start"`, `"turn-end"`, `"subagent-end"`, `"post-todo"`, and git's `g.hookName` are **fine as raw strings**, and notably *more* consistent than turning them into constants would be.
+
+- Git side already passes a free-form `g.hookName` string (e.g. `"post-commit"`), so git labels are inherently dynamic — you couldn't constant-ize them without an enum that mirrors hook registration. The agent-side labels live next to that, so raw strings keep both sides uniform.
+- These are leaf telemetry property *values*, written once each at a single call site (agent labels only flow through `agentWriteHookLabel` / the two `"session-start"` literals). The `PolicyBlocked*` constants exist because `HookType`/`Reason`/`Outcome` are each reused across 5+ call sites and a typo would silently split an analytics dimension — that risk doesn't apply to labels emitted from one place.
+- No clear winner, so per philosophy I'm not flagging it.
+
+### (b) `agentWriteHookLabel` switch
+Reads well. The `claudePostTodoCheckpointHook` case correctly precedes the `eventType` cases (post-todo is a TurnEnd variant, so order matters), and `default: "turn-end"` mirrors `hookWritesCheckpointData`'s `TurnEnd || SubagentEnd` shape. Clear.
+
+### (c) Repeated event-struct literals at call sites
+Acceptable. Each literal differs in a meaningful field (`Reason`/`Outcome`/version presence), so they read as intentional records rather than copy-paste. Extracting a builder would hide which dimension each site reports and add indirection for no real saving.
+
+### (d) `rejectUnsupportedCheckpointWritePolicy(ctx, errW, agentName, hook, worktreeRoot)` signature
+Param order reads acceptably and matches the sibling `shouldSkipSessionStartForPolicy(ctx, errW, agentName, ag, worktreeRoot)` — context first, output writer, identity, then the path. No confusion; `hook` and `worktreeRoot` are both strings but distinct enough by name. Not a finding.
+
+### Improvement (not Required)
+**`cmd/entire/cli/hooks_git_cmd.go:79-84` and `:96-101`** — Improvement. The two "unreadable" emit blocks are byte-identical (same four fields, same `g.hookName`), sitting in the same function ~12 lines apart. A tiny method like `g.emitPolicyUnreadable()` would collapse both and guarantee they can't drift (e.g., if someone later adds a field to one but not the other). One-line fix: extract `func (g *gitHookContext) emitPolicyUnreadable() { emitCheckpointPolicyBlocked(g.ctx, telemetry.CheckpointPolicyBlockedEvent{Hook: g.hookName, HookType: ..Git, Reason: ..Unreadable, Outcome: ..Skipped}) }` and call it from both branches. Low value given the blocks are 4 trivial fields; mention only because the two are guaranteed-identical by intent, not coincidence.
+
+**Note:** the same two-fields-identical pattern exists on the agent side (`shouldSkipSessionStartForPolicy` and `rejectUnsupportedCheckpointWritePolicy` each have an unreadable + unsupported emit), but those differ in `Outcome` (`Skipped` vs `Blocked`) and `Hook`, so they are *not* dedup candidates — leave them.
+
+Everything else (the optional-field omission logic, `BuildCheckpointPolicyBlockedPayload` returning `nil` on machine-ID failure, the opt-in gate in `emitCheckpointPolicyBlocked`, test coverage of both git-no-agent and agent-with-versions-omitted paths) is clear and correct.</result>
+<usage><subagent_tokens>57841</subagent_tokens><tool_uses>8</tool_uses><duration_ms>48534</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a749ab587cb28e2f6</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-checkpoint-policy-telemetry/59674bd8-9edc-47fc-adae-9e93955ab9af/tasks/a749ab587cb28e2f6.output</output-file>
+<status>completed</status>
+<summary>Agent "Correctness review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Build and tests pass. Let me do a final check on whether the agent write-hook path and session-start path could double-emit, and confirm there's no missing emit at the post-todo dispatch (line 202). The post-todo write is gated by `rejectUnsupportedCheckpointWritePolicy` at line 191-196 (since `hookWritesCheckpointData` returns true for post-todo), so the gate emits before dispatch. No second gate at line 202. Correct — single emit per gate.
+
+Let me verify there are no other policy gate/skip return paths in the agent hook flow that were missed (e.g., `shouldSkipForwardedHook` is not a policy gate, so correctly no emit there).
+
+The review is complete. Here are my findings.
+
+## Review: checkpoint_policy_blocked telemetry
+
+**Result: clean.** No confirmed defects. Build passes, unit tests pass.
+
+### Verified correct
+
+- **Reason/outcome/hook-label mapping** — All call sites map correctly:
+  - Git hook (`hooks_git_cmd.go`): all three skip paths emit `hook_type=git`, `outcome=skipped`; two unreadable paths → `policy_unreadable` (versions omitted), one unsupported path → `policy_unsupported` (versions included). The `CanSatisfyPolicy` success path (line 106-108) correctly emits nothing.
+  - Agent session-start: `outcome=skipped`; unreadable vs unsupported branches correct.
+  - Agent write hooks: `outcome=blocked`; correct reason split.
+
+- **`agentWriteHookLabel` switch** (hook_registry.go:297) — Correct. It is only reached when `hookWritesCheckpointData` returns true, so eventType ∈ {TurnEnd, SubagentEnd, post-todo-case}. Priority order matches `hookWritesCheckpointData`: post-todo checked first (where eventType is 0, so the early case is required and correct), then `SubagentEnd` → `subagent-end`, default → `turn-end`. No misclassification.
+
+- **Every skip/reject return path emits.** Git: all 3 `return true` paths. Agent: both `shouldSkipSessionStartForPolicy` early returns and both `rejectUnsupportedCheckpointWritePolicy` early returns. The post-todo dispatch (line 202) is gated through `rejectUnsupportedCheckpointWritePolicy` at line 191 (since `hookWritesCheckpointData` returns true for post-todo), so it emits once at the gate — no double-emit, no missed path. `shouldSkipForwardedHook` is not a policy gate, correctly silent.
+
+- **Settings-load-failure suppression** (checkpoint_policy_telemetry.go:15) — `err != nil || s.Telemetry == nil || !*s.Telemetry` correctly suppresses on load error and nil/false opt-in. Matches the established pattern in `plugin.go:66`. The double gate (settings opt-in at CLI layer + `ENTIRE_TELEMETRY_OPTOUT` inside tracker) mirrors `TrackPluginDetached`/`TrackCommandDetached`.
+
+- **Nil handling** — `BuildCheckpointPolicyBlockedPayload` returns nil on machine-ID failure; `TrackCheckpointPolicyBlocked` checks for nil before marshaling. JSON marshal error is silently swallowed, which is consistent with best-effort telemetry intent.
+
+- **No test seams** — No mutable globals, function-var seams, or test-only reset hooks introduced. `BuildCheckpointPolicyBlockedPayload` is exported as a pure function for testing (documented), which is a legitimate seam, not a production hook.
+
+- **No parameter sprawl / redundant state** — The signature additions (`agentName`, `hook`/`writeHook`) thread genuinely-needed identity data through; no unused fields.
+
+### Test coverage note (Improvement, not blocking)
+
+The two unit tests assert meaningful behavior: the unsupported test verifies all properties including version fields and that `agent` is absent for git hooks; the unreadable test verifies versions are omitted and `agent` is present. Both are real assertions, not smoke tests. Gaps left untested (acceptable for this change's scope): the `agentWriteHookLabel` switch and the CLI-layer opt-in gate (`emitCheckpointPolicyBlocked`) have no direct unit coverage. The label function is small and pure; a 3-case table test would be cheap insurance, but its absence is not a correctness defect.
+
+Relevant files:
+- /Users/pfleidi/entire/cli/.worktrees/checkpoint-policy-telemetry/cmd/entire/cli/telemetry/checkpoint_policy.go
+- /Users/pfleidi/entire/cli/.worktrees/checkpoint-policy-telemetry/cmd/entire/cli/checkpoint_policy_telemetry.go
+- /Users/pfleidi/entire/cli/.worktrees/checkpoint-policy-telemetry/cmd/entire/cli/hook_registry.go
+- /Users/pfleidi/entire/cli/.worktrees/checkpoint-policy-telemetry/cmd/entire/cli/hooks_git_cmd.go</result>
+<usage><subagent_tokens>65540</subagent_tokens><tool_uses>15</tool_uses><duration_ms>428049</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a400a4409b4c0fe39</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-checkpoint-policy-telemetry/59674bd8-9edc-47fc-adae-9e93955ab9af/tasks/a400a4409b4c0fe39.output</output-file>
+<status>completed</status>
+<summary>Agent "Clean Go &amp; modern Go review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>The two unreadable-reason blocks in `skipUnsupportedCheckpointPolicy` are byte-identical (same warn log + interactive print + emit). They sit in adjacent error arms of the same function. This is genuine duplication of the full handle-unreadable sequence (3 lines of log/print already duplicated pre-branch, now plus a 6-line emit). It's a small local consolidation opportunity, not a correctness problem — Improvement.
+
+I have a complete picture. The review is essentially clean with two minor improvement notes.
+
+## Clean Go Review — `checkpoint_policy_blocked` telemetry
+
+Target Go version: **1.26.4** (from `go.mod`). No version-specific modernizations apply to this diff.
+
+The changes faithfully mirror the existing `detached.go` idiom: `Build*` pure builder returning `*EventPayload`, `Track*` spawning the detached subprocess, `machineid` nil-guard, `ENTIRE_TELEMETRY_OPTOUT` check, and `map[string]any` properties. Using `map[string]any` is the correct call here — it matches every other payload builder in the package; a typed payload would be the inconsistent choice. Constants are used for the enum-like fields (`hook_type`, `reason`, `outcome`); the `hook` field correctly stays a plain string since hook names aren't an enum elsewhere. The CLI helper gates on `settings.Telemetry == true` and is best-effort. Error handling, pointers, and abstraction levels are all sound.
+
+### Required
+
+None.
+
+### Improvements (follow-up)
+
+| # | Severity | Location | Classification | Issue | Impact |
+|---|----------|----------|----------------|-------|--------|
+| 1 | Low | `cmd/entire/cli/hooks_git_cmd.go:74-85`, `:90-101` | Improvement | The two unreadable-policy arms in `skipUnsupportedCheckpointPolicy` are byte-identical (warn log + interactive print + `emitCheckpointPolicyBlocked`). | Duplicated handling drifts if one arm is edited; a small `g.skipUnreadablePolicy(err)` helper returning `true` would collapse both. |
+| 2 | Low | `cmd/entire/cli/hook_registry.go:297-306` | Improvement | `agentWriteHookLabel` is pure mapping logic feeding an observable telemetry property but has no test. | A cheap table test would lock the `post-todo`/`subagent-end`/`turn-end` mapping; low risk as-is. |
+
+Details:
+
+| # | Evidence | Suggested fix | Trade-offs |
+|---|----------|---------------|------------|
+| 1 | Lines 74-85 and 90-101 differ only in the warn-log call already present; the interactive-print string and the full `CheckpointPolicyBlockedEvent{...}` emit are identical. | Extract a private method on `gitHookContext` (e.g. `emitUnreadableAndSkip(err error) bool`) covering the print + emit, called from both arms. | Minor — keeps the two distinct warn-log messages at the call sites. |
+| 2 | No `*_test.go` references `agentWriteHookLabel`; the pure builder is tested but this mapping isn't. | Add a small table test asserting the three branches. | None. |
+
+Two Improvement findings, both low severity and optional. No Required findings — nothing to autofix. The branch is clean from a Clean Go standpoint.</result>
+<usage><subagent_tokens>68846</subagent_tokens><tool_uses>11</tool_uses><duration_ms>415981</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ab59019d4fd185eac</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-checkpoint-policy-telemetry/59674bd8-9edc-47fc-adae-9e93955ab9af/tasks/ab59019d4fd185eac.output</output-file>
+<status>completed</status>
+<summary>Agent "Second-pass coverage sweep" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Build clean. Let me also quickly confirm the agent path can't double-fire: is there any chance both the SessionStart branch and the write branch run? No — it's `if eventType == agent.SessionStart {...} else if hookWritesCheckpointData(...) {...}`, mutually exclusive. And `event != nil` SessionStart vs `claudePostTodoCheckpointHook` (event == nil) are also mutually exclusive. Single emit per invocation confirmed across all paths.
+
+One last item: the per-commit multi-emit. A git commit triggers prepare-commit-msg, commit-msg, and post-commit as separate processes — each emits its own `checkpoint_policy_blocked` event with a distinct `hook` value. That means a single blocked commit produces 3 events. This is consistent with how the gate is wired (each hook independently skips its work) and the `hook` property distinguishes them, so it's intended fan-out rather than a double-emit bug. Noting it as an observation for whoever queries the data, not a finding.
+
+## Review complete — second-pass coverage sweep
+
+I independently re-analyzed all in-scope files across security, correctness, tests, simplification, readability, and Go cleanliness. Build passes (`go build ./cmd/entire/cli/...`). No Critical/High/Required findings.
+
+**Emit-once verification (clean):**
+- Agent hook (`hook_registry.go`): the `SessionStart` / `hookWritesCheckpointData` branches are mutually exclusive (`if/else if`), and each gate function (`shouldSkipSessionStartForPolicy`, `rejectUnsupportedCheckpointWritePolicy`) emits exactly once per blocked path, then returns. No double-emit, no emit on the satisfiable path (the `return false, nil` / final `return nil` paths emit nothing).
+- Git hook (`hooks_git_cmd.go`): `skipUnsupportedCheckpointPolicy` emits at exactly one of its three blocked returns; the satisfiable path (`CanSatisfyPolicy` true) emits nothing. Each of the 4 callers invokes the gate once per hook process.
+- `agentWriteHookLabel` correctly mirrors `hookWritesCheckpointData`'s branch priority (post-todo → subagent-end → turn-end default), so the `hook` property always matches the gate that fired.
+
+**Gating (clean):** `emitCheckpointPolicyBlocked` uses `s.Telemetry == nil || !*s.Telemetry` — identical `*bool` opt-in semantics to the existing `TrackCommandDetached` gate in `root.go:63`. `LoadEntireSettings` never returns `(nil, nil)`, so the `s.Telemetry` deref is safe. Settings-load failure suppresses the event. `ENTIRE_TELEMETRY_OPTOUT` is also honored inside `TrackCheckpointPolicyBlocked`. No user content reaches properties — only enum-ish labels, version strings, agent name, OS/arch.
+
+**No import cycle / new dependency:** `telemetry` does not import `cli`; `checkpoint_policy.go` reuses `machineid` (already a dep).
+
+### Findings
+
+**Low / Improvement — `cmd/entire/cli/hook_registry.go:297` `agentWriteHookLabel` is untested.** It's a pure three-branch function whose output becomes the telemetry `hook` property; a wrong branch would silently mislabel events. The payload builder has good tests, but this helper does not. Fix: add a small table test asserting the label for each of `claudePostTodoCheckpointHook=true`, `SubagentEnd`, and `TurnEnd`. (The gate wiring itself is reasonably left untested — testing it would require a production seam around the detached spawn, which the project's testing guidance discourages.)
+
+### Observation (not a finding)
+A single blocked git commit fires three separate hook processes (prepare-commit-msg, commit-msg, post-commit), so it produces three `checkpoint_policy_blocked` events distinguished by the `hook` property. This is intended fan-out given how the gate is wired per-hook, not a double-emit bug — flagging only so whoever queries PostHog expects per-hook rows rather than one-per-commit.</result>
+<usage><subagent_tokens>71033</subagent_tokens><tool_uses>18</tool_uses><duration_ms>98665</duration_ms></usage>
+</task-notification>
+
+---
+
+apply all findings

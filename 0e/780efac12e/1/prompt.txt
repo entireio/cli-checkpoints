@@ -1,0 +1,207 @@
+/simplify
+
+---
+
+<task-notification>
+<task-id>a2e0bf73cd6434ecb</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-checkpoint-policy-semver/ca710204-d8dd-479d-beea-00bd3238c261/tasks/a2e0bf73cd6434ecb.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review of diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>All findings verified against current source. No repeated I/O or startup-blocking work was introduced; the wasted work is all in the new semver round-tripping. The package-level `supportedCheckpointVersions` table is parsed once at init, which is fine.
+
+## Efficiency findings
+
+1. **`cmd/entire/cli/checkpointpolicy/policy.go:31-37` — `EffectiveCheckpointMetadataVersion` resolves, stringifies, re-parses, and re-scans.**
+   - Cost: `EffectiveCheckpointVersion` calls `resolveCheckpointVersionSelector`, which already returns the `supportedCheckpointVersion` struct *containing* `metadataVersion` — but it's discarded down to `version.String()`. Then `MetadataVersionForCheckpointVersion` (format.go:78) re-parses that string with `semver.StrictNewVersion` and linearly re-scans the table via `findSupportedCheckpointVersion` to look up the field that was already in hand. Per call: 1 redundant semver parse + 1 redundant table scan + string allocation.
+   - Cheaper: `func EffectiveCheckpointMetadataVersion(policy Policy) (string, error) { v, err := resolveCheckpointVersionSelector(Normalize(policy).CheckpointVersion, supportedCheckpointVersions); ...; return v.metadataVersion, nil }`. One resolve, zero re-parses.
+
+2. **`cmd/entire/cli/strategy/manual_commit_condensation.go:155-162` and `cmd/entire/cli/checkpoint_policy_write.go:23-26` — `CanSatisfyPolicy` followed immediately by `EffectiveCheckpointMetadataVersion` resolves the same selector twice (three times counting finding 1).**
+   - Cost: `CanSatisfyPolicy` → `ValidatePolicy` → `ResolveCheckpointVersionSelector` parses the constraint (`semver.NewConstraint`) and scans; then `EffectiveCheckpointMetadataVersion` repeats the identical parse+scan on the same policy. `CondenseSession` runs on **every user commit** (post-commit hook), so this hits a hot hook path; `checkpointVersionForNewCheckpoint` is also used by `attach`.
+   - Cheaper: drop the pre-check and branch on the error of a single `EffectiveCheckpointMetadataVersion` call — both fail on exactly the same condition (`ValidatePolicy` and `EffectiveCheckpointVersion` are the same resolve). E.g. in `checkpoint_policy_write.go`: `version, err := EffectiveCheckpointMetadataVersion(policy); if err != nil { return "", unsupportedCheckpointPolicyError(policy) }`.
+
+3. **`cmd/entire/cli/checkpointpolicy/update.go:95-106` — `rejectCheckpointVersionDowngrade` stringifies resolved versions only to `mustSemver` them back.**
+   - Cost: `ResolveCheckpointVersionSelector` internally holds a `*semver.Version`, returns its `.String()`, and then `mustSemver(before)` / `mustSemver(after)` parse both strings back into `*semver.Version` for `LessThan`. Two pointless parse round-trips per update (plus a latent panic if the API shape ever changes). Low frequency (admin command), but pure API-shape waste.
+   - Cheaper: call the internal `resolveCheckpointVersionSelector(raw, supportedCheckpointVersions)` here and compare `before.version.LessThan(after.version)` directly — no stringify, no `mustSemver`.
+
+4. **`cmd/entire/cli/checkpointpolicy/version.go:16-24` + `format.go:56-76` — `ValidateCheckpointMetadataVersion` parses the same version string twice.** (Minor)
+   - Cost: `LogicalVersionForCheckpointMetadata` does `StrictNewVersion(raw)` then returns `version.String()`; `IsSupportedCheckpointVersion` immediately `StrictNewVersion`s that string again before scanning the table. This runs once per checkpoint metadata read in resume (`readCheckpointInfoFromStore`, called from the checkpoint-resolution loop), explain, explain-export, and rewind paths — so it repeats per checkpoint, though each parse is microseconds next to the git reads around it.
+   - Cheaper: an internal variant that returns the parsed `*semver.Version` (or the mapped table entry) so the support check compares against `supportedCheckpointVersions` with `version.Equal` directly, parsing once.
+
+All four are instances of the same root cause: the exported API surface in `format.go` only trades in strings, so every layer stringifies and re-parses. Threading the internal `supportedCheckpointVersion` / `*semver.Version` through the package-internal helpers (the internal `resolveCheckpointVersionSelector` already exists and is shaped right) would eliminate all of it without changing any exported signature except unexporting the now-unneeded `MetadataVersionForCheckpointVersion` hop.
+
+Not flagged (checked and fine): telemetry/hook changes are field removals only, no added I/O; `supportedCheckpointVersions` built once at package init; `formatCheckpointVersionPolicyValue` and `UnsupportedPolicyMessage` double-resolve only on display/error paths, once per command.</result>
+<usage><subagent_tokens>107690</subagent_tokens><tool_uses>9</tool_uses><duration_ms>112102</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a474581190418d9af</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-checkpoint-policy-semver/ca710204-d8dd-479d-beea-00bd3238c261/tasks/a474581190418d9af.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review of diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Findings verified against current source. All are within the new semver code; I also checked the pre-existing semver users (`cmd/entire/cli/versioncheck/versioncheck.go`, `cmd/entire/cli/agent/claudecode/discovery.go` — both use `golang.org/x/mod/semver`, which has no constraint-expression support, so adding `Masterminds/semver` as a direct dep is justified, not a finding) and the `checkpoint` package (only the `CheckpointVersionBranchV1` constant, no overlap).
+
+## Reuse findings
+
+1. **cmd/entire/cli/checkpointpolicy/policy.go:31** — `EffectiveCheckpointMetadataVersion` re-derives data it already resolved.
+   - Cost: `EffectiveCheckpointVersion` resolves the selector via `resolveCheckpointVersionSelector`, which returns a `supportedCheckpointVersion` that **already carries `metadataVersion`**. The function then stringifies the version and calls `MetadataVersionForCheckpointVersion`, which re-parses the string (`semver.StrictNewVersion`) and re-scans `supportedCheckpointVersions` (`findSupportedCheckpointVersion`) to fetch the field it threw away.
+   - Use instead: the package-internal `resolveCheckpointVersionSelector(Normalize(policy).CheckpointVersion, supportedCheckpointVersions)` once, returning `.metadataVersion`. (A shared internal `effectiveVersion(policy) (supportedCheckpointVersion, error)` would also serve `EffectiveCheckpointVersion` and `PolicyEnablesFeature`, which repeats the same Normalize+resolve composition at policy.go:55-61.)
+
+2. **cmd/entire/cli/checkpointpolicy/update.go:95-106** — `rejectCheckpointVersionDowngrade` round-trips resolved versions through strings and re-parses them.
+   - Cost: `ResolveCheckpointVersionSelector` internally produces a parsed `*semver.Version`, returns its `.String()`, and this caller immediately re-parses both strings with `mustSemver` (a panic-on-error path in production code) just to call `.LessThan`.
+   - Use instead: the same-package `resolveCheckpointVersionSelector(raw, supportedCheckpointVersions)`, which returns the `supportedCheckpointVersion` whose `.version` field can be compared directly — no re-parse, no `mustSemver` in the flow.
+
+3. **cmd/entire/cli/checkpointpolicy/format.go:56-64** — `IsSupportedCheckpointVersion` re-implements the lookup loop that `findSupportedCheckpointVersion` (format.go:118-125) already provides.
+   - Cost: two parallel scans of `supportedCheckpointVersions` with the identical `candidate.version.Equal(version)` predicate (one via `slices.ContainsFunc`, one via a manual loop).
+   - Use instead: `_, ok := findSupportedCheckpointVersion(version); return ok`. Same duplication exists inside `MetadataVersionForCheckpointVersion` vs `IsSupportedCheckpointVersion` callers in version.go: `ValidateCheckpointMetadataVersion` (version.go) parses then calls `IsSupportedCheckpointVersion`, which parses again — minor, same fix.
+
+4. **cmd/entire/cli/checkpointpolicy/policy.go:39-53** — three exported predicates are the same computation.
+   - Cost: `ValidatePolicy` (Normalize + `ResolveCheckpointVersionSelector`, discard value), `HasUnsupportedCheckpointVersion` (`EffectiveCheckpointVersion` err != nil — which is also Normalize + resolve), and `CanSatisfyPolicy` (`ValidatePolicy == nil`) are all one resolve check; `HasUnsupportedCheckpointVersion` is exactly `!CanSatisfyPolicy` via a second call chain.
+   - Use instead: define one in terms of another, e.g. `ValidatePolicy` as `_, err := EffectiveCheckpointVersion(policy); return err` and `HasUnsupportedCheckpointVersion` as `!CanSatisfyPolicy(policy)` (or drop one predicate).
+
+5. **cmd/entire/cli/checkpointpolicy/format.go:110-116** (minor) — `mustSemver` duplicates `semver.MustParse` from the already-imported `Masterminds/semver/v3` (the diff's own test file uses `semver.MustParse`).
+   - Cost: a hand-rolled must-helper with a panic path. Its only strictness-sensitive inputs are hardcoded constants like `"1.0.0"`, where `MustParse` behaves identically; its update.go call sites disappear entirely if finding 2 is applied.
+   - Use instead: `semver.MustParse` for the `supportedCheckpointVersions` table. (Keep only if strict parsing of the table is a deliberate invariant — flagging that as the one debatable case.)
+
+That's a computer-science-cliche word ("invariant") — apologies, occupational hazard.
+
+No cross-package re-implementations found: nothing in `cmd/entire/cli/` outside `checkpointpolicy` duplicates the new selector/resolution logic, and the legacy `branch-v1` alias mapping (`LogicalVersionForCheckpointMetadata`) exists only in the new format.go.</result>
+<usage><subagent_tokens>108483</subagent_tokens><tool_uses>9</tool_uses><duration_ms>129156</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ab4a4baa9ee0d5d9a</task-id>
+<tool-use-id>toolu_01Ph1fzRP1MjtBJetqii84xa</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-checkpoint-policy-semver/ca710204-d8dd-479d-beea-00bd3238c261/tasks/ab4a4baa9ee0d5d9a.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review of diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>All findings verified against current source. No report file written; findings below.
+
+## Altitude findings
+
+### 1. Resolve API returns a bare string, forcing callers to re-parse and re-look-up the package's own output
+
+- **File**: `cmd/entire/cli/checkpointpolicy/format.go:47-53` (`ResolveCheckpointVersionSelector`), with fallout at `format.go:78-86`, `policy.go:31-37`, `policy.go:55-62`, `update.go:95-110`
+- **Summary**: The internal resolver (`resolveCheckpointVersionSelector`, format.go:88) already produces the full resolved entry — parsed `*semver.Version`, `metadataVersion`, `features` — but the exported wrapper flattens it to a string, so every downstream consumer re-derives what was just discarded.
+- **Concrete cost**:
+  - `EffectiveCheckpointMetadataVersion` (policy.go:31-37) resolves, stringifies, then `MetadataVersionForCheckpointVersion` (format.go:78-86) re-parses via `StrictNewVersion` and rescans the table via `findSupportedCheckpointVersion` — two parses and two table scans for one lookup.
+  - `rejectCheckpointVersionDowngrade` (update.go:104-105) re-parses the resolver's own output with the panicking `mustSemver` — a caller trusting-by-panic that a string round-trip through its own package is well-formed.
+  - `PolicyEnablesFeature` (policy.go:55-62) can't use the exported API at all and has to call the internal `resolveCheckpointVersionSelector` directly to reach `features`.
+- **Deeper fix**: Make the resolve step return the resolved version entry (an exported struct or a type with `Version()`, `MetadataVersion()`, `Features()` accessors). String forms get derived at the edges (display, JSON). `MetadataVersionForCheckpointVersion`, `mustSemver`-in-update.go, and the internal-resolver bypass in `PolicyEnablesFeature` all disappear.
+
+### 2. Metadata↔logical version mapping split between the central table and a hardcoded switch
+
+- **File**: `cmd/entire/cli/checkpointpolicy/format.go:66-76` (`LogicalVersionForCheckpointMetadata`), consumed at `version.go:16-28`
+- **Summary**: The legacy alias `branch-v1 → 1.0.0` is hardcoded in a `switch`, even though `supportedCheckpointVersions` (format.go:28-34) already records `metadataVersion` per supported version — the mapping exists in two places.
+- **Concrete cost**: Adding a future version whose metadata string isn't a plain semver (or renaming an alias) requires editing both the table and this switch; nothing ties them together. Additionally the function passes through *any* valid semver as "logical" without consulting the table, so support checking happens in a second pass (`IsSupportedCheckpointVersion`, version.go:21) — the metadata-validation path (`ValidateCheckpointMetadataVersion`) parses/scans the same string across three functions to answer one question ("which supported version wrote this, if any?").
+- **Deeper fix**: One table-driven lookup: match `metadataVersion` exactly, else match semver-equal `version`, with `""` defaulting to v1. `ValidateCheckpointMetadataVersion` becomes a single lookup whose result distinguishes invalid vs. unsupported.
+
+### 3. Three exported predicates that are now the same predicate
+
+- **File**: `cmd/entire/cli/checkpointpolicy/policy.go:39-53` (`ValidatePolicy`, `HasUnsupportedCheckpointVersion`, `CanSatisfyPolicy`)
+- **Summary**: After removing `checkpoint_min_version`, all three reduce to "does the selector resolve against the support table" — `CanSatisfyPolicy(p)` ≡ `ValidatePolicy(p) == nil` ≡ `!HasUnsupportedCheckpointVersion(p)`. The trio is the shape of the old API (write-support vs. read-support vs. min-ordering) surviving after its reason vanished.
+- **Concrete cost**: Callers must know the three names are synonyms; the next version-gating change can easily update one and silently diverge the others. `HasUnsupportedCheckpointVersion` has exactly one production caller (see finding 4).
+- **Deeper fix**: Keep `ValidatePolicy` (error-returning) plus at most one boolean convenience; delete the rest and migrate the seven `CanSatisfyPolicy` call sites mechanically.
+
+### 4. Display code wraps a raw selector string in a synthetic Policy to ask a string-level question
+
+- **File**: `cmd/entire/cli/checkpoint_policy.go:100-105` (`formatCheckpointVersionPolicyValue`)
+- **Summary**: To label a configured value "(unsupported)", the CLI constructs `checkpointpolicy.Policy{CheckpointVersion: configured}` just to call the policy-level `HasUnsupportedCheckpointVersion`.
+- **Concrete cost**: A caller manufacturing a fake domain object to reach a lower-level check is the classic sign the package's API is missing the right-altitude entry point; it also couples display formatting to `Normalize` semantics it doesn't want (the `configured != ""` guard exists precisely to dodge normalization).
+- **Deeper fix**: Ask the selector-level question directly — `_, err := checkpointpolicy.ResolveCheckpointVersionSelector(configured)` (or the resolved-entry API from finding 1). Falls out naturally from collapsing the predicate trio in finding 3.
+
+### 5. Guard-then-resolve split makes callers handle an unreachable error
+
+- **File**: `cmd/entire/cli/checkpoint_policy_write.go:23-26` and `cmd/entire/cli/strategy/manual_commit_condensation.go:155-162`
+- **Summary**: Both call sites do `if !CanSatisfyPolicy(policy) { …friendly error… }` and then `EffectiveCheckpointMetadataVersion(policy)` — the same resolution run twice, with the second error branch unreachable (if the selector resolves, the resolved version is by construction in the table, so the metadata lookup cannot fail).
+- **Concrete cost**: Dead error-handling code at two call sites, and three redundant selector resolutions per checkpoint write; the pattern will be copy-pasted by the next writer path.
+- **Deeper fix**: Same as finding 1 — a single package call that returns either the resolved metadata version or the unsupported-policy error; callers map that one error to their friendly upgrade message.
+
+### 6. (Minor, scope-adjacent) Feature-gate mechanism with no production consumer
+
+- **File**: `cmd/entire/cli/checkpointpolicy/format.go:18-20`, `policy.go:55-62` (`CheckpointFeature`, `FeatureBranchMetadata`, `PolicyEnablesFeature`)
+- **Summary**: `PolicyEnablesFeature` and `FeatureBranchMetadata` are exercised only by tests and docs; no production code gates on a feature. The docs commit ("document checkpoint feature gates") suggests this is deliberate groundwork, so flagging as a note: infrastructure landing ahead of its first caller is exactly the pattern that later gets special-cased around instead of adapted, because nothing validates its shape against a real need.
+
+No misplaced legacy-compat shims found beyond finding 2 — the `branch-v1` alias handling is correctly confined to the metadata-read boundary (`LogicalVersionForCheckpointMetadata`) rather than scattered across callers; the issue there is only its duplication with the table. The caller-side rename `EnsureCanReadVersion → ValidateCheckpointMetadataVersion` across explain/resume/rewind is mechanical and at the pre-existing altitude.</result>
+<usage><subagent_tokens>110017</subagent_tokens><tool_uses>10</tool_uses><duration_ms>148930</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aad1ec2cc01784287</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-checkpoint-policy-semver/ca710204-d8dd-479d-beea-00bd3238c261/tasks/aad1ec2cc01784287.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review of diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>All findings verified against current source and callers. Here is the simplification review.
+
+## Findings
+
+**1. Three exported predicates for the same check — `ValidatePolicy` / `CanSatisfyPolicy` / `HasUnsupportedCheckpointVersion`**
+- File: `cmd/entire/cli/checkpointpolicy/policy.go`, lines 39–53
+- All three reduce to "does `ResolveCheckpointVersionSelector(Normalize(policy).CheckpointVersion)` error": `CanSatisfyPolicy` is `ValidatePolicy == nil`, and `HasUnsupportedCheckpointVersion` is exactly `ValidatePolicy != nil` (via the `EffectiveCheckpointVersion` wrapper). `HasUnsupportedCheckpointVersion` has one production caller (`checkpoint_policy.go:101`); `EffectiveCheckpointVersion` (line 26) has no callers outside this file.
+- Cost: readers must diff near-identical functions to discover they are synonyms; three names for one concept.
+- Simpler form: keep `ValidatePolicy` + `CanSatisfyPolicy`; delete `HasUnsupportedCheckpointVersion` and `EffectiveCheckpointVersion`, and have the one caller use `!CanSatisfyPolicy(...)` (or resolve the string directly, see finding 5).
+
+**2. `EffectiveCheckpointMetadataVersion` does a resolve → String → re-parse → re-scan round trip**
+- File: `cmd/entire/cli/checkpointpolicy/policy.go`, lines 31–37
+- The internal resolver already found the `supportedCheckpointVersion` struct that carries `.metadataVersion`; the code stringifies it, then `MetadataVersionForCheckpointVersion` (format.go:78) re-parses the string and scans `supportedCheckpointVersions` again to recover the same struct.
+- Cost: two extra parse/scan passes and an extra exported function (`MetadataVersionForCheckpointVersion`'s only production caller is this one) whose "not supported" error can't actually fire on this path.
+- Simpler form: `v, err := resolveCheckpointVersionSelector(Normalize(policy).CheckpointVersion, supportedCheckpointVersions); ...; return v.metadataVersion, nil` — exactly the pattern `PolicyEnablesFeature` (policy.go:57) already uses. Then delete `MetadataVersionForCheckpointVersion`.
+
+**3. Downgrade check re-parses versions it already resolved, via panic-based `mustSemver`**
+- File: `cmd/entire/cli/checkpointpolicy/update.go`, lines 95–108
+- `rejectCheckpointVersionDowngrade` calls `ResolveCheckpointVersionSelector` (which internally had a `*semver.Version`), gets a string back, then `mustSemver` re-parses both strings just to compare them.
+- Cost: two redundant parses, and a panic path in ordinary control flow.
+- Simpler form: same-package call to `resolveCheckpointVersionSelector(raw, supportedCheckpointVersions)` for before/after and compare `after.version.LessThan(before.version)` directly.
+
+**4. `UpdateOptions.CheckpointVersionSet` is now constant-true**
+- File: `cmd/entire/cli/checkpointpolicy/update.go`, line 12 (guards at lines 23 and 87); caller `cmd/entire/cli/checkpoint_policy.go`, lines 66–70
+- The set/value pair pattern made sense with two independently-optional fields; with one field left, the only production call sits inside `if checkpointVersionSet`, so `CheckpointVersionSet: checkpointVersionSet` at checkpoint_policy.go:70 is tautologically `true`, and every test passes `true`. The guards at update.go:23 and :87 are dead branches.
+- Cost: a field and two conditionals that can never vary; readers must reconstruct why the flag exists.
+- Simpler form: drop the field; `Update` always applies `opts.CheckpointVersion` (empty string already means "unset"), since callers only invoke `Update` when the flag changed.
+
+**5. Two-function formatter split is a leftover from the removed second field**
+- File: `cmd/entire/cli/checkpoint_policy.go`, lines 93–107
+- `formatCheckpointPolicyValue` now has a single caller: `formatCheckpointVersionPolicyValue`. The latter also wraps a bare string in a `Policy{}` solely to reuse the policy-level predicate.
+- Cost: an extra hop and a fake `Policy` construction to answer "does this selector resolve".
+- Simpler form: one function: if `configured != ""` and `checkpointpolicy.ResolveCheckpointVersionSelector(configured)` errors → `configured + " (unsupported)"`; if `configured == ""` → `effective + " (default)"`; else `configured`. This also removes the last caller of `HasUnsupportedCheckpointVersion` (finding 1).
+
+**6. Feature-gate machinery has zero production callers**
+- File: `cmd/entire/cli/checkpointpolicy/format.go` lines 18–33 (`CheckpointFeature`, `FeatureBranchMetadata`, `features` field) and `policy.go` lines 55–62 (`PolicyEnablesFeature`)
+- Nothing in production code checks a feature; the only references are `policy_test.go` and the new docs section. The docs themselves say to add a `CheckpointFeature` constant "when production code needs to check it" — which hasn't happened.
+- Cost: a new concept (feature gates), an exported type, an exported const, an exported function, and a slice field that gate no behavior; all must be kept coherent through future changes.
+- Simpler form: delete the type, const, field, function, and their tests; add the mechanism with its first real caller. Caveat: the recent "document checkpoint feature gates" commit suggests this scaffolding is deliberate groundwork for the v1.1 direction — if so, it's a conscious YAGNI trade the author should confirm, not an oversight.
+
+**7. `IsSupportedCheckpointVersion` duplicates `findSupportedCheckpointVersion`, inside a parse→format→re-parse call chain**
+- File: `cmd/entire/cli/checkpointpolicy/format.go`, lines 56–64 and 118–125; call chain in `version.go` lines 17–21
+- Two independent scans of `supportedCheckpointVersions` with the same `version.Equal` predicate, written in two idioms (`slices.ContainsFunc` vs a loop). Its only production caller, `ValidateCheckpointMetadataVersion`, feeds it a string that `LogicalVersionForCheckpointMetadata` just produced by parsing and re-`String()`-ing — so one validation parses the same version twice. `LogicalVersionForCheckpointMetadata` and `ParseCheckpointVersionSelector` are likewise exported with no production caller outside the package.
+- Cost: duplicate scan logic to keep in sync; redundant parsing; wider exported surface than the package's actual contract.
+- Simpler form: have `ValidateCheckpointMetadataVersion` map `""`/`branch-v1` to the v1 version, parse once with `semver.StrictNewVersion`, and check `findSupportedCheckpointVersion`; implement or delete `IsSupportedCheckpointVersion` as `_, ok := findSupportedCheckpointVersion(v); return ok` if the exported name must stay for tests.
+
+**8. (Minor) `resolveCheckpointVersionSelector`'s `candidates` parameter is a test-only seam**
+- File: `cmd/entire/cli/checkpointpolicy/format.go`, line 88
+- Every production caller passes `supportedCheckpointVersions`; the parameter exists so `format_internal_test.go` can inject a fabricated version table (the shipped table has one entry, so "pick the newest match" can never matter in production today).
+- Cost: a parameter whose production value never varies — mild, and the alternative (mutable global) would be worse. Simpler form: drop the parameter and read the package var, moving the newest-match tests behind the exported API once a second real version exists. Judgment call; acceptable to keep.
+
+**9. (Minor, test-only) Telemetry test constants obscure literal map keys**
+- File: `cmd/entire/cli/telemetry/checkpoint_policy_test.go`, lines 5–9
+- `checkpointPolicyTestCheckpointVersionProperty = "checkpoint_version"` and `checkpointPolicyTestCLIVersionProperty = "cli_version"` replace self-documenting literals used twice each, and force the awkward mixed-key `checks` map at lines 62–70.
+- Cost: reader must resolve four constants to know which telemetry property a test asserts.
+- Simpler form: plain string literals (unless a lint rule demanded the constants — occurrence counts here are below goconst's usual threshold).
+
+## Summary
+
+The diff is largely a genuine simplification (one policy field instead of two, one lint of enforcement semantics), but it leaves behind two-field-era leftovers (findings 4, 5), grows the `checkpointpolicy` package's exported surface well past its callers (1, 7), routes everything through string round trips instead of the resolved struct it already has (2, 3), and ships an unused feature-gate abstraction (6). Findings 1–5 are safe, mechanical consolidations; finding 6 needs an author decision since it appears to be deliberate groundwork.</result>
+<usage><subagent_tokens>114504</subagent_tokens><tool_uses>9</tool_uses><duration_ms>194771</duration_ms></usage>
+</task-notification>

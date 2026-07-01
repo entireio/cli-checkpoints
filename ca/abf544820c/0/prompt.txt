@@ -1,0 +1,93 @@
+<task-notification>
+<task-id>a3074a8a47b891551</task-id>
+<tool-use-id>toolu_01CMV5iABQC4oSAvCJsuUpkS</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/d70d405d-5421-4b68-beab-2e3bcaaf25a7/tasks/a3074a8a47b891551.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Now I have all the context I need. Let me create a comprehensive analysis of the altitude issues:
+
+## Altitude Issues Analysis
+
+Based on my thorough review of the code, here are the altitude issues found:
+
+### 1. **Path duplication: `.entire/runners` computed in two places**
+
+**File**: `trail_tune_init.go:22`, `trail_tune_prompt.go:28`  
+**Summary**: Runners directory path hardcoded in both `ensureRunnersPresent()` and `loadTuneRunners()`.
+
+**Right altitude**: Extract to a module-level constant in `paths/paths.go`:
+```go
+const RunnersDir = "runners"  // or "RunnersSubdir"
+```
+Then add a helper in `paths/paths.go`:
+```go
+func RunnersPath(repoRoot string) string {
+    return filepath.Join(repoRoot, EntireDir, RunnersDir)
+}
+```
+
+**Why current is fragile**: Path string is duplicated across two call sites. If a future refactor changes one and forgets the other, loading and writing diverge. The test files (`trail_tune_prompt_test.go:29`, `trail_tune_init_test.go:58`, `trail_tune_init_test.go:79`) also hardcode it, multiplying the duplication surface. This violates DRY and creates a maintenance hazard for what should be a single owner: the paths module already owns `.entire/*` constants (line 20-22 of `paths/paths.go`).
+
+---
+
+### 2. **Two-phase onboarding (ensure → re-load) introduces redundant disk I/O**
+
+**File**: `trail_tune_cmd.go:94–101`  
+**Summary**: `ensureRunnersPresent()` writes the runners to disk, then `runTrailTune()` immediately calls `loadTuneRunners()` to re-read them from disk via `os.ReadDir()` and `json.Unmarshal()`.
+
+**Right altitude**: `ensureRunnersPresent()` should return the loaded runners directly:
+```go
+func ensureRunnersPresent(w, errW io.Writer, repoRoot string, assumeYes bool) (runners []tuneRunner, created bool, err error)
+```
+Then `runTrailTune()` uses those runners if created, or calls `loadTuneRunners()` only on the no-create path. This avoids parsing the same JSON twice when the runner just wrote it.
+
+**Why current is fragile**: Every tune invocation on a fresh repo pays a second parse cost. More importantly, if `ensureRunnersPresent()` writes runner files that later fail to parse (JSON corruption, truncation, format drift), the error surfaces only after claiming "created successfully." The two-phase pattern hides parse failures behind a false success boundary. For v1 this may be acceptable, but the current structure invites bugs: you can create 8 files and have 7 load, silently dropping one.
+
+---
+
+### 3. **Non-interactive gating lives in the wrong layer**
+
+**File**: `trail_tune_init.go:33–36`  
+**Summary**: `ensureRunnersPresent()` checks `CanPromptInteractively()` and errors if not interactive and `!assumeYes`. This is a command-policy decision, not a utility function responsibility.
+
+**Right altitude**: Move the non-interactive + !assumeYes check into `runTrailTune()` before calling `ensureRunnersPresent()`. The function itself should only care about: "do I have runners?" and "should I create them (based on caller's intent)?" It should not interpret what "non-interactive" means for the command's policy.
+
+**Current signature:**
+```go
+func ensureRunnersPresent(w, errW io.Writer, repoRoot string, assumeYes bool) (created bool, err error)
+```
+
+**Right signature:**
+```go
+func ensureRunnersPresent(w, errW io.Writer, repoRoot string, confirmed bool) (created bool, err error)
+```
+Caller (`runTrailTune`) decides if it can confirm, not the utility.
+
+**Why current is fragile**: Commands that might use `ensureRunnersPresent()` in the future (e.g., `trail list` or `trail init`) must either re-implement the interactivity check or reuse this error path, coupling their policy to this function's assumptions. The function shouldn't know about `interactive` or CLI conventions — it's a filesystem utility.
+
+---
+
+### 4. **Separate `runnerdefaults` package is right-sized for v1, but boundaries are thin**
+
+**File**: `runnerdefaults/embed.go`  
+**Summary**: A dedicated package wraps the embedded runners FS and exports `Files()`. Import at `trail_tune_init.go:11`.
+
+**Assessment**: This is correct altitude for v1. The boundary is clean: `runnerdefaults` owns "what are the canonical defaults?" and exports bytes. The CLI layer decides "when to scaffold?" and "where to write them?". 
+
+**Why it works**: The package is slim (42 lines), has a single focused function, and the embedding complexity (error handling around `fs.ReadDir`, `runnersFS.ReadFile`) is genuinely separable. This is not premature modularization.
+
+**Future consideration**: If runners become configurable (user-provided defaults, versioned schema changes), this boundary will be a good home for that logic. For now, it's neither overkill nor inadequate.
+
+---
+
+## Summary Table
+
+| Issue | File | Line | Severity | Fix Altitude |
+|-------|------|------|----------|--------------|
+| Path duplication | `trail_tune_init.go:22` / `trail_tune_prompt.go:28` | Both | Medium | Add `RunnersPath(repoRoot)` helper to `paths/paths.go` |
+| Redundant re-parse | `trail_tune_cmd.go:94–101` | Both | Medium | Return loaded runners from `ensureRunnersPresent()` to avoid re-load |
+| Non-interactive gating | `trail_tune_init.go:33–36` | init | Medium | Move `CanPromptInteractively()` check to command layer; pass confirmed bool |
+| `runnerdefaults` package | All | Package | Low (✓ OK) | No change needed; boundary is clean |</result>
+<usage><subagent_tokens>36648</subagent_tokens><tool_uses>21</tool_uses><duration_ms>44481</duration_ms></usage>
+</task-notification>

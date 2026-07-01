@@ -1,0 +1,36 @@
+<task-notification>
+<task-id>a8ef47f97666c7ec7</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/5549b902-5dd9-4ff4-87b2-c6f8b300b68d/tasks/a8ef47f97666c7ec7.output</output-file>
+<status>completed</status>
+<summary>Agent "Review 466 picker+run layer" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>The picker tests cover the headless-testable logic (Merge, Split, BuildReviewPickerFields structure, slot actions, model option preservation) but not the interactive forms themselves — which is expected since `huh` forms "can't run headless" (noted in the code). The interactive gating is in cmd.go and is well-covered by the cmd-layer `interactiveTTY` checks.
+
+I have enough to deliver the review. Let me do one final check on a subtle point in the picker: `promptForReviewFocus` empty custom task falls back to `DefaultProfileName` but `RunReviewGuidedSetup` then does `if customTask != "" { profile.Task = customTask }` — fine. And one nit worth verifying: `buildCrewProfile` uses `profileTask(profileName, ...)` where profileName could be `"custom"` — let me verify that doesn't produce a broken task for the custom path. Actually customTask overrides it afterward in RunReviewGuidedSetup. Good.
+
+Let me verify one potential issue: in `RunReviewGuidedSetup`, when `len(profile.Agents) &gt; 1` it calls `promptForJudge`, but `buildCrewProfile` ALSO already set a default judge when `len(slots) &gt; 1`. The promptForJudge result overwrites `profile.Judge`. No conflict. But note: if exactly 1 slot, no judge — and the multi-agent path requires a judge. That's consistent (1 agent → single-agent path). Good.
+
+I'm confident in the assessment. Let me write up the review.
+
+## SUMMARY
+
+This layer is unusually well-engineered for a concurrency-heavy feature. `RunMulti` launches each reviewer in its own goroutine under a per-reviewer timeout context, fans all events into a single dispatch loop that is the *sole writer* of `perAgentState`, and preserves the serial-sink-dispatch contract — the data-race surface is genuinely closed by design (forwarding goroutines only send on `fanIn` and read immutable pre-launch fields; terminal results are handed to the dispatch loop rather than written cross-goroutine). Failure isolation is real and correct: a Start failure or per-agent timeout is recorded as a terminal marker while siblings and the judge proceed, and cancellation propagates through the shared context with `RunFinished` always firing exactly once. The fan-in channel is sized to guarantee no deadlock even when every reviewer fails Start, and the NEW `run_multi_test.go`/`run_test.go` assert the *behavior* that matters (failure isolation, timeout isolation, serial dispatch under `-race`, start-error context cleanup while a sibling runs, live-token ordering, deadlock-free drain) rather than mere construction. Profile→run resolution is sound: the slot's model flows through `perAgentConfiguredReviewer` to both the launched agent and the planned-run metadata, and the concurrently-invoked token enricher is correctly mutex-guarded per its contract. Non-interactive invocation never hangs — the cmd layer gates every `huh` form behind `interactive.IsTerminalWriter &amp;&amp; CanPromptInteractively`, and a bare `entire review` with no TTY exits with a clear "specify a profile" error. I found no medium-or-higher correctness/concurrency bug in the assigned files; the items below are low-severity.
+
+## MEDIUM+ FINDINGS
+
+None. The orchestration, picker gating, and profile resolution are correct and the concurrency model holds up under scrutiny.
+
+## LOW NITS
+
+- **[low] picker.go ~L67-77 (`ConfirmFirstRunSetup`)** — The function returns a bare `bool` and swallows the `form.RunWithContext` error, collapsing "user cancelled (Esc/Ctrl+C)" and a real form/IO error into the same `false` return with a "Setup cancelled." message. Every other prompt in the file distinguishes these by returning `ErrPickerCancelled` vs. a wrapped error. Harmless today (the caller treats both as a clean bail), but it diverges from the file's own error-handling convention and would mask a genuine TUI failure.
+
+- **[low] scope.go ~L228 (`countFilesChanged`) / ~L244 (`countUncommitted`)** — File counts are computed via `len(strings.Split(out, "\n"))`, which over/under-counts when a path contains an embedded newline (git emits a quoted, escaped path in `--name-only`/`--porcelain` without `-z`). This is a display-only banner value, not a correctness control, so impact is cosmetic; using `-z` and splitting on NUL would make it exact.
+
+- **[low] run.go ~L62-90 vs run_multi.go summary** — Minor inconsistency: single-agent `Run` sets `summary.Cancelled = (status == AgentStatusCancelled)` while `RunMulti` sets it from `ctx.Err() != nil`. Both are defensible and documented in `sink.go`, but the divergence is a small readability snag for anyone comparing the two orchestrators; the sink.go comment already papers over it.
+
+- **[low] picker.go ~L327 (`pickSlotList`)** — `slots := append([]crewSlot(nil), seed...)` clones `seed`, which is good; just noting the `actDone`-while-empty branch (`case picked == actDone: if len(slots)==0 { continue }`) is technically unreachable because the Done option is only appended when `len(slots) &gt; 0`. Dead-but-safe defensive code; could drop the inner guard or keep it as belt-and-suspenders.
+
+Files reviewed at `origin/review-profiles`: `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/review/run_multi.go`, `run.go`, `picker.go`, `prompt.go`, `scope.go`, `types/reviewer.go`, `types/sink.go`, and the new tests `run_multi_test.go`, `run_test.go`, `picker_test.go`, `picker_internal_test.go`. Cross-referenced caller wiring in `cmd/entire/cli/review/cmd.go` (other reviewer's file) for the interactive-gating and model-mapping verification.</result>
+<usage><subagent_tokens>140280</subagent_tokens><tool_uses>21</tool_uses><duration_ms>152454</duration_ms></usage>
+</task-notification>

@@ -1,0 +1,122 @@
+<task-notification>
+<task-id>abdb8d444bdc6557b</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/d70d405d-5421-4b68-beab-2e3bcaaf25a7/tasks/abdb8d444bdc6557b.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect! Now let me create a comprehensive report of my findings.
+
+## REUSE ISSUES REVIEW: trail_tune_*.go Files
+
+Based on my thorough analysis of the codebase, here are the genuine reuse opportunities found in the newly-added Go code:
+
+---
+
+### **1. JSON Object Extraction — Duplicates existing patterns**
+
+**Files affected:**
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_apply.go` lines 29-52 (`extractJSONObject`, `stripCodeFences`)
+
+**Existing helper:**
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/summarize/claude.go` lines 128-152 (`extractJSONFromMarkdown`)
+
+**Summary:** Both functions extract a JSON object from markdown-wrapped or prose-wrapped text by finding the first `{` and last `}`. The `trail_tune_apply.go` implementation has `stripCodeFences` and `extractJSONObject` doing substantially the same work as `summarize/claude.go`'s `extractJSONFromMarkdown` (which strips code fences then extracts the JSON span). The logic is nearly identical:
+- Both trim whitespace
+- Both strip markdown code fences (```json, ```, etc.)
+- Both find first `{` and last `}`
+- Both return the span or empty string when not found
+
+**Cost:** Medium — consolidating into a shared helper in `summarize/claude.go` or a utility package would save ~25 lines of duplicated code and ensure consistent JSON extraction behavior across the codebase.
+
+**Recommendation:** Move `extractJSONFromMarkdown` to a shared location (e.g., `stringutil` package or new `jsonutil` package) and reuse it in both files.
+
+---
+
+### **2. String Truncation with Newline Collapsing — Uses wrong helper**
+
+**File affected:**
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_gather.go` lines 385-392 (`oneLine`)
+
+**Existing helper:**
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/stringutil/stringutil.go` line 17 (`CollapseWhitespace`)
+
+**Summary:** The `oneLine` function in `trail_tune_gather.go` collapses newlines and truncates at 200 chars. The codebase already has `stringutil.CollapseWhitespace` (which replaces all whitespace sequences including newlines with single spaces), but it doesn't truncate. The `oneLine` implementation is domain-specific enough (error messages limited to 200 chars) that a generic truncation function wasn't needed until now.
+
+**Better approach:** Use `stringutil.CollapseWhitespace(s)` for the newline collapsing, then use the existing `stringutil.TruncateRunes(s, 200, "…")` for truncation. This would replace the entire `oneLine` function with:
+```go
+stringutil.TruncateRunes(stringutil.CollapseWhitespace(s), 200, "…")
+```
+
+**Cost:** Low — `oneLine` is only ~7 lines, but reusing existing helpers makes the intent clearer.
+
+**Recommendation:** Replace `oneLine` calls with composed calls to `stringutil.CollapseWhitespace` + `stringutil.TruncateRunes`.
+
+---
+
+### **3. Map-to-sorted-slice with counts — Duplicates recap pattern**
+
+**File affected:**
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_gather.go` lines 355-375 (`keyCount` struct + `topCounts` function) and lines 377-383 (`joinCounts`)
+
+**Existing pattern (different, but related):**
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/recap/render_static.go` has a `topCount` function (returns single top item) but not a general top-N sorter
+
+**Summary:** `trail_tune_gather.go` implements a complete top-N sorter with a `keyCount` struct and `topCounts` function that:
+- Builds a slice from a map
+- Sorts by count (descending) then by key (ascending) for stability
+- Limits to top N items
+
+This is a general utility that doesn't exist elsewhere in the codebase in reusable form. While `recap/render_static.go` has a `topCount` function, it only returns the single best item and is not extracted to a utility. The new code in `trail_tune_gather.go` is valuable enough to become a shared helper.
+
+**Cost:** Medium — useful pattern, but fairly small (20 lines). However, it's used in two places within `trail_tune_gather.go` itself (lines 271 and 343), suggesting extraction into a dedicated utility would pay off if this pattern is needed elsewhere in future.
+
+**Recommendation:** This is defensible as-is since it's specialized to the tuning gather logic. However, if this becomes a pattern (e.g., for other digest/summary features), extract it to `stringutil` or a new `maputil` package.
+
+---
+
+### **4. gh CLI execution — Duplicates existing pattern but different scope**
+
+**File affected:**
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_gather.go` lines 203-215 (`runGHList`)
+
+**Existing pattern:**
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/investigate/issuelink.go` lines 79-99 (`runGhExec`) and related helpers; also `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/setup_github.go` (`ghCurrentUser`, `ghListOrgs` using the `bootstrapRunner` interface)
+
+**Summary:** The new `runGHList` function does the most basic shell-out to `gh list` and unmarshals JSON. The existing codebase has:
+1. **`investigate/issuelink.go`'s `runGhExec`:** Low-level exec wrapper with security-focused credential redaction in error messages and stderr capture.
+2. **`setup_github.go`'s `bootstrapRunner` interface:** A test-friendly abstraction that `execRunner` implements; used by `ghCurrentUser` and `ghListOrgs` which call `gh api` (not `gh list`).
+
+The new code does not follow the `bootstrapRunner` pattern (which would allow testing without shelling out). It directly uses `exec.CommandContext` with no abstraction, no error redaction, and no test-friendly interface.
+
+**Recommendation:** _Not a blocker._ `runGHList` is simple enough (12 lines) that duplication is acceptable for now. However, if there are future plans to make trail_tune tests work without shelling out to gh, this should be refactored to use a `bootstrapRunner`-style interface or call a higher-level gh wrapper. The current implementation is adequate for a user-facing CLI feature.
+
+---
+
+### **5. File reading with truncation — Minor duplication**
+
+**File affected:**
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_gather.go` lines 148-158 (`readCapped`)
+
+**Existing pattern:**
+- No exact match, but similar patterns exist in:
+  - `paths/transcript.go` has file-reading helpers (`GetLastTimestampFromFile`)
+  - Various checkpoint/review context readers use `os.ReadFile` directly
+
+**Summary:** `readCapped` is a small utility (11 lines) that reads a file and truncates to a max char count, appending a marker when cut. This is very specific to the tuning gather task and doesn't duplicate any existing helper. It's defensive code with good error handling.
+
+**Recommendation:** This is fine as-is. Not a reuse opportunity—it's a reasonable, lightweight utility for this feature.
+
+---
+
+## SUMMARY
+
+| Issue | File | Severity | Recommendation |
+|-------|------|----------|-----------------|
+| JSON extraction duplication | `trail_tune_apply.go:29-52` | **Medium** | Consolidate with `summarize/claude.go:128-152` |
+| String truncation | `trail_tune_gather.go:385-392` | **Low** | Use `stringutil.CollapseWhitespace` + `stringutil.TruncateRunes` |
+| Map-to-sorted-slice | `trail_tune_gather.go:355-375` | **Low** | Acceptable for now; extract to shared util if pattern repeats |
+| gh CLI wrapper | `trail_tune_gather.go:203-215` | **Low** | Acceptable; consider `bootstrapRunner` pattern if tests need it |
+| File read with truncation | `trail_tune_gather.go:148-158` | **None** | No duplication—keep as-is |</result>
+<usage><subagent_tokens>51927</subagent_tokens><tool_uses>40</tool_uses><duration_ms>146332</duration_ms></usage>
+</task-notification>

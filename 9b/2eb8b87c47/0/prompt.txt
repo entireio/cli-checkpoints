@@ -1,0 +1,89 @@
+<task-notification>
+<task-id>a78ca6485d1be4ff7</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/78b0fe12-1b0c-46e0-ae16-2534880690c7/tasks/a78ca6485d1be4ff7.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Excellent. Now I have a comprehensive view of the diff. Let me synthesize my findings:
+
+## Altitude Review of Compact Transcript Boundary Recording
+
+Based on my analysis of the diff and surrounding codebase, here are my findings:
+
+### **1. Boundary Derivation via Line Subtraction — Appropriate Altitude**
+**File:** `cmd/entire/cli/transcript/compact/compact.go:142-159` (FullWithBoundary function)
+
+**Finding:** The boundary is computed as `lineCount(full) - lineCount(delta)`. This is a derived quantity rather than a direct measurement during compaction.
+
+**Assessment:** This is the RIGHT altitude. The rationale documented in the comment (lines 133-141) is sound: it reuses each format's existing, independently-tested slicing behavior rather than threading source indices through every emitter (JSONL, OpenCode, Gemini, Codex, Copilot, Droid, pi). The acknowledged off-by-one imprecision (lines 138-141) when a message straddles the boundary is "deterministic and harmless for segmentation" — a reasonable trade-off that avoids invasive changes across format handlers. The invariant tested in `compactfull_test.go` (assertSliceMatchesDelta) confirms the contract holds in the normal case.
+
+**Status:** ACCEPTABLE AS-IS. No deeper representation needed unless exact off-by-one precision becomes a downstream requirement.
+
+---
+
+### **2. Nullable `*int` for Legacy/New Discrimination — Appropriate Altitude**
+**File:** `api/checkpoint/metadata.go:15-24` (CompactTranscriptStart field and GetCompactTranscriptStart)
+
+**Finding:** `CompactTranscriptStart *int` uses nil to mark legacy delta files (pre-change checkpoints) and a pointer to distinguish boundary 0 (first checkpoint of full file) from "absent."
+
+**Assessment:** This is APPROPRIATE for the constraint given. The contract is clearly documented (lines 20-24): nil = legacy delta file read from line 0; *int = full file with marked offset. The GetCompactTranscriptStart accessor (lines 38-43) makes the distinction explicit with a two-value return (offset, ok). Tests (metadata_test.go TestCompactTranscriptStart_JSONRoundTrip) confirm nil is JSON-omitted while 0 round-trips.
+
+**Why not a format-version bump on transcript.jsonl?** A format bump would require entire.io readers to decode the version, version-match logic, and handle transitions — more ceremony than a simple nullable marker at read time. Since the marker lives in session metadata (not in transcript.jsonl itself), readers already fetch the metadata and can call GetCompactTranscriptStart() once.
+
+**Status:** ACCEPTABLE AS-IS. The null-pointer technique is idiomatic Go and avoids format-version overhead on transcript.jsonl.
+
+---
+
+### **3. Two Code Paths Setting CompactTranscriptStart — Minor Design Friction, Acceptable**
+**Files:**
+- Normal path: `cmd/entire/cli/checkpoint/persistent.go:410, 458` (writeSessionToSubdirectory → writeTranscript returns compactTranscriptStart, written to metadata at line 458)
+- OPF path: `cmd/entire/cli/checkpoint/persistent.go:1806, 1813-1815` (replaceTranscript → writeCompactTranscript returns start, then setCompactTranscriptStart called separately)
+
+**Finding:** The normal path captures the return from writeTranscript and writes it directly into the Metadata struct. The OPF path calls writeCompactTranscript separately and then invokes setCompactTranscriptStart to read, mutate, and re-marshal the metadata blob.
+
+**Assessment:** There IS friction here, but it's understandable and acceptable given the architectural difference:
+
+1. **Normal path:** writeTranscript returns the boundary; the caller (writeSessionToSubdirectory) constructs the Metadata struct fresh and assigns it directly. This is natural because the entire Metadata is built in-memory in one place (lines 441-472).
+
+2. **OPF path:** replaceTranscript works on a pre-existing metadata blob in the entries map (read at line 1831). Mutating it requires read-modify-write. This asymmetry exists because OPF runs on a finalized checkpoint tree, not on fresh in-memory state.
+
+**Should the marker-writing live deeper?** A deeper consolidation would move marker-setting into writeCompactTranscript itself, returning the updated metadata. But this creates a problem: writeCompactTranscript doesn't know how to serialize metadata (that's a persistent.go concern), and it shouldn't. The current design respects layer boundaries: compact.go is format-agnostic, persistent.go orchestrates metadata I/O.
+
+Alternatively, writeTranscript could call a shared helper that sets CompactTranscriptStart on the options/builder before metadata construction — but WriteOptions is immutable by the time writeTranscript is called, so this would require passing mutable state (a *Metadata pointer) through writeTranscript, which is messier than the current two-line assignment.
+
+**Status:** ACCEPTABLE AS-IS. The two paths reflect genuinely different contexts (fresh metadata vs. pre-existing blob). The duplication is minimal (one assignment vs. one helper call) and the contract is clear (both record the boundary returned by writeCompactTranscript).
+
+---
+
+### **4. full.jsonl vs. transcript.jsonl Marker Mechanism — Consistent and Correct**
+**Files:**
+- full.jsonl: CheckpointTranscriptStart (plain int, required for full.jsonl chunking logic)
+- transcript.jsonl: CompactTranscriptStart (nullable int, only recorded if compact file is written)
+
+**Finding:** The diff introduces CompactTranscriptStart as a parallel mechanism to CheckpointTranscriptStart.
+
+**Assessment:** This is APPROPRIATE. The two fields serve different readers:
+
+- **CheckpointTranscriptStart:** Indices the full.jsonl transcript (which is chunked and may be the only transcript available). Required because full.jsonl is the canonical transcript for CLI rewind/resume/explain, and the chunks are reassembled by the reader using this offset.
+
+- **CompactTranscriptStart:** Indices the transcript.jsonl (the compact, full-session version). Only recorded when transcript.jsonl is written (a best-effort file). Allows downstream readers (entire.io) to segment this checkpoint's slice from the full compact session.
+
+They are NOT duplicates because they index different files with different formats (chunked full.jsonl vs. monolithic transcript.jsonl). The comment at line 10 clarifies CheckpointTranscriptStart applies to "raw transcript (full.jsonl)"; line 16-18 clarifies CompactTranscriptStart for the compact file.
+
+**Status:** ACCEPTABLE AS-IS. The dual mechanism reflects the dual-transcript architecture.
+
+---
+
+## Summary
+
+| Finding | Altitude | Status | Notes |
+|---------|----------|--------|-------|
+| Boundary as lineCount(full) - lineCount(delta) | RIGHT | ACCEPT | Reuses format-agnostic slicing; off-by-one is documented and harmless |
+| `*int` nullable marker (nil=legacy, int=full) | RIGHT | ACCEPT | Idiomatic; avoids format-version overhead; contract is explicit |
+| Two paths setting CompactTranscriptStart | ACCEPTABLE | ACCEPT | Reflects different contexts; minimal duplication; layers respected |
+| CompactTranscriptStart parallel to CheckpointTranscriptStart | CORRECT | ACCEPT | Different files, different readers; no redundancy |
+
+**No refactoring needed.** The implementation is at the appropriate level of abstraction for the constraints (mixed legacy/new checkpoints, best-effort compact files, downstream readers needing segmentation). The code is testable and the contract is documented.</result>
+<usage><subagent_tokens>38399</subagent_tokens><tool_uses>10</tool_uses><duration_ms>38985</duration_ms></usage>
+</task-notification>

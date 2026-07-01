@@ -1,0 +1,206 @@
+<task-notification>
+<task-id>a676a8185d76c1abe</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/78b0fe12-1b0c-46e0-ae16-2534880690c7/tasks/a676a8185d76c1abe.output</output-file>
+<status>completed</status>
+<summary>Agent "Investigate session log storage" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect! Now I have the complete picture. Let me create a comprehensive summary document:
+
+Based on my investigation of the codebase, here are the precise findings about how session logs/transcripts are stored in the `entire/checkpoints/v1` branch:
+
+## Answer: **NEITHER format stores ONLY deltas — BOTH store the FULL transcript with per-checkpoint start markers**
+
+### Data Model
+
+**Metadata Structure** (`api/checkpoint/metadata.go` lines 290-396):
+- `CheckpointSummary` (root-level metadata.json) contains `sessions: []SessionFilePaths`
+- Each `SessionFilePaths` has three transcript pointers:
+  - `Transcript` → full.jsonl (raw agent transcript, stored once per session)
+  - `CompactTranscript` → transcript.jsonl (optional, derived/indexed)
+  - `Metadata` → session metadata.json (per-session, line 388-395)
+
+- Session-level `Metadata` includes:
+  - `CheckpointTranscriptStart: int` (line 324) — **line offset where THIS checkpoint's data began**
+  - `TranscriptLinesAtStart: int` (line 327) — deprecated alias for backward compat
+
+**Directory Structure** (line 403-414):
+```
+&lt;checkpoint-id[:2]&gt;/&lt;checkpoint-id[2:]&gt;/
+├── metadata.json         # CheckpointSummary (root aggregate)
+├── 1/                    # First session
+│   ├── metadata.json     # Session Metadata (includes CheckpointTranscriptStart)
+│   ├── full.jsonl        # Raw agent transcript (FULL session)
+│   ├── transcript.jsonl  # Compact transcript (SCOPED to checkpoint)
+│   └── prompt.txt
+├── 2/                    # Second session...
+```
+
+---
+
+### FORMAT 1: `full.jsonl` — **FULL TRANSCRIPT + START OFFSET**
+
+**File Storage** (`cmd/entire/cli/checkpoint/persistent.go` lines 744-844):
+- **Contains**: The COMPLETE session transcript from beginning to end
+- **Chunked**: If &gt;MaxChunkSize, splits into `full.jsonl.000`, `full.jsonl.001`, etc. (line 781, 793-806)
+- **Written**: Same for every checkpoint that includes this session (line 749-771)
+- **Start Position**: Metadata stores `CheckpointTranscriptStart` separately — a **LINE INDEX** (0-indexed)
+  - Line 324: `CheckpointTranscriptStart int` 
+  - Line 100 (WriteOptions): "Transcript line offset at start of this checkpoint's data"
+
+**Example (from manual_commit_condensation.go lines 282, 456-457)**:
+```go
+writeOpts := cpkg.WriteOptions{
+    CheckpointTranscriptStart: state.CheckpointTranscriptStart,  // Line 282
+    Transcript: redactedTranscript,  // FULL transcript
+    ...
+}
+
+// Session-level metadata writes:
+sessionMetadata := Metadata{
+    CheckpointTranscriptStart: opts.CheckpointTranscriptStart,  // Line 456
+    TranscriptLinesAtStart: opts.CheckpointTranscriptStart,     // Deprecated, line 457
+    ...
+}
+```
+
+**Key Code** (persistent.go lines 867-871):
+```go
+compacted, err := transcriptcompact.Compact(
+    redact.AlreadyRedacted(transcriptBytes),  // FULL transcript bytes
+    transcriptcompact.MetadataFields{
+        Agent: compactAgentName(agentType),
+        CLIVersion: versioninfo.Version,
+        StartLine: startLine,  // THIS is where checkpoint starts
+    },
+)
+```
+
+---
+
+### FORMAT 2: `transcript.jsonl` — **SCOPED DELTA (start-to-end of THIS checkpoint)**
+
+**File Storage** (`cmd/entire/cli/checkpoint/persistent.go` lines 856-908):
+- **Contains**: Compact format, **sliced to only the lines from `startLine` onwards**
+- **Purpose**: "derived data" (line 859) for efficient reading
+- **Optional**: Best-effort; skipped if generation fails, result is empty, or exceeds MaxChunkSize (lines 872-892)
+
+**How Scoping Works** (`cmd/entire/cli/transcript/compact/compact.go` lines 71-120):
+```go
+func Compact(redacted redact.RedactedBytes, opts MetadataFields) ([]byte, error) {
+    // ...
+    truncated := transcript.SliceFromLine(content, opts.StartLine)  // Line 106
+    if truncated == nil {
+        truncated = []byte{}
+    }
+    // ... format-specific compact functions ...
+}
+```
+
+**SliceFromLine Implementation** (`transcript/parse.go` lines 110-143):
+```go
+// Returns the content starting from line number `startLine` (0-indexed).
+// This is used to extract only the checkpoint-specific portion of a cumulative transcript.
+func SliceFromLine(content []byte, startLine int) []byte {
+    if len(content) == 0 || startLine &lt;= 0 {
+        return content  // startLine=0 → return full
+    }
+    // Find byte offset of startLine's beginning
+    lineCount := 0
+    offset := 0
+    for i, b := range content {
+        if b == '\n' {
+            lineCount++
+            if lineCount == startLine {
+                offset = i + 1
+                break
+            }
+        }
+    }
+    if lineCount &lt; startLine {
+        return nil
+    }
+    return content[offset:]  // Return from startLine to EOF
+}
+```
+
+---
+
+### What `CheckpointTranscriptStart` Means
+
+**Definition** (`cmd/entire/cli/session/state.go` lines 188-192):
+```go
+// CheckpointTranscriptStart is the transcript line offset where the current
+// checkpoint cycle began. Set to 0 at session start, updated to current
+// transcript length after each condensation. Used to scope the transcript
+// for checkpoint condensation: "everything since last checkpoint".
+CheckpointTranscriptStart int `json:"checkpoint_transcript_start,omitempty"`
+```
+
+**Lifecycle** (from code exploration):
+1. **Initialized to 0** at session start
+2. **After each checkpoint**: Set to total transcript lines at condensation time (`manual_commit_hooks.go` line 1411)
+3. **Used for scoping**: When writing compact transcript, `SliceFromLine(fullTranscript, CheckpointTranscriptStart)` extracts only new lines since the last checkpoint
+4. **Example from manual_commit_condensation.go line 516**:
+```go
+scopedTranscript = transcript.SliceFromLine(
+    transcriptBytes,
+    state.CheckpointTranscriptStart  // Skip everything before this line
+)
+```
+
+---
+
+### Checkpoint Sharing vs. Duplication
+
+**Per Checkpoint, Per Session**:
+- Each `&lt;checkpoint_id&gt;/&lt;session_num&gt;/` subdirectory gets its OWN `full.jsonl` 
+- Multiple sessions in one checkpoint → multiple full.jsonl files (one per session)
+- **Duplication is INTENTIONAL**: Each checkpoint is self-contained (readable without other checkpoints)
+
+**Content Deduplication**:
+- Git object store deduplicates identical blobs via content hashing
+- `content_hash.txt` stores sha256 of full transcript (line 813: `fmt.Sprintf("sha256:%x", sha256.Sum256(transcriptBytes))`)
+- If two checkpoints have identical transcript ranges, git packs them once
+
+---
+
+### Metadata Pointers
+
+From `SessionFilePaths` (api/checkpoint/metadata.go lines 385-396):
+```go
+type SessionFilePaths struct {
+    Metadata          string `json:"metadata"`              // metadata.json
+    Transcript        string `json:"transcript,omitempty"`  // full.jsonl
+    CompactTranscript string `json:"compact_transcript,omitempty"` // transcript.jsonl (omitted if not generated)
+    ContentHash       string `json:"content_hash,omitempty"`
+    Prompt            string `json:"prompt"`
+}
+```
+
+**Note on line 387-393**: The `Transcript` pointer intentionally stays on `full.jsonl` (not compact), because CLI read paths (rewind/resume/explain) resolve by filename:
+```go
+// Transcript points at the raw full.jsonl, which CLI read paths
+// (rewind/resume/explain) resolve by filename.
+Transcript string `json:"transcript,omitempty"`
+// CompactTranscript points at the compact transcript.jsonl when one was
+// generated alongside full.jsonl. Omitted otherwise.
+CompactTranscript string `json:"compact_transcript,omitempty"`
+```
+
+---
+
+## Final Answer
+
+| Aspect | full.jsonl | transcript.jsonl |
+|--------|-----------|------------------|
+| **Stores** | FULL session transcript | SCOPED to checkpoint (delta) |
+| **Start Position** | Fixed (line 0) | Via `CheckpointTranscriptStart` |
+| **Per Checkpoint** | Full copy | Slice from start offset to end |
+| **Example** | Lines 0-999 stored as-is | If `CheckpointTranscriptStart=750`, only lines 750-999 |
+| **Optional** | Always written | Best-effort, can be skipped |
+| **Purpose** | Source-of-truth for rewind/resume | Efficient, normalized viewing |
+
+**Both formats use the SAME underlying data** — `full.jsonl` stores it completely, `transcript.jsonl` stores a pre-sliced, pre-compacted view. Neither is a delta; both are complete within their scope (full or scoped). The `CheckpointTranscriptStart` line offset is the pivot point for scoping.</result>
+<usage><subagent_tokens>79649</subagent_tokens><tool_uses>25</tool_uses><duration_ms>57782</duration_ms></usage>
+</task-notification>

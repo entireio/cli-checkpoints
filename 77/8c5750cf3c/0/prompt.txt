@@ -1,0 +1,98 @@
+<task-notification>
+<task-id>adc72a66d4464478f</task-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/5549b902-5dd9-4ff4-87b2-c6f8b300b68d/tasks/adc72a66d4464478f.output</output-file>
+<status>completed</status>
+<summary>Agent "Review trail 547 tokens-agent-brief" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I now have all the data I need. Let me analyze the key risk areas with the full context.
+
+**1. `totalTokens` excludes `APICallCount` from total — correct** (separate field). The session usage `Total` field similarly only sums token fields. Verified by tests.
+
+**2. `buildSessionTokensUsage` zero-but-API-calls case:** returns non-nil when `total==0 &amp;&amp; APICallCount&gt;0`. The `Total` is 0 in that case. Then in `recommendationRules`, `cacheReadHotspot` needs `Total&gt;0` (skipped). API-call rule fires on `APICalls&gt;=20`. Fine.
+
+**3. `tokenPercent(CacheRead, Total)` when Total could be 0:** In `agentBriefUsageLine`, the path `if tokens.CacheRead &gt; 0` calls `tokenPercent(CacheRead, Total)`. If `Total==0` but `CacheRead&gt;0`... can that happen? `Total = totalTokens(usage)` includes CacheReadTokens, so if CacheRead&gt;0 then Total&gt;0. But wait — `sessionTokensUsage.Total` is computed via `totalTokens` (sums input+cachecreate+cacheread+output+subagent). `CacheRead` field = `usage.CacheReadTokens`. So if CacheRead&gt;0, Total &gt;= CacheRead &gt; 0. Safe. And `tokenPercent` guards `total&lt;=0` returning 0 anyway. No division by zero.
+
+**4. The percent direction/comparison math** — verified correct above.
+
+**5. Tests parallelism** — the subagent confirmed: pure-function tests use `t.Parallel()`; command-execution tests that use `setupStopTestRepo` (which does `t.Chdir`) correctly omit `t.Parallel()`. Compliant.
+
+Now let me identify the real findings. Let me look at a couple of specific concerns more closely.
+
+**Concern A — `roundedPercent` overflow guard correctness.** Let me trace the `bits` math:
+```go
+hi, lo := bits.Mul64(uint64(value), 100)        // 128-bit product value*100
+lo, carry := bits.Add64(lo, uint64(total)/2, 0) // add total/2 for rounding
+hi += carry
+divisor := uint64(total)
+if hi &gt;= divisor { return maxPercent }           // guard: Div64 panics if hi&gt;=divisor
+quotient, _ := bits.Div64(hi, lo, divisor)
+```
+`value` and `total` come from context tokens / window size, both `int`, cast to `uint64`. They're non-negative (guarded by `buildSessionTokensContext` requiring `tokens&gt;0, windowSize&gt;0`). The guard prevents the panic. This is heavily over-engineered for values that realistically fit in int64*100 without 128-bit math, but it's correct. Not a finding.
+
+**Concern B — the `--compare` percent uses `change/baseline`, and Total can legitimately be 0** when baseline checkpoint has API-call-only usage. `buildCheckpointMetricDelta` guards `if baseline != 0`. But note: it builds deltas for Total, CacheRead, AND APICalls. For CacheRead, baseline CacheRead could be 0 while Total nonzero → ChangePercent nil for that metric → printed without percent. Handled. Good.
+
+Now, the genuinely notable issue: **the comparison only requires `target.Tokens != nil &amp;&amp; baseline.Tokens != nil`**, but `buildSessionTokensUsage` returns a non-nil struct with `Total==0` for API-call-only usage. So `buildCheckpointMetricDelta(0, 0)` for Total → change 0, direction unchanged, status `observed_no_change`. That's reasonable, not a bug.
+
+Let me look for the actual medium+ issues. The strongest candidate is the spec/description mismatch and the `resolveExplainCheckpointID` lookup leak. Let me verify the leak path in `loadCheckpointTokensReport`.
+
+In `loadCheckpointTokensReport`:
+```go
+cpID, lookup, err := resolveExplainCheckpointID(...)
+if err != nil {
+    return checkpointTokensReport{}, lookup, err   // returns lookup
+}
+```
+And the caller `runCheckpointTokens`:
+```go
+report, lookup, err := loadCheckpointTokensReport(...)
+if lookup != nil {
+    defer lookup.Close()
+}
+if err != nil {
+    return tokenCommandError(err)
+}
+```
+The caller closes `lookup` even on error. Good — no leak in the primary path. And the baseline path also defers `baselineLookup.Close()`. So the lookup leak the subagent worried about is actually **handled correctly** here. Good.
+
+Now let me reconsider the **"branch average" / "recommend cheaper model"** description. The code implements neither. This is the most important reviewer note: the PR description (and command help could imply more) oversells. But the help text itself (`--compare`, recommendations) accurately describes pairwise comparison and the actual rule-based recommendations. So this is a description-vs-implementation gap for the reviewer to flag, not a code defect.
+
+Let me look at one more real concern: in `buildCheckpointTokensReport`, when `len(metas) &gt; 1`, it sums `turnCount` across metas but only builds `report.Context` for the single-session case. For multi-session, context pressure is silently dropped. That's a deliberate scoping choice (per-session context windows don't sum meaningfully), and is documented by the aggregate-scope test. Reasonable, not a bug.
+
+Let me check the `report.Agent` single-value vs the text output. In `writeCheckpointTokensText`, the `switch` has a `case report.Agent != ""` branch — but `report.Agent` is only set when `len(metas)==1`. For multi-session, `SessionCount&gt;1` branch handles it. For single session with `SessionID==""`... unlikely. Fine.
+
+I have enough to write the review. Let me also double check the `saturatingIntSub` min-int path is tested (it is: `TestSaturatingIntSubHandlesMinIntSubtrahend`) and correct. For `a&gt;=0, b==minInt`: returns maxInt. `a - minInt = a + (maxInt+1)`, for a&gt;=0 that overflows, so returning maxInt (saturate) is correct. For `a&lt;0, b==minInt`: `a-b = a-minInt = a+maxInt+1`, a in [minInt,-1] → result in [0,maxInt], no overflow, correct.
+
+I have a complete picture. Here is my review.
+
+---
+
+## SUMMARY
+
+This change adds two read-only reporting commands: `entire session tokens [session-id]` (with `--current`, `--json`, and `--agent-brief` modes) and `entire checkpoint tokens &lt;id&gt;` (with `--compare &lt;id&gt;`). Both build a structured report from already-captured token/context/skill metadata and emit rule-based optimization recommendations (cache-replay hotspots, API-call amplification, subagent-heavy usage, high context pressure, long sessions). The implementation is careful and well-tested: token sums are overflow-hardened end-to-end (`saturatingIntAdd`/`saturatingIntSub`, a 128-bit `roundedPercent`), division-by-zero is guarded in every percentage path, context cancellation is propagated, and the not-found/missing-metadata cases degrade gracefully with explicit limitations. Conventions are respected — output goes through `cmd.OutOrStdout()`/`ErrOrStderr()`, the `SilentError` pattern is used for already-printed messages, only operational metadata is emitted (no prompts/file contents), and the lookup handle from `resolveExplainCheckpointID` is closed on every path including errors. Test parallelism follows the repo rule (pure-function tests use `t.Parallel()`; `t.Chdir`-based command tests correctly omit it). Overall this is high quality and close to mergeable; my findings are mostly a spec-vs-implementation mismatch and a few medium polish items, with no high-severity correctness bug found.
+
+## FINDINGS (medium+)
+
+**[MEDIUM] PR description vs. implementation mismatch — no "branch average" comparison and no "switch model" recommendation.** *(checkpoint_tokens.go, whole comparison path; session_tokens.go `recommendationRules` ~L230-300)*
+The PR brief states `checkpoint tokens` "compares a checkpoint's token usage against the branch average" and "recommends optimizations like switching models or enabling prompt caching." The code does neither: `--compare` is a strictly pairwise comparison against one user-supplied baseline checkpoint (`buildCheckpointTokensComparison`), there is no branch-average aggregation anywhere, and `recommendationRules` never emits a model-switch or prompt-caching recommendation (its rules cover cache-replay, API-call count, subagents, context pressure, and long sessions). The code itself is internally consistent and its `--help` text is accurate, so this is a description/scope gap rather than a code defect — but it should be reconciled before merge so reviewers and users aren't expecting branch-average or cost/model advice the command doesn't provide.
+
+**[MEDIUM] `--compare` qualification can mislead because per-session cache state isn't normalized.** *(checkpoint_tokens.go, `checkpointComparisonQualification` / `buildCheckpointMetricDelta` ~L380-420)*
+The comparison reports `observed_reduction` / `observed_increase` purely from the signed delta of summed `Total` tokens between two checkpoints. Because `Total` includes `CacheReadTokens` (large-context replays), a checkpoint that simply had more cache reads will read as an "increase" and a cache-warmed follow-up as a "reduction," independent of actual work done. The qualification strings do hedge ("does not prove quality was preserved"), which is good, but the directional verdict itself is driven by a metric dominated by cache replay. Consider qualifying the verdict on the non-cache delta (input+output) or surfacing the cache-read delta as the headline caveat, so "reduction"/"increase" isn't dominated by replay volume.
+
+**[MEDIUM] `recommendationRules` and the agent-brief use fixed magic thresholds with no provenance.** *(session_tokens.go `recommendationRules` ~L235-300)*
+The thresholds — cache-read `&gt;= 80%` (high), API calls `&gt;= 20` (medium), subagent share `&gt;= 10%`, context `&gt;= 80%`, turn count `&gt;= 10` / checkpoint count `&gt;= 5` — are hardcoded inline with no named constants or comment explaining their basis. These directly drive user- and agent-facing advice (the agent-brief literally tells an agent to "batch the next diagnostic step" / "compact or restart"). They are defensible defaults, but as written they're unexplained and untunable. Extract them into named constants with a one-line rationale so the behavior is reviewable and adjustable without hunting through the rule body.
+
+## Low-severity nits
+
+- **Inconsistent int-limit helpers** (`checkpoint_tokens.go`): `saturatingIntAdd` computes `maxValue`/`minValue` inline while `saturatingIntSub` uses the `maxInt()`/`minInt()` helpers. Use the helpers in both for consistency.
+- **`roundedPercent` is over-engineered** (`session_tokens.go`): it uses `bits.Mul64`/`bits.Div64` 128-bit math for values (context tokens, window size) that comfortably fit in `int64*100`. Correct, but a plain `(value*100 + total/2)/total` on `int64` would be far easier to read; the 128-bit version is justified only if these can realistically approach 1e16.
+- **`buildCheckpointTokensReport` drops context pressure for multi-session checkpoints** (`checkpoint_tokens.go` ~L200-230): context info and the `context_pressure` contributor are only populated when `len(metas)==1`. This is a defensible choice (per-session context windows don't sum), and it is covered by `...UsesAggregateScope`, but it's silent — a one-line limitation note for the multi-session case would make the omission explicit to users.
+- **`addCheckpointTokenUsage` enumerates fields manually** (`checkpoint_tokens.go`): it copies the five scalar fields plus `SubagentTokens` by hand. If `agent.TokenUsage` gains a field later, aggregation will silently drop it. A brief comment ("update when TokenUsage gains fields") or a small unit test asserting field coverage would guard against drift.
+
+No data races (all paths are single-goroutine, request-scoped), no nil-deref (every `*TokenUsage`/`*SessionMetrics`/`state` is nil-checked, and `LoadSessionState`/`ReadCommitted` nil-returns are handled), and no privacy violations (only IDs, counts, model names, and skill labels are emitted) were found.
+
+Relevant files:
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/checkpoint_tokens.go`
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/session_tokens.go`
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/status_style.go` (only the overflow-safe `totalTokens` change)</result>
+<usage><subagent_tokens>74945</subagent_tokens><tool_uses>16</tool_uses><duration_ms>283733</duration_ms></usage>
+</task-notification>

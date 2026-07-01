@@ -1,0 +1,51 @@
+<task-notification>
+<task-id>ad8c3f2daad4b518e</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/5549b902-5dd9-4ff4-87b2-c6f8b300b68d/tasks/ad8c3f2daad4b518e.output</output-file>
+<status>completed</status>
+<summary>Agent "Review PR 1499 control-plane CRUD gaps" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>The spec deltas are coherent: new operations `getOrg`, `deleteOrg`, `getProject`, `deleteProject`, `listRepoGrants`, `revokeRepoAccess`, `revokeRepoAccessByProvider` map to correct paths, and the hand-written command code consumes them with matching param/return types. The two revoke routes correctly map to the two grantee-addressing modes.
+
+I have everything I need.
+
+---
+
+## SUMMARY
+
+PR #1499 adds six control-plane verbs (`org get/delete`, `project get/delete`, `grant repo list/remove`) plus name-resolution for repo args, on top of a large regenerated-ogen footprint. Of the +3774/-895, roughly **~280 lines are hand-written** (org.go +40, project.go +40, grant.go ~+130 net, repo.go +31, resolveref.go +47, plus ~95 lines of tests); the rest (~3500 lines across `oas_*_gen.go` and `spec/core.*.json`) is generated. The generated spec deltas are coherent — the seven new operations map to correct paths/params/return types, and the hand-written code consumes them correctly: `DeleteOrg`/`DeleteProject`/`RevokeRepoAccess*` return `error`, `ListRepoGrants` returns `*ListRepoGrantsOutputBody`, and the two revoke routes correctly correspond to the provider vs typed-ID grantee modes via the reused `parseGranteeMode`. Core resolution is clean: all commands go through `runCore`/`runCoreObject`/`runCoreList`, which dial via `coreapi.New`, and no command re-resolves the core for display (no `auth.ResolveControlPlaneTarget` misuse — the known past bug is not reintroduced). The refactors (`projectGranteeMode`→`parseGranteeMode`, `validateGrantRole`, typed role enum casts) are tidy and well-tested at the unit level.
+
+**Overall judgment: APPROVE WITH MINOR RESERVATIONS.** No correctness bugs in the wiring. The two reservations — no confirmation on destructive deletes, and no command-level test coverage of the new wiring — are both consistent with pre-existing precedent in this command family (the base branch's `repo delete` already behaves identically and is untested), so they are not regressions, but the delete-safety gap is worth a deliberate decision rather than inheritance.
+
+---
+
+## MEDIUM+ FINDINGS
+
+**[MEDIUM] Destructive deletes have no confirmation and no `--force`/`--yes` flag — `cmd/entire/cli/org.go:84-108`, `project.go:142-166`, `grant.go` repo remove ~411-461 (also inherited `repo.go:175-193`)**
+`org delete`, `project delete`, `grant repo remove`, and `repo delete` call the destructive API immediately after resolving the ref, with no `interactive.CanPromptInteractively()` confirmation and no explicit `--force` flag — the only output is `cmd.Printf("Deleted org %s\n", ...)` after the fact. Deleting an org/project is high-blast-radius and irreversible, and a name typo that happens to resolve to a real resource (or a wrong-but-valid ULID) deletes silently. The codebase already has the right pattern in `trail_cmd.go` (`confirmTrailDeletion` gated on `CanPromptInteractively`, with a `force` bypass); these commands should adopt it, or the team should consciously accept "control-plane deletes are unguarded" as policy. This matches the base branch's existing `repo delete`, so it's a pre-existing gap this PR extends rather than introduces, but it now covers four destructive verbs.
+
+**[LOW-MEDIUM] Deletes are not idempotent: deleting an already-gone resource surfaces a raw 404 — `org.go:99`, `project.go:157`, `grant.go` repo remove, `repo.go`**
+The generated decoders (e.g. `decodeDeleteOrgResponse`) return only 204 as success; any 404 becomes an `ErrorModelStatusCode` that `renderCoreError` turns into a plain error. So `entire org delete X` twice errors the second time, and `grant repo remove` for an already-revoked grantee errors. This is defensible (you learn the target didn't exist), but it makes the commands awkward in scripts/CI where "ensure absent" is the intent. Consider treating 404 as success for delete/revoke, or at minimum documenting the non-idempotent behavior. Consistent with existing `repo delete`.
+
+**[LOW-MEDIUM] No command-level tests for any new verb's wiring — `cmd/entire/cli/` (grant/org/project/repo)**
+Tests added cover only pure helpers (`pickRepo`, `validateGrantRole`, `parseGranteeMode` in `resolveref_test.go`/`grant_test.go`). Nothing exercises the actual command path — ref resolution → correct API call → output rendering — for `org/project get/delete`, `grant repo list/remove`, or the `repo get/delete` name-resolution change. The package already provides the `activeCoreClient` seam and `repo_mirror_test.go`/`trail_cmd_test.go` demonstrate the httptest-server pattern, so a test that asserts e.g. "`grant repo remove --provider github --provider-user-id 12345` hits the by-provider route, not the typed-id route" is cheap and would lock in the mode→route mapping. The whole org/project/repo/grant surface has historically lacked these tests, so this isn't a regression, but the new revoke-mode branching is exactly the kind of logic that warrants one.
+
+---
+
+## LOW NITS
+
+- **`grant.go` repo remove success message uses raw `args[0]`** (e.g. `"Revoked %s/%s from repo %s\n", provider, providerUserID, args[0]`): when the user passed a name, the message echoes the name while the operation targeted the resolved ULID. Same pattern in `org delete`/`project delete`/`repo delete` (`Deleted org %s` with `args[0]`). Minor — arguably friendlier to echo what the user typed — but it can read confusingly if resolution picked an unexpected target. Consider echoing the resolved ID, or both.
+- **`resolveRepoRef` ULID passthrough silently ignores `--project`** (resolveref.go): documented in the helper comment and PR description, but if a user passes both a repo ULID and a `--project` that doesn't actually own it, there's no validation — the flag is just dropped. Acceptable as documented; flagging only so it's a conscious choice.
+- **`pickRepo` ambiguity branch is effectively dead** given repo names are unique per project (the comment says so). The defensive multi-match error is fine to keep, but the "ambiguous" test case asserts behavior the API contract says can't occur — harmless.
+
+No issues found in core resolution / `CoreOrigin` handling, the typed-enum role casts, or the spec-to-client consistency.
+
+Relevant files (all absolute):
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/org.go`
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/project.go`
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/grant.go`
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/repo.go`
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/resolveref.go`
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/corecmd.go` (helper context, unchanged)</result>
+<usage><subagent_tokens>83600</subagent_tokens><tool_uses>19</tool_uses><duration_ms>200990</duration_ms></usage>
+</task-notification>

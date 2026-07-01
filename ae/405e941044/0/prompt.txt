@@ -1,0 +1,37 @@
+<task-notification>
+<task-id>a81ae07c29c11807f</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/5549b902-5dd9-4ff4-87b2-c6f8b300b68d/tasks/a81ae07c29c11807f.output</output-file>
+<status>completed</status>
+<summary>Agent "Review 1518 mirror-create wizard" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>MirrorUrl is a plain `entire://`-style clone URL (no embedded credentials), safe to print. Now I have a complete picture. Let me verify the spinner/progress concurrency interplay — whether the wizard's two sequential spinners and the progress block can collide. They run sequentially (spinner stops before next phase), so no collision. The progress block starts after spinners complete. Good.
+
+Let me check one potential issue: `createMirrors` writes `fmt.Fprintf(errW, "mirror creation: %v\n", err)` for the unreachable g.Wait error — but it does this while/after `prog` is animating. Since g.Wait() blocks until all goroutines finish and `prog.stop()` is called after, the ordering is fine, and the error path is dead code anyway. Minor.
+
+Now let me verify the `availableRegions` / `client` reuse: `runMirrorCreateWizard` creates `client` via `coreapi.New()` (control plane) and reuses it for both `ListAvailableMirrors` and `availableRegions` (ListClusters). Both are control-plane calls. Good. Per-cluster clients are built in `createMirrors` via `NewForCluster`. Correct separation.
+
+I have everything needed. Let me write up the review.
+
+Based on my review of the mirror-create wizard and command surface, here are my findings.
+
+## SUMMARY
+
+This is well-structured, carefully-commented code that clearly had thought put into the security-sensitive bits (the `hostFromPublicURL` userinfo-injection guard, the `validateClusterHost` reuse, the env-token-aware auth resolution). The accessibility requirement is satisfied: every `huh` form in the wizard goes through `NewAccessibleForm` (→ `uiform.New`), and the wizard correctly fails fast via `interactive.CanPromptInteractively()` before touching auth or the network, with a clean pointer at the non-interactive form. The control-plane core-resolution concern is handled correctly — the displayed "Signed in as … via {coreURL}" comes from `resolveAuthStatusTarget`, which (per CLAUDE.md) applies ENTIRE_TOKEN-first precedence itself, and the actual API calls go through `coreapi.New()`, which resolves the same way, so the displayed core can't diverge from where requests go. Clone URLs are plain `entire://` placement URLs with no embedded credentials, so printing them is safe; no secrets are logged. Error handling is consistent (SilentError for already-printed/cancelled paths, `renderCoreError` for API errors). I found no critical or high-severity issues — the items below are medium and low. Overall judgment: **APPROVE** with minor follow-ups.
+
+## MEDIUM+ FINDINGS
+
+**MEDIUM — Region-picker default pre-selection is silently discarded when the catalog has no `is_default` for the caller's jurisdiction, and the cross-product can fan out very large with no confirmation.** `repo_mirror_create_wizard.go` ~line 250 (`runMirrorCreateWizard`) → `mirrorTargets`. The wizard creates the full cross-product of every selected repo × every selected region and immediately fires `CreateMirror` for all of them (bounded only by `mirrorCreateConcurrency = 8`), with no summary/confirmation step. Selecting, say, 10 repos and 4 regions silently registers 40 mirror placements. Each `CreateMirror` is idempotent on (upstream, cluster) so this isn't catastrophic, but there's no "About to create N mirrors — proceed?" gate, and a mis-click in the multi-select is unrecoverable through the wizard. Consider a final confirm step showing the target count before the create fan-out begins.
+
+**MEDIUM — Partial-failure leaves registered placements with no cleanup path, and the "N mirror(s) failed" exit can mask that some placements were successfully created.** `repo_mirror_create_wizard.go`, `createOneMirror`/`reportMirrorResults` (~lines 370–470). If `CreateMirror` succeeds but the subsequent clone wait times out or the clone reaches `failed`/`suspended`, `res.err` is set and the run exits non-zero via `NewSilentError(fmt.Errorf("%d mirror(s) failed"))` — but the placement *was* registered on the cluster and is left in place. There is no rollback and no message telling the user the placement exists despite the "failed" status. This is defensible (a timed-out clone may still complete server-side), but the results table shows `timed out`/`failed` with a clone URL present, which is ambiguous about whether the placement persists. Worth a one-line note in the failure detail clarifying that registered-but-not-ready placements remain and can be retried (the create is idempotent).
+
+## LOW NITS
+
+- `createMirrors` ~line 320: `fmt.Fprintf(errW, "mirror creation: %v\n", err)` for `g.Wait()` is acknowledged dead code (the comment says so). Fine to keep for the errcheck invariant, but it writes to `errW` interleaved with the just-stopped progress block — harmless since it's unreachable.
+- `reportMirrorResults` ~line 445: the "Clone them:" block only lists `mirrorStatusReady` URLs, while `registered`/`empty` mirrors (which also carry a valid `MirrorUrl`) are shown only in the table. Intentional (not clonable yet), but a user with all `--no-wait`/`registered` results gets a table with URLs and no clone hint at all. Minor UX gap.
+- `multiSelectHeight` `headerSlack = 3` is a heuristic for title + wrapped description; on a very narrow terminal a long description could wrap to 3+ lines and still clamp. Edge case, low impact.
+- Test coverage is solid on the pure helpers (`selectableAvailableRepos`, `hostFromPublicURL`, `clusterChoices`, `mirrorTargets`, `clustersToRegions`, non-TTY progress) and the TTY-refusal guard, with real assertions rather than construction-only. There's no test exercising `createOneMirror`'s status→result mapping (ready/empty/registered/suspended/failed/timed-out branches) with a fake `coreapi.Client`/`mirrorStatusGetter`; that branching is the most logic-dense part of the wizard and is currently only covered indirectly. Consider a table test against the injectable `awaitMirrorReady` seam. (Not blocking — the shared path is tested via the one-shot.)
+
+Relevant files: `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/repo_mirror_create_wizard.go`, `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/repo_mirror.go`, `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/repo_mirror_create_wizard_test.go`.</result>
+<usage><subagent_tokens>87890</subagent_tokens><tool_uses>12</tool_uses><duration_ms>107765</duration_ms></usage>
+</task-notification>

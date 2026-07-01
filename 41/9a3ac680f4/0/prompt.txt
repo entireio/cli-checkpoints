@@ -1,0 +1,85 @@
+<task-notification>
+<task-id>a2d47b3fa06c6f499</task-id>
+<tool-use-id>toolu_01WHtrwF72swwMNVrvRJuuHk</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/d70d405d-5421-4b68-beab-2e3bcaaf25a7/tasks/a2d47b3fa06c6f499.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Now I have all the information I need. Let me compile my efficiency findings:
+
+## Efficiency Review: Trail Tune Go Code
+
+### Finding 1: Sequential Independent I/O in `gatherTuningContext`
+**File:** `trail_tune_gather.go:69-93`  
+**Lines:** 69-93 (gatherTuningContext function)  
+**Summary:** Four data tiers execute sequentially, but `gatherPRsAndIssues` (gh shell-out) and `gatherTrails` (HTTP API call) are independent I/O operations.  
+**Cheaper alternative:** Spawn these as concurrent goroutines with a WaitGroup. Repostat and checkpoints can stay sequential because they're fast local ops.  
+**Cost:** If gh pr+issue list takes 500ms and trails API takes 800ms, running sequentially costs ~1.3s vs. ~800ms concurrently. However, this is a one-shot interactive command where users expect moderate latency. **Judgment: Not critical, but cheap to fix.** Only worth doing if you expect users to run this repeatedly or with network lag.
+
+---
+
+### Finding 2: Sequential Per-Trail API Calls in `gatherTrails`
+**File:** `trail_tune_gather.go:312-327`  
+**Lines:** 312-327 (loop over scanned trails)  
+**Summary:** Loop over trails makes one `fetchAllTrailReviewComments` HTTP call per trail sequentially. Capped at `tuneMaxTrailsForFindings` (8 trails), so up to 8 serial HTTP round-trips.  
+**Cheaper alternative:** Fetch comments concurrently using a WaitGroup or bounded semaphore.  
+**Cost:** 8 sequential API calls at ~200-500ms each = 1.6-4s. Concurrent fetch of 8 would be ~500ms (network limited). However, continuing-on-error behavior (line 314) argues for serial safety. **Judgment: Consider concurrent fetch with error tolerance, but only if users report latency.**
+
+---
+
+### Finding 3: Redundant `topCounts` Call in `joinCounts`
+**File:** `trail_tune_gather.go:377-383`  
+**Lines:** 377-383 (joinCounts function)  
+**Summary:** `joinCounts` calls `topCounts(m, n)` to sort and slice the map, which allocates a slice, sorts it, then slices again. Called 4 times in `gatherTrails` (lines 334, 339, with implicit calls in lines 267, 271).  
+**Redundant passes:** `topCounts` does sort.Slice + slice truncation. No redundant computation within a single call, but the function is called multiple times on different maps—unavoidable.  
+**Cost:** Negligible. Each map has at most ~100 entries (severity/status/file counts from trail findings). **Judgment: Not a problem; topCounts is O(m log m) on small maps.**
+
+---
+
+### Finding 4: Double JSON Unmarshal in `replaceRunnerTemplate`
+**File:** `trail_tune_apply.go:61-92`  
+**Lines:** 63 (unmarshal raw to top), 71 (unmarshal promptRaw), then 89 (bytes.Count), 92 (bytes.Replace)  
+**Summary:** 
+- Line 63: Unmarshal raw bytes to extract "prompt" field (first unmarshal)
+- Line 71: Unmarshal that field again to extract "template" (second unmarshal)
+- Lines 89-92: bytes.Count + bytes.Replace on raw to surgically replace oldVal with newVal
+
+**Issue:** Two unmarshals to find the old template value, which could be computed once. However, the design choice is deliberate: preserve file formatting by doing bytes-level replacement rather than re-marshal. The second unmarshal is necessary to get oldVal (the original JSON-encoded template bytes, guaranteed to be a substring of raw).
+
+**Alternative:** Eliminate line 71's unmarshal by parsing "template" field from line 66's promptObj using json.RawMessage directly (already done—promptObj["template"] is a RawMessage). The oldVal is already extracted on line 76.  
+**Cost:** One unnecessary json.Unmarshal per runner file (~50-100µs per file, typically 1-3 runners). Not a bottleneck for this one-shot command.  
+**Judgment: Not a problem; the design is intentional to preserve formatting, and the extra unmarshal is negligible.**
+
+---
+
+### Finding 5: Full File Reads with Truncation in `readCapped`
+**File:** `trail_tune_gather.go:148-158`  
+**Lines:** 149 (os.ReadFile), then string slicing  
+**Summary:** `readCapped` reads the entire file into memory, then truncates to maxLen chars if needed. Called for CLAUDE.md (6000 char cap), AGENTS.md (6000), README.md (2000), and go.mod (400).  
+**Cost:** Small files typically, but still allocates full file buffer then discards tail. CLAUDE.md at 10KB could trigger a 10KB allocation for a 6KB result.  
+**Cheaper alternative:** Use `io.LimitReader(file, maxLen)` to cap the read upfront, then read into a sized buffer.  
+**Cost:** Saves re-allocation of file tail for large docs. **Judgment: Optimization exists but file sizes are plausible (6KB nominal), so negligible real impact. Only worth doing if repos have massive CLAUDE.md files.**
+
+---
+
+### Finding 6: `loadTuneRunners` Reads Each Runner File Twice
+**File:** `trail_tune_prompt.go:26-82`  
+**Lines:** 39 (os.ReadFile raw), 49 (json.Unmarshal for doc.ID extraction)  
+**Summary:** Raw bytes are read and stored in tuneRunner (line 58) for later byte-level replacement. Unmarshaling the same bytes on line 49 extracts the ID and Template.  
+**Not redundant within a single file:** This is the intended workflow—preserve raw for byte-level replacement, unmarshal once to extract metadata.  
+**Cost:** Two passes over one file per runner (1-3 runners typical). Negligible.  
+**Judgment: No issue; the pattern is intentional.**
+
+---
+
+## Summary
+
+**No critical efficiency issues found.** The code is well-designed for a one-shot interactive CLI command:
+- The only candidates for optimization (concurrent I/O in gather tiers, concurrent trail API calls) are only worth pursuing if users report actual latency complaints.
+- The JSON marshaling/unmarshaling is intentional to preserve file formatting.
+- File reads are appropriately sized for typical repo docs.
+- The redundant `topCounts` call within a single run is negligible on small cardinality maps.
+
+The code prioritizes correctness and maintainability over micro-optimizations, which is appropriate here.</result>
+<usage><subagent_tokens>24177</subagent_tokens><tool_uses>8</tool_uses><duration_ms>37403</duration_ms></usage>
+</task-notification>

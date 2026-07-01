@@ -1,0 +1,51 @@
+<task-notification>
+<task-id>a36573a86f7d1588d</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/5549b902-5dd9-4ff4-87b2-c6f8b300b68d/tasks/a36573a86f7d1588d.output</output-file>
+<status>completed</status>
+<summary>Agent "Review PR 1498 control-plane friendly names" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Confirmed: `coreapi.NewWithBearer(srv.URL, "tok")` against an httptest server is the established pattern. So the resolver functions (which contain the actual network-branching logic — the part most likely to regress) could have been tested end-to-end with modest effort, but weren't.
+
+I now have enough to assess. Let me verify one last correctness subtlety in `looksLikeULID`: a real-world collision risk. ULID is case-sensitive canonical uppercase, but the resolver accepts lowercase too. The concern flagged in the code comment: a 26-char name matching the alphabet would be misread. Also note — could a legitimate org/project *name* be a valid ULID shape? Names like generated identifiers. Low risk, acknowledged in comments. 
+
+One more: case sensitivity in name matching. `pickOrg`/`pickProject` use exact `==` (case-sensitive). If the server's `ListProjects --name` filter is case-insensitive but `pickProject` is case-sensitive, a name differing only in case would be filtered-in by the server then dropped by `pickProject` → "no project named". This is the kind of subtle mismatch worth flagging. Let me check whether the server name filter is case-sensitive — I can't see server code, but the spec just says "exact-match". I'll flag it as a medium consideration rather than a confirmed bug.
+
+I have everything needed for the review.
+
+---
+
+## SUMMARY
+
+This PR is **518/22 lines, entirely hand-written** — the ogen-generated `coreapi` methods it consumes (`ResolveHandle`, `ListOrgProjects`, `RevokeProjectAccessByProvider`) already exist on `main`, so this delta is pure CLI wiring plus a new `resolveref.go` resolver layer. The work is clean, well-commented, and idiomatic: it correctly threads name→ULID resolution inside the `runCore*` closures (so `SilenceUsage` and `renderCoreError` apply), uses the established `cmd.Printf` output convention, and does **not** re-resolve the control-plane core target anywhere (no `auth.ResolveControlPlaneTarget()` misuse — the only new print uses literal args). Name resolution handles the three cases that matter — ULID passthrough with no network call, no-match with an actionable error, and ambiguity that lists candidate ULIDs — and `projectGranteeMode` cleanly enforces the mutually-exclusive grantee addressing modes. The pure helpers (`looksLikeULID`, `parseQualifiedHandle`, `pickOrg`, `pickProject`, `filterProjectsByName`, `projectGranteeMode`) have solid table-driven tests with correct `t.Parallel()` usage. **Overall judgment: APPROVE** — the findings below are medium-and-below; none block merge.
+
+---
+
+## MEDIUM+ FINDINGS
+
+**[MEDIUM] Case-sensitivity mismatch between server name filter and client-side `pickProject` — `cmd/entire/cli/resolveref.go` ~line 78 (`resolveProjectRef`) / ~line 116 (`pickProject`)**
+`resolveProjectRef` delegates name filtering to the server via `ListProjects{Name: ...}` (documented "exact-match"), then `pickProject` re-filters with a case-sensitive Go `p.Name == name`. If the server's exact-match is case-insensitive (common for names), a query like `--project Widgets` against a project named `widgets` would be returned by the server but dropped by `pickProject`, producing a misleading "no project named" error instead of resolving. Worth confirming the server filter's case behavior; if it is case-insensitive, either normalize before comparing or drop the redundant client-side re-check and trust the server result. The same pattern applies to `pickOrg`, which filters a full `ListOrgs` client-side with `==`.
+
+**[MEDIUM] `resolveAccountRef` assumes a non-empty `AccountId` from `ResolveHandle` — `cmd/entire/cli/resolveref.go` ~line 53**
+`resolveAccountRef` returns `id.AccountId` directly after `ResolveHandle`. `ResolvedIdentity.AccountId` is a plain (non-optional) string, so if the server ever resolves a handle to an identity with no backing account (or returns 200 with an empty `accountId`), this silently forwards `""` as the owner ULID into `CreateProjectInputBody.OwnerId`, deferring failure to an opaque server-side create error. A guard — `if id.AccountId == "" { return "", fmt.Errorf("handle %q resolved to no account", ref) }` — would turn a confusing downstream error into a clear local one. Low likelihood but cheap insurance at an external boundary.
+
+**[LOW-MEDIUM] Resolver functions (the network-branching logic) are untested despite an available harness — `cmd/entire/cli/resolveref.go` / `resolveref_test.go`**
+The pure helpers are well covered, but `resolveOrgRef`/`resolveProjectRef`/`resolveAccountRef` — which contain the actual ULID-vs-name branch and the "ULID makes no network call" guarantee called out as load-bearing in the file's doc comment — have no tests. `repo_mirror_test.go` already establishes the `coreapi.NewWithBearer(httptest.NewServer(...).URL, "tok")` pattern, so a test asserting that a ULID ref issues zero HTTP requests while a name ref issues exactly one list call would be modest effort and would lock in the key invariant. Not a blocker given the helper coverage, but it leaves the most regression-prone seam unguarded.
+
+---
+
+## LOW NITS
+
+- **`cmd/entire/cli/resolveref.go` ~line 137 (`pickProject` ambiguity message)**: the error tells the user to "run `entire project list --org &lt;org&gt;`" to find the ULID, but the user is mid-`repo create`/`grant project` and may not know which org to pass — the comment above the function even acknowledges these callers have no `--org`. Minor; the listed candidate ULIDs already let the user proceed, so the suggestion is just slightly aspirational.
+- **`projectGranteeMode` returns `0` (== `granteeModeProvider`) on every error path** (`cmd/entire/cli/grant.go`). Harmless because every caller checks `err != nil` first, but returning the zero value of a *valid* mode on error is a small latent foot-gun; an explicit invalid sentinel would read more defensively. Not worth changing on its own.
+- The `--name` + `--org` combination in `project list` silently applies `--name` client-side (documented in the code comment), which is fine, but there's no user-facing note that `--name` semantics differ subtly between the two paths (server exact-match vs. client `filterProjectsByName` exact-match). They happen to agree on exact-match, so no behavioral divergence today.
+
+No issues found with control-plane core resolution (correctly avoided `ResolveControlPlaneTarget` for display), settings/logging conventions, or the `SilentError` path.
+
+Relevant files:
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/resolveref.go`
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/grant.go`
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/project.go`
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/repo.go`</result>
+<usage><subagent_tokens>78568</subagent_tokens><tool_uses>21</tool_uses><duration_ms>168358</duration_ms></usage>
+</task-notification>

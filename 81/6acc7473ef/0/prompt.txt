@@ -1,0 +1,47 @@
+<task-notification>
+<task-id>a8d9c3ff297bc32bd</task-id>
+<tool-use-id>toolu_01QRsRoqAYjaZ1yVSvV5pCT1</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/5549b902-5dd9-4ff4-87b2-c6f8b300b68d/tasks/a8d9c3ff297bc32bd.output</output-file>
+<status>completed</status>
+<summary>Agent "Review trail 542 tokens branch" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>`setupStopTestRepo` uses `t.Chdir` (process-global), so the tests using it correctly omit `t.Parallel()`. The pure-function tests (`TestRoundedPercent*`, `TestAddCheckpointTokenUsageSaturatesOverflow`, etc.) correctly use `t.Parallel()`. This conforms to conventions.
+
+Now let me check the `TestSessionsCmd_HelpIncludesTokensSubcommand` and `TestTokensCmd_CurrentAndSessionIDAreMutuallyExclusive` — the help test doesn't call `setupStopTestRepo` and doesn't `t.Parallel()`. That's a minor missed-parallelism nit, but the mutual-exclusive test calls `setupStopTestRepo` (chdir) yet the validation happens before any repo access. Not a correctness issue.
+
+Let me look at one substantive concern: the `roundedPercent` vs `tokenPercent` inconsistency and the cache-read denominator. In `recommendationRules`, `cacheReadPercent := tokenPercent(signals.Tokens.CacheRead, signals.Tokens.Total)`. `Total` includes subagent tokens (via `totalTokens`), but `CacheRead` is only the top-level cache read (not subagent). So the cache-read percentage uses mismatched numerator/denominator scopes when subagents exist. Let me verify `buildSessionTokensUsage` — `Total = totalTokens(usage)` which includes subagents, while `CacheRead = usage.CacheReadTokens` (top-level only). Confirmed.
+
+Let me double-check the context double-count nit and confirm the checkpoint multi-session path omits context (which the test confirms). I have enough. Let me verify one edge: `firstCheckpointBranch`/`Agent` single-value when `len(metas)==1`—the report sets both `Agent` and `Agents`. In JSON both emit. Minor redundancy, acceptable.
+
+Let me verify the `Limitations[0]` ordering assumption in the test is safe given `buildCheckpointTokensReport` appends the "no token data" limitation before the metadata-warnings limitation — could the readable-metadata test hit that? In that test, metas has token data (InputTokens:100), so `buildSessionTokensUsage` returns non-nil, so no "No token usage" limitation is prepended. So `Limitations[0]` is the metadata-warning string. Correct.
+
+I now have a complete picture. Let me write up the review.
+
+## SUMMARY
+
+This change adds two read-only reporting commands — `entire session tokens [session-id]` and `entire checkpoint tokens &lt;id&gt;` — that surface token usage, context-window pressure, likely cost contributors (subagents, skills, context), and heuristic optimization recommendations, in both text and `--json` form. `session tokens` reads from live `SessionState` (defaulting to the most-recent session in the current worktree); `checkpoint tokens` reuses the existing `explain` checkpoint-resolution path and aggregates committed per-session metadata, falling back to the root token summary when individual session-metadata files are unreadable. The code is careful and idiomatic: it routes all user output through `cmd.OutOrStdout()/ErrOrStderr()`, uses the `SilentError` pattern correctly (including a dedicated `tokenCommandError` that silences context cancellation), does saturating integer addition to avoid overflow in token sums, and computes percentages via 128-bit `bits` math to avoid intermediate overflow. Tests are substantive (real checkpoint shapes, real `SessionState` round-trips, JSON structure assertions, overflow edge cases) and follow repo conventions: `t.Chdir`-based tests correctly omit `t.Parallel()` while pure-function tests use it. Privacy is respected — only operational metadata (counts, IDs, model/agent labels, skill labels) is printed, no prompts or file contents. Overall this is high quality; I found no high-severity bugs, one genuine medium correctness issue in a percentage denominator, and a few low-severity nits.
+
+## MEDIUM+ FINDINGS
+
+**[MEDIUM] Cache-replay percentage mixes top-level numerator with subagent-inclusive denominator** — `cmd/entire/cli/session_tokens.go`, ~line 248 (`recommendationRules`, `cacheReadPercent := tokenPercent(signals.Tokens.CacheRead, signals.Tokens.Total)`).
+`signals.Tokens.Total` is computed by `totalTokens()`/`buildSessionTokensUsage`, which **includes** subagent tokens recursively, but `signals.Tokens.CacheRead` is only the top-level `usage.CacheReadTokens` (subagent cache reads are not surfaced in `sessionTokensUsage`). When a session has meaningful subagent token volume, the denominator is inflated relative to the numerator, so `cacheReadPercent` is systematically understated and the "context-replay-hotspot" (and the dependent `summarize-before-boundary`) recommendation can fail to fire even when top-level cache replay genuinely dominates the top-level call. The displayed cache-read figure in the recommendation message (`Cache/context replay is X% of token volume`) will also under-report. Consider computing the percentage against a top-level-only total (input+cacheCreation+cacheRead+output) or otherwise aligning numerator and denominator scope.
+
+## LOW-SEVERITY NITS
+
+- **Inconsistent rounding between two percent helpers** — `session_tokens.go`: context pressure uses `roundedPercent` (round-half-up, clamped 0–100), while cache-read uses `tokenPercent` (float, truncated to one decimal in `formatPercent`). Not a bug, but two different rounding behaviors for two displayed percentages is mildly surprising. Worth a comment or unifying.
+
+- **`Agent`/`Agents` (and `Model`/`Models`) both populated for single-session checkpoints** — `checkpoint_tokens.go`, `buildCheckpointTokensReport`: when `len(metas)==1` the report sets both the scalar `Agent` and the slice `Agents` (same for model). Harmless redundancy in JSON consumers, but the duplication could confuse machine consumers deciding which field is authoritative.
+
+- **Two new tests skip `t.Parallel()` without needing process-global state** — `sessions_test.go`: `TestSessionsCmd_HelpIncludesTokensSubcommand` builds a command and runs `--help` with no repo/chdir, so it could be `t.Parallel()`. `TestTokensCmd_CurrentAndSessionIDAreMutuallyExclusive` calls `setupStopTestRepo` (chdir) but the validated error path returns before touching the repo, so the setup is unnecessary. Neither is wrong; just slightly slower / inconsistent with the parallel pure-function tests in the same file.
+
+- **Theoretical infinite recursion on a self-referential `SubagentTokens` pointer** — `totalTokens` (`status_style.go`) and `addCheckpointTokenUsage` (`checkpoint_tokens.go`) recurse through `SubagentTokens` with no cycle guard. In practice the data is JSON-deserialized (acyclic), so this cannot occur from real inputs; flagging only for completeness, not as something to fix.
+
+No nil-deref, division-by-zero (all percent helpers guard `total &lt;= 0`), or data-race issues found; the saturating-add and 128-bit percent paths are correct and well-tested, and no secrets or user content are printed or persisted.
+
+Relevant files:
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/session_tokens.go`
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/checkpoint_tokens.go`
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/status_style.go` (`totalTokens`, `formatTokenCount`)
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/sessions_test.go`, `status_test.go`</result>
+<usage><subagent_tokens>88490</subagent_tokens><tool_uses>18</tool_uses><duration_ms>143937</duration_ms></usage>
+</task-notification>

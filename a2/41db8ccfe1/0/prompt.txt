@@ -1,0 +1,259 @@
+<task-notification>
+<task-id>a67b8c7e0f4f900ab</task-id>
+<tool-use-id>toolu_01FwR34e5cgSnu1yNmu5oWc9</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/d70d405d-5421-4b68-beab-2e3bcaaf25a7/tasks/a67b8c7e0f4f900ab.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Now I'll analyze these files systematically for simplification opportunities.
+
+## Simplification Findings
+
+### 1. **Duplicate switch/loop blocks in `gatherPRsAndIssues` (trail_tune_gather.go, lines 160-193)**
+
+**File:** `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_gather.go`  
+**Lines:** 160–193  
+**Summary:** Two nearly identical switch-case patterns handle PR and issue listing with the same logic flow.
+
+**Current form:** 
+- Lines 166–178: PR switch with three cases (error, empty, default with loop)
+- Lines 180–190: Issue switch with identical structure, variable name only difference
+
+**Simpler form:** Extract to `gatherGHItems(ctx, kind, limit)` helper that returns formatted string. Eliminates ~20 lines of copy-paste code and makes the error handling and formatting consistent in one place.
+
+**Cost of current:** Cognitive load; if one switch's logic changes, the other must be updated separately; risk of drift.
+
+---
+
+### 2. **Duplicated label struct in `labelSuffix` parameter (trail_tune_gather.go, lines 217–228)**
+
+**File:** `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_gather.go`  
+**Lines:** 195–228  
+**Summary:** The `ghItem.Labels` field uses an anonymous struct `[]struct{Name string}`, which is redefined identically in the `labelSuffix(labels []struct{...})` signature.
+
+**Current form:**
+```go
+type ghItem struct {
+    Labels []struct {
+        Name string `json:"name"`
+    } `json:"labels"`
+}
+
+func labelSuffix(labels []struct {
+    Name string `json:"name"`
+}) string { ... }
+```
+
+**Simpler form:** Define a named type once:
+```go
+type ghLabel struct {
+    Name string `json:"name"`
+}
+```
+Then use `[]ghLabel` in both places. Reduces duplication, improves readability, and makes the type reusable.
+
+**Cost of current:** Duplication; the struct appears twice with no shared name; harder to refactor or understand the data model.
+
+---
+
+### 3. **Unused `limit` parameter in `gatherCheckpoints` (trail_tune_gather.go, line 275)**
+
+**File:** `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_gather.go`  
+**Line:** 275  
+**Summary:** `func gatherCheckpoints(ctx context.Context, limit int)` accepts `limit` but immediately marks it unused with `_ = limit`.
+
+**Current form:**
+```go
+func gatherCheckpoints(ctx context.Context, limit int) string {
+    // ... lots of code ...
+    _ = limit // checkpoint listing is already bounded by repo history
+```
+
+**Simpler form:** Remove the `limit` parameter entirely and update the call site in `gatherTuningContext` (line 84). If checkpoint listing is inherently bounded by repo history (as the comment states), the parameter serves no purpose.
+
+**Cost of current:** Dead parameter pollutes the signature; callers must pass a value they can't use; comment is needed to explain why it's there.
+
+---
+
+### 4. **`tuneSources` struct + `parseTuneSources` pattern (trail_tune_gather.go, lines 27–63)**
+
+**File:** `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_gather.go`  
+**Lines:** 27–63  
+**Summary:** `tuneSources` is a 4-bool struct; `parseTuneSources` parses a list into it.
+
+**Current form:**
+```go
+type tuneSources struct {
+    repo bool
+    prs bool
+    checkpoints bool
+    trails bool
+}
+
+func parseTuneSources(list []string) (tuneSources, error) {
+    // ... switch on strings ...
+    var s tuneSources
+    s.repo = true
+    // etc.
+}
+```
+
+**Simpler form (optional):** If the four fields always move together and never vary independently, consider a bitmask or enum instead. Alternatively, if composition isn't the issue, the current approach is reasonable — struct of bools is idiomatic Go. This is **borderline**: it's not obviously wrong, just a style choice. Keep if clarity is the priority; switch to bitmask only if you're passing these around in tight loops.
+
+**Cost of current:** Modest — struct of bools is clear but takes 4 bytes + padding. Bitmask saves space but reduces readability. Skip unless you're doing this 1000s of times.
+
+---
+
+### 5. **Repeated header + content + newline pattern in `gatherTuningContext` (trail_tune_gather.go, lines 69–91)**
+
+**File:** `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_gather.go`  
+**Lines:** 69–91  
+**Summary:** Five identical patterns: `WriteString(header) + WriteString(gatherX()) + WriteString("\n")` are hardcoded.
+
+**Current form:**
+```go
+if src.repo {
+    b.WriteString("### Repository (static)\n\n")
+    b.WriteString(gatherRepoStatics(repoRoot))
+    b.WriteString("\n")
+}
+if src.prs {
+    b.WriteString("### Merged PRs &amp; issues\n\n")
+    b.WriteString(gatherPRsAndIssues(ctx, limit))
+    b.WriteString("\n")
+}
+// ... repeat 3 more times
+```
+
+**Simpler form:** Table-driven loop:
+```go
+sections := []struct {
+    enabled bool
+    header string
+    gather func() string
+}{
+    {src.repo, "### Repository (static)\n\n", func() string { return gatherRepoStatics(repoRoot) }},
+    {src.prs, "### Merged PRs &amp; issues\n\n", func() string { return gatherPRsAndIssues(ctx, limit) }},
+    // ...
+}
+for _, s := range sections {
+    if s.enabled {
+        b.WriteString(s.header)
+        b.WriteString(s.gather())
+        b.WriteString("\n")
+    }
+}
+```
+
+**Cost of current:** Repetition makes it easy to miss updating all 5 copies if the pattern changes; ~15 lines of boilerplate could become ~10 with less visual noise.
+
+---
+
+### 6. **`joinCounts` and `topCounts` tight coupling (trail_tune_gather.go, lines 360–383)**
+
+**File:** `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_gather.go`  
+**Lines:** 360–383  
+**Summary:** `joinCounts(m, n)` calls `topCounts(m, n)`, then immediately reformats the result. They're always used together.
+
+**Current form:**
+```go
+func topCounts(m map[string]int, n int) []keyCount { ... }
+func joinCounts(m map[string]int, n int) string {
+    parts := make([]string, 0, n)
+    for _, fc := range topCounts(m, n) {  // &lt;-- always calls topCounts
+        parts = append(parts, fmt.Sprintf("%s=%d", fc.key, fc.n))
+    }
+    return strings.Join(parts, ", ")
+}
+```
+
+**Simpler form:** Inline `topCounts` logic into `joinCounts`. They're only called together; keeping them separate adds a layer of indirection. If `topCounts` is genuinely reused elsewhere (e.g., for rendering file counts), keep it; otherwise merge.
+
+**Grep to check:** `grep -n "topCounts\|joinCounts" /Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_gather.go` shows `topCounts` is called at lines 271, 343, 379 — **it is reused** (for files, top findings, joinCounts itself). Keep both functions.
+
+**Cost of current:** None — they're correctly factored.
+
+---
+
+### 7. **`buildTunePrompt` string concatenation (trail_tune_prompt.go, lines 92–129)**
+
+**File:** `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_prompt.go`  
+**Lines:** 92–129  
+**Summary:** Mixed use of `WriteString` and `Fprintf` with `strings.Builder`.
+
+**Current form:**
+```go
+b.WriteString(`You are tuning...`)
+b.WriteString("\n\n")
+b.WriteString("## Gathered repository signal\n\n")
+b.WriteString(strings.TrimSpace(brief))
+b.WriteString("\n\n")
+b.WriteString("## Current runner templates\n\n")
+for _, r := range runners {
+    fmt.Fprintf(&amp;b, "### %s\n\n", r.ID)
+    b.WriteString("```\n")
+    // ...
+}
+```
+
+**Simpler form:** Consistent use of `Fprintf` for all formatting (including plain strings), or restructure to larger blocks. The current mix works but is slightly inconsistent. Not a real complexity issue — the builder pattern is sound.
+
+**Cost of current:** Minor — slightly inconsistent style, but the code is clear and efficient.
+
+---
+
+### 8. **`oneLine` utility (trail_tune_gather.go, lines 385–392)**
+
+**File:** `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_gather.go`  
+**Lines:** 385–392  
+**Summary:** Small helper that normalizes error messages. Used 3 times (lines 170, 184, 233, 350).
+
+**Current form:**
+```go
+func oneLine(s string) string {
+    s = strings.ReplaceAll(s, "\n", " ")
+    s = strings.TrimSpace(s)
+    if len(s) &gt; 200 {
+        s = s[:200] + "…"
+    }
+    return s
+}
+```
+
+**Simpler form:** This is already well-factored. No simplification needed.
+
+**Cost of current:** None — appropriate level of abstraction.
+
+---
+
+### 9. **`keyCount` struct (trail_tune_gather.go, lines 355–358)**
+
+**File:** `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_tune_gather.go`  
+**Lines:** 355–358  
+**Summary:** Small struct used only internally in `topCounts` and `joinCounts`.
+
+**Current form:**
+```go
+type keyCount struct {
+    key string
+    n   int
+}
+```
+
+**Simpler form:** Could be an anonymous struct in `topCounts` return type, but then sorting comparisons become harder to read. The named type is cleaner. No simplification needed.
+
+**Cost of current:** None — appropriate.
+
+---
+
+## Summary of High-Value Findings
+
+| Priority | File | Lines | Finding | Simplification |
+|----------|------|-------|---------|-----------------|
+| **High** | trail_tune_gather.go | 160–193 | Duplicate PR/issue switch blocks | Extract to `gatherGHItems(kind, limit)` helper |
+| **High** | trail_tune_gather.go | 217–228 | Duplicate label struct definition | Define named `ghLabel` type, reuse in `ghItem` and `labelSuffix` |
+| **Medium** | trail_tune_gather.go | 275 | Unused `limit` parameter in `gatherCheckpoints` | Remove parameter and update call site |
+| **Low** | trail_tune_gather.go | 69–91 | Repeated header+content+newline pattern | Table-driven loop if pattern evolves frequently |
+| **None** | trail_tune_gather.go | 360–383 | `joinCounts`/`topCounts` coupling | Keep as-is; `topCounts` has 3 call sites |</result>
+<usage><subagent_tokens>22205</subagent_tokens><tool_uses>4</tool_uses><duration_ms>35759</duration_ms></usage>
+</task-notification>

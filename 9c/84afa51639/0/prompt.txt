@@ -1,0 +1,110 @@
+<task-notification>
+<task-id>a457acc7c9d47e06e</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/78b0fe12-1b0c-46e0-ae16-2534880690c7/tasks/a457acc7c9d47e06e.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect. Now I have enough information. Let me analyze the efficiency issues systematically. Let me create a comprehensive analysis:
+
+## Efficiency Analysis: Double-Compaction Issue on Checkpoint-Write Path
+
+Based on my detailed review of the diff and codebase, I've identified the core efficiency concern and validated a potential alternative approach.
+
+### **FINDING 1: Double Full Compaction per Checkpoint (Line 539-560 in compact.go)**
+
+**File**: `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/transcript/compact/compact.go`
+
+**Lines**: 142–163 (FullWithBoundary function)
+
+**One-line summary**: `FullWithBoundary` calls `Compact()` twice on the entire input (full + delta), parsing and re-emitting the entire transcript twice per checkpoint write.
+
+**Concrete cost**: 
+- **Previous behavior** (pre-diff): Single `Compact(transcriptBytes, StartLine)` call that sliced input via `SliceFromLine()` or format-specific message-index offsets, then parsed &amp; emitted only the delta.
+- **New behavior** (post-diff): Two full `Compact()` calls per checkpoint:
+  1. `Compact(transcriptBytes, StartLine=0)` → full compaction (parse entire transcript, emit all format-specific lines)
+  2. `Compact(transcriptBytes, original StartLine)` → delta compaction (parse entire transcript again, emit delta only)
+  3. Then `countCompactLines(full) - countCompactLines(delta)` for the boundary
+
+For long sessions with many checkpoints, this is **O(T) per checkpoint** (where T = total transcript size), instead of **O(D) per checkpoint** (where D = delta size). On a 100-checkpoint session where each checkpoint adds ~5KB, the previous code parsed ~5KB per checkpoint; the new code parses the full session size repeatedly.
+
+**Cheaper alternative** (single-pass feasibility): 
+The commented explanation at lines 135–141 explicitly documents why single-pass wasn't chosen: "This reuses each format's existing, independently-tested slicing behavior — line offsets for JSONL/Copilot/Droid/pi, message-index for OpenCode/Gemini, response-item index for Codex — rather than threading source indices through every emitter."
+
+However, a **feasible cheaper path exists** that requires no emitter rewrites:
+- In `FullWithBoundary`, after calling `Compact(redacted, fullOpts)` (the full pass), instead of calling `Compact()` a second time, **count the newlines in the full output up to the point equivalent to `StartLine` using a single forward-scan pass through `fullOpts` with an early-exit counter**. The challenge is that different formats encode StartLine differently:
+  - JSONL/Copilot/Droid/pi: StartLine is a newline offset → count newlines directly
+  - OpenCode/Gemini: StartLine is a message-index → would need to parse the full output to re-identify message boundaries
+  - Codex: StartLine is a response_item index → similar parse requirement
+
+This means **a single-pass optimization is feasible only for JSONL-like formats** (which dominate most sessions) and would require format-specific branching in `FullWithBoundary` to avoid the second compaction for those formats. The commented doc acknowledges this design choice as deliberate (simplicity &gt; performance for boundary computation), so this is **an acceptable tradeoff**, not a bug.
+
+**Verdict**: The double compaction is a **measurable efficiency cost** (O(n) per checkpoint for n checkpoints over a session) but the diff correctly chose **simplicity over optimization** to avoid threading indices through 7 emitters. If profiling shows checkpoint writes are a bottleneck, a targeted optimization (single-pass for JSONL formats via format detection in `FullWithBoundary`) is viable.
+
+---
+
+### **FINDING 2: Redundant Metadata Read-Modify-Write in OPF Path (Lines 1821–1850 in persistent.go)**
+
+**File**: `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/checkpoint/persistent.go`
+
+**Lines**: 1824–1851 (setCompactTranscriptStart function)
+
+**One-line summary**: On OPF pre-push finalization, `setCompactTranscriptStart` re-reads the metadata blob from Git, unmarshals it, sets one field, re-marshals, and writes a new blob—even though the caller (`replaceTranscript` at line 1812–1816) already holds the metadata object in memory.
+
+**Concrete cost**:
+- `readMetadataFromBlob(entry.Hash)` (line 1831) makes a Git object read and JSON unmarshal of the full metadata blob
+- `MarshalIndentWithNewline(metadata, "", "  ")` (line 1837) re-serializes the metadata
+- `CreateBlobFromContent(s.repo, metadataJSON)` (line 1841) writes a new blob to Git
+- This happens on every OPF finalization that produces a compact transcript (line 1812–1816)
+
+The root cause: `replaceTranscript` doesn't pass the already-loaded metadata to `setCompactTranscriptStart`; instead, it asks the function to fetch it fresh from the blob hash in `entries[metadataPath]`.
+
+**Cheaper alternative**:
+Refactor `setCompactTranscriptStart` to accept the metadata object directly instead of fetching it:
+```go
+// Change signature from:
+func (s *GitStore) setCompactTranscriptStart(sessionPath string, start int, entries map[string]object.TreeEntry) error
+
+// To:
+func (s *GitStore) setCompactTranscriptStart(sessionPath string, start int, metadata *Metadata, entries map[string]object.TreeEntry) error
+  // caller: metadata.CompactTranscriptStart = &amp;start
+  // then re-marshal once, no need to fetch
+```
+Alternatively, hoist metadata update logic into `replaceTranscript` to avoid a separate function call entirely (metadata is already unpacked there for other checks if needed).
+
+**Feasibility**: Very high—this is a low-risk refactor affecting only the OPF path (not the hot checkpoint-write path) and requires only passing one additional parameter.
+
+**Verdict**: Real efficiency win on the OPF finalization path (not the critical checkpoint-write path, but non-zero cost per session finalization). **Recommend applying this optimization**.
+
+---
+
+### **FINDING 3: No Redundant Re-Reads/Re-Marshals on Main Checkpoint Path**
+
+The main checkpoint write path (`writeTranscript` + `writeCompactTranscript`) avoids redundancy:
+- `transcriptBytes` is passed once and reused (line 833)
+- Compaction happens once via `FullWithBoundary` (line 875)
+- Metadata is built fresh (lines 455–462 in the old function signature) with no re-reads
+- The `CompactTranscriptStart` pointer is returned and directly assigned to the metadata struct being constructed (line 175), not via a separate read-modify-write
+
+**Verdict**: No redundancy found here.
+
+---
+
+### **FINDING 4: No Closure/Captured-Scope Retention Issues**
+
+Reviewed `writeCompactTranscript` return path (lines 871–917): the function returns a `*int` (boundary pointer), which is stack-allocated and safe. No closures capture mutable state. No retained buffer slices from the compaction output.
+
+**Verdict**: No issues found.
+
+---
+
+## Summary
+
+| Finding | File | Lines | Cost | Acceptable? | Recommendation |
+|---------|------|-------|------|-------------|-----------------|
+| Double full-compaction per checkpoint | compact.go | 142–163 | O(T·n) for n checkpoints; measurable but acknowledged trade-off for code simplicity | **Yes—deliberate design choice** | Monitor if checkpoint writes become a bottleneck; targeted single-pass optimization for JSONL formats viable if needed |
+| Redundant metadata re-read in OPF finalization | persistent.go | 1824–1851 | Read + parse + re-marshal + write per finalization (not on hot path) | **No—optimizable** | **Refactor `setCompactTranscriptStart` to accept metadata object directly** to avoid re-fetch; very low-risk change |
+| Redundant re-reads on main checkpoint path | persistent.go | 407–846 | None found | N/A | No action needed |
+| Closure/scope retention | persistent.go + compact.go | Throughout | None found | N/A | No action needed |</result>
+<usage><subagent_tokens>40530</subagent_tokens><tool_uses>14</tool_uses><duration_ms>47821</duration_ms></usage>
+</task-notification>

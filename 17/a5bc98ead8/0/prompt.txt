@@ -1,0 +1,52 @@
+<task-notification>
+<task-id>ab980f2b645d399d7</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/5549b902-5dd9-4ff4-87b2-c6f8b300b68d/tasks/ab980f2b645d399d7.output</output-file>
+<status>completed</status>
+<summary>Agent "Review trail 669 entire clone" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Confirmed. For a full `entire://` URL, `git-remote-entire` resolves the credential via `clusterdiscovery.ResolveContextForCluster` (or the env-token path validating aud against `ResolveClusterCores`) — the credential is only sent to a host whose `/.well-known` advertises a core that an existing local context trusts. So the passthrough path is safe by construction: an attacker-controlled host has no matching local context and the resolve fails closed. The credential is never sent to an arbitrary host.
+
+I now have a complete picture. Let me write the review.
+
+---
+
+## SUMMARY
+
+This is a clean, security-conscious implementation. The credential/host safety — the highest-risk area — is sound: the synthesized clone URL is `entire://&lt;host&gt;/gh/&lt;owner&gt;/&lt;repo&gt;` with **no credential embedded** (token exchange happens later inside `git-remote-entire`, which only sends credentials to a host whose `/.well-known` advertises a core trusted by an existing local context, failing closed otherwise). Both the user-supplied `--cluster` and the server-provided `chosen.ClusterHost` pass through the allow-list/format validator `validateClusterHost` **before** any URL is built or any credentialed request is made, and that validator specifically defeats the `cluster@evil.com` userinfo-demotion attack with a round-trip-to-bare-host check plus DNS-label/IP validation. `git clone` is invoked via exec argv (not `sh -c`), owner/repo/host are charset-restricted at the boundary (closing `?`, `#`, `..`, control chars), and no token is logged or printed. Multi-cluster handling correctly uses `NewAccessibleForm`, gates on `interactive.CanPromptInteractively()`, and fails fast with a `--cluster` pointer when non-interactive; cross-cluster routing correctly uses `coreapi.NewForCluster`. **Overall: approve** (one missing `--` separator before positional args is the only finding I'd want addressed; the rest are nits/scope).
+
+---
+
+## MEDIUM+ FINDINGS
+
+### MEDIUM — Missing `--` separator before positional args in `git clone` invocation
+**File:** `cmd/entire/cli/repo_clone.go` (~`runGitClone`, line ~270)
+
+```go
+args := []string{"clone", cloneURL}
+if targetDir != "" {
+    args = append(args, targetDir)
+}
+gitCmd := exec.CommandContext(ctx, "git", args...)
+```
+
+There is no `--` separator inserted before the positional arguments, so an argument that begins with `-` could be interpreted by `git clone` as a flag rather than a positional (argument injection). For the synthesized-URL path this is closed off because `cloneURL` always starts with `entire://`, but two vectors remain reachable: (1) the full-`entire://`-passthrough path trims but never re-validates that `ref` still starts with `entire://` after trimming — actually it does (`isEntireCloneURL` is checked), so `cloneURL` is safe there too; (2) **`targetDir` (`args[1]`) is entirely user-controlled and never validated** — a user running `entire clone /gh/a/b -- --upload-pack=...` or `entire clone /gh/a/b --foo` would pass `--foo` as `git clone`'s second positional, and git would treat it as an option. Insert a `--` before the positionals: `args := []string{"clone", "--", cloneURL}` (and `targetDir` after it). This is defense-in-depth — cobra captures `--cluster`/`--json` before they reach `args[1]`, so practical exploitability is low — but the `--` is the standard, cheap fix and matches the security posture of the rest of this change.
+
+### LOW/MEDIUM — Unrelated `agentimport`/`.golangci.yaml` change rides along on this branch
+**Files:** `cmd/entire/cli/agentimport/agentimport.go` (-2), `.golangci.yaml` (+1)
+
+The diff includes moving an `ireturn` lint suppression from an inline `//nolint:ireturn` on `agentimport.Get` to a global `ifacecut` exclusion entry for `agentimport.Importer`. This is functionally fine and net-neutral, but it has nothing to do with `entire clone` and looks like a rebase artifact or scope creep. Consider splitting it into its own commit/PR so the clone PR stays focused and the changelog/blame for the lint-config change is attributable to the right work. Not blocking.
+
+---
+
+## LOW NITS
+
+- **`entire://` passthrough does not call `validateClusterHost`** (`repo_clone.go`, `isEntireCloneURL` branch). This is *safe* — `git-remote-entire` resolves the host via `clusterdiscovery.ResolveContextForCluster`/`ResolveClusterCores`, which fails closed for any host without a matching trusted local context — but a one-line comment noting "host safety for this path is enforced downstream in git-remote-entire" would save the next reader the same trace I just did. (The shorthand path's comment is excellent; this path is silent.)
+
+- **`validateClusterHost` does not validate the port component.** `url.Parse("https://"+host)` with `u.Host == host` allows `host:port`; `u.Hostname()` strips the port before label validation, so a value like `cluster.entire.io:notaport` round-trips (`u.Host == host` holds, `Hostname()` returns the host, labels pass). `url.Parse` rejects clearly-malformed ports, and a bad port only breaks the user's own clone, so this is cosmetic — not a credential-leak vector. Worth a sentence in the doc comment if you want to be precise.
+
+- **Test coverage gap: no test for the full-`entire://`-passthrough RunE path** (that `--cluster` is ignored and the URL is forwarded verbatim). `TestIsEntireCloneURL` covers the predicate, but not that `runGitClone` receives the untouched URL. Minor — the logic is trivial — but a `RunE`-level test (e.g. with a fake/stubbed `runGitClone`) would lock in the "cluster ignored for full URL" contract the Long help promises.
+
+- **Praise:** The boundary-hardening is genuinely well done — charset-restricted owner/repo regexes with dot-only rejection, the `cluster@evil.com` test case, the case-folding normalization in `clusterdiscovery` (with a real cache-hit assertion), the `handleFormCancellation` guard that prevents falling through to an empty-host `entire:///gh/...` clone, and the SilentError discipline for `git clone` failures (git already printed diagnostics). Comments explain *why* (the threat model) rather than *what*, which made this fast to audit. Test assertions are real (owner/repo/provider values, host lists in error strings, dedupe, case-insensitive match), not smoke tests.</result>
+<usage><subagent_tokens>86832</subagent_tokens><tool_uses>22</tool_uses><duration_ms>240059</duration_ms></usage>
+</task-notification>

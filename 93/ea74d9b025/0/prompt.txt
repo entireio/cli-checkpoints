@@ -1,0 +1,167 @@
+<task-notification>
+<task-id>a084a6f64efbec9bc</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/d70d405d-5421-4b68-beab-2e3bcaaf25a7/tasks/a084a6f64efbec9bc.output</output-file>
+<status>completed</status>
+<summary>Agent "Map data sources for tuning" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect! Now I have comprehensive coverage. Let me write the final report:
+
+## COMPREHENSIVE REPORT: Programmatic Access to Repo Signal Sources
+
+Based on thorough investigation of the Go CLI codebase, here's what's programmatically accessible for each of the four data sources:
+
+---
+
+### 1. CHECKPOINT / SESSION HISTORY
+
+**Checkpoint JSON Output Shape** (`entire search --json`):
+- **File**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/search/search.go:42-113`
+- **Response structure**:
+  ```
+  {
+    "results": [
+      {
+        "type": "checkpoint|commit|session",
+        "data": { /* typed payload */ },
+        "searchMeta": {
+          "matchType": "...",
+          "score": 0.0,
+          "snippet": "...",
+          ...
+        }
+      }
+    ],
+    "total": &lt;int&gt;,
+    "counts": {
+      "checkpoint": &lt;int&gt;,
+      "commit": &lt;int&gt;,
+      "session": &lt;int&gt;
+    }
+  }
+  ```
+
+**CheckpointResult fields** (from search API):
+- `id`, `prompt`, `commitMessage`, `commitSHA`, `branch`, `org`, `repo`, `author`, `authorUsername`, `createdAt`, `filesTouched` (array)
+
+**Internal Go API for Checkpoints**:
+- **File**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/checkpoint/checkpoint.go:66-144`
+- **Key types**:
+  - `checkpoint.TemporaryStore` interface: 
+    - `ListTemporary(ctx, ...)` → `[]TemporaryInfo`
+    - `ListTemporaryCheckpoints(ctx, baseCommit, worktreeID, sessionID, limit)` → `[]TemporaryCheckpointInfo`
+    - `ListAllTemporaryCheckpoints(ctx, sessionID, limit)` → `[]TemporaryCheckpointInfo`
+    - `ListCheckpointsForBranch(ctx, branchName, sessionID, limit)` → `[]TemporaryCheckpointInfo`
+    - `GetTranscriptFromCommit(ctx, commitHash, metadataDir, agentType)` → `[]byte`
+    - `ShadowBranchExists(baseCommit, worktreeID)` → `bool`
+
+- `TemporaryCheckpointInfo` fields: `commitHash`, `message`, `sessionID`, `metadataDir`, `isTaskCheckpoint`, `toolUseID`, `timestamp`
+
+- `CommittedInfo` (committed checkpoints): `checkpointID`, `sessionID`, `createdAt`, `checkpointsCount`, `filesTouched`, `agent`, `isTask`, `toolUseID`, `sessionCount`, `sessionIDs`
+
+- `CommittedMetadata` (stored in metadata.json): `cliVersion`, `checkpointID`, `sessionID`, `strategy`, `createdAt`, `branch`, `checkpointsCount`, `saveStepCount`, `filesTouched`, `agent`, `model`, `tokenUsage`, `skillEvents`, `summary`, `initialAttribution`, `kind` (e.g., "agent_review")
+
+**Verdict**: Clean internal Go API exists. **No shell-out needed**. The checkpoint package provides storage-aware introspection through `TemporaryStore` interface, which is implemented by strategy internals. Checkpoints are stored on shadow branches (entire/&lt;hash&gt;) and the metadata orphan branch (entire/checkpoints/v1). Search API provides semantic/keyword matching but the internal API gives direct programmatic access to metadata and transcripts.
+
+---
+
+### 2. TRAIL HISTORY / EVAL RESULTS
+
+**Trail API Methods**:
+- **File**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/api/trails.go:19-29`
+- `TrailsEnabled(ctx, forge, owner, repo)` → `bool` - probe if trails are provisioned for the repo
+
+**TrailListResponse** (from GET /api/v1/trails/:org/:repo):
+- **File**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/api/trail_types.go:9-20`
+- Fields: `trails: []TrailResource`, `total`, `limit`, `offset`, `repoFullName`, `defaultBranch`, `updatedAt`
+
+**TrailResource fields**:
+- `id`, `number`, `branch`, `base`, `title`, `body`, `status`, `phase`, `author`, `assignees`, `labels`, `priority`, `type`, `reviewers`, `createdAt`, `updatedAt`, `mergedAt`, `commentCount`, `unresolvedCount`, `checkpointCount`, `commitsAhead`
+
+**Trail Review Comments** (findings from code review):
+- **File**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/api/trail_review_types.go:53-79`
+- `TrailReviewComment` fields: `id`, `trailID`, `repositoryID`, `reviewID`, `codeVersionID`, `title`, `body`, `severity`, `confidence` (float64), `status` ("open"|"resolved"|"dismissed"|"stale"), `statusReason`, `staleOutcome`, `staleCheckedAt`, `location` (file/line/column), `suggestedChanges[]`, `threadID`
+
+**Access Pattern**:
+- **CLI command**: `entire trail list` / `entire trail show`
+- **File**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/trail_cmd.go:97-112`
+- Lists trails with filters: author, status (open/closed/merged/draft), limit
+- Reviews accessed via `trail_review_cmd.go` (separate subcommand)
+
+**Trail Identification**:
+- Repository scope: `forge` (github/gitlab/etc), `owner`, `repo` (parsed from origin remote)
+- Trail scope: `number` (human-facing), `id` (12-hex trail ID)
+- Branch association: `branch` field directly identifies which branch the trail covers
+
+**Verdict**: **Shell-out to data API** via `api.Client` (wrapper around HTTP). No direct language SDK for trail CRUD. To query past reviews/findings: make HTTP GET to `/api/v1/trails/{forge}/{owner}/{repo}` (list) or `/api/v1/trails/{trailID}/reviews/{reviewID}` (detail + comments). The CLI code authenticates via `api.Client` using an access token from `auth.ResolveDataAPIToken()`. Risk/confidence scores are in the `confidence` field of review comments (optional float64, range 0-1 implied).
+
+---
+
+### 3. ISSUES / PRs
+
+**GitHub Access Strategy**:
+- **File**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/setup_github.go:813-865`
+- The CLI **shells out to `gh` CLI** for GitHub operations (user availability, org enumeration, repo creation/existence checks)
+- Commands used: `gh api user`, `gh repo view`, `gh repo create`
+- No vendored GitHub SDK (go-github, octokit, etc.) in the CLI codebase
+
+**What's Available**:
+- GitHub App integration check: `api.ReportEnable()` (file: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/api/enable.go`) returns `EnableRepoResponse` with `connected` (bool), `installURL`, and basic repo metadata (`fullName`, `githubID`, `private`)
+- Repository enumeration: `api.ListRepositories()` (file: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/api/repositories.go:28-51`) - lists user's repos with `checkpointCount`, no PR/issue fields
+
+**Verdict**: **No clean internal API for PRs/issues**. To read merged PRs and issues:
+1. **Shell out to `gh` CLI** (e.g., `gh pr list --state merged`, `gh issue list`)
+2. **Or** make authenticated HTTP calls to GitHub GraphQL/REST API using a GitHub token (the CLI never does this directly; it defers to `gh`)
+3. **Identity for this repo**: Resolved via `strategy.OpenRepository(ctx)` (file: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/strategy/common.go:1011-1017`) which opens the git repo, then extract remote URLs and parse with `search.ParseGitHubRemote()` (file: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/search/github.go:17-33`) to get `owner` and `repo`
+
+---
+
+### 4. REPO STATIC CONTEXT
+
+**Repository Root Discovery**:
+- **File**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/paths/paths.go:65-101`
+- `paths.WorktreeRoot(ctx)` → worktree root via `git rev-parse --show-toplevel` (cached per cwd)
+- `strategy.OpenRepository(ctx)` → go-git Repository object
+- `strategy.GetMainRepoRoot(ctx)` → main repo root (handles worktrees)
+- `strategy.GetGitCommonDir(ctx)` → shared .git directory
+
+**Metadata File Locations**:
+- **Infrastructure dir**: `.entire/` (constant: `paths.EntireDir`)
+- **Checkpoint metadata branch**: `entire/checkpoints/v1` (orphan branch; constants: `paths.MetadataBranchName`)
+- **Trail metadata branch**: `entire/trails/v1` (orphan branch; constant: `paths.TrailsBranchName`)
+- **Checkpoint path structure**: `&lt;checkpoint-id[:2]&gt;/&lt;checkpoint-id[2:]&gt;/metadata.json` + session subdirs
+
+**ReadMe/Docs Discovery**:
+- **No built-in helper function** in the CLI to locate/read CLAUDE.md, AGENTS.md, README, go.mod, etc.
+- The search command does NOT index these files; it indexes checkpoints, commits, sessions
+- To discover repo structure: manually read files from `WorktreeRoot()` (e.g., look for README.md, go.mod, Makefile patterns)
+
+**Verdict**: **Go API exists for paths and git repo root**. No dedicated "describe repo" function. To gather static context:
+1. Call `paths.WorktreeRoot(ctx)` to get repo root
+2. Use `strategy.OpenRepository(ctx)` to open go-git repo (full tree/commit introspection available)
+3. Manually read target files (README, CLAUDE.md, go.mod, etc.) from the worktree root
+4. For committed checkpoint metadata, walk the `entire/checkpoints/v1` branch using git tree/object APIs
+
+---
+
+### IDENTIFICATION KEYS FOR EACH SOURCE
+
+| Source | Identifies "This Repo" | Identifies Specific Item |
+|--------|----------------------|-------------------------|
+| **Checkpoint** | `forge`, `owner`, `repo` (from remote URL) | Checkpoint `id` (12-hex) or commit SHA; session `sessionID` (date-prefixed) |
+| **Trail** | `forge`, `owner`, `repo` (from remote URL) | Trail `id` (12-hex) or `number` (integer); `branch` field links trail to working branch |
+| **PR/Issue** | `forge`, `owner`, `repo` (from remote URL) | GitHub PR/issue number (from `gh` CLI or GitHub API) |
+| **Static Context** | `WorktreeRoot()` (repo root path) | File path relative to repo root |
+
+---
+
+### SUMMARY TABLE
+
+| Source | Internal Go API | Shell-Out | HTTP/REST | Data Available | Notes |
+|--------|-----------------|-----------|-----------|-----------------|-------|
+| **Checkpoint/Session** | ✅ `checkpoint.TemporaryStore` + `checkpoint.Committed*` types | ❌ No | Via search service (not shell) | Metadata, transcripts, files touched, prompts, rewound state | Shadow branch storage; internal API preferred |
+| **Trail/Reviews** | ❌ Minimal (only `TrailsEnabled()`) | ❌ No | ✅ `/api/v1/trails/*` endpoint | Trail status, reviewers, review comments w/ risk/confidence | Must use data API client; CLI wraps HTTP |
+| **PR/Issue** | ❌ No | ✅ `gh` CLI | ❌ Not directly | Must shell out or call GitHub API | CLI never makes direct GitHub API calls |
+| **Repo Static** | ✅ `paths.WorktreeRoot()`, `strategy.OpenRepository()` | ✅ `git` commands | ❌ Not needed | Repo root, git metadata, manual file read | No dedicated "describe repo" function |</result>
+<usage><subagent_tokens>75044</subagent_tokens><tool_uses>54</tool_uses><duration_ms>118793</duration_ms></usage>
+</task-notification>

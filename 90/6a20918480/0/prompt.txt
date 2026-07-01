@@ -1,0 +1,225 @@
+<task-notification>
+<task-id>aff7b6f8c9c51de0f</task-id>
+<tool-use-id>toolu_017hxFTnQ5m4NtQ9yQtCtCG7</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/d70d405d-5421-4b68-beab-2e3bcaaf25a7/tasks/aff7b6f8c9c51de0f.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect. Now I have all the context I need. Let me write my review findings:
+
+## ALTITUDE CODE REVIEW: trail_tune_*.go
+
+### FINDING 1: Provider Re-Derivation in `applyTuneWithAgent`
+
+**File:** `trail_tune_cmd.go`, lines 105-123  
+**Issue:** After calling `resolveCheckpointSummaryProvider()` (which already wraps the TextGenerator in a checkpointSummaryProvider struct), the code then re-derives the raw TextGenerator by calling `agent.Get()` and `agent.AsTextGenerator()` again.
+
+**Current code:**
+```
+provider, err := resolveCheckpointSummaryProvider(ctx, errW)  // returns *checkpointSummaryProvider with Generator field
+...
+ag, err := agent.Get(provider.Name)                           // re-fetches the agent
+textGen, ok := agent.AsTextGenerator(ag)                      // re-extracts the TextGenerator
+out, err := textGen.GenerateText(ctx, prompt, provider.Model)
+```
+
+**The problem:** The provider struct already contains a `Generator` field (a `summarize.Generator` which wraps the TextGenerator). This is precisely what `explain.go` uses when it calls `generateCheckpointAISummary(ctx, scopedTranscript, cpSummary.FilesTouched, content.Metadata.Agent, provider.Generator, timeout)`. Instead, `trail_tune_cmd.go` ignores the Generator field and re-resolves the raw agent, duplicating the logic already inside `buildCheckpointSummaryProvider()`.
+
+**Right altitude:** Use the provided `provider.Generator` directly, or if raw TextGenerator is needed, have `buildCheckpointSummaryProvider` return it as a field alongside Generator. The current approach is fragile because:
+- It assumes `agent.Get()` is idempotent for the same name (reasonable but implicit dependency)
+- It duplicates null-checks and type assertions already done in buildCheckpointSummaryProvider
+- It diverges from the established pattern in explain.go that uses provider.Generator
+- Future changes to agent initialization could silently break here if the re-derived agent differs from the wrapped one
+
+**Recommendation:** Change to use `provider.Generator` (which is a TextGenerator-compatible interface). If a raw `TextGenerator` is needed, add it as a field to `checkpointSummaryProvider` in explain_summary_provider.go.
+
+---
+
+### FINDING 2: Hardcoded Document List in `gatherRepoStatics`
+
+**File:** `trail_tune_gather.go`, lines 123-130  
+**Issue:** The list of documents to embed—CLAUDE.md, AGENTS.md, README.md—is hardcoded as a literal array.
+
+**Current code:**
+```go
+for _, doc := range []struct {
+    name string
+    cap  int
+}{
+    {"CLAUDE.md", tuneDocCap},
+    {"AGENTS.md", tuneDocCap},
+    {"README.md", tuneReadmeCap},
+}
+```
+
+**Analysis:** For v1, this is defensible. These are the "standard" Entire documentation files users create. However, the hardcoding will limit this feature's extensibility if repos later add custom tuning docs or if the standard set changes.
+
+**Why it's not broken:** The files are repo-standard, the list is short, and skipping missing files is handled gracefully (lines 132-134). This is intentional filtering, not accidental brittleness.
+
+**Why it could be altitude-higher:** A small interface could make it user-configurable:
+```go
+type tuneDocSpec struct {
+    name string
+    cap  int
+}
+// In settings or config
+TuneDocuments: []tuneDocSpec{...}
+```
+
+**Recommendation for v1:** Keep the hardcoded list. The cost/benefit of parameterizing this now doesn't justify it. Revisit if users request custom docs. Flag only if this pattern spreads (e.g., if other tiers also hardcode assumptions about repo structure).
+
+---
+
+### FINDING 3: Tier Structure—Four Functions + Bool Struct vs. Interface/Slice
+
+**File:** `trail_tune_gather.go`, lines 27-94  
+**Issue:** The tier architecture uses a `tuneSources` bool struct (repo, prs, checkpoints, trails) paired with four separate `gatherX()` functions, invoked conditionally in `gatherTuningContext()`.
+
+**Current pattern:**
+```go
+type tuneSources struct {
+    repo bool
+    prs bool
+    checkpoints bool
+    trails bool
+}
+
+func gatherTuningContext(..., src tuneSources, ...) string {
+    if src.repo { b.WriteString(gatherRepoStatics(repoRoot)) }
+    if src.prs { b.WriteString(gatherPRsAndIssues(ctx, limit)) }
+    // ...
+}
+```
+
+**Analysis:** This is appropriate for v1. It's explicit, easy to reason about, and each tier has genuinely different signatures (repoRoot, ctx, ctx+errW, limit variations). An interface would over-abstract:
+```go
+type Tier interface { Gather(...) string }
+```
+would either:
+- Flatten the signatures (losing clarity about which tiers need what context), or
+- Require function closures/adapters (indirection without gain)
+
+**Why this is fine:** The four tiers are stable and unlikely to proliferate. The bool struct maps clearly to CLI flags (--sources repo,prs,all). Revisit only if tiers grow to 6+ or if there's dynamic tier registration.
+
+**Recommendation for v1:** Keep as-is. It's readable and not fragile. Flag only if the fourth or fifth tier is added without clear justification.
+
+---
+
+### FINDING 4: Runner-File Treatment as Opaque Text with Surgical Edits
+
+**File:** `trail_tune_apply.go`, lines 55-97 (replaceRunnerTemplate)  
+**Issue:** Runners are loaded as raw bytes and modified via byte-level string replacement on the JSON, rather than unmarshaling, mutating, and re-marshaling.
+
+**Current approach:**
+```go
+func replaceRunnerTemplate(raw []byte, newTemplate string) ([]byte, error) {
+    // Parse to find the old template value
+    var top map[string]json.RawMessage
+    if err := json.Unmarshal(raw, &amp;top); err != nil { ... }
+    // Get the raw bytes of the old template
+    oldVal, ok := promptObj["template"]  // This is json.RawMessage—the verbatim on-disk bytes
+    // Replace bytes
+    out := bytes.Replace(raw, oldVal, newVal, 1)
+    // Re-validate JSON
+    if !json.Valid(out) { ... }
+}
+```
+
+**Analysis:** This is intentional and correct for the use case. The design preserves unknown/backend-managed fields and minimizes git diffs (only the template string changes, not formatting). The CLI has no runner struct/loader—runners are opaque config files.
+
+**Why this is right altitude:** Unmarshaling and re-marshaling would:
+- Drop unknown fields (risk of data loss if runners evolve)
+- Reformat the entire JSON (noisy diffs, harder code review)
+- Require defining a runner struct that duplicates the on-disk schema
+
+The byte-level approach is appropriate for config-file surgery.
+
+**Potential fragility:** Line 89 asserts exactly one occurrence of the old template. This will fail (with a clear error) if:
+- The template string appears elsewhere in the runner (e.g., in a comment or example)
+- The template is used multiple times (legitimate but would require a different edit strategy)
+
+This is acceptable brittleness for v1—clear error reporting and the constraint is documented. Flag if non-unique templates become common.
+
+**Recommendation for v1:** This is good altitude. No change needed.
+
+---
+
+### FINDING 5: Error/Skip Handling—Inline `skip()` String Returns
+
+**File:** `trail_tune_gather.go`, lines 96, 162, 170, 184, 233, 236, 350  
+**Issue:** Tier gather functions return a `skip(reason)` string on error, which is a best-effort inline pattern.
+
+**Current code:**
+```go
+func skip(reason string) string { return "_skipped: " + reason + "_\n" }
+
+func gatherPRsAndIssues(ctx context.Context, limit int) string {
+    if _, err := exec.LookPath("gh"); err != nil {
+        return skip("gh CLI not on PATH")  // Inline error handling
+    }
+    // ...
+    if err != nil {
+        b.WriteString(skip("gh pr list failed: " + oneLine(err.Error())))
+    }
+}
+```
+
+**Analysis:** The design is intentional: every tier is best-effort, so returning markdown text (either data or a skip notice) is the right interface. However, there's a subtle issue:
+
+1. **Mixed error semantics:** Some skip reasons are early-exit (can't proceed with this tier at all), others are partial failure (e.g., lines 170, 184 where PR list fails but issue list might succeed). The pattern doesn't distinguish.
+
+2. **Error swallowing:** Line 315 in `gatherTrails` silently continues on fetch errors (`if err != nil { continue }`), treating trail-fetch failures as "this trail didn't contribute" rather than "this tier is broken." This works, but it's silent failure.
+
+**Why it's acceptable for v1:** The prompt still contains useful signal even with skipped/partial tiers. Users can see what data was collected. For a "play around" feature, this is fine.
+
+**Fragility:** If a tier's error should bubble up (e.g., "no checkpoints" should not be treated as success), the string-based approach obscures the distinction. A structured result would make this clearer:
+```go
+type TierResult struct {
+    Data string       // Markdown
+    Err  error        // nil = success, non-nil = full failure
+    Partial bool      // true = success but some data missing
+}
+```
+
+**Recommendation for v1:** Keep the string-based approach. It's adequate for "gather best-effort signal." Document in comments why skip() is inline. Revisit only if users report missing tiers being treated silently as empty data.
+
+---
+
+### FINDING 6: Command Wiring and Convention Adherence
+
+**File:** `trail_tune_cmd.go`, lines 25-72 and 73-100  
+**Issue:** Verify the command follows the established runE→run&lt;Verb&gt; convention and that insecureHTTP plumbing is consistent.
+
+**Pattern observed:**
+- `newTrailTuneCmd()` defines runE that calls `runTrailTune()` ✓
+- `runTrailTune()` is a public function that abstracts flag extraction ✓
+- `trailInsecureHTTP(cmd)` is called to plumb the persistent flag ✓
+
+This matches the trail_cmd.go pattern (e.g., newTrailShowCmd → runTrailShow).
+
+**Status:** No altitude issue here. Wiring is correct and consistent.
+
+---
+
+## SUMMARY TABLE
+
+| Finding | File | Lines | Severity | v1 Verdict |
+|---------|------|-------|----------|-----------|
+| Re-derivation of TextGenerator after resolveCheckpointSummaryProvider | trail_tune_cmd.go | 105-123 | Medium | Fix: Use provider.Generator directly |
+| Hardcoded document list (CLAUDE.md, AGENTS.md, README.md) | trail_tune_gather.go | 123-130 | Low | Accept: Reasonable for v1; revisit if customization requested |
+| Tier structure (4 funcs + bool struct) | trail_tune_gather.go | 27-94 | Low | Accept: Appropriate for v1; over-abstraction not warranted |
+| Byte-level runner template surgery | trail_tune_apply.go | 55-97 | Low | Accept: Right altitude; clear error on non-unique templates |
+| Inline skip() string returns for best-effort errors | trail_tune_gather.go | Multiple | Low | Accept: Adequate for v1; document intent, revisit if silent failures become issues |
+| Command wiring and insecureHTTP plumbing | trail_tune_cmd.go | 25-72, 49-60 | None | Accept: Correct and consistent |
+
+---
+
+## KEY ACTIONABLE RECOMMENDATIONS
+
+1. **High priority (real fragility):** In `trail_tune_cmd.go` line 110-120, replace the re-derivation of `textGen` with direct use of `provider.Generator`, or add the raw TextGenerator as a field to checkpointSummaryProvider if needed elsewhere. This diverges from explain.go's pattern and duplicates logic.
+
+2. **Document, don't change:** Add a comment in trail_tune_gather.go explaining that tiers are best-effort so the feature degrades gracefully when tools (gh, checkpoints, trails API) are unavailable, rather than failing the whole command.
+
+3. **Future-watch:** If a fifth tier is added or the hardcoded doc list is requested to be configurable, revisit the abstraction. For now, v1 is at the right altitude.</result>
+<usage><subagent_tokens>55085</subagent_tokens><tool_uses>26</tool_uses><duration_ms>93137</duration_ms></usage>
+</task-notification>

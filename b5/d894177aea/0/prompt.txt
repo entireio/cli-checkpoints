@@ -1,0 +1,205 @@
+<task-notification>
+<task-id>ae67cdc7ce91e6157</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/d70d405d-5421-4b68-beab-2e3bcaaf25a7/tasks/ae67cdc7ce91e6157.output</output-file>
+<status>completed</status>
+<summary>Agent "Map local agent launch infra" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect! Now I have all the information I need. Let me compile a comprehensive report.
+
+## Summary Report
+
+I've conducted a thorough investigation of the codebase. Here are the concrete findings:
+
+---
+
+### PART 1: LAUNCHING A LOCAL AGENT SESSION WITH A SEEDED PROMPT
+
+#### **Key Function Signatures &amp; Locations:**
+
+**1. Main Launch Entry Point:**
+- **Function**: `agentlaunch.LaunchFixAgent(ctx context.Context, agentName string, prompt string) error`
+- **Location**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/agentlaunch/launch.go:33-61`
+- **Contract**: Launches an interactive coding agent session (claude-code, codex, gemini) with a pre-seeded prompt. Strips `ENTIRE_REVIEW_*` and `ENTIRE_INVESTIGATE_*` env vars so the fix session is not tagged as review/investigate. Returns nil on clean exit, wrapped error on failure.
+
+**2. Per-Agent Reviewer Interface (required to implement):**
+- **Interface**: `reviewtypes.AgentReviewer`
+- **Location**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/review/types/reviewer.go:24-43`
+- **Methods**:
+  - `Name() string` — returns agent registry key (e.g., "claude-code")
+  - `Start(ctx context.Context, run RunConfig) (Process, error)` — spawns agent with config, returns event stream
+
+**3. Agent Launcher Discovery (how system knows which agent is launchable):**
+- **Function**: `agent.LauncherFor(name AgentName) (Launcher, bool)`
+- **Location**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/agent/registry.go:270-280`
+- **Contract**: Returns a `Launcher` interface for agents that support subprocess launching. Returns `(nil, false)` for non-launchable agents (cursor, opencode, factoryai-droid, copilot-cli).
+
+**4. Launcher Interface (what agents must implement to be spawnable):**
+- **Interface**: `agent.Launcher`
+- **Location**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/agent/agent.go:291-293`
+- **Method**:
+  - `LaunchCmd(ctx context.Context, initialPrompt string) (*exec.Cmd, error)` — builds an `exec.Cmd` ready to `Run()`, with stdin/stdout/stderr wired to caller's TTY.
+
+**5. Concrete Example: Claude Code Reviewer Implementation:**
+- **Function**: `claudecode.NewReviewer() *reviewtypes.ReviewerTemplate`
+- **Location**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/agent/claudecode/reviewer.go:28-34`
+- **Builds cmd via**: `buildReviewCmd(ctx context.Context, cfg reviewtypes.RunConfig) *exec.Cmd`
+  - **Argv shape**: `claude -p &lt;prompt&gt; --output-format stream-json --verbose`
+  - **Env setup**: Calls `review.AppendReviewEnv(os.Environ(), "claude-code", cfg, prompt)` to inject review session markers
+  - **Output parsing**: `parseClaudeOutput(r io.Reader) &lt;-chan reviewtypes.Event` parses JSONL stream into typed events
+
+#### **RunConfig Structure (what you pass to launch):**
+- **Location**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/review/types/reviewer.go:65-135`
+- **Key Fields**:
+  - `PromptOverride string` — the exact prompt to send (set this)
+  - `Skills []string` — skill invocations (e.g., `["/pr-review-toolkit:review-pr"]`) — serialized to JSON in env var
+  - `AlwaysPrompt string` — per-agent always-prompt from settings
+  - `PerRunPrompt string` — optional per-invocation prompt extension
+  - `ScopeBaseRef string` — git ref for scope (e.g., `origin/main`); scope clause auto-appended to prompt if set
+  - `StartingSHA string` — HEAD at invocation time; propagated to lifecycle hook via `ENTIRE_REVIEW_STARTING_SHA`
+  - `CheckpointContext string` — best-effort context from checkpoints; appended to generated prompts
+
+#### **Environment Variable Contract (the "handshake"):**
+- **Location**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/provenance/env.go`
+- **Constants**:
+  - `ENTIRE_REVIEW_SESSION=1` — marks it as a review session
+  - `ENTIRE_REVIEW_AGENT=&lt;agent-name&gt;` — e.g., "claude-code"
+  - `ENTIRE_REVIEW_SKILLS=&lt;json-array&gt;` — skill invocations (empty list: `"[]"`)
+  - `ENTIRE_REVIEW_PROMPT=&lt;text&gt;` — the full composed prompt
+  - `ENTIRE_REVIEW_STARTING_SHA=&lt;sha&gt;` — HEAD commit hash
+- **Function to inject**: `review.AppendReviewEnv(base []string, agentName string, cfg RunConfig, prompt string) []string`
+- **Location**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/review/env.go:59-91`
+- **Behavior**: Strips existing `ENTIRE_REVIEW_*` and `ENTIRE_INVESTIGATE_*` entries before appending new ones (handles nested invocations).
+
+#### **Prompt Composition (how the seeded prompt is built):**
+- **Function**: `review.ComposeReviewPrompt(cfg RunConfig) string`
+- **Location**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/review/prompt.go:25-60`
+- **Algorithm**:
+  1. If `cfg.PromptOverride` is set, return it verbatim (skip all composition)
+  2. Otherwise, join sections with `\n\n`:
+     - Skills (one per line)
+     - `AlwaysPrompt` (trimmed)
+     - `PerRunPrompt` (trimmed)
+     - **Scope clause** (if `ScopeBaseRef` non-empty): `"Scope: review the commits unique to this branch vs &lt;ScopeBaseRef&gt;, plus any uncommitted changes in the working tree. Ignore code outside this scope."`
+     - `CheckpointContext` (trimmed)
+
+#### **Example: How `entire review` Launches Agents**
+- **Entry**: `review.NewCommand(deps)` in `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/review/cmd.go:98-213`
+- **Key Path** (single-agent):
+  1. Load settings, resolve eligible agents
+  2. Call `reviewer.Start(ctx, cfg)` where `reviewer = deps.ReviewerFor(agentName)` (returns `AgentReviewer` for launchable agents)
+  3. Reviewer builds `exec.Cmd` via `buildReviewCmd()`, injects env vars, spawns process
+  4. Orchestrator consumes `Event` stream from `Process.Events()`, fans out to `Sink` observers
+  5. Calls `Process.Wait()` to block until exit
+- **Multi-agent path** (when 2+ launchable agents):
+  1. Shows picker, collects per-run prompt
+  2. Builds per-agent `reviewtypes.AgentReviewer` adapters
+  3. Calls `RunMulti(ctx, reviewers, cfg, sinks)` to launch all concurrently
+  4. Each agent spawned in its own goroutine with isolated `RunConfig`
+
+---
+
+### PART 2: NON-INTERACTIVE "PROMPT IN → TEXT OUT" PROVIDER
+
+#### **Yes, a reusable provider exists.**
+
+**Interface Definition:**
+- **Interface**: `agent.TextGenerator`
+- **Location**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/agent/agent.go:214-223`
+- **Single Method**:
+  ```go
+  GenerateText(ctx context.Context, prompt string, model string) (string, error)
+  ```
+  - `ctx` — context for cancellation
+  - `prompt` — the text prompt to send
+  - `model` — optional hint (e.g., "haiku", "sonnet"); implementations may ignore
+  - **Returns**: raw text response or error
+
+**How to Invoke Programmatically (non-interactive):**
+
+1. **Resolve the provider**:
+   ```go
+   ag, err := agent.Get(agentName)  // agent.AgentName("claude-code")
+   textGen, ok := agent.AsTextGenerator(ag)
+   if !ok {
+       // Agent does not support non-interactive text generation
+   }
+   ```
+
+2. **Call directly**:
+   ```go
+   result, err := textGen.GenerateText(ctx, prompt, model)
+   ```
+
+**Concrete Implementation for Claude Code:**
+- **Function**: `text_generator_cli.RunIsolatedTextGeneratorCLI(ctx, runner, binary, displayName, args, stdin) (string, error)`
+- **Location**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/agent/text_generator_cli.go:21-67`
+- **Behavior**:
+  - Runs CLI in isolated temp directory (isolated from repo hooks/context)
+  - Strips all `GIT_*` env vars
+  - Captures stdout (the response)
+  - Returns `(output string, error)` or error on non-zero exit
+  - CLI binary examples: `claude`, `codex`, `gemini` (mapped by agent type)
+
+**Higher-Level Wrapper (what the summarize system uses):**
+- **Struct**: `summarize.TextGeneratorAdapter`
+- **Location**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/summarize/text_generator.go`
+- **Method**: `Generate(ctx context.Context, input Input) (*checkpoint.Summary, error)`
+- **What it does**:
+  1. Takes a structured `Input` (transcript entries + files touched)
+  2. Formats as text via `FormatCondensedTranscript()`
+  3. Builds a summarization prompt via `buildSummarizationPrompt()`
+  4. Calls `textGen.GenerateText(ctx, prompt, model)`
+  5. Parses response via `parseSummaryText()` into structured `checkpoint.Summary`
+
+**Provider Selection Infrastructure:**
+- **Function**: `explain_summary_provider.resolveCheckpointSummaryProvider(ctx, w)`
+- **Location**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/explain_summary_provider.go:39-83`
+- **Behavior**:
+  1. Reads `settings.SummaryGeneration.Provider` (if set)
+  2. Falls back to auto-detection: discovers all agents, filters for `TextGenerator` capability
+  3. Single installed → auto-select; multiple → interactive prompt; none → error
+  4. Returns `*checkpointSummaryProvider` (wraps `TextGenerator + model`)
+
+**Settings Integration:**
+- **Config**: `settings.SummaryGenerationSettings`
+- **Fields**: `Provider` (agent name), `Model` (optional model hint)
+- **Persistence**: Saved to `settings.local.json` (machine-specific)
+- **CLI Check**: `agent.IsSummaryCLIAvailable(name AgentName) bool` — checks if binary is on PATH
+
+---
+
+### SUMMARY FOR YOUR COMMAND
+
+**To build your command that optionally launches a local agent OR prints a prompt:**
+
+**Option A: Launch Interactive Agent Session**
+1. Get launcher: `launcher, ok := agent.LauncherFor(agentName)`
+2. Build config: `cfg := reviewtypes.RunConfig{PromptOverride: yourPrompt, StartingSHA: sha, ...}`
+3. Compose prompt: `prompt := review.ComposeReviewPrompt(cfg)` (if you don't use `PromptOverride`)
+4. **Direct launch** (simplest for your use case):
+   ```go
+   cmd, err := launcher.LaunchCmd(ctx, prompt)
+   cmd.Env = review.AppendReviewEnv(os.Environ(), "claude-code", cfg, prompt)
+   err = cmd.Run()  // blocks until exit
+   ```
+5. **Or use review infrastructure** (if you need event streaming/sinks):
+   - Get reviewer: `reviewer := deps.ReviewerFor(agentName)`
+   - Call `review.Run(ctx, reviewer, cfg, sinks)` — returns `RunSummary` + error
+
+**Option B: Non-Interactive Text Generation (just print response)**
+1. Get provider: `ag, _ := agent.Get(agentName); textGen, _ := agent.AsTextGenerator(ag)`
+2. Call directly: `result, err := textGen.GenerateText(ctx, prompt, model)`
+3. Print: `fmt.Println(result)`
+
+---
+
+### KEY FILE REFERENCES (for deeper exploration)
+
+- **Agent discovery/selection**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/agent/registry.go`
+- **Review orchestrator**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/review/cmd.go` (entry point) + `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/review/run.go` (single-agent)
+- **Agent reviewer implementations**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/agent/{claudecode,codex,geminicli}/reviewer.go`
+- **Env-var contract**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/provenance/env.go` (names) + `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/review/env.go` (composition)
+- **Summarize/TextGenerator**: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/summarize/text_generator.go` + `explain_summary_provider.go`</result>
+<usage><subagent_tokens>75720</subagent_tokens><tool_uses>32</tool_uses><duration_ms>105300</duration_ms></usage>
+</task-notification>

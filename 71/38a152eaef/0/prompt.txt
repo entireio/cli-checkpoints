@@ -1,0 +1,47 @@
+<task-notification>
+<task-id>a00e7c2eeb4432641</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/5549b902-5dd9-4ff4-87b2-c6f8b300b68d/tasks/a00e7c2eeb4432641.output</output-file>
+<status>completed</status>
+<summary>Agent "Verify PR 1499 fixes" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I now have a complete picture. The grant revoke commands have NO command-path test exercising the mode→route mapping (the exact F3 example), and no get-path wiring test exists. The resolve helpers are tested (resolveref_test.go), but those are the pure resolution layer, not the revoke command wiring. Let me verify there's no confirmation prompt anywhere in the get commands too (F1 scope is deletes only, so get is fine — F1 only concerns deletes/removes).
+
+I have everything needed.
+
+---
+
+## Verification Results — `origin/feat/control-plane-crud-gaps` (PR #1499)
+
+### F1 [medium] — Destructive deletes lack confirmation / --force: **PARTIALLY ADDRESSED**
+
+The three typed deletes — `org delete`, `project delete`, `repo delete` — are now fully fixed. All three route through a shared `runControlPlaneDelete` helper (`corecmd.go:72`) which gates on `confirmControlPlaneDeletion(...)` before deleting (`corecmd.go:85`), and each registers `addForceFlag(cmd)` (`org.go:111`, `project.go:190`, `repo.go:196`). The gate (`corecmd.go:113-119`) bypasses on `--force`/`--yes`, and when non-interactive without force it **refuses** rather than deleting (`return false, fmt.Errorf("refusing to delete %s without confirmation; pass --force", label)`), with an interactive `huh` confirm form otherwise. This is the exact `trail_cmd.go` pattern the finding asked for.
+
+**What remains:** the three `grant ... remove` commands were NOT fixed. `newGrantRepoRemoveCmd` (`grant.go:451-500`) — the one explicitly named in F1 — calls `c.RevokeRepoAccessByProvider(...)` / `c.RevokeRepoAccess(...)` immediately after `resolveRepoRef`, with no `confirmControlPlaneDeletion`, no `CanPromptInteractively()` check, and no force flag (its `cmd.Flags()` block at `grant.go:494-498` registers only grantee/project flags). Identically, `newGrantOrgRemoveCmd` (`grant.go:175-201`, calls `RemoveOrgMember`) and `newGrantProjectRemoveCmd` (`grant.go:282-330`, calls `RevokeProjectAccess*`) have no confirmation and no force flag. So the "grant repo remove (grant.go)" item in F1 is unaddressed, plus the two sibling grant removes.
+
+### F2 [low-medium] — Deletes not idempotent (raw 404 on already-gone): **PARTIALLY ADDRESSED**
+
+For the typed deletes this is fixed: `runControlPlaneDelete` catches the delete error with `if isCoreNotFound(err) { cmd.Printf("%s not found; nothing to delete\n", label); return nil }` (`corecmd.go:96-99`), and `isCoreNotFound` keys on `*coreapi.ErrorModelStatusCode` with `StatusCode == http.StatusNotFound` (`resolveref.go:47-50`). So `entire org delete X` twice now succeeds the second time.
+
+**What remains:** the grant revoke/remove path — explicitly called out in F2 ("'grant repo remove' for an already-revoked grantee errors") — is unchanged. `RemoveOrgMember`, `RevokeRepoAccess(ByProvider)`, and `RevokeProjectAccess(ByProvider)` (`grant.go:187`, `:472`/`:482`, `:303`/`:313`) all `return err` directly with no `isCoreNotFound` guard, so a second revoke still surfaces a raw 404, and there's no documentation note covering it.
+
+### F3 [low-medium] — No command-level wiring tests: **PARTIALLY ADDRESSED**
+
+A real command-path test now exists for the typed deletes: `TestControlPlaneDelete_Wiring` (`corecmd_delete_test.go:62`) drives `newOrgDeleteCmd`/`newProjectDeleteCmd`/`newRepoDeleteCmd` through cobra against an `httptest` server, asserting (a) `--force` issues `DELETE` against the correct path (`/api/v1/orgs|projects|repos/&lt;ULID&gt;`), (b) a 404 is idempotent ("not found; nothing to delete"), and (c) a non-interactive run without `--force` refuses. `resolveref_test.go` also adds httptest-backed tests for the resolve helpers (`TestResolveRepoRef`, etc.).
+
+**What remains:** the specific example F3 named — a command-path test asserting `grant repo remove --provider github --provider-user-id 12345` hits the **by-provider** route rather than the typed-id route — does not exist. `grant_test.go` still tests only pure helpers (`TestValidateGrantRole`, `TestParseGranteeMode`, `TestParseOrgRole`); a tree-wide grep for any test exercising `RevokeRepoAccessByProvider` / `RevokeProjectAccessByProvider` / `RemoveOrgMember` routes returns nothing. There is also no get-path wiring test (no `GetOrg`/`GetProject`/`GetRepo` command test in `corecmd_test.go` or elsewhere) — `corecmd_test.go` covers only `confirmControlPlaneDeletion`, `fetchAllPages`, and table/field printing. So the revoke mode→route mapping and the get verbs remain untested at the command level.
+
+---
+
+### Summary
+
+All three findings were addressed **only for the typed `org`/`project`/`repo` delete verbs**, via the well-built shared `runControlPlaneDelete` + `confirmControlPlaneDeletion` + `addForceFlag` + `isCoreNotFound` machinery in `corecmd.go`/`resolveref.go`, with matching wiring tests in `corecmd_delete_test.go`. The **grant remove/revoke commands** (org, project, and the explicitly-named repo) were left untouched on every axis: no confirmation, no force flag (F1), no 404-idempotency (F2), and no command-level route-mapping test (F3). Each finding is therefore **PARTIALLY ADDRESSED**, with the grant-revoke surface being the consistent gap across all three.
+
+Relevant files (all at ref `origin/feat/control-plane-crud-gaps`):
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/corecmd.go` (helpers, lines 53-140)
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/grant.go` (unfixed removes: 175-201, 282-330, 451-500)
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/resolveref.go` (`isCoreNotFound`, 47-50)
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/corecmd_delete_test.go` (delete wiring tests)
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/grant_test.go` (helper-only tests)</result>
+<usage><subagent_tokens>75204</subagent_tokens><tool_uses>10</tool_uses><duration_ms>109009</duration_ms></usage>
+</task-notification>

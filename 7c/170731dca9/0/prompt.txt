@@ -1,0 +1,72 @@
+<task-notification>
+<task-id>ae1568282b2f6f76a</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/5549b902-5dd9-4ff4-87b2-c6f8b300b68d/tasks/ae1568282b2f6f76a.output</output-file>
+<status>completed</status>
+<summary>Agent "Verify PR 1498 fixes" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Confirmed. `pickProject`/`pickOrg` are entirely gone from the resolver path; the resolvers now read the server's singular `Org`/`Project` field directly. There is no client-side `p.Name == name` re-filter anymore. I have everything needed for all three findings.
+
+## Verification results — PR #1498, head of `origin/feat/control-plane-friendly-names`
+
+All three findings target `cmd/entire/cli/resolveref.go`, which was refactored away from the original "server filter + client re-filter" design into a server-side singular-match lookup. Verdicts below.
+
+---
+
+### F1 [medium] — Case-sensitivity mismatch between server filter and client picker → **ADDRESSED**
+
+The redundant client-side re-filter that the finding flagged is gone entirely. The resolvers no longer call a `pickOrg`/`pickProject` helper that re-checks `p.Name == name`; those helpers no longer exist anywhere in `cmd/entire/cli/` (grep confirms zero matches). Instead the server now returns the single match under a singular `org`/`project` response field, and the resolver just unwraps it:
+
+- `resolveOrgRef` (lines 59-70): `out, err := c.ListOrgs(... Name: ...)` then `org, ok := out.Org.Get()` — returns `org.ID` with no name comparison.
+- `resolveProjectRef` (lines 118-129): same shape via `out.Project.Get()`.
+
+Because there is no client-side string comparison at all, the case-sensitivity mismatch cannot occur — a server case-insensitive match flows straight through. The doc comment (lines 17-21) explicitly documents the new contract: "case-insensitive by-name lookup … the CLI never lists everything and filters client-side." Note this is a fix-by-redesign rather than the suggested `strings.EqualFold` patch, but it fully closes the issue (it's actually stronger, since no client filter remains to diverge).
+
+---
+
+### F2 [medium] — `resolveAccountRef` forwards empty `AccountId` → **ADDRESSED**
+
+The exact empty-AccountId guard suggested in the finding is present, with an explanatory comment matching the failure mode described:
+
+```go
+// resolveref.go:89-94
+// ResolvedIdentity.AccountId is a plain string, so a handle that resolves to
+// an identity with no backing account would silently forward "" as the owner
+// ULID and fail later with an opaque server-side create error. Catch it here.
+if id.AccountId == "" {
+    return "", fmt.Errorf("handle %q resolved to no account", ref)
+}
+return id.AccountId, nil
+```
+
+This returns a clear local error before the empty string can reach `CreateProjectInputBody.OwnerId`, exactly as recommended.
+
+---
+
+### F3 [low-medium] — Resolver functions untested, including the "ULID makes no network call" invariant → **ADDRESSED**
+
+A new `cmd/entire/cli/resolveref_test.go` exists and exercises all three resolvers using the `coreapi.NewWithBearer(httptest…)` harness the finding pointed to. Crucially it asserts the load-bearing zero-network-call invariant via an `atomic.Int64` request counter wired into the test server (`resolveTestClient`, lines 29-43):
+
+- ULID short-circuit asserts **zero** HTTP calls: `TestResolveOrgRef`/`TestResolveProjectRef`/`TestResolveAccountRef` each have a "ULID passes through without a network call" subtest asserting `calls.Load() == 0` (lines 61-63, 121-123, 180-182).
+- Name/handle ref asserts **exactly one** call: "name is resolved server-side in one call" subtests assert `calls.Load() == 1` and that the server received `name=&lt;ref&gt;` (lines 82-87, 142-147, 199-201) — directly guarding F1's "filtering must be server-side" property.
+- Unknown-name friendly errors (lines 90-101, 150-161), the F2 empty-account guard ("empty resolved account id is an error", lines 204-214), and the pre-network non-qualified-handle rejection asserting 0 calls (lines 216-228).
+
+There are also supporting tests for `looksLikeULID`, `parseQualifiedHandle`, and `toProjectList`. Coverage exceeds what the finding asked for.
+
+---
+
+## Summary
+
+| Finding | Verdict |
+|---|---|
+| F1 — case-sensitivity / redundant client re-filter | **ADDRESSED** (client re-filter removed via server-side singular-match redesign; no `EqualFold` needed because no client comparison remains) |
+| F2 — empty AccountId guard | **ADDRESSED** (explicit guard at lines 92-94) |
+| F3 — resolver tests incl. zero-network-call invariant | **ADDRESSED** (new `resolveref_test.go` asserts 0 calls for ULID, 1 for name, plus error paths) |
+
+Nothing remains outstanding on these three. (I did not verify the tests compile/pass — verdicts are from reading the code at the ref, as instructed.)
+
+Relevant files:
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/resolveref.go`
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/resolveref_test.go`</result>
+<usage><subagent_tokens>64269</subagent_tokens><tool_uses>4</tool_uses><duration_ms>64940</duration_ms></usage>
+</task-notification>

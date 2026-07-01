@@ -1,0 +1,121 @@
+<task-notification>
+<task-id>a0b8ca16f3d36a411</task-id>
+<tool-use-id>toolu_01UFXiusrY9HdiCZDcJLiZR9</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/78b0fe12-1b0c-46e0-ae16-2534880690c7/tasks/a0b8ca16f3d36a411.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Now I have enough information. Let me create my final assessment:
+
+## Summary
+
+I've reviewed the diff for reuse opportunities. Here are my findings:
+
+### 1. **HIGH-CONFIDENCE: `setCompactTranscriptStart` duplicates `replaceSkillEvents` pattern**
+
+**Location:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/checkpoint/persistent.go`
+- New function: `setCompactTranscriptStart` (lines 1824-1851)
+- Existing function: `replaceSkillEvents` (lines 1670-1698)
+
+**Duplication:** Both implement identical read-modify-write patterns:
+1. Get metadata path from sessionPath
+2. Check if entry exists in map
+3. Read metadata blob via `readMetadataFromBlob(entry.Hash)`
+4. Mutate metadata field (SkillEvents vs CompactTranscriptStart)
+5. Marshal to JSON with `jsonutil.MarshalIndentWithNewline`
+6. Create blob via `CreateBlobFromContent`
+7. Update entries map with new TreeEntry
+
+**Concrete cost:** 22 lines of duplicated code, same error handling structure.
+
+**Recommendation:** Extract a generic helper:
+```go
+func (s *GitStore) updateSessionMetadata(sessionPath string, mutate func(*Metadata) error, entries map[string]object.TreeEntry) error
+```
+Then both `replaceSkillEvents` and `setCompactTranscriptStart` call this helper with their specific mutation lambda.
+
+**Alternative:** Call pattern is simpler but both functions are substantial enough that the pattern is clearly duplicated.
+
+---
+
+### 2. **MEDIUM-CONFIDENCE: Line-splitting pattern in checkpoint tests could use existing `nonEmptyLines`**
+
+**Location:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/checkpoint/persistent_compact_transcript_test.go`
+- Lines 150 and 349: `lines := strings.Split(strings.TrimRight(compactContent, "\n"), "\n")`
+- Helper function: `assertCodexSliceIsGamma` (lines 347-360)
+
+**Existing utility:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/transcript/compact/compact_test.go` line 596
+- Function `nonEmptyLines(data []byte) []string` — already used in `compactfull_test.go` throughout
+
+**Duplication issue:** The checkpoint test re-implements line-splitting inline instead of using `nonEmptyLines`. However, `nonEmptyLines` is in a different package (`compact` vs `checkpoint`), and these tests have different requirements:
+- `nonEmptyLines`: filters out empty lines (defensive)
+- `TrimRight` pattern: assumes JSONL format with no empty lines
+
+**Concrete cost:** Minimal — 1 inline line per test helper function. The pattern itself is simple enough that duplication is lower cost than cross-package import.
+
+**Recommendation:** SKIP THIS — The packages are intentionally separate; extracting `nonEmptyLines` to a shared test utility package would add import coupling that isn't worth the minimal duplication cost.
+
+---
+
+### 3. **LOW-CONFIDENCE: `GetCompactTranscriptStart` follows existing `GetTranscriptStart` pattern**
+
+**Location:** `/Users/soph/Work/entire/devenv/cli/api/checkpoint/metadata.go` lines 393-403
+
+The new getter correctly follows the precedent set by `GetTranscriptStart` (lines 383-391) but returns `(int, bool)` instead of just `int`. This is intentional and appropriate for a nullable pointer field, not a reuse issue.
+
+---
+
+### 4. **NO ISSUE: `countCompactLines` and `FullWithBoundary` are new, non-duplicative**
+
+- `countCompactLines` (compact.go line 168): Uses `bytes.Count` for efficiency
+- `FullWithBoundary` (compact.go line 539): New algorithm for full-with-boundary compaction
+- Tests in `compactfull_test.go` use `nonEmptyLines` appropriately
+
+These are novel implementations, not duplications.
+
+---
+
+## Final Recommendation
+
+**Only one actionable reuse opportunity:**
+
+Extract a shared metadata mutation helper in `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/checkpoint/persistent.go`:
+```go
+// updateSessionMetadata reads session metadata, applies a mutation, and rewrites it to the entries map.
+func (s *GitStore) updateSessionMetadata(sessionPath string, mutate func(*Metadata) error, entries map[string]object.TreeEntry) error {
+	metadataPath := sessionPath + paths.MetadataFileName
+	entry, exists := entries[metadataPath]
+	if !exists {
+		return fmt.Errorf("session metadata not found at %s", metadataPath)
+	}
+	metadata, err := s.readMetadataFromBlob(entry.Hash)
+	if err != nil {
+		return fmt.Errorf("read session metadata: %w", err)
+	}
+	if err := mutate(metadata); err != nil {
+		return err
+	}
+	metadataJSON, err := jsonutil.MarshalIndentWithNewline(metadata, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal session metadata: %w", err)
+	}
+	metadataHash, err := CreateBlobFromContent(s.repo, metadataJSON)
+	if err != nil {
+		return err
+	}
+	entries[metadataPath] = object.TreeEntry{
+		Name: metadataPath,
+		Mode: filemode.Regular,
+		Hash: metadataHash,
+	}
+	return nil
+}
+```
+
+Then refactor:
+- `replaceSkillEvents` → calls `updateSessionMetadata` with mutation lambda
+- `setCompactTranscriptStart` → calls `updateSessionMetadata` with mutation lambda
+
+**Cost savings:** 22 lines of duplicated code eliminated, improved maintainability (single read-modify-write pattern). **No import cycles** — all code is in the same `checkpoint` package.</result>
+<usage><subagent_tokens>44263</subagent_tokens><tool_uses>39</tool_uses><duration_ms>100394</duration_ms></usage>
+</task-notification>

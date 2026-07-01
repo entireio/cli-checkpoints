@@ -1,0 +1,88 @@
+<task-notification>
+<task-id>aa670b38ef7122b62</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/5549b902-5dd9-4ff4-87b2-c6f8b300b68d/tasks/aa670b38ef7122b62.output</output-file>
+<status>completed</status>
+<summary>Agent "Verify trail 559 fixes" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Both findings are now fully resolvable from the current code. Here are my verdicts.
+
+---
+
+## F1 — `--current` flag is a no-op — **ADDRESSED**
+
+The flag now drives a genuinely different code path. The `--current` branch was rewired to call a new worktree-scoped function, `FindMostRecentSessionInCurrentWorktree`, distinct from the cross-worktree-fallback `FindMostRecentSession` used in the default branch.
+
+Current `runSessionTokens` (session_tokens.go, the no-args dispatch):
+```go
+if sessionID == "" {
+    if current {
+        sessionID = strategy.FindMostRecentSessionInCurrentWorktree(ctx)
+    } else {
+        sessionID = strategy.FindMostRecentSession(ctx)
+    }
+    if sessionID == "" {
+        fmt.Fprintln(cmd.OutOrStdout(), "No active session found in this worktree.")
+        return nil
+    }
+}
+```
+
+Current flag definition:
+```go
+cmd.Flags().BoolVar(&amp;currentFlag, "current", false, "Prefer the current worktree's most recent session")
+```
+
+This is no longer the "identical code path" described in the original finding. `--current` now selects `FindMostRecentSessionInCurrentWorktree` (which, by name and contract, stays scoped to the current worktree and suppresses the cross-worktree fallback), whereas the default path keeps the fallback behavior via `FindMostRecentSession`. The help text was also updated to "Prefer the current worktree's most recent session," matching the actual behavior.
+
+One verification gap I cannot close from these two files alone: I read the call sites, not the body of `strategy.FindMostRecentSessionInCurrentWorktree`. The verdict assumes that function actually scopes to the worktree without the cross-worktree fallback (as its name and the original finding's requirement imply). If that function were a thin alias to `FindMostRecentSession`, the no-op would persist — but the existence of a separately-named function invoked only under `--current` is the structural fix the finding asked for. The branching is real and the flag is no longer dead.
+
+---
+
+## F2 — `tokens profile` vs `checkpoint tokens` diverge on partial-metadata precedence — **ADDRESSED**
+
+There is now a single shared precedence helper, `checkpointTokenUsage`, defined in checkpoint_tokens.go, and both call sites route through it. They can no longer diverge.
+
+Shared helper (checkpoint_tokens.go):
+```go
+func checkpointTokenUsage(summary *checkpoint.CheckpointSummary, metas []*checkpoint.CommittedMetadata, metadataReadWarning bool) *agent.TokenUsage {
+	sessionUsage := aggregateCheckpointTokenUsage(metas)
+	if !metadataReadWarning &amp;&amp; sessionUsage != nil {
+		return sessionUsage
+	}
+	if summary != nil &amp;&amp; summary.TokenUsage != nil {
+		return summary.TokenUsage
+	}
+	return sessionUsage
+}
+```
+
+Call site 1 — `buildCheckpointTokensReport` (checkpoint_tokens.go):
+```go
+usage := checkpointTokenUsage(summary, metas, metadataWarnings &gt; 0)
+```
+
+Call site 2 — `tokensProfileCheckpointUsage` (tokens_profile.go):
+```go
+return checkpointTokenUsage(summary, metas, metadataReadWarning), metadataReadWarning, nil
+```
+
+The precedence rule is now unified and explicitly warning-aware: when there is no metadata-read warning **and** the per-session aggregate is non-nil, it uses the aggregate; otherwise (warning present, or aggregate nil) it prefers the root `summary.TokenUsage`, falling back to the aggregate only if the summary total is absent. This is the single rule the original finding requested. The earlier mismatch — `tokensProfileCheckpointUsage` preferring root summary on warning while `buildCheckpointTokensReport` ignored the warning and always preferred the aggregate — is gone, because both now pass the warning flag into the same function and that function branches on it identically.
+
+Note the old divergent logic has been fully removed: `buildCheckpointTokensReport` no longer does its own aggregate-first selection; it delegates to `checkpointTokenUsage(summary, metas, metadataWarnings &gt; 0)`.
+
+---
+
+## Summary
+
+| Finding | Verdict |
+|---|---|
+| F1 — `--current` no-op | **ADDRESSED** — flag now dispatches to `FindMostRecentSessionInCurrentWorktree` vs `FindMostRecentSession`; help text updated. (Assumes the new function genuinely scopes to worktree; only the call sites were inspected, not its body.) |
+| F2 — precedence divergence | **ADDRESSED** — single shared `checkpointTokenUsage(summary, metas, metadataReadWarning)` helper consumed by both `buildCheckpointTokensReport` and `tokensProfileCheckpointUsage`; both pass the warning flag, so they cannot diverge. |
+
+Files read at `origin/tokens-profile` (HEAD `4492b95ee2d00a4683c1463e975f50948e88d33c`):
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/session_tokens.go`
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/tokens_profile.go`
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/checkpoint_tokens.go`</result>
+<usage><subagent_tokens>81208</subagent_tokens><tool_uses>4</tool_uses><duration_ms>42417</duration_ms></usage>
+</task-notification>

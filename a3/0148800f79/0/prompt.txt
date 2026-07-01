@@ -1,0 +1,32 @@
+<task-notification>
+<task-id>acb9f26eddbbec259</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/5549b902-5dd9-4ff4-87b2-c6f8b300b68d/tasks/acb9f26eddbbec259.output</output-file>
+<status>completed</status>
+<summary>Agent "Review 466 sinks+trail+deletions" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>This is a significant restructuring of the TUI lifecycle (RunFinished no longer blocks; new PostRunComplete with grace-timeout fallback). The kill-fallback logic is defensive and reasonable. One subtle concern: after `s.program.Send(postRunCompleteMsg{})` succeeds (sent closed), it then waits on `&lt;-s.done` with another grace timeout, killing if the program doesn't exit. That handles the case where the message is delivered but the model doesn't quit. Looks robust.
+
+Let me quickly check `posttrail_test.go` uses `t.Parallel()` and whether `maybePostReviewToTrail` reads any process-global state (it doesn't — pure function with injected deps), so `t.Parallel()` is correct there. Good.
+
+I now have a complete picture. Let me write the review findings.
+
+## SUMMARY
+
+This layer is well-constructed and the high-risk deletions are safe. The `trail/store.go` removal (−489) is a genuine supersession: trails moved from a local `entire/trails/v1` git branch to the core API, and every removed symbol (`Store`, `GenerateID`, `ValidateID`, `Discussion`, `CheckpointRef`, `Priority`/`Type`, sharding helpers) has no remaining references at head — the surviving `Reviewer`/`Metadata`/`Status` types are still consumed by `api/trail_types.go`. The `review/migration.go` removal (−275) is also safe to compile and the migration's privacy purpose is now moot, because the legacy `review`/`review_fix_agent` keys are explicitly retained as deprecated-but-parseable and no longer read at all; the only residual concern is an upgrade-UX one (old committed review config is silently ignored with no migration into the new `review_profiles` model — flagged for the config reviewer). The trail output sink degrades gracefully on every failure path (not-logged-in, no-trail, not-mirrored, server error all surface a notice rather than failing the review), the synthesis path correctly filters failed/empty agents and hardens against prompt injection, and the strategy change that pins review sessions to a single checkpoint is correct, well-justified, and backed by a real two-commit regression test. The OPF exhaustive-switch refactor is behavior-equivalent (verified against go-git's full 7-value FileMode enum). My findings are one medium (double error message) plus low nits.
+
+## MEDIUM+ FINDINGS
+
+**[MEDIUM] cmd/entire/cli/review_bridge.go ~line 60 / cmd/entire/cli/review/cmd.go ~line 1398 — double error message on trail-post auth failure.** `postReviewToTrail` calls `runAuthenticatedDataAPI(ctx, out, ...)`, which on `ErrNotLoggedIn` prints `"Not logged in. Run 'entire login' to authenticate."` to `out` and returns a (Silent) error. That error propagates back to `maybePostReviewToTrail`, which then prints `"Could not post the review to the trail: not logged in"` to the same writer. The user sees two stacked messages for one cause. Either pass a discard/secondary writer into `runAuthenticatedDataAPI` here, or have `maybePostReviewToTrail` suppress its own line when the returned error is already a `*SilentError` (e.g. `var se *SilentError; if !errors.As(err, &amp;se) { fmt.Fprintf(...) }`).
+
+## LOW NITS
+
+- **cmd/entire/cli/review/cmd.go ~line 1393 — dead branch in production.** `maybePostReviewToTrail` handles `deps.PostReviewToTrail == nil` ("Trail output is not available here; the review was kept local."), but `buildReviewDeps()` always wires `postReviewToTrail`, so this only fires in tests. Harmless and arguably good defense, but worth a one-line comment noting it's a test-only path so a future reader doesn't hunt for the production caller that leaves it nil.
+
+- **cmd/entire/cli/strategy/cleanup.go ~line 70 — orphan-protection for a now-unwritten branch.** `paths.TrailsBranchName` ("entire/trails/v1") is still in the cleanup carve-out, but with `trail/store.go` gone nothing writes that branch anymore. The guard is harmless (protects a branch that won't exist locally), but if trails are fully server-side now, consider removing the reference in a follow-up so the dead concept doesn't linger as a false signal that local trail branches still exist.
+
+- **cmd/entire/cli/settings/settings.go ~line 163 — `ReviewMigrationDismissed` is now write-nothing/read-nothing dead config.** With `migration.go` deleted, nothing sets or reads `ReviewMigrationDismissed` anymore; it only survives so old preference files parse. Fine to keep for parse-compat, but the doc comment still describes it as gating an active prompt ("stops prompting on every invocation") — update the comment to mark it fully vestigial so it isn't mistaken for live behavior.
+
+(For the config/settings reviewer: the deletion of `migration.go` means users who had committed legacy `review`/`review_fix_agent` keys get neither a migration into `review_profiles` nor any honoring of the old keys — their configured review setup silently stops taking effect on upgrade. This is intentional per the deprecation comments, but there is no migration bridging old→new, so it's an upgrade-path UX gap worth a conscious decision rather than a code defect in my layer.)</result>
+<usage><subagent_tokens>123994</subagent_tokens><tool_uses>47</tool_uses><duration_ms>278601</duration_ms></usage>
+</task-notification>

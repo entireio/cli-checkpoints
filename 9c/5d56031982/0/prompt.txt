@@ -1,0 +1,40 @@
+<task-notification>
+<task-id>ab0220103d4f0fce1</task-id>
+<tool-use-id>toolu_0193dcZ7ssYwB1gdm8f83Zfo</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/5549b902-5dd9-4ff4-87b2-c6f8b300b68d/tasks/ab0220103d4f0fce1.output</output-file>
+<status>completed</status>
+<summary>Agent "Review trail 652 enablement cache" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Both new contexts tests use `t.Setenv` and correctly omit `t.Parallel()`. The lifecycle tests use `t.Chdir` and omit `t.Parallel()` with explanatory comments. The API test uses `t.Parallel()` correctly (no env/chdir). The `trail_cmd_test` `TestTrailsEnabledForRepo_ReadsClonePreference` uses `t.Chdir` and (pre-existing) omits parallel.
+
+I now have a complete picture.
+
+---
+
+## SUMMARY
+
+This change cleanly achieves its goal: TurnStart/context-injection now reads only the local clone cache (`cachedTrailsEnablementForRepo`, no client/network/auth), the bounded best-effort refresh moved to SessionStart with a 3s timeout whose failure is logged and ignored, and the HTTP-status→cache-decision mapping is correctly conservative. The critical mapping in `api/trails.go` writes `false` only on 403/404/410; 401/5xx/429/network/timeout all return an error, and every caller leaves the cache unchanged on error (verified through `refreshTrailsEnabledCacheForScope`, `noteTrailCommandEnablement`, and the fact that auth failures short-circuit before `fn` runs). The scope key correctly combines repo + API base + a derived, non-secret auth identity (issuer/subject/handle/audience, never the raw JWT), and scope/staleness invalidation is exercised by tests. Privacy is respected — no tokens or user content are persisted or logged, and writes are atomic via `WriteFileAtomic`. Overall judgment: **approve-with-reservations** — the logic is sound and well-tested; the reservations are a non-atomic read-modify-write on the shared clone-preferences file (concurrency) and added synchronous network latency on cold SessionStart, both low-to-medium and arguably acceptable for a clone-local best-effort cache.
+
+No invented issues. The status-mapping, no-network-on-TurnStart, secret-handling, and invalidation requirements are all met.
+
+## MEDIUM+ FINDINGS
+
+**1. [MEDIUM] Non-atomic read-modify-write race on the shared clone-preferences file**
+`cmd/entire/cli/trail_context_cache.go` ~L141 (`saveTrailsEnabledForScope`) and `cmd/entire/cli/settings/settings.go` L577 (`SaveClonePreferences`)
+
+`saveTrailsEnabledForScope` does `LoadClonePreferences` → mutate → `SaveClonePreferences`. The individual file write is atomic (`WriteFileAtomic`, temp+rename), but the load-modify-save sequence is not. The clone-preferences file in `.git/` is shared across all worktrees/sessions and is also written by the interactive picker; concurrent hooks (multiple sessions/worktrees firing SessionStart or trail commands at once) can interleave such that one writer's update to an *unrelated* field is silently clobbered by another writer that loaded a stale copy. This won't corrupt the file, but it can lose writes. Worth a comment acknowledging last-writer-wins, or serialization via a file lock if other fields here are correctness-sensitive. (Note: this race largely pre-exists the PR; the PR adds new write sites that increase the window.)
+
+**2. [MEDIUM] Synchronous network work (token exchange + well-known fetch + probe) added to cold SessionStart**
+`cmd/entire/cli/lifecycle.go` L149–155 (`refreshTrailsEnabledCacheIfStale`) and `cmd/entire/cli/api_client.go` L33
+
+When the cache is missing/stale/different-scope, SessionStart now calls `refreshTrailsEnabledCacheIfStale`, which calls `NewAuthenticatedAPIClient` → `auth.ResolveDataAPIToken` (fetches `/.well-known/entire-api.json` and performs a token exchange) followed by the `TrailsEnabled` probe — all synchronously on the SessionStart hook path, bounded to 3s. This is by design and is correctly best-effort (errors logged and ignored, TurnStart stays local-only), but it adds up to ~3s of blocking latency to the agent's session startup on the first session after enablement or after any scope/TTL change. Confirm 3s is an acceptable worst-case startup delay; if not, consider running the refresh asynchronously or shortening the bound. Flagging so the latency tradeoff is a conscious decision rather than incidental.
+
+## LOW-SEVERITY NITS
+
+- `cmd/entire/cli/trail_context_cache.go` ~L101 `trailEnablementRepoKey` joins `forge/owner/repo` with `/`; for an unsupported (empty-forge) remote this yields a key like `//repo`. It's internally consistent (the same function builds both the saved and compared keys) so it's not a bug, but the empty-forge path relies on `Supported=false` short-circuits elsewhere rather than the key itself being meaningful.
+- `cmd/entire/cli/api/trails.go` L21 drains the body via `io.LimitReader(resp.Body, 1&lt;&lt;16)` — fine, but the 64KB cap is a magic number; a named const would document intent.
+- `cmd/entire/cli/trail_cmd.go` ~L886 `postTrailCreate` now calls `noteTrailCommandEnablement` on the transport-error branch *and* the `checkTrailResponse` branch, then `saveTrailsEnabledForRemoteBestEffort(...true)` on success — three separate enablement-write sites in one function. Correct, but slightly easy to miss one if the function grows; a single deferred outcome-recorder would be tidier.
+
+All paths confirmed against code at `origin/dip/trail-context-cache-refresh`. Relevant files: `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/trail_context_cache.go`, `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/api/trails.go`, `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/auth/contexts.go`, `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/lifecycle.go`, `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/settings/settings.go`.</result>
+<usage><subagent_tokens>85007</subagent_tokens><tool_uses>21</tool_uses><duration_ms>198424</duration_ms></usage>
+</task-notification>

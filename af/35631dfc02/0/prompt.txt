@@ -1,0 +1,1190 @@
+/simplify
+
+---
+
+<task-notification>
+<task-id>ab565518d9048e7cb</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/473b5e55-d61f-4bc6-bcae-ab078e0d3cdd/tasks/ab565518d9048e7cb.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review of the diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect. Now I have enough context. Let me write a detailed efficiency report:
+
+## Efficiency Review: Redundant Network I/O in Cell Client Path
+
+I found **one significant efficiency issue** the diff introduces:
+
+### **CRITICAL: Double Control-Plane Round Trip on Cell Client Success** 
+
+**File/Lines:** `cmd/entire/cli/recap.go` lines 193-194
+
+**Summary:** When the entire-api cell client succeeds, `newRecapClient()` immediately calls `currentRepoID(ctx)` (line 194), which performs its own `coreapi.New()` + `listMirrorsForRepo()` (control plane API call). The cell client construction **already** called this same control plane API during `NewEntireAPICellClient()`.
+
+**Root Cause:**
+1. `NewEntireAPICellClient()` (auth/cell_data_api.go:95) calls:
+   - `resolveContextForCellAPI()` (line 122) → discovery via `/.well-known/entire-api.json`
+   - `exchangeJurisdictionToken()` (line 173) → STS token exchange at entire-core
+
+2. But `currentRepoID()` (entireapi_client.go:57-75) independently:
+   - Calls `coreapi.New()` (line 66) → creates a fresh control-plane client
+   - Calls `listMirrorsForRepo()` (line 70) → **makes a ListMirrors API call to control plane**
+   - Filters mirrors to find the current repo
+
+**The Problem:**
+- The cell client **already contacted entire-core** to exchange tokens and potentially discover cluster info
+- The new `currentRepoID()` path makes an **independent, duplicate network call** to list mirrors for the same repo
+- These are sequential, blocking calls on an interactive command path (`runRecap`)
+- Cost: **1 extra round trip to control plane** (ListMirrors call)
+
+**Quantified Cost:**
+- **Network latency:** +1 control-plane API call on the hot path (every `entire recap` when routed to cell)
+- **Typical latency:** ~200-500ms for a cross-region ListMirrors call
+- **Frequency:** Every time the cell client succeeds and the user runs `recap` or `activity`
+
+**Concrete Example:**
+```
+newRecapClient() on cell success:
+  1. NewEntireAPICellClient() [already happened]
+     - Discovers login context and token info
+     - Exchanges JWT at entire-core
+  2. currentRepoID() [NEW, REDUNDANT]
+     - Creates coreapi.New()
+     - Calls ListMirrors(gh, owner, repo) ← WASTED call
+     - Filters results
+```
+
+**Better Alternative:**
+The repo ID should either:
+1. Be resolved **during** the cell client construction (if it's a repo-scoped endpoint) — but it's not needed for `activity`/`recap` which are user-scoped (`/me/*`)
+2. Be resolved **before** the cell client (fetch it once, pass it to the function)
+3. Be cached/memoized if both cell and data API paths need it
+4. Recognize that for user-scoped activity/recap, the entire-api cell doesn't actually need the repo ID — only the data API does
+
+The comment in `entireapi_client.go:51-56` claims "no extra resolution is needed" but the code **does** an extra resolution (the `coreapi.New()` + `listMirrorsForRepo` call).
+
+---
+
+### **Secondary: Fallback Path Also Duplicates on Auth Failures** 
+
+**File/Lines:** `cmd/entire/cli/recap.go` lines 193-200
+
+**Summary:** On cell client failure (any reason except `ErrNoCellForJurisdiction`), the code logs debug and falls through to the data API path. If the failure was due to "not logged in," the fallback calls `auth.ResolveDataAPIToken()` which may retry discovery/login. This is **not redundant** (different error type triggers different behavior), but it is **sequential fallback latency** on an interactive command.
+
+**Cost:** Sequential failures add up: cell attempt (fails) → log → then data API attempt. If both fail, user sees cumulative latency. **Mitigation:** The logging (line 199) correctly suppresses noise for `ErrNoCellForJurisdiction`, reducing user-facing impact.
+
+---
+
+### **Activity Command Delegation** 
+
+**File:** `cmd/entire/cli/activity_cmd.go` line 59
+
+The `activity` command now uses `runAuthenticatedActivityAPI()` instead of the old `runAuthenticatedDataAPI()`. This function (entireapi_client.go:28) does the same cell-first-with-fallback pattern as recap. **No new inefficiency introduced here**, but the same cell → `currentRepoID()` redundancy would apply if activity ever tried to fetch repo-scoped data.
+
+---
+
+## Summary Table
+
+| Issue | File/Line | Type | Cost | Fix |
+|-------|-----------|------|------|-----|
+| Double control-plane call on cell success | `recap.go:194` | **CRITICAL** | +1 ListMirrors RPC per command | Resolve repo ID before cell client, or recognize activity/recap don't need it for user-scoped endpoints |
+| Fallback sequential latency | `recap.go:195-200` | Minor | Cumulative on failures | Acceptable; logging prevents spam |
+
+The **primary efficiency win** the diff seeks (preferring cell over data API) is sound, but the implementation pays for it with an extra control-plane round trip on the success path—defeating some of the benefit of the faster cell routing.</result>
+<usage><subagent_tokens>32979</subagent_tokens><tool_uses>14</tool_uses><duration_ms>34292</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a171886cf9af536e2</task-id>
+<tool-use-id>toolu_01AutErLvALCFPo7h56BUhyz</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/473b5e55-d61f-4bc6-bcae-ab078e0d3cdd/tasks/a171886cf9af536e2.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review of the diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect. Now I have enough context. Let me create a comprehensive analysis of simplification opportunities:
+
+## Simplification Review
+
+I found **four concrete simplifications** the diff should address:
+
+---
+
+### 1. **`newRecapClient` if/else-if shape is inverted and creates awkward control flow**
+**File:** `cmd/entire/cli/recap.go`, lines 192-200
+
+**Current code:**
+```go
+if client, err := auth.NewEntireAPICellClient(ctx, insecureHTTP, nil); err == nil {
+	return client, currentRepoID(ctx), nil
+} else if !errors.Is(err, auth.ErrNoCellForJurisdiction) {
+	// Best-effort upgrade: fall back to the data API on any cell failure...
+	logging.Debug(ctx, "recap: entire-api cell client unavailable, using data API", "error", err.Error())
+}
+
+if insecureHTTP {
+	auth.EnableInsecureHTTP()
+}
+// ... rest of data API path
+```
+
+**Problem:** The else-if with empty implicit fallthrough (no else block) is awkward. When `ErrNoCellForJurisdiction` is returned, nothing happens and execution falls through silently. The inverse check `!errors.Is(err, auth.ErrNoCellForJurisdiction)` is harder to reason about than a positive check.
+
+**Simpler form:**
+```go
+if client, err := auth.NewEntireAPICellClient(ctx, insecureHTTP, nil); err == nil {
+	return client, currentRepoID(ctx), nil
+}
+// Fall back to data API on any cell failure (including ErrNoCellForJurisdiction, which isn't logged)
+if !errors.Is(err, auth.ErrNoCellForJurisdiction) {
+	logging.Debug(ctx, "recap: entire-api cell client unavailable, using data API", "error", err.Error())
+}
+```
+
+**Concrete cost:** Removes the confusing else-if empty branch and clarifies the logic as "try cell, if it fails for non-obvious reasons log it, then proceed to data API path."
+
+---
+
+### 2. **Duplicate fallback/logging logic in `runAuthenticatedActivityAPI` vs `newRecapClient`**
+**Files:** `cmd/entire/cli/entireapi_client.go` lines 28-36 vs `cmd/entire/cli/recap.go` lines 192-200
+
+**Current code in both files:**
+```go
+client, err := auth.NewEntireAPICellClient(ctx, insecureHTTP, nil)
+if err != nil {
+	if !errors.Is(err, auth.ErrNoCellForJurisdiction) {
+		logging.Debug(ctx, "...", "error", err.Error())
+	}
+	return runAuthenticatedDataAPI(ctx, errW, insecureHTTP, fn) // or fallback to data API path
+}
+return fn(ctx, client)
+```
+
+**Problem:** Both functions implement the identical pattern: "try cell client, log non-ErrNoCellForJurisdiction failures, fall back to data API." This is copy-paste logic that should be shared.
+
+**Simpler form:**
+Extract a helper in `entireapi_client.go`:
+```go
+// tryAndFallbackToDataAPI attempts cellFn with the cell client, logging non-obvious failures.
+// On any error, falls back to dataAPIFn with the data API client.
+func tryAndFallbackToDataAPI(ctx context.Context, cellFn func(*api.Client) error, dataAPIFn func(*api.Client) error, insecureHTTP bool, errW io.Writer) error {
+	client, err := auth.NewEntireAPICellClient(ctx, insecureHTTP, nil)
+	if err != nil {
+		if !errors.Is(err, auth.ErrNoCellForJurisdiction) {
+			logging.Debug(ctx, "cell client unavailable, using data API", "error", err.Error())
+		}
+		return runAuthenticatedDataAPI(ctx, errW, insecureHTTP, dataAPIFn)
+	}
+	return cellFn(client)
+}
+```
+
+Then both callers reduce to:
+- `runAuthenticatedActivityAPI` → wrap fn, call helper
+- `newRecapClient` → call helper to get client, call helper with repo-slug-returning wrapper
+
+**Concrete cost:** Eliminates ~10 lines of duplicate fallback logic and single logging message, centralizes cell→data-API routing reasoning in one place.
+
+---
+
+### 3. **`forgeToMirrorProvider` switch can be simplified**
+**File:** `cmd/entire/cli/entireapi_client.go`, lines 42-49
+
+**Current code:**
+```go
+func forgeToMirrorProvider(forge string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(forge)) {
+	case "gh", mirrorCloneProviderGitHub:
+		return mirrorCloneProviderGitHub, true
+	default:
+		return "", false
+	}
+}
+```
+
+**Problem:** Returns a constant value that's already in the switch case (GitHub). The function does 2 things: normalize input and map to the constant. The map is trivial and adds a branch.
+
+**Simpler form:**
+```go
+func forgeToMirrorProvider(forge string) (string, bool) {
+	normalized := strings.ToLower(strings.TrimSpace(forge))
+	if normalized == "gh" || normalized == mirrorCloneProviderGitHub {
+		return mirrorCloneProviderGitHub, true
+	}
+	return "", false
+}
+```
+
+Or even simpler if only "gh" and "github" are valid:
+```go
+func forgeToMirrorProvider(forge string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(forge)) {
+	case "gh", "github":
+		return mirrorCloneProviderGitHub, true
+	default:
+		return "", false
+	}
+}
+```
+(Then use the constant value directly instead of repeating it in the case.)
+
+**Concrete cost:** Removes unnecessary branch nesting, makes the simple mapping transparent.
+
+---
+
+### 4. **`firstActiveRepoID` loop has redundant continue on empty ID**
+**File:** `cmd/entire/cli/entireapi_client.go`, lines 80-93
+
+**Current code:**
+```go
+func firstActiveRepoID(mirrors []coreapi.Mirror) string {
+	for i := range mirrors {
+		if mirrors[i].IsArchived.Or(false) {
+			continue
+		}
+		if st := mirrors[i].Status.Or(coreapi.MirrorStatusReady); st == coreapi.MirrorStatusFailed || st == coreapi.MirrorStatusSuspended {
+			continue
+		}
+		if id := strings.TrimSpace(mirrors[i].MirrorId); id != "" {
+			return id
+		}
+	}
+	return ""
+}
+```
+
+**Problem:** The final check `if id != ""` just continues to the next iteration (implicit fallthrough). The third if-block adds a level of nesting that doesn't prevent any failures — an empty ID just skips this mirror and moves to the next, the same as the archived/failed cases.
+
+**Simpler form:**
+```go
+func firstActiveRepoID(mirrors []coreapi.Mirror) string {
+	for i := range mirrors {
+		if mirrors[i].IsArchived.Or(false) {
+			continue
+		}
+		if st := mirrors[i].Status.Or(coreapi.MirrorStatusReady); st == coreapi.MirrorStatusFailed || st == coreapi.MirrorStatusSuspended {
+			continue
+		}
+		if id := strings.TrimSpace(mirrors[i].MirrorId); id != "" {
+			return id  // early return on first valid ID
+		}
+		// Implicitly continue to next mirror if ID is empty
+	}
+	return ""
+}
+```
+
+Or explicitly inline the check:
+```go
+func firstActiveRepoID(mirrors []coreapi.Mirror) string {
+	for i := range mirrors {
+		m := mirrors[i]
+		if m.IsArchived.Or(false) || (m.Status.Or(coreapi.MirrorStatusReady).In(coreapi.MirrorStatusFailed, coreapi.MirrorStatusSuspended)) {
+			continue
+		}
+		if id := strings.TrimSpace(m.MirrorId); id != "" {
+			return id
+		}
+	}
+	return ""
+}
+```
+
+**Concrete cost:** Clarifies that skipping empty IDs is the same skip-and-continue pattern as archived/failed — saves one level of indent, one conditional, reduces decision points from 3 to 2.
+
+---
+
+## Summary
+
+| Finding | File | Lines | Simplification | Cost |
+|---------|------|-------|-----------------|------|
+| Awkward else-if with empty fallthrough | `recap.go` | 192-200 | Invert condition, clarify with comment | Clearer control flow |
+| Duplicate cell→data-API fallback logic | `entireapi_client.go`, `recap.go` | 28-36, 192-200 | Extract shared helper | ~10 lines, centralized routing |
+| Unnecessary switch branch | `entireapi_client.go` | 42-49 | Use if-or or inline constant | One fewer level of nesting |
+| Redundant nested if for empty ID | `entireapi_client.go` | 80-93 | Flatten: empty ID is just a skip-and-continue like archived/failed | One fewer indent, one fewer condition |</result>
+<usage><subagent_tokens>27700</subagent_tokens><tool_uses>16</tool_uses><duration_ms>43900</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ae840a838c6d7c86c</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/473b5e55-d61f-4bc6-bcae-ab078e0d3cdd/tasks/ae840a838c6d7c86c.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review of the diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect. Now I have a comprehensive picture. Let me analyze the ALTITUDE issues:
+
+## Analysis
+
+### Issue 1: Fallback semantics location (Cell/Data API wrapper)
+
+**Location:** `cmd/entire/cli/entireapi_client.go`, lines 28-36 (new `runAuthenticatedActivityAPI` function)
+
+**Finding:** The fallback pattern ("try cell, fall back to data API") lives at the cli layer in a new helper `runAuthenticatedActivityAPI`, while the underlying mechanism `auth.NewEntireAPICellClient` does NOT embed this fallback. This creates a **command-specific wrapper around shared infrastructure**.
+
+**Comparison with experts:**
+- `experts_cmd.go` calls `auth.NewEntireAPICellClient(ctx, insecureHTTP, target)` **directly** — no fallback wrapper. When the cell is unavailable, experts fails. When a `CellTarget` is explicitly passed, there's no fallback at all.
+- `activity` and `recap` now both use a fallback pattern, but it's implemented by wrapping the shared client at the cli layer.
+
+**The deeper/more-general implementation:** The cell-vs-data-API fallback should live inside `auth.NewEntireAPICellClient` itself, parameterized by a `fallbackAllowed` or `allowDataAPIFallback` flag. This would:
+1. Centralize the fallback logic where the decision about cell vs. data API originates
+2. Prevent the same pattern from being reimplemented in activity, recap, and future commands
+3. Make the contract explicit: "this client type supports fallback" vs. "this doesn't"
+
+**Cost of current shallow implementation:**
+- Code duplication: The nearly-identical fallback pattern exists in both `runAuthenticatedActivityAPI` (entireapi_client.go:28) and `newRecapClient` (recap.go:192), except recap has extra logic to handle the post-fallback token resolution.
+- Maintainability: Any future command needing fallback must reimplement the error-checking and logging.
+- Inconsistency: `experts` doesn't get the fallback, even though `activity` does for the same shared client. New commands won't know which pattern to follow.
+
+---
+
+### Issue 2: Repo-to-mirror resolution duplication
+
+**Location:** `cmd/entire/cli/entireapi_client.go`, lines 51-75 (`currentRepoID` + `currentRepoSlug` in recap.go, mirrors `distinctActiveClusterHosts` logic from experts_cell_target.go)
+
+**Finding:** The new code implements "resolve current repo to ULID for cell routing" (`currentRepoID`), which requires:
+1. Forge→provider mapping (`forgeToMirrorProvider`)
+2. Mirror listing and filtering (`listMirrorsForRepo`)
+3. Active mirror selection (`firstActiveRepoID`)
+
+Meanwhile, `experts_cell_target.go` already solves the same problem for experts:
+- Lines 90-123: `resolveRepoClusterHost` does the ULID OR owner/repo→cluster-host resolution
+- Lines 125-156: `distinctActiveClusterHosts` filters archived/failed/suspended mirrors, dedupes by host
+
+**The deeper/more-general implementation:** Extract a shared abstraction "resolve current repo's active placement(s)" that both experts and activity/recap can use. This should live in `experts_cell_target.go` (or a new `repo_resolution.go`) and expose:
+```go
+// RepoPlacement describes one of a repo's active mirror placements
+type RepoPlacement struct {
+    ClusterHost string   // for experts to map to cell via catalog
+    MirrorID    string   // for activity/recap to scope ULID-keyed queries
+}
+
+// ResolveRepoPlacement best-effort resolves the repo and filters to active placements
+func ResolveRepoPlacement(ctx context.Context, ...) ([]RepoPlacement, error)
+```
+
+Then:
+- `experts`: use placement.ClusterHost
+- `activity/recap`: use placement.MirrorID (or call `currentRepoID` as a thin wrapper)
+
+**Duplication details:**
+- `firstActiveRepoID` (lines 80-93) reimplements the archived/failed/suspended filter that already exists in `distinctActiveClusterHosts` (lines 134-141).
+- Both filter the same three states with identical logic: `IsArchived.Or(false)` skip, then `Status.Or(coreapi.MirrorStatusReady)` check against `Failed`/`Suspended`.
+- `forgeToMirrorProvider` (lines 42-49) maps "gh"/"github"→"github", but no shared constant exists for this (repo_clone.go line 30 defines `const mirrorCloneProviderGitHub = "github"`, but it's not exposed for reuse).
+
+**Cost of current shallow implementation:**
+- Logic duplication: Same archived/failed/suspended filter exists twice, diverging easily if one is later fixed or extended.
+- Hidden coupling: `experts` and `activity/recap` both depend on the same mirror-status semantics, but the implementation is scattered. If `MirrorStatus` gains a new non-serving state, both sites must be updated separately.
+- Provider mapping friction: `forgeToMirrorProvider` is defined in `entireapi_client.go` but `mirrorCloneProviderGitHub` lives in `repo_clone.go`. A third site needing this mapping would need to redefine it or create yet another module.
+- Scope creep: `currentRepoID` has too many concerns baked in (forge resolution, control-plane calls, mirror filtering) at the cli layer instead of a shared location.
+
+---
+
+### Issue 3: ErrNoCellForJurisdiction narrowness
+
+**Location:** `cmd/entire/cli/auth/cell_data_api.go`, lines 377-382 (new sentinel error), used at lines 430 and 432.
+
+**Finding:** The error is narrow—it only signals "no cell for home jurisdiction in the cluster catalog." But the actual resolution failures are broader:
+
+From `NewEntireAPICellClient` (lines 95-179):
+- Line 123: `clusterdiscovery.ErrDiscoveryUnavailable` (/.well-known/entire-api.json missing)
+- Line 142: `ErrNotLoggedIn`
+- Line 173: Token exchange errors
+- Line 164+: `resolveCellAPIBaseURL` errors (including `ErrNoCellForJurisdiction`)
+
+The fallback logic in `runAuthenticatedActivityAPI` (line 31) treats `ErrNoCellForJurisdiction` as "non-obvious failure, don't log" but logs everything else. Yet:
+- "Not logged in" is obvious and requires no logging
+- Discovery unavailable is an infrastructure issue, worth logging
+- Token exchange errors are also infrastructure issues
+
+**The deeper/more-general implementation:** Instead of a single `ErrNoCellForJurisdiction`, define categorized errors that the caller can use to decide logging/fallback:
+
+```go
+// Categorize cell resolution failures
+var (
+    // ErrNoCellForJurisdiction: region has no entire-api yet, fallback is safe
+    ErrNoCellForJurisdiction = errors.New("...")
+    
+    // ErrCellResolutionAvailable: discovery/infrastructure problem, not a cell-vs-home choice
+    ErrCellResolutionUnavailable = errors.New("...")
+)
+
+// Or: a structured error type
+type CellResolutionError struct {
+    reason string // "jurisdiction", "not_logged_in", "discovery_unavailable", "exchange_failed"
+}
+```
+
+This lets `runAuthenticatedActivityAPI` (and future commands) make smarter decisions:
+- Only log "exchange failed" / "discovery unavailable" (infrastructure problems)
+- Don't log "not logged in" (expected on first use)
+- Don't log "no cell yet" (expected during rollout)
+
+**Cost of current shallow implementation:**
+- Semantic loss: Callers conflate "we don't have a cell yet" (feature rollout, not a problem) with other infrastructure errors (should be surfaced).
+- Logging inconsistency: `newRecapClient` logs all non-`ErrNoCellForJurisdiction` failures, but `runAuthenticatedActivityAPI` has the same pattern. A future caller might guess wrong about which failures to log.
+- Brittle fallback logic: If a new cell error gets added (e.g., "cell exists but rejects our token"), the fallback pattern doesn't know whether to treat it as transient vs. permanent.
+
+---
+
+## Summary
+
+| Issue | File | Lines | Altitude Problem | Shared Infrastructure Cost |
+|-------|------|-------|------------------|---------------------------|
+| **1. Fallback wrapper pattern** | `entireapi_client.go` | 28–36; `recap.go` 192–200 | Fallback logic should be in `auth.NewEntireAPICellClient`, not a cli-layer wrapper around it. Experts doesn't get fallback but activity/recap do, creating inconsistency. | Code duplication in `runAuthenticatedActivityAPI` and `newRecapClient`; future commands unsure which pattern to follow. |
+| **2. Repo→mirror resolution** | `entireapi_client.go` 51–75; `experts_cell_target.go` 125–156 | Reimplements archived/failed/suspended filtering already in `distinctActiveClusterHosts`. Forge→provider mapping undefined as shared const. | Extract shared `ResolveRepoPlacement` function; both experts and activity/recap depend on same mirror-status semantics but implementations scattered. | Mirror-status filter duplicated; provider mapping fragmented; if status enum changes, two sites must be updated. |
+| **3. ErrNoCellForJurisdiction too narrow** | `cell_data_api.go` | 377–382, 430, 432 | Single error masks multiple failure modes (not logged in, discovery unavailable, exchange failed). Conflates "region has no cell yet" (expected, no logging) with infrastructure errors (should be logged). | Fallback logic can't distinguish transient vs. permanent failures; logging decisions inconsistent across commands. |</result>
+<usage><subagent_tokens>37124</subagent_tokens><tool_uses>15</tool_uses><duration_ms>56459</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a718eee68b2a79909</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/473b5e55-d61f-4bc6-bcae-ab078e0d3cdd/tasks/a718eee68b2a79909.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review of the diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Excellent! Now I have a complete picture. Let me create my final report. Here are the REUSE issues I found:
+
+## Summary
+
+I found **2 concrete reuse opportunities** where the new code duplicates existing logic already present in the codebase:
+
+### 1. **`firstActiveRepoID` duplicates `distinctActiveClusterHosts` filtering logic**
+
+**File:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/entireapi_client.go`, lines 80-92
+
+**Issue:** The `firstActiveRepoID` function implements the exact same mirror-active-filtering logic as the existing `distinctActiveClusterHosts` function, but for a different purpose (picking the first ID vs. extracting cluster hosts). Both filter out:
+- Archived mirrors (`IsArchived.Or(false)`)
+- Failed/Suspended mirrors (`Status.Or(coreapi.MirrorStatusReady)` == MirrorStatusFailed/Suspended)
+
+**Existing helper:** `distinctActiveClusterHosts` in `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/experts_cell_target.go`, lines 131-156
+
+**Recommendation:** Extract a shared helper `isActiveMirror(m coreapi.Mirror) bool` that both functions can use, or refactor `distinctActiveClusterHosts` to return filtered mirrors and have both functions operate on the result. This consolidates the health-check logic in one place.
+
+**Concrete cost:** Maintains two copies of the same filtering criteria (lines 82-87 in entireapi_client.go vs. lines 134-140 in experts_cell_target.go). Any future change to what "active" means (e.g., new unhealthy statuses) requires updates in two places.
+
+---
+
+### 2. **`forgeToMirrorProvider` is a thin wrapper over `parseMirrorCloneRef` logic**
+
+**File:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/entireapi_client.go`, lines 42-49
+
+**Issue:** The `forgeToMirrorProvider` function maps "gh" → "github" by hardcoding `mirrorCloneProviderGitHub`. This is the same mapping that `parseMirrorCloneRef` (in `repo_clone.go`) already encodes implicitly — it parses `/gh/&lt;owner&gt;/&lt;repo&gt;` and returns `mirrorCloneProviderGitHub`. 
+
+**Existing pattern:** `parseMirrorCloneRef` in `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/repo_clone.go`, lines 55-65
+
+**Recommendation:** Rather than a standalone `forgeToMirrorProvider(forge)` function, consider:
+- Calling `parseMirrorCloneRef("gh/&lt;owner&gt;/&lt;repo&gt;")` and extracting the provider, or
+- Extracting the forge→provider mapping into a shared constant/enum so both `forgeToMirrorProvider` and `parseMirrorCloneRef` reference the same source of truth (currently both hardcode `mirrorCloneProviderGitHub` independently).
+
+**Concrete cost:** If GitHub's forge identifier changes (e.g., "gh" → "github-internal"), the mapping must be updated in two places. The constants are already unified (`mirrorCloneProviderGitHub`), but the *logic* of mapping the forge to it is duplicated.
+
+---
+
+**Note on `currentRepoSlug`:** This function in `recap.go` (line 255) is new and does not duplicate anything — it's a simple owner/repo slug builder using `gitremote.ResolveRemoteRepo`, which is different from `currentRepoID` that also calls `listMirrorsForRepo`. No reuse issue here.</result>
+<usage><subagent_tokens>41448</subagent_tokens><tool_uses>27</tool_uses><duration_ms>181882</duration_ms></usage>
+</task-notification>
+
+---
+
+can you open a PR
+
+---
+
+Wednesday 1 Jul (today)  169 commits
+21ff7f2 (no message) 01KSJ0MTMNSX253M6RF86J35EC  Unknown   +33 / -21  3 files  1 checkpoint
+21ff7f2 (no message) 01KWEE1WHJ5CRZFM497WNKJPCK  Unknown   +33 / -21  3 files  1 checkpoint
+21ff7f2 (no message) entireio/cli  Claude Code             +33 / -21  3 files  1 checkpoint
+f7eccb6 (no message) 01KWEE1WHJ5CRZFM497WNKJPCK  Unknown   +169 / -7  4 files  1 checkpoint
+f7eccb6 (no message) 01KSJ0MTMNSX253M6RF86J35EC  Unknown   +169 / -7  4 files  1 checkpoint
+f7eccb6 (no message) entireio/cli  Claude Code             +169 / -7  4 files  1 checkpoint
+8a978d3 (no message) 01KWEE1WHJ5CRZFM497WNKJPCK  Unknown    +30 / -6  2 files  1 checkpoint
+8a978d3 (no message) entireio/cli  Claude Code              +30 / -6  2 files  1 checkpoint
+8a978d3 (no message) 01KSJ0MTMNSX253M6RF86J35EC  Unknown    +30 / -6  2 files  1 checkpoint
+0ea0b0f (no message) entireio/cli                                      +1323 / -29  8 files
+0ea0b0f (no message) 01KSJ0MTMNSX253M6RF86J35EC                        +1323 / -29  8 files
+0ea0b0f (no message) 01KWEE1WHJ5CRZFM497WNKJPCK                        +1323 / -29  8 files
+2bf185a (no message) 01KWEE1WHJ5CRZFM497WNKJPCK  Unknown   +65 / -29  5 files  1 checkpoint
+
+---
+
+how does this work in entire.io today isn't it using the same endpoints?
+
+---
+
+can we check ../entire-api if this should work and is just a backfill issue or general broken, why are the reponames missing?
+
+---
+
+<task-notification>
+<task-id>acf0b03c865b93992</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/473b5e55-d61f-4bc6-bcae-ab078e0d3cdd/tasks/acf0b03c865b93992.output</output-file>
+<status>completed</status>
+<summary>Agent "Trace repo name population in entire-api" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect! So `GitHubFullName` queries github_repo_meta first, then falls back to repos.full_name, then empty string. Now I have enough understanding. Let me summarize what I've found:
+
+## Summary
+
+Based on my investigation of the entire-api codebase, here are the answers to your questions:
+
+### 1. **What populates `github_repo_meta`?**
+
+**File Evidence:**
+- **Migration schema:** `/Users/soph/Work/entire/devenv/entire-api/internal/store/migrations/repo/009_github_repo_meta.sql` (lines 1-12) documents the table as "Fed by the github_meta_v1 NATS consumer (internal/githubmeta), whose producer is mirror-pipeline's meta-fanout."
+- **Consumer code:** `/Users/soph/Work/entire/devenv/entire-api/internal/httpapi/internal/githubmeta/consumer.go` (lines 33-39) defines the Consumer that "durably pulls github_meta_v1 from this cell's LOCAL JetStream stream... and upserts each event into the local repo store keyed by repo ULID."
+- **Server wiring:** `/Users/soph/Work/entire/devenv/entire-api/internal/server/server.go` (lines 474-478) shows the consumer IS wired and running when `cfg.ConsumeGitHubMeta` is true.
+
+**Verdict:** The write path IS implemented and wired. The github_meta_v1 stream is consumed from mirror-pipeline (which gets GitHub webhooks), and the githubmeta consumer upserts github_repo_meta.full_name. **This is a deployed, working code path.**
+
+### 2. **What populates the repos-table `full_name`?**
+
+**File Evidence:**
+- **Ingest write path:** `/Users/soph/Work/entire/devenv/entire-api/internal/ingest/flow.go` (lines 432-453) shows that in `ensureRepo()`, the repos table `full_name` is populated from:
+  1. `repoMeta.RepoFullName()` (Core's path, line 647)
+  2. **Fallback** to `Store.GitHubFullName()` (line 450) — which queries github_repo_meta first
+  3. Empty string if both are missing
+
+- **Store write:** `/Users/soph/Work/entire/devenv/entire-api/internal/store/store.go` (lines 362-390) `UpsertRepo()` upserts the repos table with full_name.
+
+**Verdict:** The repos table full_name IS populated, but only when Core.GetRepo supplies a path OR when github_repo_meta already has the full_name (best-effort fallback, lines 450-452). **The path is implemented, but the repos table relies on github_repo_meta as a fallback.**
+
+### 3. **Where does the human "owner/repo" name ORIGINATE for entire-api?**
+
+**File Evidence:**
+- **Primary source:** `github_repo_meta.full_name` — fed by mirror-pipeline's github_meta_v1 events (GitHub webhooks for repo metadata changes)
+- **Fallback source:** Core.GetRepo's path field, parsed via `repoMeta.RepoFullName()` at `/Users/soph/Work/entire/devenv/entire-api/internal/coreapi/client.go` (lines 76-90)
+
+**Verdict:** entire-api depends on TWO sources: (a) entire-core's repo.path (when available), OR (b) mirror-pipeline's GitHub webhook stream → github_repo_meta (the canonical read-side source per line 442 of flow.go). The name is NOT generated fresh by entire-api; it originates from Core and GitHub webhooks.
+
+### 4. **VERDICT on missing repo names:**
+
+**Diagnostic:** Callers see ULID when BOTH `github_repo_meta.full_name` AND `repos.full_name` are empty/null. This happens when:
+- The repo was ingested BEFORE the github_meta_v1 event arrived (timing gap)
+- Core's GetRepo omitted the path (foreign/mirror/unresolved repo)
+- The github_meta_v1 stream is not flowing (CONSUME_GITHUB_META not set, or mirror-pipeline not publishing)
+
+**Decision Tree:**
+- **Is the consumer running?** Check `cfg.ConsumeGitHubMeta` in the deployment config. If false → **backfill/timing gap** (no writes happening)
+- **Has the event arrived yet?** Query `github_repo_meta WHERE repo_id = ?` in the repo store. If empty → **backfill/timing gap** (consumer is running, but event hasn't arrived)
+- **Is mirror-pipeline publishing?** Check mirror-pipeline's meta-fanout logs for github_meta_v1 publishes to the jurisdiction/cluster subject
+
+**Actual verdict:** This is **(a) a backfill/timing gap — the population code exists and IS deployed**, but the data hasn't arrived yet. The github_meta_v1 consumer is wired (line 475, server.go), UpsertGitHubRepoMeta is working (store.go line 886+), and the read-side prefers MetaFullName (me.go line 438). The missing names are because github_meta_v1 events from mirror-pipeline either haven't been published or haven't reached entire-api's cell yet.
+
+### Short note on `/me/commits` and commit_message / commit_author_username:
+
+**File Evidence:**
+- **Commit messages:** The commits table was **dropped** in migration 006 (`/Users/soph/Work/entire/devenv/entire-api/internal/store/migrations/repo/006_drop_commits.sql`). Comment at line 2-4: "Git data isn't materialised locally: commit lists / diffs / branch reachability are read through to entiredb..."
+- **Read path:** `/me/commits` reads messages via `hydrateCommitMessages()` → `deps.commitMsgs.Messages()` → `repoContentClient.BatchCommits()` from entiredb (commits_readthrough.go line 199)
+- **Author username:** Resolved at line 195 of me.go via `resolveAuthorEmailLogins()` from the author email, not stored locally
+
+**Verdict:** Commit messages and author usernames are **read-through from entiredb at serve time**, not stored in entire-api. This is **working as designed** — no local persistence, no backfill gap. If `/me/commits` returns null commit_message, it means the entiredb read-through failed (log `deps.commitMsgs.Messages` failures at commits_readthrough.go line 28).</result>
+<usage><subagent_tokens>76120</subagent_tokens><tool_uses>51</tool_uses><duration_ms>39983222</duration_ms></usage>
+</task-notification>
+
+---
+
+hmm, slight segway: But can we build a command (I think the github cli has that too) to call an api endpoint and the entire cli will take care of adding the correct auth? And then return the response as nicely formatted json? can you take a look what the github cli doing there?
+
+---
+
+the data api is also cell specific?
+
+---
+
+the data api goes away soon, let's just ignore this for this effort, we only support core and cell
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>ae52bc95a27283898</task-id>
+<tool-use-id>toolu_01HHzbQA38mVHVkq4XKtKppK</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/473b5e55-d61f-4bc6-bcae-ab078e0d3cdd/tasks/ae52bc95a27283898.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review of entire api command" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect. Now I have all the details. Let me analyze the efficiency issues:
+
+## Efficiency Issues Report
+
+### 1. **Redundant `gitremote.ResolveRemoteRepo` call** (CRITICAL)
+**File:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/api_cmd.go`
+**Lines:** 148, 169
+**Summary:** Path with both `{owner}/{repo}` and `{repo_id}` triggers two git operations.
+
+In `expandAPIPlaceholders`:
+- Line 147-153: First call to `gitremote.ResolveRemoteRepo(ctx, "origin")` when path contains `{owner}` or `{repo}`
+- Line 155-160: Calls `resolveCurrentRepoID` which internally calls `gitremote.ResolveRemoteRepo(ctx, "origin")` again at line 169
+
+**Example user command:**
+```bash
+entire api --to cell "/api/v1/me/recap?owner={owner}&amp;repo={repo}&amp;repo_id={repo_id}"
+```
+
+This executes `ResolveRemoteRepo` twice: once in `expandAPIPlaceholders`, then again inside `resolveCurrentRepoID`.
+
+**Cost:** Git remote resolution likely involves spawning `git config` or parsing `.git/config`, which is a user-visible disk I/O operation. On slow storage or high-latency networks, visible latency hit.
+
+**Fix:** Extract the git resolution to a helper that returns `(forge, owner, repo)`, call it once in `expandAPIPlaceholders`, cache the result, and pass `owner, repo` to `resolveCurrentRepoID` to skip the redundant call. Refactored `expandAPIPlaceholders` signature:
+```go
+func expandAPIPlaceholders(ctx context.Context, s string) (string, error) {
+  // Resolve git once upfront if needed
+  var forge, owner, repo string
+  if strings.Contains(s, "{owner}") || strings.Contains(s, "{repo}") || strings.Contains(s, "{repo_id}") {
+    var err error
+    forge, owner, repo, err = gitremote.ResolveRemoteRepo(ctx, "origin")
+    if err != nil {
+      return "", fmt.Errorf("resolve origin remote: %w", err)
+    }
+  }
+  // ... reuse forge/owner/repo; pass to resolveCurrentRepoID if {repo_id} present
+}
+```
+
+---
+
+### 2. **Double `TrimSpace` on response body** (Minor)
+**File:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/api_cmd.go`
+**Line:** 378
+**Summary:** `bytes.TrimSpace(raw)` is called for both validation and then implicitly again during indent.
+
+At line 378:
+```go
+if body := bytes.TrimSpace(raw); len(body) &gt; 0 &amp;&amp; json.Valid(body) {
+```
+
+Then line 380 calls `json.Indent(&amp;pretty, body, "", "  ")` on the trimmed `body`, but the trimmed slice is local to the if-block. However, the actual inefficiency is subtle: `json.Valid(body)` walks the entire trimmed body to check syntax before `json.Indent` parses it again.
+
+**Cost:** Low on typical JSON (&lt;1 MiB): two passes over the same bytes. On 32 MiB responses, measurable but not critical (CLI not hot-path).
+
+**Fix:** Use `json.Indent` with error handling instead of `json.Valid` first:
+```go
+toWrite := raw
+if body := bytes.TrimSpace(raw); len(body) &gt; 0 {
+  var pretty bytes.Buffer
+  if err := json.Indent(&amp;pretty, body, "", "  "); err == nil {
+    pretty.WriteByte('\n')
+    toWrite = pretty.Bytes()
+  }
+}
+```
+This eliminates the `json.Valid` pass. (Actually, the code already does this—line 380 checks `json.Indent` for error, so only one pass occurs. **False alarm—no issue here.**) ✓
+
+---
+
+### 3. **32 MiB `LimitReader` cap is reasonable; no double-read**
+**Line:** 372, 328
+**Summary:** Response body read is single-pass; cap is appropriate for CLI output.
+
+Line 372: `io.ReadAll(io.LimitReader(resp.Body, apiMaxResponseBytes))` reads once into memory.
+Line 378: `bytes.TrimSpace(raw)` is a pointer reuse; no second read.
+
+**Cost:** Zero—this is correctly implemented. ✓
+
+---
+
+### 4. **Sequential placeholder expansions and request building**
+**Lines:** 81–94 in `runAPI`
+**Summary:** `expandAPIPlaceholders`, `buildAPIFields`, `buildAPIRequestBody`, `parseAPIHeaders` run sequentially.
+
+```go
+path, err := expandAPIPlaceholders(ctx, rawPath)      // blocks on git I/O
+fields, err := buildAPIFields(f.rawFields, f.typedFields)  // CPU-bound
+req, err := buildAPIRequestBody(ctx, path, f, fields)     // CPU-bound, depends on path
+headers, err := parseAPIHeaders(f.headers)                 // CPU-bound
+```
+
+`expandAPIPlaceholders` is the only blocking call; `buildAPIFields` and `parseAPIHeaders` are independent CPU-bound operations that could run in parallel.
+
+**Cost:** CLI (not hot-path); gains would be negligible in practice. The git I/O is the real bottleneck, not the parallel CPU work.
+
+**Fix:** Low priority. If parallelized:
+```go
+var wg sync.WaitGroup
+var fields map[string]any
+var headers http.Header
+var fieldErr, headerErr error
+
+wg.Add(2)
+go func() { fields, fieldErr = buildAPIFields(...); wg.Done() }()
+go func() { headers, headerErr = parseAPIHeaders(...); wg.Done() }()
+wg.Wait()
+```
+But not worth the complexity for a CLI command. ✗
+
+---
+
+### 5. **`stdinReader` closure scope** (Not an issue)
+**Line:** 342
+**Summary:** `var stdinReader = func(context.Context) io.Reader { return os.Stdin }`
+
+This is a function pointer, not a closure capturing large scope. Only captures `os.Stdin` (a file descriptor), negligible. ✓
+
+---
+
+## Summary
+
+| Finding | File | Lines | Cost | Fix |
+|---------|------|-------|------|-----|
+| **Redundant `gitremote.ResolveRemoteRepo` call** | `api_cmd.go` | 148, 169 | **User-visible latency** (git I/O 2x when {owner}/{repo_id} both used) | Cache git resolution; call once, pass result to both placeholders |
+| Double `TrimSpace` on response body | `api_cmd.go` | 378 | **False alarm**—code already avoids it by checking `json.Indent` error instead of `json.Valid` | N/A |
+| 32 MiB limit reasonable | `api_cmd.go` | 372, 328 | N/A | N/A |
+| Sequential `parseAPIHeaders` &amp; `buildAPIFields` | `api_cmd.go` | 81–94 | Negligible (CPU-bound, dwarfed by git I/O) | Not worth parallelizing |
+| `stdinReader` closure scope | `api_cmd.go` | 342 | N/A | N/A |
+
+**Main actionable finding:** The **redundant git call** at lines 148 &amp; 169 is the only real inefficiency. When a user invokes `entire api` with a path containing both `{owner}/{repo}` and `{repo_id}` placeholders, `gitremote.ResolveRemoteRepo` executes twice. A single call cached upfront would cut git latency in half for that case.</result>
+<usage><subagent_tokens>25794</subagent_tokens><tool_uses>4</tool_uses><duration_ms>23941</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a6314b15ee93f6651</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/473b5e55-d61f-4bc6-bcae-ab078e0d3cdd/tasks/a6314b15ee93f6651.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review of entire api command" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect. Now I have all the information I need. Let me compile my findings.
+
+## Simplification Findings for `entire api` Command
+
+### 1. **Duplicate git remote resolution** — Lines 148 &amp; 169 (`expandAPIPlaceholders` and `resolveCurrentRepoID`)
+**File:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/api_cmd.go`
+
+**Issue:** When a path contains `{owner}/{repo}` AND `{repo_id}`, the git remote is resolved twice. Line 148 calls `gitremote.ResolveRemoteRepo(ctx, "origin")` to fill `{owner}/{repo}`. If the same path also contains `{repo_id}`, line 169 calls it again inside `resolveCurrentRepoID`.
+
+**Simpler form:** Cache the first remote resolution and pass it to `resolveCurrentRepoID` to avoid redundant I/O:
+```go
+// Instead of expandAPIPlaceholders calling resolveCurrentRepoID which re-resolves:
+func expandAPIPlaceholders(ctx context.Context, s string) (string, error) {
+    if !strings.Contains(s, "{") {
+        return s, nil
+    }
+    var forge, owner, repo string
+    if strings.Contains(s, "{owner}") || strings.Contains(s, "{repo}") || strings.Contains(s, "{repo_id}") {
+        var err error
+        forge, owner, repo, err = gitremote.ResolveRemoteRepo(ctx, "origin")
+        if err != nil {
+            return "", fmt.Errorf("resolve remote: %w", err)
+        }
+        s = strings.ReplaceAll(s, "{owner}", owner)
+        s = strings.ReplaceAll(s, "{repo}", repo)
+    }
+    if strings.Contains(s, "{repo_id}") {
+        id, err := resolveCurrentRepoID(ctx, forge, owner, repo)
+        if err != nil {
+            return "", err
+        }
+        s = strings.ReplaceAll(s, "{repo_id}", id)
+    }
+    return s, nil
+}
+```
+**Cost:** Avoids a second `gitremote.ResolveRemoteRepo` I/O on paths like `/api/v1/me/recap?owner={owner}&amp;repo={repo}&amp;repo_id={repo_id}`.
+
+---
+
+### 2. **Ceremony around `stdinReader` seam** — Line 342 (`api_cmd.go`)
+**File:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/api_cmd.go`
+
+**Issue:** Line 342 defines a package-level function variable `stdinReader = func(context.Context) io.Reader { return os.Stdin }` solely for testing. It takes `context.Context` but ignores it, and adds no observable behavior—it's pure ceremony. Tests could mock at the `readAPIInput` level instead.
+
+**Simpler form:** Remove the seam and have tests mock `readAPIInput` or use dependency injection via a config struct:
+```go
+// Instead of:
+var stdinReader = func(context.Context) io.Reader { return os.Stdin }
+// in readAPIInput:
+raw, err := io.ReadAll(io.LimitReader(stdinReader(ctx), apiMaxResponseBytes))
+
+// Use direct os.Stdin or inject via a builder type:
+type apiCmdDeps struct {
+    stdin io.Reader
+}
+// Default: deps.stdin = os.Stdin
+// Test: deps.stdin = testReader
+```
+**Cost:** Reduces global mutable state and simplifies the contract; tests don't pay for a closure they may never use.
+
+---
+
+### 3. **Overly-split `buildAPIFields` — Lines 200–217**
+**File:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/api_cmd.go`
+
+**Issue:** The function duplicates the key-value parsing loop for `rawFields` and `typedFields`. Both blocks are identical except for calling `inferFieldValue` on the second. This is a classic copy-paste-with-variation pattern.
+
+**Simpler form:** Unify with a helper or loop over both slices with a type-inferred flag:
+```go
+func buildAPIFields(rawFields, typedFields []string) (map[string]any, error) {
+    out := make(map[string]any, len(rawFields)+len(typedFields))
+    for _, kv := range rawFields {
+        if err := addField(out, kv, false); err != nil {
+            return nil, err
+        }
+    }
+    for _, kv := range typedFields {
+        if err := addField(out, kv, true); err != nil {
+            return nil, err
+        }
+    }
+    return out, nil
+}
+
+func addField(out map[string]any, kv string, infer bool) error {
+    k, v, ok := strings.Cut(kv, "=")
+    if !ok || k == "" {
+        return fmt.Errorf("invalid field %q (want key=value)", kv)
+    }
+    if infer {
+        out[k] = inferFieldValue(v)
+    } else {
+        out[k] = v
+    }
+    return nil
+}
+```
+**Cost:** Reduces duplication; if parsing logic evolves, one change fixes both branches.
+
+---
+
+### 4. **Over-decomposed `runAPI` orchestration** — Lines 73–108
+**File:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/api_cmd.go`
+
+**Issue:** `runAPI` calls five sequential builders (`resolveAPIClient`, `expandAPIPlaceholders`, `buildAPIFields`, `buildAPIRequestBody`, `parseAPIHeaders`) with no shared state or interdependencies, then immediately uses them. Each is one-liners in the caller. The decomposition is clear for *intent* but adds indentation depth and makes the critical path harder to trace at a glance.
+
+**Simpler form:** Inline the three stateless builders (`parseAPIHeaders`, `buildAPIFields`, `expandAPIPlaceholders`—or at least the last two) and keep only `resolveAPIClient` (auth cost) and `buildAPIRequestBody` (logic complexity) as separate functions:
+```go
+func runAPI(ctx context.Context, w, errW io.Writer, rawPath string, f *apiFlags) error {
+    client, err := resolveAPIClient(ctx, f.to, applyInsecureHTTPAuth(f.insecureHTTP))
+    if err != nil {
+        return err
+    }
+
+    // Expand placeholders inline
+    path := rawPath
+    if strings.Contains(path, "{") {
+        if path, err = expandAPIPlaceholders(ctx, path); err != nil {
+            return err
+        }
+    }
+
+    // Parse fields inline
+    fields := make(map[string]any, len(f.rawFields)+len(f.typedFields))
+    for _, kv := range f.rawFields {
+        // ... parse …
+    }
+    // ... etc
+
+    // Defer the two substantive builders
+    req, err := buildAPIRequestBody(ctx, path, f, fields)
+    headers, err := parseAPIHeaders(f.headers)
+    // ... send &amp; respond
+}
+```
+**Cost:** Reduced call depth and intermediate state; the hot path is clearer. Trade-off: `runAPI` becomes longer; weigh testability of the constituent pieces against clarity of the orchestration.
+
+---
+
+### 5. **`buildAPIRequestBody` structure — Lines 249–291**
+**File:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/api_cmd.go`
+
+**Issue:** The method/body branching has three if-statements that could be refactored to a single state machine. Currently:
+- If `--input` is given → check no fields, read file/stdin, infer method, return body
+- Else if no method specified → infer from fields presence
+- Else if method is GET → fields go to query string
+- Else → fields go to JSON body
+
+This is not wrong, but the nested ifs after the `--input` block (lines 266–272) feel like redundant state juggling.
+
+**Simpler form:** Frontload all method inference before the body branching:
+```go
+func buildAPIRequestBody(ctx context.Context, path string, f *apiFlags, fields map[string]any) (apiRequest, error) {
+    method := strings.ToUpper(strings.TrimSpace(f.method))
+    
+    // Infer method early
+    if method == "" {
+        if f.input != "" || len(fields) &gt; 0 {
+            method = http.MethodPost
+        } else {
+            method = http.MethodGet
+        }
+    }
+
+    // Now route by input vs fields
+    if f.input != "" {
+        if len(fields) &gt; 0 {
+            return apiRequest{}, errors.New("use either --input or -f/-F, not both")
+        }
+        raw, err := readAPIInput(ctx, f.input)
+        if err != nil {
+            return apiRequest{}, err
+        }
+        return apiRequest{method: method, path: path, body: bytes.NewReader(raw)}, nil
+    }
+
+    // Fields: GET → query, else → JSON body
+    if len(fields) &gt; 0 &amp;&amp; method == http.MethodGet {
+        q, err := fieldsToQuery(fields)
+        if err != nil {
+            return apiRequest{}, err
+        }
+        return apiRequest{method: method, path: appendQuery(path, q), body: nil}, nil
+    }
+    if len(fields) &gt; 0 {
+        // … marshal to JSON body
+    }
+    return apiRequest{method: method, path: path, body: nil}, nil
+}
+```
+**Cost:** Clearer control flow; eliminates the "method is empty, now check again" pattern. Slightly longer but less cognitive load.
+
+---
+
+### 6. **`parseAPIHeaders` + `fieldsToQuery` — copy-paste parsing**
+**File:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/api_cmd.go` (lines 344–354 and lines 295–312)
+
+**Issue:** `parseAPIHeaders` (lines 344–354) and the key-value parsing in `buildAPIFields` both use `strings.Cut` with identical error checking (`if !ok || k == ""` for fields; `if !ok || strings.TrimSpace(k) == ""` for headers). These are slightly different (fields check empty key, headers check whitespace-stripped key), but the duplication is redundant.
+
+**Simpler form:** Extract a shared parser:
+```go
+func parseKeyValue(kv, sep string, allowEmptyKey bool) (string, string, error) {
+    k, v, ok := strings.Cut(kv, sep)
+    if !ok {
+        return "", "", fmt.Errorf("invalid format %q (want key%cvalue)", kv, rune(sep[0]))
+    }
+    k = strings.TrimSpace(k)
+    if !allowEmptyKey &amp;&amp; k == "" {
+        return "", "", fmt.Errorf("empty key in %q", kv)
+    }
+    return k, strings.TrimSpace(v), nil
+}
+```
+**Cost:** Single source of truth for parsing; easier to evolve error messages consistently.
+
+---
+
+### Summary
+
+**Key findings (actionable simplifications):**
+
+1. **Duplicate git remote resolution** (lines 148, 169) — pass `forge/owner/repo` through to `resolveCurrentRepoID` to avoid re-calling `gitremote.ResolveRemoteRepo`.
+2. **`stdinReader` seam** (line 342) — use dependency injection or direct `os.Stdin` instead of a closure that ignores its `context.Context` parameter.
+3. **Copy-paste in `buildAPIFields`** (lines 202–207 vs 209–214) — extract the key-value parsing into a helper to unify both branches.
+4. **Over-split `runAPI`** (lines 73–108) — consider inlining the three lightweight builders (`expandAPIPlaceholders`, `buildAPIFields`, `parseAPIHeaders`) to reduce call depth and clarify the hot path.
+5. **Redundant method inference in `buildAPIRequestBody`** (lines 250–272) — hoist method inference before the input/fields branching to eliminate the second if-check.
+6. **Duplicate key-value parsing** — extract `parseKeyValue` to unify `buildAPIFields` error messages with `parseAPIHeaders`.</result>
+<usage><subagent_tokens>31877</subagent_tokens><tool_uses>9</tool_uses><duration_ms>41047</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ae915465d24235a96</task-id>
+<tool-use-id>toolu_01BLGZkCormNC34ivT9mUCmo</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/473b5e55-d61f-4bc6-bcae-ab078e0d3cdd/tasks/ae915465d24235a96.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review of entire api command" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect! Now I have all the information I need. Let me write up my findings.
+
+## ALTITUDE ISSUES IN `entire api` COMMAND
+
+I found **three genuine altitude problems** where the implementation duplicates or internalizes patterns that should be shared across the codebase:
+
+---
+
+### 1. **Mirror "Active" Filter Duplicated in CLI Layer**
+**File:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/api_cmd.go`, lines 184–190  
+**Summary:** The filter for "active mirrors" (non-archived, non-failed/suspended) is inlined locally.
+
+```go
+for i := range mirrors {
+  if mirrors[i].IsArchived.Or(false) {
+    continue
+  }
+  if st := mirrors[i].Status.Or(coreapi.MirrorStatusReady); st == coreapi.MirrorStatusFailed || st == coreapi.MirrorStatusSuspended {
+    continue
+  }
+  if id := strings.TrimSpace(mirrors[i].MirrorId); id != "" {
+    return id, nil
+  }
+}
+```
+
+**Deeper/more-general implementation:** This **identical filter already exists** in `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/experts_cell_target.go` as the helper function `distinctActiveClusterHosts()` (lines 131–156), which encapsulates exactly this logic:
+
+```go
+func distinctActiveClusterHosts(mirrors []coreapi.Mirror) []string {
+  // Filters archived + failed/suspended mirrors, returns deduped hosts
+}
+```
+
+**Cost of shallow version:**  
+- **Duplication bug vector:** When the "active mirror" definition changes (e.g., add a new unhealthy status), maintainers must update it in two places. The current definition is already replicated across `distinctActiveClusterHosts` and `resolveCurrentRepoID`.
+- **Inconsistency risk:** If one definition drifts, `experts` commands pick a different cell than `api {repo_id}` for the same repo, breaking user expectations.
+- **Per-command pollution:** Each command that needs to pick from active mirrors inlines the logic instead of reusing a shared predicate.
+
+**Recommendation:** Extract an `activeRepoMirror(mirrors []coreapi.Mirror) []coreapi.Mirror` filter function to `repo_clone.go` (where `listMirrorsForRepo` lives), then use it in both `distinctActiveClusterHosts` and `resolveCurrentRepoID`.
+
+---
+
+### 2. **Backend Resolution (`--to core|cell`) Reinvents Core/Cell Selection**
+**File:** `/Users/soph/Work/entire/devenv/cli/api_cmd.go`, lines 118–137  
+**Summary:** `resolveAPIClient` manually switches between core and cell backends; both return `*api.Client`.
+
+```go
+func resolveAPIClient(ctx context.Context, to string, insecure bool) (*api.Client, error) {
+  switch strings.ToLower(strings.TrimSpace(to)) {
+  case "", "core":
+    target, err := resolveAuthStatusTarget(ctx, auth.Contexts, auth.RefreshedLoginToken)
+    if err != nil {
+      return nil, err
+    }
+    // ... token validation, URL check ...
+    return api.NewClientWithBaseURL(target.token, target.coreURL), nil
+  case "cell":
+    client, err := auth.NewEntireAPICellClient(ctx, insecure, nil)
+    if err != nil {
+      return nil, err
+    }
+    return client, nil
+  }
+}
+```
+
+**Deeper/more-general implementation:** The codebase already has **unified backend resolution** patterns:
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/api_client.go` exports `NewAuthenticatedAPIClient` (core) and `NewAuthenticatedEntireAPICellClient` (cell).
+- `experts_cmd.go` and other repo-scoped commands use these high-level builders, not `resolveAuthStatusTarget` + manual URL/token plumbing.
+- The `auth` package provides `resolveAuthStatusTarget` for **auth-management commands** (`auth status`, `logout`, `auth token`), not general-purpose backend selection.
+
+**Cost of shallow version:**  
+- **Altitude mismatch:** `resolveAPIClient` duplicates token-resolution logic already encapsulated in `NewAuthenticatedAPIClient` and `NewAuthenticatedEntireAPICellClient`. Users looking for "how do I pick a backend" now have two places: `api_cmd.go` and `api_client.go`.
+- **Fragmentation:** Auth-status validation (TLS check, token check) is repeated in `resolveAPIClient` instead of delegated to the constructors, making it harder to change the contract in one place.
+- **Missing cell-target resolution:** Unlike `NewAuthenticatedEntireAPICellClient`, which calls `resolveExpertsCellTarget` to pick a repo-aware cell, `resolveAPIClient` always passes `nil` to `NewEntireAPICellClient`, forcing home-cell routing even when `{repo_id}` is specified. This is a latent bug: using `entire api --to cell "/api/v1/me/recap?repo={repo_id}"` doesn't gain the per-repo cell selection that experts do.
+
+**Recommendation:** Replace `resolveAPIClient` with calls to the existing `NewAuthenticatedAPIClient` and `NewAuthenticatedEntireAPICellClient` (or a new variant that accepts repo context for cell targeting). This keeps backend resolution at one altitude.
+
+---
+
+### 3. **Placeholder Substitution ({owner}/{repo}/{repo_id}) Should Be Shared**
+**File:** `/Users/soph/Work/entire/devenv/cli/api_cmd.go`, lines 145–163  
+**Summary:** `expandAPIPlaceholders` is command-local, but placeholder substitution is a general pattern.
+
+```go
+func expandAPIPlaceholders(ctx context.Context, s string) (string, error) {
+  if !strings.Contains(s, "{owner}") &amp;&amp; !strings.Contains(s, "{repo}") &amp;&amp; !strings.Contains(s, "{repo_id}") {
+    return s, nil
+  }
+  // ... lazy resolution: {owner}/{repo} from git remote, {repo_id} from mirror lookup ...
+}
+```
+
+**Deeper/more-general implementation:**  
+The concept of "path placeholders for the current repo" is already implicitly used by other commands (e.g., `experts` resolves repo context to pick a cell). A shared placeholder resolver could live alongside other repo-context helpers (e.g., in `gitremote.go` or a new `repo_context.go`), parameterized by which placeholders are needed.
+
+**Cost of shallow version:**  
+- **Discoverable reuse:** If another command (e.g., `entire browse` or a future `entire export`) needs `{owner}/{repo}` or `{repo_id}` substitution, it won't find a shared helper and will either duplicate this code or work around it by hand-building URLs.
+- **Lazy-loading assumptions baked in:** `expandAPIPlaceholders` assumes `{repo_id}` is only needed when explicitly referenced in the path (saves a control-plane call), but if another command wants the ULID eagerly, it must duplicate the logic or accept unnecessary latency.
+- **Not exported:** The function is private to `api_cmd.go`, so there's no affordance for other packages to use it.
+
+**Recommendation:** Extract `expandAPIPlaceholders` to `gitremote.go` or a shared `repo_context.go` module, make it public, and document the lazy-loading contract. Use it in `api_cmd.go` and other repo-scoped operations.
+
+---
+
+## Summary Table
+
+| Finding | Location | Altitude Smell | Cost | Fix |
+|---------|----------|-----------------|------|-----|
+| Active mirror filter duplication | `api_cmd.go:184–190` | Filter logic duplicated in 2 places; `experts_cell_target.go` already has `distinctActiveClusterHosts` | Maintenance divergence, per-command pollution | Extract `activeRepoMirror()` predicate to `repo_clone.go` |
+| Backend resolution reinvention | `api_cmd.go:118–137` | Duplicates `NewAuthenticatedAPIClient` + `NewAuthenticatedEntireAPICellClient` logic | Token/URL plumbing scattered; missing per-repo cell targeting | Use high-level constructors from `api_client.go` directly |
+| Placeholder substitution local-only | `api_cmd.go:145–163` | Private function; no reuse path for other commands | Other commands duplicate or work around; lazy-loading contract hidden | Export to `gitremote.go` or `repo_context.go` for shared use |
+
+Each of these can be fixed independently. The highest-impact fix is **#2** (backend resolution), which unblocks correct cell targeting when `{repo_id}` is used and consolidates auth logic.</result>
+<usage><subagent_tokens>42031</subagent_tokens><tool_uses>21</tool_uses><duration_ms>58887</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a98b4fc5f77ff4459</task-id>
+<tool-use-id>toolu_01GqsVGnthwubLDoA9N8xfqy</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/473b5e55-d61f-4bc6-bcae-ab078e0d3cdd/tasks/a98b4fc5f77ff4459.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review of entire api command" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Good! Now I have enough information. Let me write the final report:
+
+## REUSE Issues Found in `entire api` Command
+
+### 1. **JSON Pretty-Printing Pattern (Moderate Reuse Issue)**
+- **File**: `cmd/entire/cli/api_cmd.go`, lines 377-383 (in `writeAPIResponse`)
+- **Summary**: Re-implements JSON pretty-printing using `json.Indent` + manual newline
+- **Existing Helper**: `cmd/entire/cli/jsonutil/json.go` provides `MarshalIndentWithNewline(v, "", "  ")` for this exact pattern
+- **Cost**: The codebase already has a standard indentation utility used across 50+ files (metadata.go, sessions.go, experts_cmd.go, settings/, checkpoint/, investigate/, dispatch/, agent/, etc.). The API command rolls its own inline logic instead of reusing it.
+- **Recommendation**: When JSON body is valid, use `jsonutil.MarshalIndentWithNewline()` or `json.Encoder.SetIndent()` pattern like the rest of the codebase, not `json.Indent` + `WriteByte('\n')`.
+
+### 2. **Response Byte-Limit Constant Mismatch (Minor Inconsistency)**
+- **File**: `cmd/entire/cli/api_cmd.go`, line 25 (defines `apiMaxResponseBytes = 32 &lt;&lt; 20`)
+- **Existing Constant**: `cmd/entire/cli/api/client.go`, line 17 defines `maxResponseBytes = 16 &lt;&lt; 20`
+- **Summary**: Two different response size limits in the same API layer (32 MiB for `api` command, 16 MiB for internal client)
+- **Cost**: Inconsistent limits can cause confusion. The passthrough command is more permissive (32 MiB) than the underlying client (16 MiB), creating a silent truncation gap if both are used on the same response.
+- **Recommendation**: Consider unifying these constants or documenting why the asymmetry is intentional. If 32 MiB is appropriate for user-facing output, consider raising the api/client.go limit to match, or document this as a deliberate trade-off.
+
+### 3. **Active Mirror Filtering Logic (Significant Reuse Opportunity)**
+- **File**: `cmd/entire/cli/api_cmd.go`, lines 184-195 (in `resolveCurrentRepoID`)
+- **Summary**: Filters mirrors for active (non-archived, non-failed/suspended) placements to pick the first one
+- **Existing Helper**: `cmd/entire/cli/experts_cell_target.go`, lines 131-156, function `distinctActiveClusterHosts()` already implements identical archive + status filtering logic
+- **Reused By**: `experts_cell_target.go` → `resolveRepoClusterHost()`, `repo_clone.go` → `selectCloneTarget()`, now duplicated in `resolveCurrentRepoID()`
+- **Cost**: Three separate code paths iterate mirrors with the same filtering rules (archived check, status check for Failed/Suspended). The filter logic should be extracted to a shared helper.
+- **Recommendation**: Extract a helper like `getFirstActiveMirror(mirrors []coreapi.Mirror) (coreapi.Mirror, error)` or `filterActiveMirrors(mirrors []coreapi.Mirror) []coreapi.Mirror` in `repo_clone.go` (where `listMirrorsForRepo` already lives) and reuse it in `resolveCurrentRepoID()` instead of inlining the loop.
+
+### 4. **listMirrorsForRepo and mirrorCloneProviderGitHub Already Available**
+- **File**: `cmd/entire/cli/api_cmd.go`, lines 173, 180
+- **Existing Definitions**: 
+  - `listMirrorsForRepo()` defined in `cmd/entire/cli/repo_clone.go:180` (also has the `mirrorLister` interface)
+  - `mirrorCloneProviderGitHub` constant defined in `cmd/entire/cli/repo_clone.go:30`
+- **Status**: ✓ Already reusing correctly (no issue here)
+
+### 5. **resolveAuthStatusTarget Reuse (Good Pattern)**
+- **File**: `cmd/entire/cli/api_cmd.go`, line 116
+- **Summary**: Correctly reuses `resolveAuthStatusTarget()` for core branch client resolution
+- **Status**: ✓ Appropriate reuse, no issue
+
+---
+
+## Summary
+
+**Real Issues**: 2 (JSON indentation pattern, active mirror filtering duplication)  
+**Inconsistency**: 1 (byte-limit constant divergence)  
+**Already Reusing Correctly**: 2
+
+The main extraction opportunity is **extracting active mirror filtering** into a reusable helper in `repo_clone.go` to avoid the third separate implementation of the same archive+status check. The **JSON pretty-printing** should use `jsonutil` like the rest of the codebase.</result>
+<usage><subagent_tokens>45709</subagent_tokens><tool_uses>27</tool_uses><duration_ms>293966</duration_ms></usage>
+</task-notification>
+
+---
+
+can you give me an example for the activity page
+
+---
+
+- High: cmd/entire/cli/api_cmd.go:101 sends authenticated requests using the
+    user-supplied <path> without rejecting absolute or scheme-relative URLs. api.Client
+    resolves that path through cmd/entire/cli/api/base_url.go:72, and url.ResolveReference
+    will let https://evil.example/... or //evil.example/... replace the intended Entire
+    host. Since the bearer transport then adds Authorization at
+    cmd/entire/cli/api/client.go:80, entire api https://... can leak the Entire token to
+    another host, including plain http:// despite the base URL TLS check. Validate that
+    <path> is origin-relative before calling Request, or verify the resolved host still
+    matches the selected backend.

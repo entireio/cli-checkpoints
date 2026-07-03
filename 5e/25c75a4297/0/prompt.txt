@@ -1,0 +1,602 @@
+did you smoke test new output?
+
+---
+
+can you do a table with the before/after?
+
+---
+
+and does this have the correct, charmbracelelet formatting, etc.?
+
+---
+
+yes proceed
+
+---
+
+can you run /pr-review-toolkit:review-pr and /review
+
+---
+
+<task-notification>
+<task-id>ac3e9466fd720aeff</task-id>
+<tool-use-id>toolu_01BSigHhEkAYbufboVoUyEbn</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-labs/951dfb50-f9e5-45be-8575-9dd17e7639e5/tasks/ac3e9466fd720aeff.output</output-file>
+<status>completed</status>
+<summary>Agent "Finder: efficiency" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I've reviewed the full diff and the relevant source (`corecmd.go`, `repo.go`, `grant.go`, `org.go`, `project.go`, `repo_mirror.go`). The PR is almost entirely output plumbing on one-shot commands; the only place it introduces work that is genuinely computed-then-discarded is `repo create`.
+
+Verification of the parent behavior for the hinted case: before this PR, `repo create` went through `runCoreJSON`, which **always** printed the wire object as JSON — so `repoCreateOutput`'s marshal/unmarshal round-trip was always consumed. After the PR, `runCoreMutation` only uses `wire` when `--json` is passed, but the closure in `newRepoCreateCmd` (repo.go:140) still calls `repoCreateOutput(created)` unconditionally, and additionally calls `repoRemoteURL(*created)` a second time (repo.go:145) for the human line even though `repoCreateOutput` already computed it internally. So the discard is new in this PR. Beyond the (small) wasted marshal/unmarshal, there's a behavioral edge: a `repoCreateOutput` failure now fails the command in human mode even though the repo was successfully created and the wire object would never have been printed.
+
+The other `runCoreMutation` callers (org/project create, grant add ×3) pass the API return value straight through as `wire` and build one `fmt.Sprintf` message — no extra computation on either branch, nothing worth flagging. No repeated API calls, no lazy→eager moves, no string-building issues at a scale that matters were introduced.
+
+```json
+[
+  {
+    "file": "cmd/entire/cli/repo.go",
+    "line": 140,
+    "summary": "repo create computes repoCreateOutput (a JSON marshal + unmarshal round-trip of the created repo, plus a second redundant repoRemoteURL call at line 145) on every create, but runCoreMutation discards the wire value unless --json was passed. This waste is new in this PR: the parent (runCoreJSON) always printed the wire object, so the round-trip was always consumed. Cheaper alternative: make the wire lazy — have runCoreMutation accept a wire thunk (func() (any, error)) invoked only under jsonRequested, or branch on jsonRequested(cmd) inside the create closure so the round-trip and second repoRemoteURL call only run when JSON output is requested.",
+    "failure_scenario": "Every default (non --json) `entire repo create` performs a JSON encode/decode of the created repo whose result is thrown away. The cost per invocation is small (microseconds next to the HTTP call), but the discarded path also changes failure semantics: if json.Marshal/Unmarshal of the repo errors, the command now returns an error and prints no success message even though the repo was created and the wire object was never needed for human output."
+  }
+]
+```</result>
+<usage><subagent_tokens>68583</subagent_tokens><tool_uses>4</tool_uses><duration_ms>69597</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>af9c43ffe1f1a1405</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-labs/951dfb50-f9e5-45be-8575-9dd17e7639e5/tasks/af9c43ffe1f1a1405.output</output-file>
+<status>completed</status>
+<summary>Agent "Finder: CLAUDE.md conventions" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I read the full diff and checked for CLAUDE.md files governing the changed code. Only the repo-root CLAUDE.md exists (`/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/labs/CLAUDE.md`); there is no CLAUDE.md or CLAUDE.local.md in `cmd/`, `cmd/entire/`, or `cmd/entire/cli/`.
+
+I evaluated each rule area the caller flagged:
+
+1. **t.Parallel()** — Rule: "**Always use `t.Parallel()` in tests.** Every top-level test function and subtest should call `t.Parallel()` unless it modifies process-global state (e.g., `os.Chdir()`)" with "**Exception:** Tests that modify process-global state cannot be parallelized. This includes `os.Chdir()`/`t.Chdir()` and `os.Setenv()`/`t.Setenv()`". The new tests in `corecmd_list_test.go` and `corecmd_mutation_test.go` swap the package-level `activeCoreClient` function variable — that is process-global state, and the exception's "e.g."/"This includes" list is illustrative, not exhaustive. Each test carries a comment ("Not parallel: swaps the package-level activeCoreClient seam"), matching the pre-existing pattern in `grant_wiring_test.go`. Covered by the documented exception — not a violation.
+
+2. **Config/keyring isolation in tests** — The new tests bypass auth entirely: the seam returns `coreapi.NewWithBearer(srvURL, "tok")`, so no context resolution, no `~/.config/entire`, no keyring is touched. Additionally the in-process `userdirs`/testdirs safety net applies. No violation.
+
+3. **Logging vs user output** — Rule: "User-facing output: Use `fmt.Fprint*(cmd.OutOrStdout(), ...)`" and "Don't use `fmt.Print*` for operational messages (checkpoint saves, hook invocations, strategy decisions)". Every new `fmt.Fprintf(cmd.OutOrStdout(), ...)` call (delete confirmations, grant confirmations, mirror removal, empty-state sentences) is direct user-facing output of a user-invoked command, not internal operational logging — the diff actually moves *toward* the documented pattern (replacing `cmd.Printf` and stderr `"(none)"`). No violation.
+
+4. **SilentError** — The new targeted error in `repo_mirror.go` ("no mirror of github.com/... — it may be on a different cluster") is returned directly for main.go to print, which is the documented "normal error" path; no custom message is pre-printed, so `NewSilentError` is correctly not used. The `cmd.SilenceUsage = true` addition in `repo.go` before returning a parse error is likewise consistent. No violation.
+
+5. **Agent-safe CLI fallbacks** — Nothing newly terminal-gated. `runCoreMutation` switches the default from JSON to a human line but keeps `--json` with the full wire model ("Plain text output is acceptable when it contains the full information"; "JSON is preferred ... following existing patterns such as `--json`"), and the human line includes the resource name and ULID. Empty list states moved from stderr to stdout with a complete sentence, and empty `--json` now emits `[]` — all improvements for non-interactive consumers. No violation.
+
+6. **CLAUDE.md staleness** — The root CLAUDE.md's Command Layout section never describes the org/project/repo/grant command families' output, empty states, or column order (it only lists `tokens: profile` under labs-advertised experimental families — an omission that predates this PR and is unchanged by it). The "Keep this file ... current" rule is explicitly scoped to strategy behavior, which this PR doesn't touch. No violation.
+
+No clear, quotable rule violations found.
+
+```json
+[]
+```</result>
+<usage><subagent_tokens>57445</subagent_tokens><tool_uses>2</tool_uses><duration_ms>58485</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a5034eb81366370c7</task-id>
+<tool-use-id>toolu_01MDLmALNPzpANJQpQp8h7dz</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-labs/951dfb50-f9e5-45be-8575-9dd17e7639e5/tasks/a5034eb81366370c7.output</output-file>
+<status>completed</status>
+<summary>Agent "Code review PR 1626" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Review complete. I examined the full branch diff (3 commits, 955acc562..494541b09), built the package, ran the affected unit tests (all pass), and ran `mise run lint` (0 issues, gofmt clean). I also traced the runtime paths in `corecmd.go` and searched `docs/`/`CLAUDE.md` for stale references.
+
+## Critical
+None.
+
+## Important
+None.
+
+## Suggestions
+
+- **Minor repetition across the six mutation closures** (`org.go:44`, `project.go:58`, `repo.go:124`, `grant.go:120/235/383`). Each new `runCoreMutation` closure repeats the `out, err := c.X(...); if err != nil { return "", nil, err }; return fmt.Sprintf(...), out, nil` tail. It's below the dupl threshold (confirmed: `lint` reports 0 issues), the API call/params/message differ in each, and factoring it out would obscure the per-command wiring — so leaving it is the right call. Noting only because the task flagged the closures for a look; no action needed.
+
+- **Intended-but-worth-confirming behavior shift at `repo_mirror.go:535`.** The mirror-remove 404 path now returns a targeted `fmt.Errorf(...)` instead of letting the server's problem detail surface via `renderCoreError`. This is a real behavior change (not pure output formatting), but it's explicitly listed in the PR description, the in-code comment correctly explains the deliberate non-`%w` wrapping, and I verified `renderCoreError` (`corecmd.go:450`) passes a plain error through unchanged because `coreapi.APIError` returns "" when the chain has no API error. Correct and CLAUDE.md-compliant.
+
+## Strengths (CLAUDE.md compliance verified)
+
+- **Error handling** follows the documented pattern exactly. The mirror-404 message is a plain error, and `runCoreClient` (`corecmd.go:413`) already sets `SilenceUsage = true`, so main.go prints it with no usage dump — matching the `renderCoreError` doc comment's rationale for plain (not `Silent`) errors.
+- **Logging-vs-user-output** rule is honored — and this PR actively *fixes* a violation: the five `cmd.Printf` sites (which fell back to stderr in production because nothing calls `SetOut` on root) are now `fmt.Fprintf(cmd.OutOrStdout(), ...)`. Success/empty-state text is user-facing output correctly routed to stdout; no `fmt.Print*` and no operational logging misuse. `corecmd_delete_test.go:179` and `corecmd_list_test.go:260` assert stderr stays empty, locking the fix in.
+- **Test isolation** is correct. The new `corecmd_list_test.go` and `corecmd_mutation_test.go` drive everything through the `activeCoreClient` seam + `httptest`, so `coreapi.New()` (the only real-config path) is never reached — no touch to `~/.config/entire` or the keyring.
+- **`t.Parallel()` exception** is applied correctly: the new tests omit it and each carries the documented "Not parallel: swaps the package-level activeCoreClient seam" comment (`corecmd_list_test.go:256/263/269`, `corecmd_mutation_test.go:312/322`).
+- **Agent-safe fallbacks** preserved: `--json` still emits the full wire model on mutations and lists, empty `--json` lists now correctly encode `[]` not `null` (`corecmd.go:76`), and empty human states print a complete sentence to stdout. No new prompts / TUI / interactive gating introduced — accessibility is a non-issue here.
+- **No stale docs.** The remaining `(none)` hits (`hooks.go`, `explain.go`, `investigate/`) are unrelated features; no `runCoreJSON` or old control-plane output strings survive outside the plan doc, which is not part of this PR's diff range.
+- **Commit hygiene** is good: 3 well-scoped commits with descriptive messages matching the PR's stated slices.
+
+Relevant files: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/labs/cmd/entire/cli/corecmd.go`, `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/labs/cmd/entire/cli/grant.go`, `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/labs/cmd/entire/cli/repo_mirror.go`.</result>
+<usage><subagent_tokens>69157</subagent_tokens><tool_uses>14</tool_uses><duration_ms>164027</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>abb5c4119105682fc</task-id>
+<tool-use-id>toolu_0157EZPegBCHemeEAE5sohwC</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-labs/951dfb50-f9e5-45be-8575-9dd17e7639e5/tasks/abb5c4119105682fc.output</output-file>
+<status>completed</status>
+<summary>Agent "Finder: reuse" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>[
+  {
+    "file": "cmd/entire/cli/corecmd_list_test.go",
+    "line": 226,
+    "summary": "The new runListRender helper re-implements runCoreCmd, which this same PR just generalized (its doc comment now says it \"runs any control-plane command against a seamed httptest core\"). runListRender duplicates the exact same steps — swap the package-global activeCoreClient seam with coreapi.NewWithBearer, wire stdout/stderr buffers, SetArgs, ExecuteContext, restore via t.Cleanup — and on top of that hand-registers the --json flag (line 243) with a copied help string instead of getting it from addControlPlaneFlags or a real command factory. The sibling tests added in the same PR (corecmd_mutation_test.go) show the intended pattern: build an httptest server that returns the list payload and call runCoreCmd(t, newOrgCmd, srv.URL, \"list\") against the real command.",
+    "failure_scenario": "Two parallel seam-swap harnesses in the same package must now be kept in sync (e.g. if the seam gains a second variable or the bearer setup changes, one harness gets fixed and the other silently keeps passing). Worse, the synthetic command registers --json as a local flag with a duplicated description while production registers it as a persistent flag via addControlPlaneFlags on the group root — so a future change to that flag's registration (rename, move, shorthand) is not exercised by these tests, and the empty-state/JSON-array behavior they lock in is verified against wiring that differs from what users actually run."
+  },
+  {
+    "file": "cmd/entire/cli/corecmd.go",
+    "line": 102,
+    "summary": "runControlPlaneDelete hand-rolls its mutation output (\"✓ Deleted %s\" / \"not found; nothing to delete\" straight to stdout) instead of routing through runCoreMutation, the helper this same PR introduces at corecmd.go:365 whose stated purpose is to render mutation outcomes \"the way the rest of the CLI renders mutations\" — ✓ human line by default, wire JSON under --json. grant.go's revokeGrant (grant.go:498) does the same hand-rolled ✓/not-found rendering. Delete/revoke are mutations under group roots where --json is a persistent flag, yet they never consult jsonRequested.",
+    "failure_scenario": "Two mutation-rendering conventions now live in the same file and will diverge: `entire org create acme --json` emits JSON while `entire org delete &lt;id&gt; --json` emits the human \"✓ Deleted org &lt;id&gt;\" line, breaking scripts that pass --json uniformly across a group whose root advertises the flag. Any future change to the mutation-output contract (styling, ✓ prefix, JSON envelope) must be replicated in runCoreMutation, runControlPlaneDelete, and revokeGrant independently."
+  }
+]
+
+Notes on angles I checked and deliberately did not flag:
+
+- **The "✓ " literal**: `status_style.go` does have `successBullet()` (line 165, renders "✓ &lt;label&gt;\n" with green/bold), but it is a method on `statusStyles` used only inside `entire status` rendering, bakes in a trailing newline and bold-label styling, and the dominant repo-wide convention is bare `"✓ "` literals (setup.go, resume.go, rewind.go, clean.go, sessions.go — 30+ sites predate this PR). The new literals follow the existing convention rather than bypass a fitting helper.
+- **printJSON vs writeJSON**: `writeJSON` (attribution.go:1430) is a pre-existing near-duplicate of `printJSON` (corecmd.go:462), but both predate this PR and the new test code correctly reuses `writeJSON`; no new duplication introduced.
+- **Empty-state messages**: the `"No X found."` sentences match the existing repo convention (doctor.go, rewind.go, resume_picker.go); no shared empty-state helper exists to reuse.
+- **The six create/add mutation closures**: they share the `call → err-check → Sprintf("✓ ...")` shape, but no existing generic in the codebase solves this; flagging would be proposing a new abstraction, not reuse.
+- **nil-slice → `[]T{}` JSON normalization**: no existing helper for this exists (explain.go and state.go handle it inline the same way).</result>
+<usage><subagent_tokens>74246</subagent_tokens><tool_uses>11</tool_uses><duration_ms>162939</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a0efa909fbea4adfe</task-id>
+<tool-use-id>toolu_01PMVXn7No8tR62cp6Eiy7iD</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-labs/951dfb50-f9e5-45be-8575-9dd17e7639e5/tasks/a0efa909fbea4adfe.output</output-file>
+<status>completed</status>
+<summary>Agent "Comment accuracy review PR 1626" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>All comments verified against actual code behavior. Report follows.
+
+## Summary
+
+Reviewed every comment added or modified in `955acc562..494541b09` across the nine command files and five test files, verifying each against the implementation (`runCoreClient` preamble, `repoCreateOutput`, `coreapi.APIError`, the generated `decodeCreateOrgResponse`, `NewWithBearer`, group command wiring). Also swept the touched files for rot in unchanged comments. Result: **no critical issues — every added/modified comment is accurate.** The grep sweep found zero lingering references to `runCoreJSON`, `runDeleteCmd`, `(none)`, `GRANTEE-TYPE`, or the old column order. However, three pre-existing group doc comments are now saliently stale because the PR refreshed the labs.go summaries without touching their sibling doc comments.
+
+## Verified Comments (accurate)
+
+- **`cmd/entire/cli/corecmd.go:144-150` (runCoreList `empty` param)** — Accurate. `empty` is printed to stdout (`corecmd.go:180`) in place of the table; example matches the actual call site in org.go.
+- **`cmd/entire/cli/corecmd.go:155-157` (runCoreListForCluster)** — Accurate. "identical table/JSON/empty-state rendering" holds; both delegate to `renderCoreList`.
+- **`cmd/entire/cli/corecmd.go:162-166` (renderCoreList)** — Accurate; describes all three render paths and the client-selection separation correctly.
+- **`cmd/entire/cli/corecmd.go:175` (`// a nil slice encodes as null; scripts expect []`)** — Accurate and precisely scoped: only the nil case needs conversion; a non-nil empty slice already encodes as `[]`.
+- **`cmd/entire/cli/corecmd.go:357-364` (runCoreMutation doc)** — Accurate on all claims. Preamble claims verified in `runCoreClient` (corecmd.go:412-428: `SilenceUsage`, client build, `renderCoreError`). The "additive-only: synthesized fields like the repo remote URL are merged in, nothing is ever omitted" claim verified against `repoCreateOutput` (repo.go:90-112): it round-trips the full wire object and merges `remote` only when absent, so the server value wins and nothing is dropped.
+- **`cmd/entire/cli/corecmd.go:460-461` (printJSON)** — Accurate. The old "default for create commands" clause was correctly removed; all three remaining callers (lines 177, 223, 372) are `--json`-gated.
+- **`cmd/entire/cli/repo_mirror.go:526-531` (mirror remove 404 comment)** — Accurate. The rewrite from "surfaces verbatim via renderCoreError" to "maps to a targeted 'may be on a different cluster' error" matches the new code exactly.
+- **`cmd/entire/cli/repo_mirror.go:539-541` (no-%w rationale)** — Accurate and load-bearing. Verified: `renderCoreError` → `coreapi.APIError` (internal/coreapi/client.go:215-229) uses `errors.As` on `*ErrorModelStatusCode`, so a `%w`-wrapped 404 would indeed match and the server's detail/title would replace the targeted message. Excellent "why" comment — it protects a non-obvious invariant a future maintainer would plausibly "fix" by adding `%w`.
+- **`cmd/entire/cli/corecmd_mutation_test.go:14-16` (201 is load-bearing)** — Accurate. Verified in `internal/coreapi/oas_response_decoders_gen.go:357-395`: `decodeCreateOrgResponse` has only a `case 201`; any other status falls into the problem-detail decode path and errors. Also a strong "why" comment — a default 200 from `httptest` is exactly the mistake this prevents.
+- **`cmd/entire/cli/corecmd_mutation_test.go:44-45` (--json persistent on group root)** — Accurate: `addControlPlaneFlags` uses `PersistentFlags()` and is called on `newOrgCmd` (org.go:21), not on the create subcommand — driving the group is genuinely required for the `--json` test.
+- **`cmd/entire/cli/corecmd_list_test.go:14-16, 22-23` (runListRender doc; "URL is never contacted")** — Accurate. `NewWithBearer` (client.go:146-153) only constructs; the injected `fn` returns items directly, so nothing dials.
+- **All five "Not parallel: … swaps the package-level activeCoreClient seam" comments** (corecmd_list_test.go:44/50/56, corecmd_mutation_test.go:20/40, grant_wiring_test.go:53/114, corecmd_delete_test.go:62) — Accurate: `runCoreCmd`/`runListRender` mutate the package-global `activeCoreClient` (corecmd.go:383).
+- **`cmd/entire/cli/labs.go:44-57` (refreshed summaries)** — Accurate. Verified against wiring: org has create/list/get/delete (org.go:22-25), project likewise (project.go:21-24), repo has create/list/get/delete/clone/mirror/visibility (repo.go:27-33).
+- **`cmd/entire/cli/grant.go:66-69` (grantColumns comment, unchanged)** — Still accurate. The prose is order-agnostic (GRANTEE friendly name, SOURCE provenance, ID for revoke), so the column reorder didn't rot it.
+- **`cmd/entire/cli/repo_mirror.go:372` ("On stderr so it never lands in a piped table")** — Still accurate: that comment covers the `Listing mirrors on …` banner, not the empty state, and the banner correctly remains on stderr.
+
+## Improvement Opportunities
+
+- **`cmd/entire/cli/corecmd_delete_test.go:35` — runCoreCmd doc** — Mildly over-broad. "runs **any** control-plane command against a seamed httptest core" — the seam only intercepts active-context commands. Cluster-addressed commands (`mirror create/remove`, `mirror collaborators list`) go through `runCoreForCluster` → `coreapi.NewForCluster` and bypass `activeCoreClient` entirely; running one through this helper would attempt real cluster discovery. The second clause ("via the activeCoreClient seam") lets a careful reader infer this, but a future test author reaching for it on a mirror command would be misled. Suggestion: "runs any **active-context** control-plane command…" or add "(commands using runCoreForCluster are not seamed)".
+- **`cmd/entire/cli/corecmd.go:385-389` — runCore doc (unchanged)** — Framing drifted. "runCore is the variant for commands that don't render JSON (delete, revoke, remove)" was written in contrast to the now-deleted `runCoreJSON`. Today runCore is the shared base that `runCoreList`, `runCoreObject`, and `runCoreMutation` — all of which render JSON — delegate to. The examples remain true for its *direct* command callers, so this is imprecise rather than wrong. Suggestion: reframe as "runCore is the base variant: it runs the shared preamble and leaves all rendering to fn; delete/revoke/remove call it directly, and the list/object/mutation helpers build on it."
+- **`cmd/entire/cli/corecmd.go:359` — "the ✓ human confirmation"** — Minor: the ✓ is supplied by each caller's message, not by `runCoreMutation` itself. All six current callers comply, but the comment reads as if the helper enforces it. Acceptable as a statement of convention; consider "callers pass a ✓-prefixed confirmation" if you want it airtight.
+
+## Stale Comments Found (pre-existing rot, made inconsistent by this PR's labs refresh)
+
+These were not touched by the diff, but the PR updated the labs.go summaries in the same files' command groups to list the full verb sets — leaving the sibling doc comments contradicting them:
+
+- **`cmd/entire/cli/org.go:12-13`** — "create and list organizations" — **stale**: the group also wires `get` and `delete` (org.go:24-25), and labs.go:46 now advertises exactly that.
+- **`cmd/entire/cli/project.go:12-13`** — "create and list projects" — **stale**: same, `get`/`delete` at project.go:23-24 vs labs.go:51.
+- **`cmd/entire/cli/repo.go:15-19`** — "lifecycle (create, list within a project, get, delete) plus the `clone` convenience" — **stale/incomplete**: omits the `mirror` and `visibility` subgroups (repo.go:32-33) that labs.go:56 now lists. The "log, diff out of scope" sentence remains valid.
+
+Since the PR already touched all three files, updating these three doc comments would be a natural, zero-behavior-change addition.
+
+## Recommended Removals
+
+None. Every added comment carries non-obvious information (rationale, invariants, test constraints); nothing merely restates code.
+
+## Overall Assessment
+
+High-quality comment work. The added comments are overwhelmingly "why" comments protecting non-obvious invariants — the no-%w rationale, the 201-load-bearing note, the nil-slice-encodes-as-null note, and the "Not parallel" seam warnings are exactly the kind that prevent future regressions. All factual claims checked out against the implementation, including the generated decoder and error-unwrapping paths. The only actionable items are the three stale group doc comments (pre-existing, one-line fixes each) and two minor precision tweaks in helper docs.</result>
+<usage><subagent_tokens>86160</subagent_tokens><tool_uses>22</tool_uses><duration_ms>285502</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a51621faf91d9dea1</task-id>
+<tool-use-id>toolu_01UsL4mq9tQFfrTK9Gn9Nsr4</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-labs/951dfb50-f9e5-45be-8575-9dd17e7639e5/tasks/a51621faf91d9dea1.output</output-file>
+<status>completed</status>
+<summary>Agent "Finder: altitude" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Both greps and file reads are done; I have enough to judge all four altitude questions. Findings:
+
+**Verified context:**
+- `root.go` never calls `SetOut`/`SetErr` on the root command; the only record of the cobra v1.10+ `cmd.Print()`-goes-to-stderr behavior is an inline comment in `newVersionCmd` (root.go:158). After this PR, the tree has **zero** remaining `cmd.Print*` call sites — so a guard (or a root-level `SetOut`) would be zero-behavior-change right now, and `.golangci.yaml` already uses `forbidigo` with `analyze-types: true` for exactly this class of footgun (os.Getwd, go-git Reset/Checkout), but has no rule for cobra `Print*`.
+- Empty-state sentences: per-call-site is the right depth — "No repositories found in this project." and "No repos available to mirror." cannot be derived from a `"No %s found."` noun template. Not flagged.
+- ✓ prefix: embedding the literal `✓` in format strings is the established repo-wide idiom (rewind.go, resume.go, setup.go, clean.go, sessions.go all do it), so per-string is idiomatic in general — but `runCoreMutation`'s own doc comment claims it renders "the ✓ human confirmation" while actually delegating the ✓ to all 6 caller-supplied strings. Flagged narrowly at the helper boundary only.
+- mirror-remove 404: the call-site special case is the right altitude. `isCoreNotFound` semantics are operation-specific — idempotent success in `runControlPlaneDelete`/`revokeGrant`, try-next-route in `resolveref.go` (4 sites), empty-result in `project.go`, targeted error at mirror remove. Hoisting 404 mapping into `renderCoreError` would be actively wrong. Not flagged.
+
+```json
+[
+  {
+    "file": ".golangci.yaml",
+    "line": 100,
+    "summary": "The cmd.Printf-to-stderr bug was fixed by hand-replacing the 5 call sites, but nothing prevents reintroduction: no forbidigo rule bans (*cobra.Command).Print*, root.go never calls SetOut/SetErr (which would make cmd.Print* correct CLI-wide), and the only written rationale is a one-line comment buried in newVersionCmd (root.go:158). The repo already uses type-aware forbidigo for exactly this footgun class (os.Getwd, go-git Reset/Checkout), and the tree is now clean of cmd.Print*, so adding a pattern like '^.*\\.Print(f|ln)?$' scoped to github.com/spf13/cobra would be a zero-exception one-liner.",
+    "failure_scenario": "The next control-plane (or any) command author writes cmd.Printf(\"✓ Created ...\") — the natural cobra API — and output silently lands on stderr again under cobra v1.10+. Scripts piping stdout see nothing, and unless that command happens to have a require.Empty(errOut) test like the ones this PR added, review is the only defense; the bug this PR fixed five instances of recurs one command at a time."
+  },
+  {
+    "file": "cmd/entire/cli/corecmd.go",
+    "line": 374,
+    "summary": "runCoreMutation's contract (its doc comment: 'renders ... the ✓ human confirmation on stdout') promises the checkmark, but the helper prints the caller's message verbatim and relies on all 6 callers (org.go:53, project.go:80, repo.go:141, grant.go:127/240/388) remembering to embed '✓ ' at the head of their format strings. Inside this newly created helper's boundary, the prefix is one line to own centrally (fmt.Fprintln(cmd.OutOrStdout(), \"✓ \"+message)) with zero behavior change, and it makes the doc comment true by construction.",
+    "failure_scenario": "The 7th mutation command returns \"Added token to project x\" without the marker — it compiles, tests pass (nothing asserts the ✓ except per-command string matches), and control-plane output becomes inconsistent. Separately, any later restyle of the success marker (green ✓ via the existing status_style.go successBullet pattern, or an ASCII/NO_COLOR fallback) requires editing every mutation format string across 4 files instead of one helper line."
+  }
+]
+```</result>
+<usage><subagent_tokens>75657</subagent_tokens><tool_uses>12</tool_uses><duration_ms>184672</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a17d73d593696de12</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-labs/951dfb50-f9e5-45be-8575-9dd17e7639e5/tasks/a17d73d593696de12.output</output-file>
+<status>completed</status>
+<summary>Agent "Silent failure review PR 1626" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Audit complete. I verified every claim against the actual code (including cobra v1.10.2's `Print` implementation and the `coreapi.APIError`/`isCoreNotFound` machinery) and ran the PR's tests (`go test ./cmd/entire/cli/ -run 'TestRunCoreList|TestOrgCreate|TestControlPlaneDelete_Wiring|TestGrantRemove'` — pass). Findings, ordered by your numbered questions, then extras.
+
+## 1. mirror remove 404 replacement — sound mechanism, one debuggability gap
+
+`/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/labs/cmd/entire/cli/repo_mirror.go:538-542`
+
+The no-wrap is not just stylistic — it is **required** by `renderCoreError`'s design. Verified in `corecmd.go:450-458` + `internal/coreapi/client.go:215-229`: `renderCoreError` calls `coreapi.APIError(err)`, which uses `errors.As` to find `*ErrorModelStatusCode`; if it succeeds it returns `errors.New(serverDetail)`, **discarding all outer wrap text**. A `%w`-wrapped error here would therefore have its targeted message silently replaced by the server's generic detail. The comment's claim is correct.
+
+Scope is appropriately narrow: `isCoreNotFound` (`resolveref.go:54-57`) matches only a successfully decoded problem-JSON 404 (`ErrorModelStatusCode`). A proxy/HTML 404 or an undecodable response is not an `ErrorModelStatusCode`, doesn't match, and passes through raw. Non-404 server errors fall to `return err` → `renderCoreError` → verbatim server problem detail. All good.
+
+**Finding (Minor, debuggability):** the server's actual 404 detail is discarded with zero capture — no `logging.Debug`, nothing (grep confirms no `logging.` calls in `repo_mirror.go`, `corecmd.go`, or `grant.go`). All decoded-404 causes collapse into one hypothesis ("may be on a different cluster"). Concrete scenario: the mirror exists on the named cluster but the server 404s because it's *not visible to this login* (different federation/permissions); the user follows the hint, runs `entire repo mirror list`, sees nothing, and hits a dead end — the server detail that would have disambiguated is gone forever. Zero-loss fix that doesn't re-trigger the `renderCoreError` extraction (because it doesn't `%w`-wrap): append the detail as plain text, e.g. `... (server: %s)", coreapi.APIError(err))`, or `logging.Debug` the original before returning.
+
+## 2. runCoreMutation — no swallowed partial success
+
+`corecmd.go:365-377`. Every `fn` implementation (org/project/repo create, grant org/project/repo add) returns `("", nil, err)` immediately on error; message/wire are only populated after the mutation succeeded, so discarding them on error discards nothing. `printJSON` errors propagate: `printJSON` → non-nil → `runCore` → `renderCoreError` → `APIError` returns `""` for a local encode error → raw `"encode output: %w"` reaches main.go. Clean.
+
+**Finding (Minor, pre-existing shape):** `repo.go:138-146` — repo create runs the fallible `repoCreateOutput(created)` even in human mode where the wire is unused. If that marshal ever failed (practically impossible for a generated struct), a *successfully created* repo would be reported as a command error with no success line. Same failure shape existed before the PR (encode-after-create), so not a regression; computing the wire only under `jsonRequested` would eliminate it.
+
+## 3. renderCoreList nil→[] coercion
+
+`corecmd.go:174-176`. No case in the diff depends on the nil/empty distinction — `fetchAllPages` returns a nil slice for zero items and the "404 → empty result" paths return nil, so **every** zero-item `--json` list previously printed `null` and now prints `[]`. That is a deliberate, tested wire change (`TestRunCoreList_EmptyJSONIsArray`), an improvement for scripts, and loses no error information. Only scripts explicitly testing for `null` would notice; flagging for completeness since it is technically a behavior change.
+
+## 4. Idempotent-404 delete/revoke paths — semantics unchanged, but there IS a production stream change
+
+`corecmd.go:96-99` (`runControlPlaneDelete`), `grant.go:491-499` (`revokeGrant`). The nil-return-on-404 design is untouched; exit codes identical (nil before and after in every branch).
+
+**Finding (Important — flag to whoever wrote "zero behavior change"):** the `cmd.Printf` → `fmt.Fprintf(cmd.OutOrStdout(), ...)` swap changes the output *stream in production*. Cobra's `Printf` writes to `OutOrStderr()` (verified in cobra v1.10.2 `command.go:1435-1437`), which falls back to **os.Stderr** when no out-writer is set — and nothing in `cmd/entire/main.go` calls `SetOut`. So "Deleted ...", "... not found; nothing to delete", "Revoked ...", "no such grant; nothing to revoke", and "Removed mirror ..." previously went to **stderr** in real terminals and now go to **stdout**. The tests never revealed this because they always `SetOut` a buffer, making `OutOrStderr()` return the buffer. This is almost certainly the intended cleanup (the new test asserts "success output must go to stdout, not stderr", and stdout is the correct stream), but it is a real behavior change invisible in the test diff — scripts that captured these confirmations from stderr, or that treated stdout-empty as "no-op", will see different output. Not an error-suppression issue: exit codes and error propagation are byte-identical, and `Fprintf`'s ignored return matches `cmd.Printf`, which also discarded it.
+
+## 5. Ignored Fprintf/Fprintln returns
+
+Consistent with the package convention: single-line human messages ignore write errors everywhere in this CLI (and `cmd.Printf` did too), while the bulk renderers `printTable` (`corecmd.go:287-289`), `printFields` (`corecmd.go:316-318`), and `printJSON` (`corecmd.go:465-467`) check and wrap. Worst case on a closed stdout: a "✓ Deleted" line is lost with exit 0 — but the mutation already happened and the exit code is the contract. Minor at most; no new instance deviates from convention.
+
+## 6. Deleted runCoreJSON — no lost error surface
+
+Old `runCoreJSON` always encoded and surfaced `printJSON` errors. New paths: under `--json`, `printJSON` still runs with identical propagation; in human mode no encoding occurs, so there is no encoding error to lose (except repo create's wire-building, covered in finding 2, which still propagates). Nothing that previously errored can now succeed silently.
+
+## Full-diff scan — everything else
+
+- `repo.go:307` (`newRepoVisibilitySetCmd`): added `cmd.SilenceUsage = true` before returning the `parseVisibility` error — suppresses the usage dump, not the error; matches sibling commands. Fine.
+- Empty-list human message moved from stderr `"(none)"` to stdout sentence (`corecmd.go:179-181`) — same stream-change category as finding 4, deliberate and tested (`TestRunCoreList_EmptyHumanMessageOnStdout`).
+- Grant column reordering, flag-help capitalization, labs summaries: no error-path content.
+- `confirmControlPlaneDeletion`, `reportOneShotMirror` error handling: untouched by the diff.
+- No empty catch-equivalents, no new `_ = err` discards, no downgraded errors anywhere else in the range.
+
+**Bottom line:** no Critical findings. One Important note (production stderr→stdout stream change for delete/revoke/remove confirmations — intended but real and test-invisible pre-PR), and two Minor ones (mirror-remove 404 discards the server's problem detail with no debug logging; repo create computes fallible wire output in human mode). The mirror-remove no-wrap decision itself is correct and mechanically necessary.</result>
+<usage><subagent_tokens>81678</subagent_tokens><tool_uses>16</tool_uses><duration_ms>285033</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a2cd82c415c6d22a6</task-id>
+<tool-use-id>toolu_01Qb7jLq6mAYiQ3Jqq5Lsk3a</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-labs/951dfb50-f9e5-45be-8575-9dd17e7639e5/tasks/a2cd82c415c6d22a6.output</output-file>
+<status>completed</status>
+<summary>Agent "Test coverage review PR 1626" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>All tests pass. I have everything needed for the report.
+
+# Test Coverage Review — PR #1626 (955acc562..494541b09)
+
+## Summary
+
+The PR's testing strategy is sound: pin the shared helpers (`runCoreList`, `runCoreMutation`, `runControlPlaneDelete`) once, treat per-command call sites as data. That works fully for the empty-list change, mostly for deletes, and only partially for the create verbs — because the create switch is a **per-callsite** edit (each `RunE` individually moved from `runCoreJSON` to `runCoreMutation`), the shared-helper defense does not protect against a single command being partially reverted. The one genuinely logic-bearing change in the PR — the mirror-remove 404 branch — has no test at all. No gaps rise to critical (this is an output-only PR; worst-case regression is degraded UX/scripting output), but two are worth closing before merge.
+
+All touched tests pass (`go test ./cmd/entire/cli -run 'TestOrgCreate|TestRunCoreList|TestControlPlaneDelete|TestGrantRemove|TestGrantRows|TestReportOneShotMirror'` → ok).
+
+## (a) Pinning walk — the five changes
+
+**1. Delete/revoke success → stdout with ✓** — *partially pinned.*
+- org/project/repo delete: pinned by `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/labs/cmd/entire/cli/corecmd_delete_test.go:86` (`Contains "✓ Deleted …"`). A revert to `cmd.Printf("Deleted %s\n")` fails this.
+- **Important caveat**: the stdout-vs-stderr half is pinned only by the ✓, not by `require.Empty(t, errOut, "success output must go to stdout, not stderr")` (corecmd_delete_test.go:87). Cobra's `cmd.Printf` writes to `OutOrStderr()`, which under `cmd.SetOut(&amp;out)` resolves to the *same test buffer as stdout*. So a hypothetical `cmd.Printf("✓ Deleted …")` — stderr in production — passes both assertions. The assertion message overclaims what it verifies.
+- Consequence: the idempotent path "not found; nothing to delete" (`corecmd.go:97`), whose **text is unchanged** and only routing moved, is effectively **un-pinned** — reverting it to `cmd.Printf` passes corecmd_delete_test.go:97–100. Same for grant revoke's "nothing to revoke" (grant_wiring_test.go:135–138).
+- grant revoke success `✓ Revoked/Removed` (`grant.go:498`): **no test**. `TestGrantRemove_RouteWiring` drives the success path (204) but asserts only method/path (grant_wiring_test.go:99–103), never output.
+- mirror remove success `✓ Removed mirror` (`repo_mirror.go:546`): **no test** — there is no test for `newRepoMirrorRemoveCmd` at all.
+- `✓ Registered mirror` (`repo_mirror.go:294`): repo_mirror_test.go:266 uses `Contains "Registered mirror "+id`, which passes with or without the ✓ — not pinned (cosmetic).
+
+**2. Create verbs human-by-default, --json opt-in** — *pinned for org create only.*
+`corecmd_mutation_test.go:31-37` (`TestOrgCreate_HumanByDefault`) fails cleanly on a revert to `runCoreJSON` (both the `✓ Created` Contains and the `NotContains "{"`), and `TestOrgCreate_JSONOnRequest` (:40-51) correctly drives the **group root** so the persistent `--json` registration is exercised. But project create (`project.go:83`), repo create (`repo.go:144-147`), and all three grant adds (`grant.go:144,253,401`) are untested at command level — a partial revert of any one of them ships silently.
+
+**3. Empty lists** — *fully pinned at the helper, and this one genuinely pins routing.* Unlike the delete case, the old code wrote `(none)` via `cmd.ErrOrStderr()`, which `SetErr` captures distinctly — so `TestRunCoreList_EmptyHumanMessageOnStdout` (corecmd_list_test.go:47-51) fails on both assertions if reverted. `TestRunCoreList_EmptyJSONIsArray` pins `[]`-not-`null` exactly via `JSONEq` against `corecmd.go:175`. The 9 per-command empty sentences are untested individually — acceptable; they're string literals fed to a tested helper.
+
+**4. Mirror-remove 404 message** (`repo_mirror.go:542`) — **no pinning test.** See Critical Gaps.
+
+**5. Grant column reorder** — pinned by grant_test.go:66 and :81 (cell order for both row builders) plus the width-lockstep check at :53. Header *order* in `grantColumns` itself is unasserted — a header-only reorder would mislabel columns without failing anything (minor).
+
+Also in the diff, untested: `cmd.SilenceUsage = true` on visibility parse error (`repo.go:307`); labs summaries (alignment is tested structurally in labs_test.go, content is cosmetic); flag-help capitalization (no test warranted).
+
+## (b) Critical / important gaps
+
+**Gap 1 — mirror-remove 404 targeted error. Rated 6. Should be added.**
+`repo_mirror.go:537-543` is the only real logic in this PR: branch on `isCoreNotFound`, return a deliberately **non-`%w`-wrapped** error. The code comment itself names the regression ("renderCoreError would extract the server's generic problem detail and replace this targeted message") — a future cleanup adding `%w` is exactly the kind of change a linter or well-meaning reviewer suggests, and nothing would fail. The harness is already in place: a `runCoreCmd(t, newRepoMirrorRemoveCmd, srv.URL, ...)` against `writeNotFoundProblem` asserting `ErrorContains(err, "may be on a different cluster")`, plus a non-404 case asserting the raw error passes through. This would also be the natural home for pinning the success `✓ Removed mirror` line (folds Gap 3 in for free).
+
+**Gap 2 — repo create human message. Rated 5.**
+`repo.go:144-147` is the only per-command message with logic: the conditional `Remote:` second line, and the `--json` path must emit the *merged* `repoCreateOutput` wire (not the raw `created`). The building blocks `repoRemoteURL`/`repoCreateOutput` are well unit-tested (repo_test.go:57, :141-221), but nothing checks the assembly — swapping `wire` and `created` in the return, or dropping the `Remote:` line, compiles and passes everything. One httptest-backed test mirroring `TestOrgCreate_*` (201 status, per the load-bearing comment in `newCreateOrgServer`) closes it.
+
+**Gap 3 — mirror remove &amp; grant revoke success output. Rated 4.**
+`✓ Removed mirror` (`repo_mirror.go:546`) and `✓ %s %s` (`grant.go:498`) have zero output assertions. For grant revoke the fix is one line: `TestGrantRemove_RouteWiring` already exercises the success path — add `require.Contains(t, out, "✓ ")` (or the full `Revoked …` string for one case) at grant_wiring_test.go:103.
+
+## Acceptable gaps (shared-helper argument holds)
+
+- **project create / grant add human messages** (rated 4): pure `fmt.Sprintf` with no branches, on top of the pinned `runCoreMutation` dispatch. A wrong-arg-order bug is possible but low-consequence; testing all five would mostly duplicate the org test. If you add the repo create test (Gap 2), I'd stop there.
+- **Per-command empty sentences** (rated 2): data into a tested helper.
+- **`✓ Registered mirror`** (rated 2): cosmetic; upgrading repo_mirror_test.go:266 to `Contains "✓ Registered mirror "+id` is a one-character-class fix if you want it.
+- **grantColumns header order** (rated 3), **SilenceUsage on visibility** (rated 2), **labs/flag-help strings** (rated 1).
+
+## (c) Test quality
+
+- **False-confidence assertion**: `require.Empty(t, errOut, "success output must go to stdout, not stderr")` (corecmd_delete_test.go:87, :100; corecmd_mutation_test.go:36; grant_wiring_test.go:138) cannot detect the `cmd.Printf` failure mode it names, because cobra's `OutOrStderr()` fallback collapses onto the `SetOut` buffer in tests. It *does* catch explicit `ErrOrStderr()` writes (and legitimately pins the empty-list case), so keep it — but the message should be honest, e.g. a comment noting it guards against explicit stderr writes only, with the ✓/text Contains doing the real pinning. Not fixable within this harness without capturing real os.Stdout/os.Stderr; not worth that machinery for an output-only PR.
+- **`NotContains(out, "{")`** (corecmd_mutation_test.go:35): mildly brittle if a human message ever contains a brace, but as a "default must not be JSON" behavioral guard it's the right assertion; fine.
+- **Fixture fidelity, `runListRender`** (corecmd_list_test.go:33): registers `--json` as a *local* flag whereas production registers it persistently on the group root. `jsonRequested` (corecmd.go:38-41) resolves both through `cmd.Flags()`, and the persistent-flag path is exercised by `TestOrgCreate_JSONOnRequest` driving `newOrgCmd`, so this is acceptable — but worth a one-line comment. Related nit: `TestOrgCreate_HumanByDefault` runs `newOrgCreateCmd` bare, so `jsonRequested` returns false via the flag-undefined *error* branch, not the production flag-defined-but-false branch. Both yield false; cosmetic.
+- **Non-parallel justifications**: every new test carries the "Not parallel: swaps the package-level activeCoreClient seam" comment — compliant with the project's `t.Parallel()` policy exception, and the `runDeleteCmd` → `runCoreCmd` comment updates in grant_wiring_test.go were kept in sync. Good hygiene.
+- **Good fixture note**: the 201-status comment in `newCreateOrgServer` (corecmd_mutation_test.go:14-16) documents a real trap in the generated decoder — exactly the kind of comment that saves the next author an hour.
+
+## Positive observations
+
+- The empty-list tests are the model here: exact `JSONEq("[]")` rather than substring, and a routing assertion that genuinely distinguishes old from new behavior.
+- Widening `runCoreCmd` to return stderr makes every future control-plane output assertion cheap — good harness investment.
+- `TestOrgCreate_JSONOnRequest` deliberately routing through the group root (with a comment explaining why) shows attention to where the persistent flag actually lives.
+- The zero-behavior-change constraint holds for everything tested: route-wiring and idempotency tests were mechanically migrated with unchanged expectations and still pass.
+
+**Bottom line**: add a mirror-remove test (404 targeted error + `✓ Removed` success — Gap 1/3, one table-driven test using the existing `runCoreCmd` + `writeNotFoundProblem` harness) and a repo-create mutation test (Gap 2). With those two, every non-cosmetic behavioral change in this PR has a test that fails on revert; the remaining gaps are acceptably covered by the shared-helper tests or are pure string cosmetics.</result>
+<usage><subagent_tokens>74205</subagent_tokens><tool_uses>15</tool_uses><duration_ms>315745</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ac4ba6eaa681926bf</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-labs/951dfb50-f9e5-45be-8575-9dd17e7639e5/tasks/ac4ba6eaa681926bf.output</output-file>
+<status>completed</status>
+<summary>Agent "Finder A: line-by-line scan" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I've read every hunk of the diff and the enclosing functions in the checkout (corecmd.go, grant.go, org.go, project.go, repo.go, repo_mirror.go, repo_mirror_collaborators.go), verified labs.go's summaries against actual subcommands, confirmed `runCoreJSON` has no remaining callers, and ran the new/changed tests (all pass).
+
+```json
+[
+  {
+    "file": "cmd/entire/cli/grant.go",
+    "line": 253,
+    "summary": "Project/repo grant-add ✓ messages echo the user's --role flag value instead of the server-returned role, inconsistent with org add which correctly uses the server-authoritative m.Role (grant.go:144). Same pattern at grant.go:401 for repo grants.",
+    "failure_scenario": "The server returns the effective grant in `out` (e.g. the grant already existed at a different role, or the server clamps/normalizes the role); the CLI prints '✓ Granted github:alice writer access to project widgets' while the effective role is admin. The org-add sibling in the same PR reads the role off the response, so the two paths can disagree about the same class of mutation."
+  },
+  {
+    "file": "cmd/entire/cli/corecmd.go",
+    "line": 180,
+    "summary": "Empty-state list output moved from stderr '(none)' to a full sentence on stdout. Previously an empty non-json list produced completely empty stdout (early return before printTable, so not even headers); now stdout carries prose.",
+    "failure_scenario": "A script consuming default (non --json) output, e.g. `entire org list | awk '{print $2}'` or `... | wc -l`, previously saw empty stdout for zero items and now receives 'No organizations found.' as a fake data row (prints 'organizations' / counts 1). This contradicts the PR's 'zero behavior change beyond output' claim for pipeline consumers of the human view; only --json consumers are protected."
+  },
+  {
+    "file": "cmd/entire/cli/repo_mirror.go",
+    "line": 542,
+    "summary": "The new mirror-remove 404 rewrite asserts 'it may be on a different cluster' and names a cluster host the user may never have typed (clusterArg silently defaults to aws-us-east-2.entire.io), while discarding the server's problem detail that might carry the actual reason.",
+    "failure_scenario": "User runs `entire repo mirror remove github.com/me/typo-repo` (no cluster arg). The repo was never mirrored anywhere — or the mirror exists on the default cluster but is authorization-masked as 404 — yet the error says 'no mirror of github.com/me/typo-repo on aws-us-east-2.entire.io — it may be on a different cluster', steering the user toward cluster-hunting via `mirror list` (which also won't show a masked mirror) instead of the real cause. The previously surfaced server problem-detail is now unconditionally replaced for every 404."
+  },
+  {
+    "file": "cmd/entire/cli/grant.go",
+    "line": 144,
+    "summary": "'✓ Added %s to org %s as %s' claims a state change even when AddOrgMember was an idempotent re-add of an existing member (the API returns the existing Membership either way).",
+    "failure_scenario": "Running `entire grant org add acme github:alice --role member` twice prints '✓ Added github:alice to org acme as member' both times; on the second run nothing changed (and if alice already held admin, the line reports whatever m.Role comes back, telling the operator an 'add' happened when it was a no-op). The delete-side code in this same PR carefully distinguishes 'not found; nothing to delete' from '✓ Deleted', but the add side has no analogous already-present branch."
+  },
+  {
+    "file": "cmd/entire/cli/repo_mirror.go",
+    "line": 294,
+    "summary": "`repo mirror create` inherits the persistent --json flag from the repo group root but its output path ignores jsonRequested entirely — the newly ✓-ified 'Registered mirror' line (plus clone instructions and spinners) prints as human text even under --json, contradicting runCoreMutation's contract established in this PR ('the wire object as JSON when --json was passed').",
+    "failure_scenario": "A script runs `entire repo mirror create github.com/o/r --json | jq .mirrorId` expecting the wire object (as every other mutation in this PR now documents); it gets '\\n✓ Registered mirror 01…' on stdout and jq fails to parse. The flag is silently accepted (no unknown-flag error) so nothing signals the mismatch."
+  },
+  {
+    "file": "cmd/entire/cli/corecmd_mutation_test.go",
+    "line": 32,
+    "summary": "TestOrgCreate_HumanByDefault runs newOrgCreateCmd() standalone, where no --json flag exists at all — jsonRequested() short-circuits on the flag-lookup error, so the test passes vacuously and would keep passing even if the human/JSON branch in runCoreMutation were inverted or the flag plumbing broke.",
+    "failure_scenario": "If someone later inverts the jsonRequested condition in runCoreMutation (printing JSON by default and the ✓ line under --json), this test still cannot fail via the flag path it appears to guard: on the bare create command GetBool(\"json\") errors and returns false regardless. Only the group-driven JSON test (line 41) exercises the real persistent-flag lookup; the default-path claim in this test's name is not actually pinned against the production command tree."
+  }
+]
+```
+
+Notes on things checked and cleared: cobra's `cmd.Printf` writes to `OutOrStderr()`, so the `cmd.Printf` → `fmt.Fprintf(cmd.OutOrStdout(), ...)` swaps in corecmd.go:97/102, grant.go:493/498, and repo_mirror.go:546 are genuine production stream fixes (tests previously passed only because `SetOut` was wired). The `items == nil → []T{}` nil-slice guard is correct for all list call sites (`fetchAllPages` returns nil on zero items). `runCoreListForCluster`'s new `clusterHost, empty` parameter order is passed correctly at its one call site (repo_mirror_collaborators.go:72). labs.go's expanded summaries match the real subcommand sets in org.go, project.go, and repo.go. `grantColumns` reorder is consistent across both row functions and both updated tests, with no stale "GRANTEE-TYPE" references anywhere.</result>
+<usage><subagent_tokens>106010</subagent_tokens><tool_uses>12</tool_uses><duration_ms>254077</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ad2087f698e4834db</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-labs/951dfb50-f9e5-45be-8575-9dd17e7639e5/tasks/ad2087f698e4834db.output</output-file>
+<status>completed</status>
+<summary>Agent "Finder: simplification" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Verified the surrounding code (helper signatures, `jsonRequested`, `repoCreateOutput`, all call sites, and that nothing was orphaned by `runCoreJSON`'s deletion — `printJSON` and `jsonRequested` are still live). Findings:
+
+```json
+[
+  {
+    "file": "cmd/entire/cli/corecmd_list_test.go",
+    "line": 17,
+    "summary": "runListRender re-implements the harness runCoreCmd already provides (seam swap, out/err buffers, args, ExecuteContext) plus a hand-built synthetic command with a hand-registered --json flag duplicating addControlPlaneFlags' registration. SIMPLER FORM: drive the real command through the existing helper — `runCoreCmd(t, newOrgCmd, srv.URL, \"list\", ...)` against a ~8-line httptest handler answering GET /api/v1/orgs (mirroring newCreateOrgServer in corecmd_mutation_test.go). An empty response still yields a nil slice from fetchAllPages, so the nil→[] JSON guard is still exercised, and the test covers the real `org list` wiring and the real persistent --json flag instead of a lookalike.",
+    "failure_scenario": "Two parallel test harnesses must be kept in sync; the synthetic command drifts from the real one (e.g. if --json registration or flag inheritance changes, the fake keeps passing while real `org list` behaves differently), and future authors must learn/choose between two helpers that do the same job."
+  },
+  {
+    "file": "cmd/entire/cli/corecmd.go",
+    "line": 365,
+    "summary": "runCoreMutation's fn returns a bare (message string, wire any, err error) 3-tuple, so all six create/add closures grow position-based `return \"\", nil, err` on every intermediate error path (14 occurrences in this diff) plus a copy-pasted call/check/Sprintf tail. SIMPLER FORM: a two-field result struct — `type mutation struct { Message string; Wire any }` with `fn func(ctx, c) (*mutation, error)`. Error paths revert to idiomatic `return nil, err`, success tails become one named-field literal (`return &amp;mutation{Message: fmt.Sprintf(...), Wire: org}, nil`), and repo create's special case (fallible repoCreateOutput wire + multi-line message) fits without any extra abstraction. (A generic `fn func(...) (T, error)` + `message func(T) string` split matching the runCoreObject/runCoreList render-config idiom is even leaner for five of the six sites, but repo create's wire is a synthesized map, not the created Repo, so the struct form is the shape that covers all six.)",
+    "failure_scenario": "Every future mutation command copies the anonymous-tuple tail; a swapped return position (message vs a stringy wire, or `return \"\", nil, nil` on a forgotten error) compiles silently, and the 14 `\"\", nil, err` returns are noise every reader must re-verify at each call site."
+  },
+  {
+    "file": "cmd/entire/cli/corecmd_mutation_test.go",
+    "line": 34,
+    "summary": "The two org-create tests drive different command shapes: TestOrgCreate_HumanByDefault runs newOrgCreateCmd standalone — where the persistent --json flag from the group root isn't even registered, so jsonRequested() is unconditionally false and 'human by default' passes somewhat vacuously — while TestOrgCreate_JSONOnRequest must use newOrgCmd + \"create\" and carries a comment explaining why. SIMPLER FORM: drive `runCoreCmd(t, newOrgCmd, srv.URL, \"create\", \"acme\")` in both tests. One invocation shape, the explanatory comment becomes unnecessary, and the default-mode assertion runs in the same flag environment users actually hit.",
+    "failure_scenario": "The asymmetry invites copy-paste of the flagless standalone-child form into future mutation tests, where a regression that makes --json leak into default output would go undetected because the flag can never be seen by the command under test."
+  }
+]
+```
+
+Candidates evaluated and deliberately not flagged:
+
+- **Dead code after runCoreJSON's deletion**: none. `printJSON` (corecmd.go:462) and `jsonRequested` (corecmd.go:38) remain used by list/object/mutation paths; grep found no orphaned helpers or imports.
+- **The `empty string` positional param threading** (corecmd.go:151/158/167): the current form matches this file's established idiom — `runCoreObject` and `runCoreList` already pass render config (`headers`, `row`) positionally, and the empty messages are full per-resource sentences that can't be derived from a noun ("No repositories found in this project."). A struct/option chain for a 5-param helper with ~8 call sites would be over-abstraction here. The one residual hazard — two adjacent same-typed strings in `runCoreListForCluster(cmd, clusterHost, empty, ...)` where a swap compiles — has a single call site and didn't clear the "clear net win" bar.
+- **repo create computing `repoRemoteURL(*created)` twice** (once inside `repoCreateOutput`, once for the message, repo.go:140-147): deduping would require threading the remote through `repoCreateOutput`'s signature; not worth it for a pure two-string function.</result>
+<usage><subagent_tokens>73167</subagent_tokens><tool_uses>10</tool_uses><duration_ms>239340</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a335b06d9d590cace</task-id>
+<tool-use-id>toolu_01V6M1Wc464fPdLDPJGtiukp</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-labs/951dfb50-f9e5-45be-8575-9dd17e7639e5/tasks/a335b06d9d590cace.output</output-file>
+<status>completed</status>
+<summary>Agent "Finder B: removed behavior" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Audit complete. I read the full diff, traced every deleted line to its replacement in the checkout, verified the single `runCoreListForCluster` caller (`cmd/entire/cli/repo_mirror_collaborators.go:72`) was updated, confirmed `repoCreateOutput`'s `map[string]json.RawMessage` renders byte-identically through `runCoreMutation`'s `--json` path (same `printJSON`), confirmed `--json` is registered as a persistent flag on all four group roots so every old `runCoreJSON` caller's JSON remains reachable, grepped for external consumers of `grantColumns`/grant rows, `"(none)"`, and old help strings (none outside the updated tests and the plan doc), and ran the affected unit tests (pass).
+
+Key non-obvious verification: cobra's `cmd.Printf` writes to `OutOrStderr()` — i.e. **os.Stderr in production** (tests masked this by calling `SetOut`). So the `cmd.Printf` → `cmd.OutOrStdout()` swaps are a real stderr→stdout stream migration, not a no-op.
+
+```json
+[
+  {
+    "file": "cmd/entire/cli/corecmd.go",
+    "line": 365,
+    "summary": "runCoreJSON's always-JSON default is gone: org/project/repo create and grant add now print a human '✓ ...' line by default and emit the wire JSON only when --json is passed (runCoreMutation). The --json rendering itself is byte-identical (verified for repo create's map[string]json.RawMessage via the same printJSON), but the old default contract is removed.",
+    "failure_scenario": "Any existing script or CI step that runs `entire repo create &lt;name&gt; --project &lt;p&gt; | jq -r .remote` (the remote field was synthesized precisely for this) or parses `entire org create` / `entire grant project add` stdout as JSON now receives '✓ Created repository ...' and fails jq parsing, without any error from the CLI."
+  },
+  {
+    "file": "cmd/entire/cli/corecmd.go",
+    "line": 102,
+    "summary": "Delete/revoke confirmations silently moved from stderr to stdout in production. Cobra's cmd.Printf writes to OutOrStderr() — os.Stderr when SetOut is unset — so 'Deleted &lt;label&gt;', '&lt;label&gt; not found; nothing to delete' (corecmd.go:97), revokeGrant messages (grant.go:493,498), and 'Removed mirror ...' (repo_mirror.go:546) previously landed on stderr for real users. The new fmt.Fprintf(cmd.OutOrStdout(), ...) sends them to stdout, and the text also gained a '✓ ' prefix. The old tests only passed because SetOut made OutOrStderr resolve to the test buffer, so no test ever pinned the production stream.",
+    "failure_scenario": "A wrapper that captures `entire org delete X --force 2&gt;&gt;audit.log` loses the deletion record from its audit stream; conversely a pipeline treating delete's stdout as machine output (previously empty) now receives an unexpected '✓ Deleted org ...' line; greps for the exact old 'Deleted org' / 'Removed mirror' text miss the new '✓ '-prefixed form."
+  },
+  {
+    "file": "cmd/entire/cli/corecmd.go",
+    "line": 180,
+    "summary": "The '(none)' empty-list marker on stderr is replaced by a full sentence ('No organizations found.' etc.) on stdout. The old design deliberately kept stdout empty for empty lists so piped table-consumers saw zero rows; that invariant is not re-established anywhere.",
+    "failure_scenario": "`entire repo list myproj | wc -l` (or `| tail -n +2` row-scraping) returned 0 for an empty project and now returns 1, so a script gating on 'any repos exist?' via stdout line count takes the wrong branch; scripts matching '(none)' on stderr never match again."
+  },
+  {
+    "file": "cmd/entire/cli/corecmd.go",
+    "line": 175,
+    "summary": "Empty-list --json output changed from `null` to `[]`: old renderCoreList passed the nil slice straight to printJSON (encoding as null); new code substitutes []T{}. An intentional fix with a test, but a wire-visible change to every list command's --json empty case.",
+    "failure_scenario": "A consumer that adapted to the old behavior — e.g. `[ \"$(entire org list --json)\" = null ]` or code special-casing the literal null before iterating — no longer detects the empty case and falls into its non-empty path."
+  },
+  {
+    "file": "cmd/entire/cli/repo_mirror.go",
+    "line": 542,
+    "summary": "mirror remove's raw 404 passthrough (renderCoreError surfacing the server's problem-detail message) is replaced by a hardcoded 'no mirror of github.com/&lt;o&gt;/&lt;r&gt; on &lt;cluster&gt; — it may be on a different cluster' error. The server's actual 404 detail is discarded (deliberately not %w-wrapped), so any server-side distinction carried in the problem detail (not-visible vs nonexistent vs permission-shaped 404) is now flattened into the cluster-mismatch hypothesis.",
+    "failure_scenario": "A user whose 404 is caused by lacking visibility on an existing mirror (or a subtly wrong owner/repo) is told the mirror 'may be on a different cluster' and burns time enumerating clusters via `entire repo mirror list` instead of seeing the server's own explanation; tooling matching the old problem-detail text stops matching."
+  },
+  {
+    "file": "cmd/entire/cli/grant.go",
+    "line": 72,
+    "summary": "grantColumns reorder (GRANTEE-TYPE,GRANTEE,ID,ROLE,SOURCE → GRANTEE,ROLE,SOURCE,TYPE,ID) plus header rename GRANTEE-TYPE→TYPE. All in-repo consumers (projectGrantRow, repoGrantRow, TestGrantRows) were updated in lockstep and --json is unaffected, but the positional contract of the human table — the documented source of the ULID for `grant ... remove` — changed.",
+    "failure_scenario": "A positional table-scraper like `entire grant repo list R --project P | awk 'NR&gt;1{print $3}'` that previously extracted the grant ULID (column 3) for a revoke loop now feeds SOURCE values ('direct'/'inherited') into `entire grant repo remove`, which fails resolution — or worse, silently no-ops through the 'no such grant; nothing to revoke' idempotent path, leaving grants unrevoked."
+  }
+]
+```
+
+Not flagged (verified clean): `runCoreListForCluster` has exactly one caller, updated; `repoCreateOutput`'s JSON through the new path is byte-identical under `--json`; no docs/goldens/tests pin the old lowercase help strings or `(none)`; `jsonRequested` degrades safely where the flag is absent; the renamed test helper `runDeleteCmd`→`runCoreCmd` has no stale references; affected unit tests pass.</result>
+<usage><subagent_tokens>82118</subagent_tokens><tool_uses>18</tool_uses><duration_ms>293760</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a0ca4f3d287fcb046</task-id>
+<tool-use-id>toolu_01B98E5ZySEAUCuaUE9xQcX8</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-labs/951dfb50-f9e5-45be-8575-9dd17e7639e5/tasks/a0ca4f3d287fcb046.output</output-file>
+<status>completed</status>
+<summary>Agent "Finder C: cross-file tracer" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Tracing complete. Verified facts first, then candidates.
+
+**What checked out clean:**
+- Every caller of the changed signatures (`runCoreList` +`empty`, `runCoreListForCluster` +`empty`, `renderCoreList`, the removed `runCoreJSON` → `runCoreMutation`) lives in `cmd/entire/cli` and was updated; `go build ./...` passes, so no missed caller anywhere (no callers in `e2e/`, `integration_test/`, or generated code — the coreapi generated code is the callee, not a caller).
+- No e2e test (`e2e/`) or integration test (`cmd/entire/cli/integration_test/`) drives `entire org/project/repo/grant` at all — nothing silently pinned to `(none)`, raw create JSON, or `"Deleted "` on stderr.
+- `repo_mirror_test.go:266` asserts `Contains(out, "Registered mirror "+id)` — still matches the new `"✓ Registered mirror"` (substring). All affected unit tests pass (`go test -run ...` OK).
+- `docs/` has no examples showing old output; the only in-repo reference to the old contract is the historical `CHANGELOG.md:74` entry (see candidate 1). `labs_test.go` derives summaries dynamically, not pinned.
+
+**Candidates:**
+
+```json
+[
+  {
+    "file": "cmd/entire/cli/corecmd.go",
+    "line": 365,
+    "summary": "runCoreMutation flips create/add commands' default stdout from the raw JSON wire object to a human '✓ ...' line; JSON now requires --json. No in-repo consumer parses it, but CHANGELOG.md:74 explicitly advertised the JSON-by-default contract ('entire repo create now stamps a usable entire:// remote in its JSON output', #1441).",
+    "failure_scenario": "Any user script written against the released contract — e.g. `entire repo create x --project p | jq -r .remote` to wire up a git remote — now feeds jq the line '✓ Created repository x (ULID)' and dies with a parse error. PR claims zero behavior change; this is the largest actual break and there is no CHANGELOG note in the diff."
+  },
+  {
+    "file": "cmd/entire/cli/corecmd.go",
+    "line": 180,
+    "summary": "Empty-state message moved from stderr '(none)' to a full sentence on stdout ('No organizations found.' etc.). Previously the no-items case left stdout completely empty.",
+    "failure_scenario": "A script that pipes list stdout — `entire org list | awk 'NR&gt;1 {print $1}'` or `... | wc -l` to detect 'any orgs?' — previously saw zero stdout lines when empty; now it sees one line and parses 'No' as an org name / counts 1 row, silently taking the wrong branch."
+  },
+  {
+    "file": "cmd/entire/cli/repo_mirror.go",
+    "line": 542,
+    "summary": "mirror remove now intercepts every core 404 and replaces the server's problem detail with a fabricated 'no mirror ... may be on a different cluster' error (deliberately not %w-wrapped, so renderCoreError can't recover the real detail). The plan doc claims '404 semantics stay identical'; the error text and cause attribution changed, and no unit test covers this new branch.",
+    "failure_scenario": "A 404 from DeleteMirror has multiple causes: typo'd [cluster-host], mirror invisible due to permissions, unknown provider route. A user who fat-fingers the cluster host now gets steered to 'it may be on a different cluster (run entire repo mirror list)' instead of the server's detail naming the actual problem, sending them down the wrong debugging path."
+  },
+  {
+    "file": "cmd/entire/cli/grant.go",
+    "line": 253,
+    "summary": "grant project/repo add print '✓ Granted &lt;grantee&gt; &lt;role&gt; access' from the client-side --role flag (also grant.go:401), but GrantProjectAccessOutputBody/GrantRepoAccessOutputBody carry only a Status field the message ignores. Contrast org add (grant.go:144) which correctly echoes the server's m.Role.",
+    "failure_scenario": "If the server treats a re-grant as idempotent/unchanged (Status indicating the grantee already held a different or higher role), the CLI still prints an unconditional '✓ Granted alice reader access', asserting a role change that did not happen — an operator 'downgrading' a user believes the downgrade succeeded."
+  },
+  {
+    "file": "cmd/entire/cli/grant.go",
+    "line": 72,
+    "summary": "grantColumns reordered from {GRANTEE-TYPE, GRANTEE, ID, ROLE, SOURCE} to {GRANTEE, ROLE, SOURCE, TYPE, ID}: the revoke-critical ULID moved from column 3 to column 5 and the GRANTEE-TYPE header was renamed TYPE. Only the in-repo row unit test was updated; nothing pins the header row.",
+    "failure_scenario": "External automation harvesting grant IDs positionally — `entire grant repo list r --project p | awk 'NR&gt;1 {print $3}'` then feeding them to `grant ... remove` — now extracts SOURCE values ('direct'/'inherited') instead of ULIDs; the subsequent revoke calls fail (or worse, a value that happens to parse as a ref revokes the wrong grant)."
+  },
+  {
+    "file": "cmd/entire/cli/corecmd.go",
+    "line": 102,
+    "summary": "Delete/revoke confirmations switched from cobra cmd.Printf — which writes to OutOrStderr(), i.e. stderr in production where SetOut is never called — to explicit stdout (also grant.go:494,498). Tests only ever exercised the SetOut-injected buffer, so the old tests masked that these messages really went to stderr in the shipped binary.",
+    "failure_scenario": "Automation that ran `entire org delete x --force 2&gt;err.log` and treated any stdout as unexpected (or grepped stderr for 'Deleted' as its success signal) now sees the message move channels: the stderr grep goes silent and stdout is non-empty, flipping the wrapper's success/failure detection. Intended cleanup, but it contradicts the zero-behavior-change claim and deserves a release note."
+  }
+]
+```
+
+Notes on confidence: candidates 1–3 and 5 are concrete contract changes with no in-repo breakage but real external exposure (1 is the strongest — it contradicts a shipped CHANGELOG-documented behavior). Candidate 4 is a correctness gap in the new message construction. Candidate 6 is the same intended stdout/stderr cleanup the tests now lock in, flagged only because the PR is framed as zero-behavior-change.</result>
+<usage><subagent_tokens>84444</subagent_tokens><tool_uses>23</tool_uses><duration_ms>288227</duration_ms></usage>
+</task-notification>
+
+---
+
+wait what did you change with mirror? and yes agree with teh recommendations too

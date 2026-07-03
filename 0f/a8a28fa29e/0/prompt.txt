@@ -1,0 +1,180 @@
+can you open a PR
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>aee28fa179852d263</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/d1d167dd-56d2-45a2-a584-af55d141b0d3/tasks/aee28fa179852d263.output</output-file>
+<status>completed</status>
+<summary>Agent "Cleanup review: reuse" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Based on my thorough investigation, I have found:
+
+**NO DUPLICATE CODE DETECTED.**
+
+The diff adds genuinely new functionality with no reusable existing helpers being duplicated:
+
+1. **procsignal package (holder struct + Store/Load/Reset)** — No existing atomic signal holder exists in the codebase. There are no other process-wide atomic.Value signal storage patterns in internal/ or cmd/ (only test-only atomic uses in unrelated packages).
+
+2. **TestMain re-exec pattern for signal testing (via dieFromSignalEnvVar)** — This is new. While other TestMain functions exist (e.g., in integration_test, global_test, e2e), none of them use the env-var + re-exec + WaitStatus.Signaled() pattern for testing real process signal death. The lockfile test uses a simpler child-mode pattern without signal testing, and integration/e2e TestMains only set up state and build binaries.
+
+3. **recordInterruptSignal function** — This is new; there are no existing helpers in the codebase that discriminate signal-based context.Canceled from other context.Canceled sources or wrap keyring errors to record interrupts.
+
+The code is well-motivated (addressing a race between the async signal handler and keyring path) and introduces no unnecessary duplication.</result>
+<usage><subagent_tokens>41057</subagent_tokens><tool_uses>23</tool_uses><duration_ms>57266</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a861b4fefc75a6af5</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/d1d167dd-56d2-45a2-a584-af55d141b0d3/tasks/a861b4fefc75a6af5.output</output-file>
+<status>completed</status>
+<summary>Agent "Cleanup review: altitude" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Excellent! Now I have a complete picture. Let me create a final analysis document.
+
+---
+
+## Analysis: Altitude Review of procsignal Global Architecture
+
+### Summary
+The change introduces a **package-level mutable global** (`internal/procsignal`) to coordinate signal state between two asynchronous signal listeners: the main handler in `cmd/entire/main.go` (which cancels the root context) and the keyring interrupt path in `internal/entireclient/tokenstore/keyring_timeout.go` (which cancels a local timeout context). The global eliminates a race where the abort gate could read `caughtSignal` before the handler's goroutine wrote it.
+
+**Verdict**: This is a **reasonable pragmatic choice** given external constraints, but a **deeper fix exists and should be noted as tech debt**. The global is not optimal architecture, but it's justified by real factors you'd need to coordinate with the auth-go maintainers to fix properly.
+
+---
+
+### Finding 1: Layering Inversion - tokenstore Writing Process Signal State
+
+**Location**: `/Users/soph/Work/entire/devenv/cli/internal/entireclient/tokenstore/keyring_timeout.go:75`  
+**Issue**: A low-level credential package (`tokenstore`, part of `internal/entireclient`) now mutates a package-global process-signal marker (`procsignal.Store(os.Interrupt)`).
+
+**Concrete cost**: 
+- Violates module dependency clean-up: `tokenstore` is designed as a reusable credential backend (the docstring explicitly says it's "shared by the entiredb and entire-core CLIs"). Adding cross-cutting process-signal semantics makes it harder to:
+  - Reuse `tokenstore` in other binaries without importing procsignal
+  - Test tokenstore in isolation (you now have to think about procsignal state)
+  - Reason about whether a keyring call has side effects beyond reading/writing credentials
+- **Maintenance hazard**: If someone adds a third signal listener to the process, `tokenstore` remains hidden as a partial observer; the next maintainer won't immediately realize the keyring path also records signals.
+
+**Deeper alternative**: Thread `context.Context` through auth-go's `Store` interface (`LoadTokens` / `SaveTokens`). The auth-go `tokenmanager.Manager.Refresh(ctx)` already accepts context and could pass it through to the Store methods. This moves the signal-cancellation concern from tokenstore up to the keyring timeout wrapper (still in tokenstore, but only as a timeout mechanism) and removes the process-global coupling.
+
+**Feasibility assessment**: 
+- `contextTokenStore` (in `cmd/entire/cli/auth/refresh.go:36-44`) implements the Store interface via two methods: `LoadTokens(string) (tokens.TokenSet, error)` and `SaveTokens(string, tokens.TokenSet) error`.
+- **auth-go v0.5.0 is external** — the Store interface is defined in `github.com/entireio/auth-go`, not in this repo.
+- To thread context, you'd need to propose a breaking change to auth-go's Store interface: `LoadTokens(ctx context.Context, key string) (...)` and `SaveTokens(ctx context.Context, key string, ts tokens.TokenSet) error`.
+- **This is feasible** but requires coordination with the auth-go maintainers. The change is straightforward and moves an important concern (cancellation) to the right level of abstraction.
+
+**Recommendation**: Document as tech debt. Add a comment in `procsignal.go` noting that once auth-go's Store interface accepts context, `tokenstore` can drop its own signal.Notify listener and remove the `procsignal.Store()` call here. The author has already hinted at this in the `keyring_timeout.go` comment ("the credential store is reached through auth-go's Store interface ... which carries no context.Context, so a per-request context can't be threaded down to this point").
+
+---
+
+### Finding 2: Redundant Signal Listeners - tokenstore Keeps Its Own signal.Notify
+
+**Location**: `/Users/soph/Work/entire/devenv/cli/internal/entireclient/tokenstore/keyring_timeout.go:59-63`
+
+**Issue**: `callKeyringWithTimeout` sets up its own `signal.Notify(sigCh, os.Interrupt)` listener (lines 60-62) AND now also calls `procsignal.Store(os.Interrupt)` via `recordInterruptSignal`. This is two mechanisms to handle the same interrupt:
+1. **Local signal listener** (in tokenstore): catches SIGINT, returns a wrapped `context.Canceled` error from the `select` block.
+2. **Global signal writer** (in tokenstore → procsignal): records the SIGINT in the shared process global on the main goroutine.
+
+**Concrete cost**:
+- **Conceptual overhead**: The two mechanisms are at cross-purposes. The local listener is scoped to "I need to unblock a stuck keyring call immediately." The global writer is scoped to "I need to tell the abort gate that we were signalled." Bundling them in the same package makes the intent unclear.
+- **Testing burden**: `TestRecordInterruptSignal` now has to reset `procsignal` state, creating coupling between the keyring timeout tests and the process-global state. Tests can't run in parallel without reset cleanup.
+- **Maintenance hazard**: If `cmd/entire` ever adds a second top-level signal listener (for graceful drain in a server context), you'd need to be careful that `tokenstore`'s writer doesn't stomp a different signal value.
+
+**Justification (why it's not redundant)**:
+- The **local listener** is necessary for responsiveness: it makes a stuck keyring read unblock *immediately* on Ctrl-C instead of waiting for the `defaultKeyringTimeout` (5 seconds).
+- The **global writer** is necessary for correctness: the local listener runs on a **different goroutine** from the main command handler. By the time the main handler reads `caughtSignal` (now `procsignal.Load()`), the signal handler's goroutine might not have written it yet. Recording the signal on the **same main goroutine** (via `recordInterruptSignal`, which runs on the goroutine that unwinds to the CLI's abort gate) removes the race.
+
+So the two are **not actually redundant** — they solve different problems: the local listener solves responsiveness, the global writer solves race-free visibility to the abort gate.
+
+**Recommendation**: Not a problem. The design is correct. The comment in `keyring_timeout.go:66-72` already explains this. No change needed.
+
+---
+
+### Finding 3: Right-Altitude Question - Is procsignal a Package Abstraction or a Bandaid?
+
+**Location**: `/Users/soph/Work/entire/devenv/cli/internal/procsignal/procsignal.go`
+
+**Assessment**: The package is **the right altitude *as a pragmatic choice***. It cleanly encapsulates what it does: "the shared source of truth for 'were we signalled?'" The API is minimal and correct (`Store`, `Load`, `Reset`). However, it **masks a deeper missing abstraction**.
+
+**The deeper abstraction** would be: "cancellation sources that should be visible to the top-level abort gate." Right now, two unrelated systems write to it:
+1. The signal handler goroutine in `cmd/entire/main.go` (line 48).
+2. The keyring interrupt path in `tokenstore/keyring_timeout.go` (line 75).
+
+Both write `os.Interrupt` (SIGINT), and the gate treats them identically. **But they arise from different code paths** — one from an async signal event, one from a synchronous keyring timeout. This works because the gate only needs to know "was I signalled?" not "by what source?"
+
+**Concrete cost**: 
+- If another cancellation source appears (e.g., explicit user-driven timeout), it would also need to write `procsignal`, coupling unrelated subsystems.
+- The package hides the fact that multiple code paths converge at the abort gate.
+
+**Alternative deeper architecture**:
+Instead of a global signal marker, thread `context.Context` from `main()` through the auth path, so all cancellations (signal handler, keyring timeout, user-driven) are carried by the same root context. This is the right abstraction: a single cancellation scope that all subsystems read from.
+
+**Feasibility**: 
+- Requires threading context through auth-go's Store interface (see Finding 1).
+- Once that's done, `tokenstore` no longer needs its own `signal.Notify` listener; it relies on the context.
+- `procsignal` package becomes unnecessary.
+- **This is the "right" design** but requires coordinating with auth-go maintainers.
+
+**Recommendation**: Document as tech debt with a clear path. Add a comment to `procsignal.go`:
+
+```
+// TODO: Once auth-go's Store interface accepts context.Context, remove this
+// package. Thread the root context through LoadTokens/SaveTokens so keyring
+// cancellation rides the context instead of a separate signal listener. This
+// unifies all cancellation sources (signal handler, keyring timeout, user-driven)
+// under a single context scope.
+```
+
+---
+
+### Finding 4: Dual-Binary Compatibility (cmd/entire vs cmd/git-remote-entire)
+
+**Location**: `procsignal` is now imported by `cmd/entire/main.go` and `internal/entireclient/tokenstore/keyring_timeout.go`.
+
+**Question**: Is `procsignal` needed for both binaries, or is it only for `cmd/entire`?
+
+**Answer**: **It's only needed for `cmd/entire`**, but `git-remote-entire` doesn't create a problem:
+
+- `git-remote-entire` calls `resolveCreds()` → `creds.Token()` which uses the tokenmanager, which calls `contextTokenStore.LoadTokens()`, which calls `tokenstore.Get()`, which calls `callKeyringWithTimeout()`.
+- So `git-remote-entire` **does enter the keyring code path** and will call `procsignal.Store(os.Interrupt)` if Ctrl-C is pressed during a keyring read.
+- However, `git-remote-entire` doesn't have the same abort-gate problem: it uses `signal.NotifyContext()` (line 76 in `main.go`) which ties the signal directly to the context. There's no race between reading a global signal marker and the signal handler writing it.
+- So `git-remote-entire` doesn't **need** the `procsignal` global, but it **does call it harmlessly** when the keyring times out.
+
+**Concrete cost**: 
+- Minimal. `procsignal.Store()` is a no-op for `git-remote-entire` since it never reads the global.
+- Not worth refactoring.
+
+**Recommendation**: No action needed. It's fine that both binaries write to `procsignal`; only `cmd/entire` reads it.
+
+---
+
+### Summary Table
+
+| Finding | Category | Severity | Action |
+|---------|----------|----------|--------|
+| 1: Layering inversion — tokenstore writes process signal state | Architecture | Reasonable pragmatic choice | Document as tech debt; note path to fix (thread context through auth-go Store interface) |
+| 2: Redundant signal listeners — local + global | Design | **Not actually redundant** | No action; existing comment explains the design |
+| 3: procsignal as bandaid over missing context abstraction | Architecture | Reasonable pragmatic choice | Document as tech debt with clear migration path (context threading) |
+| 4: Dual-binary compatibility | Integration | **Non-issue** | No action; harmless that git-remote-entire also writes procsignal |
+
+---
+
+### Recommendation
+
+**Ship as-is.** The implementation is sound and well-commented. The layering inversion (tokenstore → procsignal) and the lack of context threading are **reasonable pragmatic choices given that auth-go's Store interface doesn't accept context**. They should be documented as tech debt with a clear future migration path:
+
+1. **Tech debt issue**: "Thread context.Context through auth-go's Store interface (LoadTokens/SaveTokens)."
+2. **Benefit**: Removes `tokenstore`'s cross-cutting dependency on `procsignal`, unifies all cancellation under a single context scope, makes the architecture more modular.
+3. **Owner**: Requires coordination with auth-go maintainers; not a blocker for this repo.
+
+The existing code comments (especially in `keyring_timeout.go:51-57` and `procsignal.go:1-17`) already hint at this future direction and are honest about the constraints. Concretely, the change is correct and maintainable in its present form.</result>
+<usage><subagent_tokens>36023</subagent_tokens><tool_uses>23</tool_uses><duration_ms>278372</duration_ms></usage>
+</task-notification>

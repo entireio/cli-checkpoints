@@ -1,0 +1,351 @@
+/goal Can you take a look at the repo and the existing e2e tests targeting individual agents. What we are missing is tests that handle upstream git resolution properly and cover various talking to git remotes. Can you gather data, also look at earlier PRs / bugfixes and develop a test plan so we have proper coverage for git operations for both storage backends
+
+---
+
+/goal Can you take a look at the repo and the existing e2e tests targeting individual agents. What we are missing is tests that handle upstream git resolution properly and cover various talking to git remotes. Can you gather data, also look at earlier PRs / bugfixes and develop a test plan so we have proper coverage for git operations for both storage backends
+
+---
+
+<task-notification>
+<task-id>ab2a7cafddb9010da</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/ab321ee9-7f1c-4332-8773-44ce3dd4e28f/tasks/ab2a7cafddb9010da.output</output-file>
+<status>completed</status>
+<summary>Agent "Inventory e2e git-remote coverage" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Report follows.
+
+## 1. E2E harness repo setup — no remote by default
+
+- `e2e/testutil/repo.go:45-120` (`SetupRepo`): `git init` in a temp dir, user config, `commit --allow-empty -m "initial commit"`, then `entire enable` (which installs git hooks, incl. pre-push — `cmd/entire/cli/strategy/hooks.go`, pre-push template comment at line 238). **No remote is created by default.**
+- Remote is opt-in per test: `testutil.SetupBareRemote(t, s)` at `e2e/testutil/repo.go:768-787` — `git init --bare` in a temp dir, `git remote add origin &lt;bareDir&gt;`, `git push -u origin HEAD`. The e2e `Git()` helper (`repo.go:606`) does **not** pass `--no-verify`, so every e2e `push` (including the one inside `SetupBareRemote`) runs the real installed pre-push hook — but no e2e test asserts the hook alone pushed checkpoints (see gaps).
+- Checkpoint refs are pushed **explicitly** via `PushCheckpointRefs` (`repo.go:190-200`): `entire/checkpoints/v1` (git-branch store) or `refs/entire/checkpoints/*` (git-refs store).
+- Store parameterization: `E2E_CHECKPOINT_STORE` = `git-branch` (default) | `git-refs`, mapped to `ENTIRE_CHECKPOINTS_PRIMARY` (`e2e/testutil/backend.go:12-38`).
+- Registered agents (`Register(...)` in `e2e/agents/*.go`): claude (`claude.go:34`), gemini (`gemini.go:18`), codex (`codex.go:19`), opencode (`opencode.go:29`), cursor-cli (`cursor_cli.go:18`), copilot-cli (`copilot-cli.go:17`), factoryai-droid (`droid.go:22`), pi (`pi.go:18`), roger-roger (`roger_roger.go:24`), vogon (`vogon.go:24`). Tests run per-agent via `testutil.ForEachAgent` / `ForEachNamedAgent`; `E2E_AGENT` filters.
+
+## 2. E2E tests (e2e/tests/) — remote/push flags
+
+**Touch remotes/push (4 files):**
+- `alternates_test.go:26` `TestAlternates_RelativeObjectAlternate_CheckpointSync` — shared clone (`git clone --shared`, relative `objects/info/alternates`), bare `origin.git` seeded with a v1 tip (lines 70-72), invokes the pre-push hook binary directly: `entire hooks git pre-push origin` (line 106), asserts remote v1 branch advanced (line 122). **Skipped under git-refs** (line 28). The only e2e test exercising non-fast-forward v1 sync over pre-push.
+- `doctor_test.go:19` `TestDoctorNoIssues` — `SetupBareRemote` (line 21), two real `git push` (lines 25/35), explicit `PushCheckpointRefs` (line 36), asserts doctor reports healthy. Vogon-only.
+- `explain_test.go:49` `TestExplainCheckpointFromClonedRepo` — bare remote, `push -u origin feature` + `PushCheckpointRefs`, `git clone`, `entire explain &lt;id&gt;` fetch-on-demand from the clone.
+- `resume_remote_test.go:22` `TestResumeFromClonedRepo` — bare remote, push feature + checkpoint refs, clone to fresh dir, `entire resume feature` auto-fetches checkpoint metadata; `:96` `TestResumeMetadataBranchAlreadyLocal` — same but metadata ref already local, fetch updates it.
+
+**No remote (all others, one line each):**
+- `attach_test.go:19,57` — attach session creates/appends checkpoint.
+- `attribution_test.go:20,50,80,120,144` — line attribution, shadow-branch cleanup, mixed human/agent.
+- `checkpoint_metadata_test.go:15` — deep metadata/transcript validation.
+- `clean_test.go:19` — `entire clean` current HEAD.
+- `codex_resume_test.go:20` — codex resume with sanitized compacted history.
+- `deleted_files_test.go:20` — deletion bundled in commit.
+- `disable_test.go:19` — no checkpoints after disable.
+- `edge_cases_test.go:20,64,95,130,161` — continue-after-commit, amend, dirty tree, rapid commits, mid-turn split.
+- `existing_files_test.go:18,52,97,141` — tracked-file modification checkpointing / overlap detection.
+- `explain_test.go:19` `TestExplainCheckpoint` — local explain.
+- `external_agent_test.go:18,47,89,117` — external-agent protocol flow.
+- `factory_hooks_test.go:18,43` — Factory task checkpoint timing / untracked exclusion.
+- `interactive_test.go:13` — multi-step interactive.
+- `mid_turn_commit_test.go:28` — mid-turn commit with different files.
+- `multi_session_test.go:15,43` — multi-prompt checkpointing.
+- `resume_test.go:23,69,165,198` — resume from feature branch / squash-merge (GitHub + git CLI formats, all local `merge --squash`) / no-checkpoint branch / older checkpoint. All local-branch only.
+- `rewind_test.go:21,61,117,157` — rewind pre/post-commit, multi-file, squash logs-only.
+- `session_lifecycle_test.go:18,53,90` — post-exit commits, depleted session, trailer removal.
+- `single_session_test.go:18,42,69,92`, `split_commits_test.go:19`, `stash_workflows_test.go:19,67,115`, `subagent_commit_flow_test.go:17` — local commit/stash/split flows.
+
+There are **no e2e worktree tests** (the only `worktree_test.go` is in integration_test).
+
+## 3. Integration tests (cmd/entire/cli/integration_test/) touching remotes
+
+Helpers (`testenv.go`): `SetupBareRemote` :1766 / `SetupNamedBareRemote` :1774 (bare + `remote add` + `push --no-verify -u`), `CloneFrom` :1816 (`git clone --branch &lt;cur&gt;` + `InitEntire`), `BranchExistsOnRemote` :1886, `GitPush` :1926 (**always `--no-verify`**), `RunPrePush` :1939/`RunPrePushWithError` :1947 (spawns `entire hooks git pre-push &lt;remote&gt;` with **`Stdin = nil`** — never a real git-invoked hook with refspec lines on stdin), `FetchMetadataBranch` :1965 (raw `git fetch` of v1). Default `NewFeatureBranchEnv` has **no remote**.
+
+**remote_operations_test.go** (bare file-path remotes, all via `RunPrePush`):
+- :20 `TestPrePush_PushesCheckpointBranchToOrigin` — v1 branch + checkpoint metadata arrive on bare origin.
+- :73 `TestPrePush_NoOpWhenNoCheckpoints`.
+- :90 `TestPrePush_IdempotentWhenAlreadyPushed` — remote ref unchanged on second push.
+- :141 `TestPrePush_PushDisabledSkipsCheckpoints` — `strategy_options.push_sessions: false`.
+- :188 `TestPrePush_CheckpointRemoteRoutesToSeparateRemote` — two bare remotes (`origin` + named `checkpoint-store`); routing simulated with direct `GitPush` because URL derivation can't parse local paths (comment :178-187).
+- :231 `REDACTED`.
+- :322 `TestCloneAndResume_FetchesCheckpointMetadata` — push, `CloneFrom`, raw `FetchMetadataBranch` (production `fetchMetadataBranchIfMissing` deliberately not exercised; comment :316-321 — unit-tested in `strategy/checkpoint_remote_test.go`).
+- :356 `TestCloneAndResume_SessionListingWorksAfterClone`; :395 `TestCloneAndResume_SessionLogRetrievalWorksAfterClone`; :432 `TestCloneAndResume_NewSessionPushAppends` (both clones' checkpoints on remote).
+- :476 `TestConcurrentPush_SecondPusherRebasesAndRetries` — non-fast-forward fetch+rebase+retry, asserts linear parent count.
+- :537 `TestGracefulDegradation_UnreachableCheckpointRemotePushContinues`; :577 `TestGracefulDegradation_UnreachableCheckpointRemoteOnCloneIsSilent`.
+- :649 `TestResume_FetchesPrimaryBranchFullyWithFilteredFetches` — clone, detach HEAD (:669), delete feature branch, `filtered_fetches: true`, `session resume --force` must fetch the branch unfiltered (full blobs).
+
+**http_remote_test.go** (in-process go-git smart-HTTPS server, :54 `startGitHTTPSServer`; auth via `ENTIRE_CHECKPOINT_TOKEN` + `GIT_SSL_CAINFO`):
+- :203 `TestHTTPS_PushCheckpointBranchToRemote` — token injection over HTTPS pre-push.
+- :257 `TestHTTPS_CheckpointRemoteRoutesToSeparateRepo` — real URL derivation to a second HTTPS repo, push+fetch routing, non-FF rebase.
+- :343 `TestHTTPS_OutOfSyncCheckpointBranchRebases`.
+- :406 `TestHTTPS_PushFailsWithoutToken` — 401 degrades gracefully; retry with token succeeds.
+
+**explain_test.go**:
+- :208 `TestExplain_CheckpointFetchesFromRemoteWhenMissingLocally` — deletes local + remote-tracking v1 refs, explain fetch-on-miss.
+- :271 `TestExplain_CheckpointFetchDoesNotRewindLocalAheadBranch`.
+- :333 `TestExplain_CheckpointSucceedsAfterTreelessFetch` — `fetch --filter=blob:none --depth=1` of v1 only (smart protocol forced via `file://` + `uploadpack.allowFilter`, :385).
+
+**Others:**
+- `trail_resume_test.go:227-244` `addTrailResumeIntegrationOrigin` — `git remote add origin &lt;https URL&gt;` purely so trail/control-plane repo resolution works; no git network ops.
+- `testenv_test.go:208,226` — git-config guard normalization for promisor-remote entries (transport-keyed vs `[remote "origin"]`), config-text only.
+- `manual_commit_workflow_test.go:498-528` and `mid_session_rebase_test.go` — "pull"/rebase simulated with local commits/reset; no remote.
+- `worktree_test.go:21` `TestWorktreeOpenRepository` — worktrees, local only, no remote.
+
+Related but out-of-scope unit tests referenced by the above (strategy package): `push_common_test.go`, `checkpoint_remote_test.go` (`TestResolvePushSettings_ForkDetection`, `TestFetchBranchIfMissing_*`, `TestDeriveCheckpointURLFromInfo` in `checkpoint/remote/util_test.go`), `refs_push_test.go`, `manual_commit_opf_rewrite_test.go`.
+
+## 4. Gaps observed
+
+1. **Real git-invoked pre-push hook never tested end-to-end with assertions.** Integration `RunPrePush` calls the binary with `Stdin = nil` and only a remote name (`testenv.go:1950-1953`); real git feeds `&lt;local-ref&gt; &lt;sha&gt; &lt;remote-ref&gt; &lt;sha&gt;` lines on stdin and passes remote name + URL. E2E repos do run the real hook on `git push`, but no e2e test asserts that a plain user `git push` alone landed `entire/checkpoints/v1` on the remote — `doctor_test.go:36`, `resume_remote_test.go:49`, `explain_test.go:70` all call `PushCheckpointRefs` explicitly, masking any hook failure.
+2. **Non-"origin" remote names / multiple remotes / origin-absent.** Production hardcodes `origin` widely: `strategy/common.go:479,813,1372,1387,1396,1399`, `checkpoint/persistent.go:2028`, `checkpoint/remote/util.go:18` (`originRemote`), `strategy/metadata_reconcile.go:82`, plus `ResolveRemoteRepo(ctx, "origin")` in `api_cmd.go:216`, `trail_cmd.go:1702`, `experts_cmd.go:355`, `recap.go:237`. No test has a repo whose only remote is `upstream`, or origin + upstream fork triangles. The only multi-remote test (`remote_operations_test.go:194`) still keeps `origin` present.
+3. **Upstream tracking config.** Nothing tests `branch.&lt;name&gt;.remote`/`@{u}` divergence from `origin`, `push.default` variants, or triangular push/pull remotes.
+4. **Fork detection with real URLs** is unit-only (`checkpoint_remote_test.go`); no integration/e2e push where checkpoint_remote owner mismatches an SSH/HTTPS origin (integration file-path remotes explicitly can't exercise it — comment `remote_operations_test.go:178-187`).
+5. **OPF pre-push rewrite has zero integration/e2e coverage** (grep for OPF in `integration_test/` and `e2e/tests/` returns nothing); only `strategy/manual_commit_opf_rewrite_test.go` unit tests. No test of OPF + real remote + non-FF divergence.
+6. **SSH remotes: no coverage anywhere.** Only local file paths and the in-process HTTPS server.
+7. **Shallow clones.** Only the metadata-branch treeless fetch (`explain_test.go:333`) uses `--depth=1`; no test of a user working in a `git clone --depth=1` repo (condensation/pre-push/resume there).
+8. **Detached HEAD** appears only as setup plumbing (`remote_operations_test.go:669`); no behavioral test of hooks/push/resume while detached.
+9. **Worktrees + remotes.** `integration_test/worktree_test.go:21` is a single local `OpenRepository` test; no push/fetch of checkpoints from a linked worktree, and no e2e worktree tests at all (despite worktree-specific shadow-branch namespacing being a core strategy feature).
+10. **Production fetch-on-clone path (`fetchMetadataBranchIfMissing`) untested at integration level** — clone-resume integration tests substitute raw `git fetch` (`remote_operations_test.go:316-321`); the e2e `TestResumeFromClonedRepo` covers the resume-triggered fetch but only over a local file-path remote, never HTTPS/auth.
+11. **git-refs store remote behavior at integration level.** Integration tests have no `ENTIRE_CHECKPOINTS_PRIMARY`/git-refs parameterization (grep: zero hits); the e2e suite parameterizes but its one pre-push-focused test (`alternates_test.go:28`) skips under git-refs, leaving git-refs fast-forward push + fetch+replay recovery covered only by strategy unit tests (`refs_push_test.go`).</result>
+<usage><subagent_tokens>109256</subagent_tokens><tool_uses>24</tool_uses><duration_ms>804332</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a8a79e4eadf8b4c92</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/ab321ee9-7f1c-4332-8773-44ce3dd4e28f/tasks/a8a79e4eadf8b4c92.output</output-file>
+<status>completed</status>
+<summary>Agent "Map git remote code paths" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result># Git Remote / Upstream / Remote-Communication Map — `entire` CLI
+
+## 1. Remote resolution logic and precedence
+
+### 1a. General-purpose remote URL parsing — `cmd/entire/cli/gitremote/gitremote.go`
+- `GetRemoteURL`/`GetRemoteURLInDir` (gitremote.go:93-108): shells out to `git remote get-url &lt;name&gt;`; error is `remote %q not found`. Note: this is the *fetch* URL — `get-url --push` is never used anywhere.
+- `ParseURL` (gitremote.go:111-155): parses SCP-style SSH (`git@host:owner/repo.git`), any `scheme://` URL, and `entire://host/&lt;forge&gt;/owner/repo`. Extracts Protocol/Host/Port/Forge/Owner/Repo. Forge mapping is a hardcoded `hostToForge = {"github.com": "gh"}` (gitremote.go:46-48); anything else gets an empty forge.
+- `ResolveRemoteRepo(ctx, remoteName)` (gitremote.go:190-200): URL → (forge, owner, repo). **Every caller passes the literal `"origin"`:**
+  - `entire api` `{owner}`/`{repo}`/`{repo_id}` substitution — `cmd/entire/cli/api_cmd.go:216` (`expandAPIPlaceholders`); `{repo_id}` additionally requires forge == gh and does a control-plane mirror lookup (api_cmd.go:237-258).
+  - `experts_cmd.go:355`, `recap.go:237`, `trail_cmd.go:1702`, `setup.go:979` (`reportRepoEnabled`), `trail_context_cache.go:79`.
+- Control-char injection guard on owner/repo in `splitOwnerRepo` (gitremote.go:202-218).
+
+### 1b. Checkpoint remote resolution — `cmd/entire/cli/checkpoint/remote/util.go`
+The canonical resolver for where checkpoint data lives. Remote name is the constant `originRemote = "origin"` (util.go:18).
+- `FetchURL` (util.go:40-126) — precedence:
+  1. Read `origin`'s URL (missing origin tolerated → empty).
+  2. `ENTIRE_CHECKPOINT_TOKEN` set → coerce origin URL to HTTPS (`deriveTokenOriginURL`, util.go:404-419; SSH ports intentionally dropped).
+  3. `strategy_options.checkpoint_remote` configured in settings → derive `&lt;origin-protocol&gt;://&lt;origin-host&gt;/&lt;config.Repo&gt;.git` (`deriveCheckpointURLFromInfo`, util.go:288-302; SSH with non-default port uses `ssh://` form).
+  4. Non-derivable origin protocol (`entire://`, `file://`) → provider-canonical-host fallback (`resolveProviderCheckpointURL`, util.go:320-361): token→HTTPS, else reuse the scheme of *any existing remote already pointing at the provider host* (iterated in sorted remote-name order, `findRemoteInfoForHost` util.go:380-402), else SSH. Providers: only `github`→github.com, `gitlab`→gitlab.com (util.go:421-430).
+  5. Any failure at any step logs `logFallback` and falls back to the raw origin URL; no origin at all → error `no fetch URL found`.
+- `PushURL(ctx, pushRemoteName)` (util.go:140-240) — same idea but derives protocol from the *push remote the pre-push hook was invoked for*, not origin, and adds **fork detection**: if push-remote owner ≠ `checkpoint_remote` owner (case-insensitive), the dedicated checkpoint URL is skipped and the fallback (origin, or the push remote itself when origin is missing — `resolvePushFallbackURL` util.go:448-473) is used.
+- `Configured` (util.go:243-252): whether a structured checkpoint_remote exists.
+
+### 1c. Push-time settings — `cmd/entire/cli/strategy/checkpoint_remote.go`
+- `resolvePushSettings(ctx, pushRemoteName)` (checkpoint_remote.go:55-96): builds `pushSettings{remote, checkpointURL, pushDisabled}`; `pushTarget()` (line 33-40) prefers the derived checkpoint URL over the remote name. The remote name comes from the git pre-push hook's `$1` (`strategy/hooks.go:238` comment, hook script `pre-push "$1"` at hooks.go:200; cobra command `hooks git pre-push &lt;remote&gt;` at `cmd/entire/cli/hooks_git_cmd.go:306-348`).
+
+### 1d. Default-branch / upstream resolution (all hardcoded to origin)
+- `getDefaultBranchFromRemote` — `cmd/entire/cli/git_operations.go:149-171`: `refs/remotes/origin/HEAD` symbolic ref → fallback origin/main → origin/master.
+- Duplicate in `strategy/common.go:1381-1405` (`GetDefaultBranchName`, noted as ENT-129 tech debt) and `GetMainBranchHash` (common.go:1362-1378).
+- `resolveBranchCommit` fallback local→`origin/&lt;name&gt;`: `resume_picker.go:311-323`, `resume.go:605-620` (`branchCommit`), `resume.go:873`.
+- **Nothing anywhere consults `branch.&lt;name&gt;.remote` / `branch.&lt;name&gt;.merge` (the configured upstream), `remote.pushDefault`, or push URLs.** Remote choice is: hook-provided `$1` for pushes, literal `"origin"` for everything read/fetch-side.
+
+### 1e. Token-auth target rewriting — `cmd/entire/cli/checkpoint/remote/git.go`
+- `newCommand` (git.go:239-283): if `ENTIRE_CHECKPOINT_TOKEN` set, extracts the remote from the git argv (`extractRemoteFromArgs` git.go:341-352, first positional after flags), rewrites SSH targets to HTTPS (`resolveTargetForTokenAuth` git.go:293-320), and injects `http.extraHeader: Authorization: Basic base64(x-access-token:&lt;token&gt;)` via `GIT_CONFIG_COUNT/KEY/VALUE` env (git.go:363-392, preserving pre-existing GIT_CONFIG entries). Token control-char validation (git.go:394-404); one-shot stderr warning when the remote stays SSH (git.go:271-275). All commands get `GIT_TERMINAL_PROMPT=0` and nil stdin (git.go:244, 437-442).
+
+## 2. Push flows
+
+### 2a. Pre-push hook (the main flow) — `strategy/manual_commit_push.go`
+`ManualCommitStrategy.PrePush(ctx, remote)` (manual_commit_push.go:35-131):
+1. `resolvePushSettings` (may do a one-time network fetch of the metadata branch — see 3b). `push_sessions: false` → no-op.
+2. **Backend fork**: `checkpoint.PrimaryIsRefs(cfg)` (checkpoint/open.go:36) → `prePushCheckpointRefs` (git-refs path, below); else the git-branch (v1) path.
+3. v1 path: `syncCheckpointPolicyForPrePush` (strategy/checkpoint_policy.go:38-56) — ls-remote + fetch of `refs/entire/policies/checkpoint` against `ps.pushTarget()` via `checkpointpolicy.Sync` (`checkpointpolicy/remote.go:47-130`); a blocked/diverged/unsupported policy **skips checkpoint push without aborting the user push**.
+4. OPF: `redact.OPFEnabled()` → `RewriteUnpushedV1WithOPF` (see 2b). OPF errors *abort the user's push* (hook exits non-zero — hooks_git_cmd.go:318-346; hook script deliberately doesn't `|| true`, strategy/hooks.go:178-200).
+5. Push each ref in `refs.Push` (default just `entire/checkpoints/v1`, checkpoint/persistent_refs.go:25) via `pushRefIfNeeded` (`strategy/push_common.go:103-124`): skip if branch ref + named-remote target + `refs/remotes/&lt;remote&gt;/&lt;branch&gt;` equals local (push_common.go:128-140); otherwise `doPushRef` (push_common.go:156-212): try push → on rejection classify (protected ref GH013 → banner and give up, push_common.go:349-415; non-fast-forward → `fetchAndRebaseRefCommon` then retry). Never force-pushes. Shared 2-minute budget (`checkpointPushBudget` push_common.go:152). Transient failures are warned+swallowed (user push proceeds).
+6. `cleanupPushedShadowBranches` (manual_commit_push.go:230-240) — local-only cleanup; shadow branches (`entire/&lt;sha7&gt;-&lt;wt6&gt;`) are never pushed.
+- Actual push runs `git push --no-verify --porcelain` through `remote.PushWithOptions` (git.go:149-170); `resolvePushCommandTarget` (git.go:416-429) swaps a remote *name* for the checkpoint URL when checkpoint_remote is configured, but leaves names alone otherwise so git updates remote-tracking refs. Branch refs push by short name (tracking works), non-branch refs use explicit `refs/x:refs/x` refspec (push_common.go:315-337).
+- `fetchAndRebaseRefCommon` (push_common.go:421-550): fetch into `refs/remotes/&lt;remote&gt;/&lt;branch&gt;` for name+branch, else temp ref `refs/entire-fetch-tmp/...`; reconcile disconnected metadata (`ReconcileDisconnectedMetadataRef`, strategy/metadata_reconcile.go:100+); merge-base; cherry-pick local-only non-merge commits onto remote tip (cap `MaxCommitTraversalDepth`); deliberately no `--unshallow`.
+
+### 2b. OPF pre-push rewrite — `strategy/manual_commit_opf_rewrite.go`
+- `resolveRemoteV1Tip` (opf_rewrite.go:380-414): fetches `refs/heads/entire/checkpoints/v1` from the push target into temp ref `refs/entire-fetch-tmp/opf-rewrite-v1`, so divergence is checked against the *live* remote tip, not a stale tracking ref. Fallbacks: fetch failure on a *named* remote → use `refs/remotes/&lt;target&gt;/entire/checkpoints/v1`; on a *URL* target → treat as bootstrap (ZeroHash).
+- Divergence detection (opf_rewrite.go:221-234): merge-base ≠ remoteTip → `V1DivergedError` (aborts push). Bootstrap cap when remote has no v1 (`BootstrapTooLargeError`), batch prose-size cap (`OPFBatchTooLargeError`), `OPFRuntimeFailedError`.
+- CAS: after rewriting, the local v1 ref is updated only if it still points at the pre-rewrite tip; a concurrent move → `V1RefMovedError` ("re-run git push; the move was local").
+- Sentinel errors are `errors.As`-able; hook wraps with `pre-push:` prefix (hooks_git_cmd.go:345).
+- git-refs backend: OPF **descoped** — not applied on `prePushCheckpointRefs` (manual_commit_push.go:138-143).
+
+### 2c. git-refs pre-push — `manual_commit_push.go:144-225` + `checkpoint/pushqueue.go`
+- Flock-protected JSONL queue `entire-checkpoint-push-queue.jsonl` in the git *common* dir (shared across worktrees; pushqueue.go:18-56). Writes enqueue (`refs_store.go:113-120`); pre-push `Drain`s, prunes stale refs (`partitionLocalRefs` push_common.go:29-45), then `batchPushRefs` (push_common.go:58-70) — one `git push` with N refspecs `refs/entire/checkpoints/&lt;shard&gt;/&lt;id&gt;:same`, fast-forward-only. On rejection: per-ref `pushCheckpointRefWithRecovery` (push_common.go:82-95) fetch+replay then non-force retry; conflicted refs stay queued. Queue entries removed only after confirmed push.
+
+### 2d. Other push paths
+- Checkpoint policy push: `checkpointpolicy.Push` (checkpointpolicy/remote.go:147-162), refspec `refs/entire/policies/checkpoint:same`, target from `remote.FetchURL` — invoked by hidden `entire checkpoint-policy` command (`checkpoint_policy.go:87`).
+- Trail branches: `pushBranchToOrigin` / `deleteBranchFromOrigin` / `branchExistsOnOrigin` — raw `git push --no-verify -u origin`, `git push origin --delete`, `git ls-remote --heads origin` (trail_cmd.go:1871-1909). Hardcoded origin, no token injection.
+- Setup wizard: `git push -q --no-verify -u origin HEAD` (setup_github.go:892).
+- `git-remote-entire` push: `internal/remotehelper/githelper/push.go` — bridges `git send-pack --stateless-rpc` to one HTTP POST `/git-receive-pack` with repo-scoped STS tokens (`internal/entireclient/repocreds/repocreds.go:75+`, action "push") and replica failover (`internal/remotehelper/replicas`).
+
+## 3. Fetch flows
+
+### 3a. Low-level — `checkpoint/remote/git.go`
+- `Fetch` (git.go:65-95): `git fetch --no-auto-gc [--no-tags] [--depth=1 | --depth=N | --unshallow] [--filter=blob:none]` with token injection. `ResolveFetchTarget` (git.go:199-208) resolves a remote *name* to its URL when filtered fetches are on, so promisor config isn't persisted onto the named remote.
+- `FetchBlobs` (git.go:107-123): `git fetch-pack &lt;url&gt; &lt;hash…&gt;` — plumbing to bypass partial-clone integrity checks; URL redacted in errors.
+- `LsRemoteInDir` (git.go:173-189).
+
+### 3b. Metadata branch (v1) fetches — `cmd/entire/cli/git_operations.go`
+- `FetchMetadataBranch` / `FetchMetadataTreeOnly` → `fetchMetadataFromOrigin` (git_operations.go:363-443): hardcoded origin; refspec `+refs/heads/&lt;v1&gt;:refs/remotes/origin/&lt;v1&gt;`; `Depth: 1_000_000_000` to heal legacy `--depth=1` shallow grafts without global unshallow (git_operations.go:356-361); then `SafelyAdvanceLocalRef`.
+- Checkpoint-remote variant: `strategy.FetchMetadataBranch(ctx, url)` (strategy/checkpoint_remote.go:105-122) — fetch into `refs/entire-fetch-tmp/&lt;branch&gt;` then `PromoteTmpRefSafely`; 30s timeout (line 19). `fetchMetadataBranchIfMissing` (lines 162-183) runs inside every pre-push settings resolution but only when the local v1 is missing; fetch failures silently swallowed.
+- `FetchMetadataFromCheckpointRemote` (git_operations.go:448-462).
+- `FetchBlobsByHash` (git_operations.go:505-536): target from `resolveCheckpointFetchTarget` (FetchURL, else literal "origin", git_operations.go:468-474); on failure falls back checkpoint-remote-full-fetch → origin-full-fetch.
+- `FetchCheckpointRef` (git_operations.go:480-494): per-checkpoint ref `+refs/entire/checkpoints/&lt;shard&gt;/&lt;id&gt;:same-name` — the git-refs cross-machine read path.
+- `FetchAndCheckoutRemoteBranch` (git_operations.go:307-354): resume-a-branch flow; origin hardcoded; NoFilter (needs blobs); 2-min timeout; creates local branch + CLI checkout.
+- `BranchExistsOnRemote` (git_operations.go:226-254): tracking ref, then `git ls-remote --heads origin`; ls-remote failure treated as "not found".
+
+### 3c. Consumers
+- **resume** (`resume.go`): layered strategy — treeless/tree-only fetch → local ref → full origin fetch → origin remote-tracking tree (`GetRemotePrimaryTree` strategy/common.go:806-830) (resume.go:500-560); for checkpoint-by-ID: checkpoint_remote first, then `promoteRemoteTrackingPrimary` (resume.go:860-880, advances local v1 to origin's tracking ref), then origin fetch (resume.go:760-840).
+- **attach**: no fetch — suggests a paste-able `git fetch &lt;url|origin&gt; entire/checkpoints/v1:entire/checkpoints/v1` (attach.go:577-587). `adopt` is local-only (no remote interaction found).
+- **explain / tokens profile / attribution / trail resume / search**: open stores with `BlobFetcher: FetchBlobsByHash, RefFetcher: FetchCheckpointRef` (explain.go:694,870; tokens_profile.go:115; attribution.go:354; trail_resume_cmd.go:465; config.go:70).
+- **checkpoint policy sync** (checkpointpolicy/remote.go:35-130): `ls-remote` for the policy ref hash; on mismatch fetch into `refs/entire/policies/checkpoint-fetch`, ancestry-compare, fast-forward or mark `SourceLocalDiverged`. Target = `remote.FetchURL` with worktree root.
+- **trail**: `fetchBranchFromOrigin` (trail_cmd.go:1857-1869), raw `git fetch --no-tags origin`.
+- **`entire repo clone`** (`repo_clone.go:67-167`): not a git-remote resolution — resolves a mirror placement via the control plane (`listMirrorsForRepo`), multi-cluster → `--cluster` flag or interactive picker (non-TTY errors with available hosts, repo_clone.go:241-243), then shells out to `git clone entire://&lt;cluster&gt;/gh/&lt;owner&gt;/&lt;repo&gt;`, which is served by **git-remote-entire** (`cmd/git-remote-entire/main.go`, `internal/remotehelper/*`): smart-HTTP v0/v2 over HTTPS with STS repo-scoped tokens and replica failover.
+- **repo mirror** commands (`repo_mirror.go`): pure control-plane API; only synthesize clone URLs (`mirrorCloneURL` repo_clone.go:47).
+
+## 4. The two checkpoint storage backends
+
+Selection: `checkpoint.Open` via registry (`checkpoint/registry.go:65-68`) from `settings.LoadCheckpointsConfig`; nil config = git-branch primary, no mirrors. Both are git-backed; supported topology during rollout: **git-refs primary + git-branch mirror** (registry.go:21-26). Mirrors are write-only best-effort fan-out (`checkpoint/fanout.go:11-31,67-75`) — a mirror write failure never fails a checkpoint.
+
+### git-branch backend (`GitStore`, `checkpoint/persistent.go`)
+- Refs: single branch `entire/checkpoints/v1` (`PersistentRefs{Primary, Read, Push: [v1]}`, persistent_refs.go:16-37).
+- Remote interactions: pushed by pre-push hook (2a) with refspec = bare branch name (remote-tracking `refs/remotes/&lt;remote&gt;/entire/checkpoints/v1` maintained when pushing to a named remote); fetched via 3b flows; read fallback to `refs/remotes/origin/&lt;v1&gt;` when the local ref is missing and `ReadBootstrappableFromOrigin` (persistent.go:2021-2035); blob-level lazy fetch through `FetchingTree` + `FetchBlobsByHash`.
+- OPF rewrite applies only to this backend.
+
+### git-refs backend (`gitRefsStore`, `checkpoint/refs_store.go`)
+- Refs: one per checkpoint, `refs/entire/checkpoints/&lt;shard&gt;/&lt;id&gt;` (`refs_naming.go:16`).
+- Push: write → enqueue in flock JSONL push queue (refs_store.go:103-120, pushqueue.go) → pre-push drain + batch push with explicit `ref:ref` refspecs, fast-forward-only, per-ref fetch+replay recovery (2c).
+- Fetch: `resolveRefMaybeFetch` (refs_store.go:266-300) — missing local ref triggers injected `RefFetcher` (= `FetchCheckpointRef`, refspec `+ref:ref` from FetchURL-or-origin); still-missing after fetch = "checkpoint not found". Blobs via injected `BlobFetcher`. Listing is local-refs-only (refs_store.go:361 comment) — no remote enumeration.
+
+## 5. Edge cases
+
+### Explicitly handled (test-plan candidates)
+- Missing origin remote: FetchURL/PushURL fallbacks (util.go:56-59,141-176), `reportRepoEnabled` silently skips (setup.go:979-984), ls-remote failure = branch-not-found (git_operations.go:248-251).
+- Push remote ≠ origin: pre-push hook passes `$1`; PushURL derives from it; fallback chain push-remote→origin (util.go:448-473); tracking-ref optimization keyed on the actual remote name (push_common.go:119,128-140).
+- Pushing to a raw URL target (`git push &lt;url&gt;`): `IsURL` short-circuits tracking-ref optimization and target rewriting (git.go:192-194,416-429; push_common.go:119).
+- checkpoint_remote fork detection (owner mismatch, util.go:211-218); checkpoint_remote not committed to HEAD settings → discoverability hint (push_common.go:243-271).
+- Protocol matrix: SCP SSH, `ssh://` with non-default port (util.go:291-296), HTTPS with port, `entire://` (forge-in-path), non-derivable protocols → provider fallback (util.go:113-122,220-236).
+- `ENTIRE_CHECKPOINT_TOKEN`: SSH→HTTPS coercion, header injection preserving existing GIT_CONFIG_* env, control-char token rejection, SSH-ignored warning, port kept only for HTTPS sources (git.go:239-404, util.go:404-419).
+- Non-fast-forward: fetch + cherry-pick replay, non-force retry; genuine divergence left queued/never overwritten (push_common.go:58-95, 154-212).
+- Disconnected metadata (no merge base / empty-orphan bug): detect (metadata_reconcile.go:31-59,82), warn-once, reconcile in pre-push and `entire doctor` (doctor.go:346-395).
+- OPF: diverged v1, bootstrap cap, batch cap, CAS ref-moved, runtime failure — each a typed abort; fetch-failure fallbacks differ for named remote vs URL (opf_rewrite.go:380-398).
+- Shallow repos: no `--unshallow` on sync (push_common.go:444-450); ref-scoped `--depth=1e9` healing (git_operations.go:356-421); `--depth=1` tip probes.
+- Filtered fetches: name→URL resolution to avoid promisor persistence (git.go:199-208); `NoFilter` for blob-needing flows (resume/explain).
+- Protected refs / GH013 → banner, no retry (push_common.go:339-415).
+- Auth hangs: `GIT_TERMINAL_PROMPT=0` + nil stdin everywhere in `checkpoint/remote`; timeouts (30s policy/metadata, 2m fetches, 2m shared push budget); command termination-on-cancel (`remote/command_cancel*.go`).
+- Stale push-queue entries pruned (push_common.go:29-45); duplicate queue entries collapsed (pushqueue.go).
+- URL redaction in all error/log paths (gitremote.go:170-183, checkpoint_remote.go:150-155).
+- Multi-cluster mirrors: `--cluster` + non-TTY fallback (repo_clone.go:211-273).
+
+### Apparently NOT handled (gaps to probe in tests)
+- **Non-origin-named remotes on the read/fetch side**: every fetch/read path hardcodes `"origin"` — resume, `FetchAndCheckoutRemoteBranch`, `BranchExistsOnRemote`, metadata fetch, remote-tracking fallbacks, `resolveCheckpointFetchTarget`, api/search/dispatch/experts/recap/trail. A repo whose only remote is `upstream` breaks all of these; a push to `upstream` pushes checkpoints there (hook `$1`) while every later read still looks at origin.
+- **Tracking-branch upstream ignored**: `branch.&lt;name&gt;.remote`, `remote.pushDefault`, and `git remote get-url --push` (separate pushurl) are never consulted; `PushURL` derives the "push" URL from the remote's *fetch* URL.
+- **Multiple URLs on one remote**: `git remote get-url` returns only the first; `findRemoteInfoForHost` scans all URLs but the main resolvers don't.
+- **`url.&lt;base&gt;.insteadOf` rewrites**: parsing operates on the configured URL, so protocol/host derivation can disagree with what git actually dials.
+- **Local-path origins**: `ParseURL` fails ("no protocol"), silently falling back to raw-origin behavior; `isLocalPath` (git.go:431-433) misses bare relative paths like `sub/dir`.
+- **Token auth beyond GitHub-style**: `x-access-token:` Basic header is applied to any HTTPS host, including the GitLab provider fallback — GitLab token semantics untested/unhandled.
+- **Forge map**: only github.com; GHE / self-hosted hosts get empty forge — `{repo_id}`, trails, experts paths error or degrade.
+- **git-refs backend**: no remote listing (a checkpoint that exists only remotely and isn't referenced by a commit trailer is undiscoverable); no OPF; no mirror push of the v1 branch at pre-push yet (manual_commit_push.go:49-50 comment "downgrade safety is a later step").
+- **`extractRemoteFromArgs`** would mis-pick a flag value passed as a separate token (e.g. `--depth 5`); current internal callers always use `=` forms, but it's a latent trap for new call sites.
+- **Concurrent pre-push to two different remotes**: push queue and policy sync have no per-remote state; queue entries are removed after a push to *whichever* remote ran first, so the second remote never gets those refs.
+- **`hasUnpushedBranchRef` staleness**: skip decision trusts the local tracking ref; a remote-side v1 deletion or move isn't noticed until a rejection path triggers.
+
+Key files: `cmd/entire/cli/gitremote/gitremote.go`, `cmd/entire/cli/checkpoint/remote/{util.go,git.go}`, `cmd/entire/cli/strategy/{manual_commit_push.go,push_common.go,checkpoint_remote.go,manual_commit_opf_rewrite.go,metadata_reconcile.go,checkpoint_policy.go,hooks.go}`, `cmd/entire/cli/checkpoint/{persistent.go,persistent_refs.go,refs_store.go,refs_naming.go,pushqueue.go,fanout.go,registry.go,open.go}`, `cmd/entire/cli/{git_operations.go,resume.go,attach.go,repo_clone.go,repo_mirror.go,api_cmd.go,doctor.go,hooks_git_cmd.go}`, `cmd/entire/cli/checkpointpolicy/remote.go`, `cmd/git-remote-entire/main.go`, `internal/remotehelper/`, `internal/entireclient/repocreds/repocreds.go`.</result>
+<usage><subagent_tokens>154629</subagent_tokens><tool_uses>35</tool_uses><duration_ms>828577</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a6d5addfa6d845e4d</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/ab321ee9-7f1c-4332-8773-44ce3dd4e28f/tasks/a6d5addfa6d845e4d.output</output-file>
+<status>completed</status>
+<summary>Agent "Mine PR/bugfix history for remote bugs" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Done mining. Note: `gh` worked fine (repo is `entireio/cli`; #1471 is an issue not a PR, and #1474/#1484 were closed/superseded). Below is the raw catalog of past remote/push/fetch bugs, ordered by the priority areas requested.
+
+## A. Pushing/fetching `entire/checkpoints/v1` (branch store) — ref-advance data loss family
+
+This is the richest regression cluster: the recurring failure mode is "local metadata ref moved destructively, orphaning unpushed checkpoints (GC-loss)" or "false disconnect."
+
+1. **PR #953 "Fix explain to fetch metadata from remote"** — explain failed "checkpoint not found" when metadata lived only on remote; while fixing, discovered every fetch helper unconditionally reset the local metadata ref to origin tip, orphaning unpushed checkpoints; v2 refspec `+refs/...` let git force-overwrite before Go could intervene. Tests added.
+2. **Commit `96034892c` "don't rewind locally-ahead entire/checkpoints/v1 in FetchMetadataTreeOnly"** — fetch-on-miss in `explain --checkpoint`/`resume` force-updated local v1 ref to origin's tip during every post-commit-pre-push window; unpushed commits orphaned. Root cause: unconditional `SetReference`. Test added (commit A pushed, commit B unpushed, explain miss → ref stays at B).
+3. **PR #1252 "Fix resume when local metadata branch is stale + preserve diverged refs"** — (a) `promoteRemoteTrackingMetadataBranch` early-returned when local ref existed even if origin was ahead → resume printed "session log not available"; (b) `SafelyAdvanceLocalRef` overwrote diverged/unrelated local refs, silently discarding unpushed commits from a fetch landing sibling commits (cross-machine). Fixed to missing→create / behind→FF / diverged→no-op. Failing-before-fix tests added (`resume_test.go`, `safely_advance_local_ref_test.go`).
+4. **PR #1251 "replay local checkpoints when fetch finds a diverged remote"** — the #1252 no-op left diverged local-only commits stranded; `SafelyAdvanceLocalRef` now merge-base-splits and cherry-picks local-only commits onto remote tip (`errNoMergeBase` sentinel distinguishes disconnected from real git failure). Regression tests under `FetchMetadataBranch`.
+5. **PR #1260** — dedicated regression-test PR for the above: diverged replay, disconnected empty-root orphan filtering, multi-commit preservation, shallow-boundary refusal, e2e stale-local resume, and **no-double-replay** (`TestPushAfterDiverged_NoDoubleReplayCommits` guards against `SafelyAdvanceLocalRef` and `ReconcileDisconnectedMetadataBranch` both cherry-picking the same commits). Files: `cmd/entire/cli/strategy/replay_disconnected_test.go`, `cmd/entire/cli/integration_test/diverged_replay_test.go`.
+6. **Commit `743c43f4c` "skip non-root no-op commits in push signing"** — cross-clone push: replaying a non-root no-op commit reused `original.TreeHash`, overwriting the remote tip's accumulated tree — other clone's files silently dropped. No dedicated test in that commit (fix inside `push_signing.go`).
+7. **Commit `016a94034` "PrePush signs local-only commits before pushing"** — exposed two latent bugs: `collectCommitsSince` ZeroHash-exclude guard and `buildCherryPickCommit` root-commit handling. Tests added (`push_signing_test.go`).
+8. **Commit `4cf01edb3` "Drop commit-count cap when replaying commits during pre-push"** — &gt;1000 local-only metadata commits turned a valid push into hard failure (MaxCommitTraversalDepth applied to replay). No test mentioned.
+9. **PR #1033 "Detect push to protected branches"** — GH013 branch-protection rejection of `entire/checkpoints/v1` produced an easily-missed one-line warning; checkpoints silently never synced. Added `classifyPushOutput` + loud block + token-masking; tests added.
+10. **Commit `1e8628ade` "Use fetched ref hash instead of ls-remote hash for disconnect check"** — remote can advance between `ls-remote` and `fetch`; merge-base/cherry-pick operated on a stale hash (`metadata_reconcile.go`). No test in commit.
+11. **Commit `cac63b010`** — disconnect check hard-failed when **no origin remote exists at all**; now reports OK "no remote to compare". Test updated (`doctor_test.go`).
+12. **Concurrency**: `TestConcurrentPush_SecondPusherRebasesAndRetries` (pre-existing) covers two pushers racing on v1.
+
+## B. Shallow / partial-clone edge cases
+
+13. **PR #1443 "stop shallow-fetching the metadata tip"** (root-cause fix) — `FetchMetadataTreeOnly --depth=1` wrote a `.git/shallow` boundary; later `merge-base` vs `origin/entire/checkpoints/v1` falsely reported "no common ancestor" → push aborted, `entire doctor` looped. Self-inflicted on every `resume` when checkpoints live on origin. Fix: full-depth + `--filter=blob:none`. Test: `TestFetchMetadataTreeOnly_DoesNotShallowRepo`. Companion healing commits: `d775042ad`/`301e0da34` (doctor deepens prior shallow metadata via ref-scoped `--depth`), `eaada8378` (shallow merge-base miss ≠ disconnected), `428c3274b` (doctor reopens repo after deepening).
+14. **PR #1276 "Prevent pack file race condition during checkpoint sync"** — accumulating promisor packs triggered `gc --auto` mid-sync; go-git snapshots pack list at open and hit ENOENT (`open .git/objects/pack/pack-*.pack: no such file or directory`) during pre-push rebase. Fix: `--no-auto-gc` on all fetches, removed `--depth=1` checkpoint fetches, auto-`--unshallow` of legacy shallow repos, `.git/shallow`-aware commit walks. Integration tests added. Related: `6f104c7ec` (don't `--unshallow` on push hot path — it's clone-global, can pull a whole monorepo).
+15. **PR #1069 "Make explain work with partial-clone"** — go-git `Tree.File()` returns `ErrFileNotFound` for filter-omitted blobs; read paths treated it as "checkpoint doesn't exist". Also: porcelain `git fetch` rejects blob-only fetches (partial-clone integrity checks) → switched to `git fetch-pack`; `cat-file` tried before network. Tests added.
+16. **PR #934 "Fetch checkpoint refs by URL to avoid polluting origin config"** — fetching by remote *name* stamped `promisor = true` / `partialclonefilter = blob:none` on `[remote "origin"]`, affecting all user fetches. Fix: fetch by URL; added an integration-test guard asserting operations don't touch `.git/config` unexpectedly.
+
+## C. Checkpoint-remote / upstream URL resolution
+
+17. **PR #976** — `FetchBlobsByHash` hardcoded `origin`; broke `entire resume` with `checkpoint_remote` + `filtered_fetches` (blobs live on the checkpoint remote). Added `resolveCheckpointFetchTarget()`; tests added.
+18. **PR #989** — consolidated `FetchURL`/`PushURL` into `checkpoint/remote`; `ENTIRE_CHECKPOINT_TOKEN` now rewrites SSH origins to HTTPS; on FetchURL failure, fallback to "origin" with logging instead of silent empty target.
+19. **Commit `7afdaa33e` "Rewrite SSH target to HTTPS in newCommand for token auth"** — push coerced SSH→HTTPS for token auth but **fetch didn't**: v1/v2 metadata fetch, doctor reconcile, and resume branch fetches silently failed for `ENTIRE_CHECKPOINT_TOKEN` users on SSH origins. Unit tests cover SCP-style, ssh:// with port, HTTPS passthrough, local paths, unknown remotes.
+20. **PR #1279 "Route checkpoints to provider host when origin protocol is non-derivable"** — with `checkpoint_remote` configured and an `entire://` (or `file://`) origin, PushURL/FetchURL fell back to origin; v1 branch was pushed to the `entire://` helper which doesn't host it → non-FF failure, 2-min recovery timeout, helper wedged on shutdown. Tests added. (`gitremote.ParseURL` also taught `entire://`.)
+21. **Commit `53bc37a88` (attribution audit round 4)** — `remote.FetchURL` silently returns the **origin URL** when the checkpoint remote's URL can't be derived; a "successful" refresh could hit origin and fake evidence. Also: tests with `ENTIRE_CHECKPOINT_TOKEN` set in the environment did **live github.com fetches** — hermeticity fix. Tests added.
+22. **PR #1463** — pre-existing bug: `TestResolvePushSettings_*` tests did real network fetches against github.com (via `fetchMetadataBranchIfMissing`), stalling on macOS keychain prompts. Test-hermeticity regression class worth keeping in mind for the test plan.
+23. **PR #1286** — `gitremote.ParseURL` threw away the forge segment of `entire://host/gh/owner/repo`; trail commands sent the regional hostname as the API host → rejected. `Info.Forge` added.
+24. **Commit `c734ce1fa`** — `entire repo clone`: URL trimmed for detection but the raw (untrimmed) arg forwarded to `git clone`. One-line class: detection vs. execution disagree on normalization.
+
+## D. Git-refs per-checkpoint store (PR #1566, implements issue #1471; stack #1480/#1481/#1482/#1533 was refactoring, no remote bugs there)
+
+25. **Commit `2c4159060`** — initial queue push was **force**; with no server-side ref protection a racing/buggy client could clobber good remote refs. Now FF-only plain refspec; divergence REJECTED. Tests: `AllowsFastForward`, `RejectsNonFastForward` (`strategy/refs_push_test.go`).
+26. **Commit `6ba80842a`** — rejected diverged per-checkpoint ref recovered by fetch + cherry-pick replay + non-force retry (remote commit preserved as ancestor); genuine overlap degrades to "left queued". Test proves both remote-only and local-only changes survive.
+27. **Commit `7bbdad09c`** — git-refs read paths masked real IO/fetch errors as "not found" (silent-data-loss risk: orphan restart overwrites ref history); failed on-demand fetch (offline) now propagates; transient errors keep queue entries pushable; **pre-push skipped the checkpoint policy check the v1 path runs** — now honors it. Test updated.
+28. **Commit `d71e0717e`** — `RefName` accepted invalid/`KindUnknown` checkpoint IDs → malformed refs. Now errors.
+29. **Commit `40cded153`** — push queue file grew unboundedly (Enqueue append-only; only Remove rewrote); Drain now compacts. Tests added (`checkpoint/pushqueue_test.go`).
+30. **Commits `5c6d612cc`/`b37743eaa`** — on-demand fetch of a missing checkpoint ref on read (resume/explain/attribution/tokens) so cross-machine checkpoints resolve after clone; explain-on-clone fetches the specific ref by full ID. E2E backend matrix `E2E_CHECKPOINT_STORE=git-refs` runs in PR CI canary (one skip: `TestAlternates`, v1-branch-specific).
+31. **Checkpoint policy remote edges** (PR #1509/#1541 area): `9e881cb8c` — local policy ref *ahead* of remote was misclassified as divergence (regression test added for linear-unpushed case); `32e54b0c4` — context cancellation during ancestry traversal treated as divergence + temp policy fetch ref leaked on read failure (tests added); `c6529b2f0` — enforce local policy after sync failure.
+
+## E. OPF pre-push rewrite
+
+32. **PR #1214/#1236 "OPF runs at pre-push"** — architecture deliberately built around remote edge cases: divergence detection (`V1DivergedError`), bootstrap caps (`BootstrapTooLargeError`), CAS-on-conflict local ref update (`V1RefMovedError` — the ref moved between rewrite and CAS), `OPFRuntimeFailedError`. See `strategy/manual_commit_opf_rewrite.go` (sentinel types via `errors.As`) and `docs/security-and-privacy.md`. Regression-worthy: OPF rewrite racing a concurrent checkpoint write; diverged v1 during rewrite.
+33. **Commit `05e15705a`** — failed/skipped OPF compact regeneration used to ship a **stale, less-redacted** `transcript.jsonl`; now drops it and clears the marker (privacy-flavored push bug).
+34. **Commit `626a0344e` (PR #1470)** — OPF progress went to `/dev/tty`; broke non-TTY pushes.
+
+## F. Timeout / hang / transport edge cases
+
+35. **Commit `4dfd7447f` (PR #1282)** — `git push`/`fetch` over `entire://` hung the pre-push hook ~1 hour despite a 2-min timeout: SIGKILL killed `git` but the `git-remote-entire` grandchild held the output pipe, blocking `CombinedOutput()`. Fix: `WaitDelay` + unix process-group kill.
+36. **Commit `2e2c1b73a`** — pre-push blocked ~4 min: initial push and post-sync retry each minted a fresh 2-min timeout; now one shared 60s budget.
+37. **PR #1438** — `git-remote-entire` feeder-goroutine races turned a **server-side-committed** push into a fatal client error: (1) response closed while `io.Copy` mid-read → "use of closed network connection"; (2) socket dropped after send-pack drained report-status and exited 0. Fix: transfer close ownership; treat send-pack exit code as authoritative.
+38. **PR #1148** — v2 rotation: local-only generation numbering (`NextGenerationNumber`) collided across clones; non-FF recovery **tree-merged the old generation back into fresh `/full/current`**, keeping raw transcripts GC-reachable forever; pending publications never cleared on failed push → warning loop. Fix: pending-publication markers + force-with-lease + `4873bceb8` renumber-past-remote-max at push time. Extensive regression coverage listed in the PR. (v2 write paths since removed — historical, but the *pattern* — numbering from local-only state, and recovery-merge resurrecting old data — is regression-worthy for the refs store.)
+39. **Mirror probe bugs**: PR #1327 (probe client refused the node **307 redirect** that `git clone` follows → "cloning..." dots never stop), PR #1320 (probe body not drained → TLS handshake per 2s probe), PR #1357 (clone polling on an **empty upstream** never completes), `60576d5e8`/#1602 (admin-suspended mirror: create exited zero).
+
+## G. Worktrees, clones, resume/attach across machines
+
+40. **PR #1288 "Rewrite relative alternates"** — go-git's `dotgit.Alternates()` mangles relative `objects/info/alternates` (shape of `git clone --shared`/`--reference`); pre-push checkpoint sync couldn't resolve alternate-resident commits though git itself could. Linked worktrees covered via common-dir wrap. Unit + integration + e2e (`TestAlternates_RelativeObjectAlternate_CheckpointSync`).
+41. **Commit `e29ae2e00`** — `resume` single-checkpoint path used `GetMetadataBranchTree` directly → failed on **fresh clones** (no local v1); also `BranchExistsOnRemote` only checked local remote-tracking refs → now falls back to `git ls-remote`. e2e test added (`e2e/tests/resume_remote_test.go`).
+42. **PR #1252/#1251 cross-machine scenarios** above; plus `10969bb7a` "Add cross-machine resume + push-replay integration tests".
+43. **Commit `f61602a81`** — three clones of the same repo at the same commit gave three different `entire why` outputs (#1551): partial/unreadable session records didn't trigger remote refresh; per-checkpoint fetch chains discarded errors (one network timeout per missing checkpoint). Fixed with memoized once-per-resolver refresh; the ~15 "attribution audit round" commits that follow are all small remote-honesty fixes with tests.
+44. **`checkpoint/configloader.go`** (from CLAUDE.md, commit in tree) — go-git's `os.Root` config loader rejects absolute symlinks (dotfile-managed `~/.config`) → global git config silently dropped → checkpoint author "Unknown", signing skipped. Related PR #1278.
+45. **PR #1478** — `mirror list` banner displayed a core the request never dialed (re-resolved via `ResolveControlPlaneTarget` instead of asking the client); fixed with `client.CoreOrigin()`.
+46. **`c5168fa42`** — Lefthook rewrote `.git/hooks/pre-push`, silently removing the Entire session-push hook while Entire stayed enabled. Integration tests exist (`TestUserPromptSubmit_ReinstallsOverwrittenHooks`, `TestHookOverwrite_MidTurnWipe_NextPromptRecovers`).
+
+## Cross-cutting regression themes for a test plan
+
+- **Never move the local v1 ref destructively**: ahead / behind / diverged / disconnected / shallow-boundary × (resume, explain fetch-on-miss, doctor, pre-push) is the single most re-broken matrix (items 1–5, 13).
+- **Cross-clone replay fidelity**: no-op commits, root commits, &gt;1000 commits, double-replay count assertions (6–8).
+- **Remote-target resolution precedence**: origin vs `checkpoint_remote` vs `ENTIRE_CHECKPOINT_TOKEN`-HTTPS vs `entire://`/`file://` non-derivable origin vs *no origin at all* (11, 17–21).
+- **Errors masked as not-found** (git-refs 27, partial-clone 15) — silent data loss / wrong "doesn't exist" answers.
+- **FF-only + fetch-replay recovery** for per-checkpoint refs, and queue durability/compaction (25–29).
+- **Time-of-check/time-of-use on remote hashes** (10, OPF CAS 32).
+- **Hang bounds**: grandchild helper holding pipes, per-attempt timeout stacking (35–36).
+- **Test hermeticity**: any test path that resolves a checkpoint remote can hit live github.com / OS keychain (21, 22, `32e54b0c4` git-config isolation).
+
+Key files: `cmd/entire/cli/strategy/{manual_commit_push.go,push_common.go,push_signing.go,metadata_reconcile.go,common.go,manual_commit_opf_rewrite.go}`, `cmd/entire/cli/git_operations.go`, `cmd/entire/cli/checkpoint/{remote/git.go,refs_store.go,pushqueue.go}`, `cmd/entire/cli/checkpointpolicy/remote.go`, existing regression suites `cmd/entire/cli/strategy/{replay_disconnected_test.go,safely_advance_local_ref_test.go,refs_push_test.go,checkpoint_remote_test.go,hard_reset_test.go}` and `cmd/entire/cli/integration_test/diverged_replay_test.go`.</result>
+<usage><subagent_tokens>113499</subagent_tokens><tool_uses>10</tool_uses><duration_ms>872211</duration_ms></usage>
+</task-notification>

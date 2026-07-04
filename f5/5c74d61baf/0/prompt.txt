@@ -1,0 +1,2073 @@
+yeah let's do 2
+
+---
+
+<task-notification>
+<task-id>aacf965542e77a7f4</task-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/6852b33a-0d22-4364-aa6c-8de706ecc215/tasks/aacf965542e77a7f4.output</output-file>
+<status>failed</status>
+<summary>Background agent "Implement gitRefsStore + treeWriter" was running when the previous Claude Code process exited and did not complete. Its in-process state was lost. Check its worktree/output for partial work before assuming the task landed.</summary>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aae3431c7f240e772</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/68fc4cd3-542e-47f4-812e-c60eaecaaeed/tasks/aae3431c7f240e772.output</output-file>
+<status>completed</status>
+<summary>Agent "Finish gitRefsStore on committed base" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>PR 2 complete. Worker fork report follows.
+
+---
+
+**Task:** Finish PR 2 of the per-checkpoint git-ref checkpoint store on `feat/checkpoint-refs-resolver` — extract the shared subtree core, route git-branch through it (no tree-output change), add `gitRefsStore`, register it, test.
+
+**Commits (on top of the committed foundation `acad3b43b9`):**
+- `959f8f95d4` — Route git-branch writes through shared treeWriter core (no tree-output change)
+- `7aabf09715` — Add git-refs per-checkpoint checkpoint backend
+- `3ca8f0d36e` — Test git-refs store: unit + git-refs-primary/git-branch-mirror seam
+
+**What landed:**
+- **Shared core on `*treeWriter`** (`persistent.go`): `subtreeObjAt` / `flattenExisting` / `buildCheckpointSubtree` + four backing-independent appliers (`applySessionWrite`, `applyTranscriptBackfill`, `applySummaryBackfill`, `applyAttributionBackfill`). `writeCheckpointSummary` now takes the checkpoint-version to stamp. GitStore's four write methods route through the appliers and keep the v1 sharded `basePath`, so the **v1 tree output is byte-identical** (stored `/&lt;shard&gt;/&lt;id&gt;/&lt;n&gt;/…` pointers unchanged). `spliceCheckpointSubtree` reduced to the shard tree-surgery step. Read helpers extracted to free functions over `*FetchingTree` (`readSummaryFromCheckpointTree`, `readSession*FromTree`) and shared by both stores.
+- **`gitRefsStore`** (`refs_store.go`, 332 lines): full `PersistentStore` + `AuthorReader`, one commit per `refs/entire/checkpoints/&lt;shard&gt;/&lt;id&gt;` whose tree root is the checkpoint contents; orphan-then-parented per-checkpoint history; stamps `refs-1`; no Vercel merge; `List` enumerates local refs.
+- **Registered** `git-refs` in the built-in registry with `gitBacked: true`.
+- **Tests**: 8 unit tests + a seam test driving `primary: git-refs, mirror: git-branch` through `checkpoint.Open`.
+
+**Acceptance:** `mise run fmt` clean; `mise run lint` **0 issues** (`dupl` did not fire); `mise run test` **6903 tests pass**; `mise run test:integration` **375 tests pass**. (e2e not run, per instructions.)
+
+**Deviation / finding:** the ULID store-level round-trip the directive requested isn't possible yet — `id.CheckpointID.UnmarshalJSON` accepts **12-hex only**, so a ULID written into `metadata.json` fails to parse on read-back. The ref-naming/sharding layer is ULID-ready (asserted naming-only here + in PR 1's `refs_naming_test`); **end-to-end ULID storage needs `id.Validate`/`UnmarshalJSON` loosened, which belongs with the deferred ULID-generation switch** (touches the `Entire-Checkpoint` trailer regex too). Scoped the test to legacy-hex storage + a ULID naming assertion and documented it in the commit message.
+
+**Out of scope (as planned):** PR 3 (config-driven topology: `ResolveRefs`/push awareness + push-discovery queue + on-demand ref fetch). Until then, selecting `git-refs` as primary writes/reads refs locally but they aren't pushed (`PrePush` still resolves the static v1 topology). OPF remains fully descoped per your earlier call.</result>
+<usage><subagent_tokens>370677</subagent_tokens><tool_uses>68</tool_uses><duration_ms>1677948</duration_ms></usage>
+</task-notification>
+
+---
+
+let's continue, will review then end2end
+
+---
+
+<task-notification>
+<task-id>abe6914a0791e6ade</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/68fc4cd3-542e-47f4-812e-c60eaecaaeed/tasks/abe6914a0791e6ade.output</output-file>
+<status>completed</status>
+<summary>Agent "Map push/fetch/remote machinery" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect! Now I have enough information. Let me compile the comprehensive report:
+
+---
+
+## PUSH/FETCH MACHINERY MAPPING — ENTIRE CLI
+
+### 1. **PrePush Flow** — `cmd/entire/cli/strategy/manual_commit_push.go`
+
+**Function signature (lines 33–124):**
+```go
+func (s *ManualCommitStrategy) PrePush(ctx context.Context, remote string) error
+```
+
+**Full body flow:**
+1. **Lines 38–40:** `resolvePushSettings(ctx, remote)` — resolves push config once (remote name, checkpoint URL, push_disabled flag)
+2. **Lines 42–44:** Early return if `pushDisabled` flag is true (skips all push work)
+3. **Line 46:** `checkpoint.ResolveRefs(ctx)` — returns committed metadata ref topology (`PersistentRefs{Primary, Read, Push}`)
+4. **Lines 53–95:** OPF rewrite path (if enabled) — invokes `RewriteUnpushedV1WithOPF(ctx, repo, ps.pushTarget())` to redact unpushed v1 commits before push
+5. **Lines 99–107:** Core push loop over `refs.Push` (array of `plumbing.ReferenceName`):
+   - For each ref, calls `pushRefIfNeeded(pushCtx, ps.pushTarget(), ref)`
+   - Records errors on perf span, returns on first error
+6. **Lines 113–121:** Post-push cleanup — calls `CleanupPushedShadowBranches(ctx)` only after all refs succeed (non-fatal failures logged)
+
+**`resolvePushSettings` signature (lines 55–96 in `checkpoint_remote.go`):**
+```go
+func resolvePushSettings(ctx context.Context, pushRemoteName string) pushSettings
+```
+
+Returns `pushSettings` struct with:
+- `remote` — git remote name (e.g., "origin")
+- `checkpointURL` — derived URL from `remote.PushURL()` if checkpoint_remote configured
+- `pushDisabled` — true if `push_sessions` set to false
+
+**Push target resolution:**
+- `pushSettings.pushTarget()` (line 35–40 in `checkpoint_remote.go`): Returns `checkpointURL` if set, else `remote` name
+- Calls `remote.PushURL(ctx, pushRemoteName)` (in `checkpoint/remote/util.go`, lines 140–240) to derive checkpoint URL from push remote's protocol when `checkpoint_remote` is configured
+
+**`checkpoint.ResolveRefs` (lines 47–49 in `checkpoint/persistent_refs.go`):**
+```go
+func ResolveRefs(_ context.Context) PersistentRefs {
+    return DefaultV1Refs()
+}
+```
+Returns hardcoded v1 topology:
+```go
+type PersistentRefs struct {
+    Primary plumbing.ReferenceName  // branch: "refs/heads/entire/checkpoints/v1"
+    Read    plumbing.ReferenceName  // same as Primary
+    Push    []plumbing.ReferenceName // [Primary]
+}
+```
+
+---
+
+### 2. **Per-Ref Push Helpers** — `cmd/entire/cli/strategy/push_common.go`
+
+**`pushRefIfNeeded` signature (lines 31–52):**
+```go
+func pushRefIfNeeded(ctx context.Context, target string, ref plumbing.ReferenceName) error
+```
+
+**Behavior:**
+1. Opens repo, gets local ref hash
+2. If local ref doesn't exist, returns nil (nothing to push)
+3. For branch refs (and non-URL targets): calls `hasUnpushedBranchRef()` to check `refs/remotes/&lt;remoteName&gt;/&lt;branch&gt;` tracking ref
+   - If local == remote, skips push (no-op)
+4. Calls `doPushRef(ctx, target, ref)` to actually push
+
+**`doPushRef` signature (lines 84–140):**
+```go
+func doPushRef(ctx context.Context, target string, ref plumbing.ReferenceName) error
+```
+
+**Behavior with timeout:**
+```go
+ctx, cancel := context.WithTimeout(ctx, checkpointPushBudget)  // 2-minute shared budget
+defer cancel()
+```
+
+1. **Lines 91–99:** Prints progress, calls `tryPushRefCommon()` for initial push
+2. **Lines 102–107:** If protected ref error (`GH013`, branch protection), prints block message, returns nil (non-fatal)
+3. **Lines 109–125:** On non-fast-forward, attempts fetch+rebase recovery:
+   - Calls `fetchAndRebaseRefCommon(ctx, target, ref)` (lines 345–474)
+   - Retries push after rebase
+4. **Lines 126–139:** Returns nil on success or non-fatal failure (warnings only)
+
+**`tryPushRefCommon` signature (lines 239–261):**
+```go
+func tryPushRefCommon(ctx context.Context, remoteName string, ref plumbing.ReferenceName) (pushResult, error)
+```
+
+**Git push invocation (lines 240–252):**
+- **Refspec construction:**
+  - **Branch ref:** `refSpec := ref.Short()` — e.g., `"entire/checkpoints/v1"`
+  - **Non-branch ref:** `refSpec := "+" + ref.String() + ":" + ref.String()` — e.g., `"+refs/entire/checkpoints/shard/id:refs/entire/checkpoints/shard/id"` (force, no remote-tracking shadow)
+- **Remote call (line 251):**
+  ```go
+  result, err := remote.Push(ctx, remoteName, refSpec)
+  ```
+  This invokes `git push --no-verify --porcelain &lt;remote&gt; &lt;refSpec&gt;`
+
+**`fetchAndRebaseRefCommon` signature (lines 345–474):**
+```go
+func fetchAndRebaseRefCommon(ctx context.Context, target string, ref plumbing.ReferenceName) error
+```
+
+**Behavior:**
+1. **Lines 347–365:** Resolves fetch target, determines refspec:
+   - For URL targets or non-branch refs: fetches into temp ref `refs/entire-fetch-tmp/&lt;ref&gt;`
+   - For named remotes + branch refs: fetches into `refs/remotes/&lt;remote&gt;/&lt;branch&gt;` (standard tracking ref)
+2. **Lines 376–383:** Calls `remote.Fetch(ctx, FetchOptions{...})` with:
+   - `Remote: fetchTarget`
+   - `RefSpecs: []string{refSpec}`  — e.g., `"+refs/heads/entire/checkpoints/v1:refs/remotes/origin/entire/checkpoints/v1"`
+   - `NoTags: true`
+3. **Lines 400–402:** Reconciles disconnected metadata branches via `ReconcileDisconnectedMetadataRef()`
+4. **Lines 427–473:** Computes cherry-pick rebase of local-only commits onto remote tip:
+   - Uses `collectCommitsSince()` (lines 502–535) to enumerate non-merge commits local..remote
+   - Calls `cherryPickOnto()` to replay them
+
+---
+
+### 3. **Remote Package Primitives** — `cmd/entire/cli/checkpoint/remote/git.go` + `util.go`
+
+**Fetch primitives:**
+
+**`Fetch` signature (lines 68–98 in `git.go`):**
+```go
+func Fetch(ctx context.Context, opts FetchOptions) ([]byte, error)
+```
+
+**Constructs:**
+```bash
+git fetch --no-auto-gc [--no-tags] [--depth=&lt;N&gt; | --unshallow | --depth=1] [--filter=blob:none] &lt;remote&gt; &lt;refSpec...&gt;
+```
+
+**FetchOptions fields:**
+- `Remote: string` — remote name or URL
+- `RefSpecs: []string` — refspecs (e.g., `"+refs/heads/entire/checkpoints/v1:refs/remotes/origin/entire/checkpoints/v1"`)
+- `NoTags: bool`, `Shallow: bool`, `Unshallow: bool`, `Depth: int`, `NoFilter: bool`
+- `ExtraArgs: []string`
+
+**`FetchBlobs` signature (lines 110–126):**
+```go
+func FetchBlobs(ctx context.Context, remote string, hashes []string) error
+```
+
+Uses `git fetch-pack` (plumbing, not porcelain) to fetch specific objects by hash:
+```bash
+git fetch-pack &lt;remote&gt; &lt;hash1&gt; &lt;hash2&gt; ...
+```
+
+**Push primitives:**
+
+**`Push` signature (lines 261–266):**
+```go
+func Push(ctx context.Context, remote, refSpec string) (PushResult, error)
+```
+
+Delegates to `PushWithOptions()`.
+
+**`PushWithOptions` signature (lines 270–291):**
+```go
+func PushWithOptions(ctx context.Context, opts PushOptions) (PushResult, error)
+```
+
+**Constructs:**
+```bash
+git push --no-verify --porcelain &lt;target&gt; &lt;refSpec...&gt;
+```
+
+Where `target` is resolved via `resolvePushCommandTarget()` (lines 537–550):
+- If already URL or local path, use as-is
+- If remote name, calls `PushURL(ctx, target)` to get derived checkpoint URL or fallback
+
+**No batch push:** Each ref is pushed individually in a separate `git push` invocation (line 251 in `push_common.go`).
+
+**Token injection:**
+- All Fetch/Push commands created via `newCommand()` (lines 360–404 in `git.go`)
+- If `ENTIRE_CHECKPOINT_TOKEN` env var set:
+  - Converts SSH targets to HTTPS via `resolveTargetForTokenAuth()`
+  - Injects `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_*`, `GIT_CONFIG_VALUE_*` env vars with `Authorization: Basic &lt;base64(x-access-token:&lt;token&gt;)&gt;` header
+
+---
+
+### 4. **Read Bootstrap / Blob Fetch Wiring** — `cmd/entire/cli/checkpoint/open.go` + `git_operations.go`
+
+**`checkpoint.Open` signature (lines 50–74 in `open.go`):**
+```go
+func Open(ctx context.Context, repo *git.Repository, opts OpenOptions) (*Stores, error)
+```
+
+**OpenOptions (lines 13–25):**
+```go
+type OpenOptions struct {
+    BlobFetcher BlobFetchFunc  // nil leaves fetching off
+    Refs        *PersistentRefs // nil uses DefaultV1Refs()
+}
+```
+
+**BlobFetcher wiring (lines 126–127, 140–141):**
+- Both git-branch and git-refs backends call `store.SetBlobFetcher(env.BlobFetcher)` if `env.BlobFetcher != nil`
+- BlobFetcher is used by `FetchingTree` (lines 45–51 in `fetching_tree.go`):
+  ```go
+  func NewFetchingTree(ctx context.Context, tree *object.Tree, s storer.EncodedObjectStorer, fetch BlobFetchFunc) *FetchingTree
+  ```
+
+**Caller injection (lines 206, 277, 411 in `resume.go`):**
+```go
+stores, err := checkpoint.Open(ctx, repo, checkpoint.OpenOptions{BlobFetcher: FetchBlobsByHash})
+```
+
+**`FetchBlobsByHash` (lines 546–577 in `git_operations.go`):**
+```go
+func FetchBlobsByHash(ctx context.Context, hashes []plumbing.Hash) error
+```
+
+1. **Line 554:** Resolves fetch target via `resolveCheckpointFetchTarget(ctx)` — defers to `remote.FetchURL()` for checkpoint remote URL
+2. **Line 561:** Calls `remote.FetchBlobs(ctx, fetchTarget, hashStrs)` to fetch by hash
+3. **Lines 568–572:** On failure, falls back to:
+   - `FetchMetadataFromCheckpointRemote(ctx)` (full metadata from checkpoint remote)
+   - Then `FetchMetadataBranch(ctx)` (full metadata from origin)
+
+**Bootstrap fetch for reads (lines 212–214, 284–286 in `resume.go`):**
+```go
+if refs.ReadBootstrappableFromOrigin() {
+    promoteRemoteTrackingPrimary(ctx, repo, refs)
+}
+```
+
+**`ReadBootstrappableFromOrigin()` definition (lines 34–38 in `persistent_refs.go`):**
+```go
+func (r PersistentRefs) ReadBootstrappableFromOrigin() bool {
+    return r.Read == r.Primary &amp;&amp; r.PrimaryFetchableFromOrigin()
+}
+```
+
+Returns true when:
+- Read ref == Primary ref (default: both point to `refs/heads/entire/checkpoints/v1`)
+- Primary is a branch with a remote-tracking ref (`refs/remotes/origin/entire/checkpoints/v1`)
+
+When true, `promoteRemoteTrackingPrimary()` makes missing committed ref fetchable from origin by updating local ref to remote-tracking ref if missing.
+
+---
+
+### 5. **Git Common Dir Helper** — `cmd/entire/cli/session/state.go` + `strategy/common.go`
+
+**Function name + signature (lines 705–707 in `session/state.go`):**
+```go
+func GetGitCommonDir(ctx context.Context) (string, error)
+```
+
+**Wrapper delegates to (lines 713–748):**
+```go
+func getGitCommonDir(ctx context.Context) (string, error) {
+    // Cached per working directory
+    cmd := exec.CommandContext(ctx, "git", "rev-parse", "--git-common-dir")
+    cmd.Dir = "."
+    output, err := cmd.Output()
+    // ... returns .git (or .git/worktrees/..main .git for regular repos, shared .git for worktrees
+    return filepath.Clean(commonDir), nil
+}
+```
+
+**Also in `strategy/common.go` (lines 1079–1096):**
+```go
+func GetGitCommonDir(ctx context.Context) (string, error)
+```
+
+Same implementation (uncached version).
+
+**Existing flock helper** — `cmd/entire/cli/internal/flock/flock_unix.go`:
+
+**Function signature (lines 20–30):**
+```go
+func Acquire(path string) (release func(), err error)
+```
+
+**Behavior:**
+1. Opens file (creates if missing, mode 0o600)
+2. Acquires exclusive advisory lock via `syscall.Flock(..., LOCK_EX)`
+3. Returns cleanup function that closes file (drops lock)
+
+**Usage example (lines 145–147 in `checkpoint/shadow_ref.go`):**
+```go
+release, err := flock.Acquire(path)
+// ... do work with lock held
+release()
+```
+
+Also used in `settings/settings.go` (line 727) for atomic settings writes.
+
+---
+
+### 6. **PrePush Registration** — `cmd/entire/cli/hooks_git_cmd.go`
+
+**Hook entrypoint (lines 230–272):**
+```go
+func newHooksGitPrePushCmd() *cobra.Command {
+    return &amp;cobra.Command{
+        Use:   "pre-push &lt;remote&gt;",
+        Short: "Handle pre-push git hook",
+        Args:  cobra.ExactArgs(1),
+        RunE: func(cmd *cobra.Command, args []string) error {
+            // ...
+            hookErr := g.strategy.PrePush(g.ctx, remote)  // Line 253
+            // ...
+            return fmt.Errorf("pre-push: %w", hookErr)
+        },
+    }
+}
+```
+
+**Git hook command registration (line 130 in `hooks_git_cmd.go`):**
+```go
+cmd.AddCommand(newHooksGitPrePushCmd())
+```
+
+**Hook script generation (lines 234–240 in `strategy/hooks.go`):**
+```go
+{
+    name: "pre-push",
+    content: fmt.Sprintf(`#!/bin/sh
+# %s
+# Pre-push hook: push session logs alongside user's push
+# $1 is the remote name (e.g., "origin")
+%s
+`, entireHookMarker, prePushCmd),
+}
+```
+
+Where `prePushCmd` is constructed as (line 199):
+```go
+prePushCmd := gitHookCommand(cmdPrefix, `pre-push "$1"`, false)
+```
+
+**Full hook invocation chain:**
+1. Git calls `.git/hooks/pre-push &lt;remote_name&gt;`
+2. Hook script invokes: `entire hooks git pre-push "$1"`
+3. Cobra routes to `newHooksGitPrePushCmd().RunE()`
+4. Calls `g.strategy.PrePush(g.ctx, remote)` where `remote = args[0]`
+
+**Error handling (lines 256–269):**
+- PrePush privacy-critical errors (OPF rewrite failures) are propagated as non-zero exit
+- Transient checkpoint-push failures are logged and swallowed (return nil from PrePush)
+
+---
+
+## Summary: File Locations + Key Signatures
+
+| Component | File | Signature/Line |
+|-----------|------|---------|
+| **PrePush** | `strategy/manual_commit_push.go` | `PrePush(ctx, remote) error` @ lines 33–124 |
+| **resolvePushSettings** | `strategy/checkpoint_remote.go` | `resolvePushSettings(ctx, pushRemoteName) pushSettings` @ lines 55–96 |
+| **ResolveRefs** | `checkpoint/persistent_refs.go` | `ResolveRefs(ctx) PersistentRefs` @ lines 47–49 |
+| **pushRefIfNeeded** | `strategy/push_common.go` | `pushRefIfNeeded(ctx, target, ref) error` @ lines 31–52 |
+| **doPushRef** | `strategy/push_common.go` | `doPushRef(ctx, target, ref) error` @ lines 84–140 |
+| **tryPushRefCommon** | `strategy/push_common.go` | `tryPushRefCommon(ctx, remoteName, ref) (pushResult, error)` @ lines 239–261 |
+| **fetchAndRebaseRefCommon** | `strategy/push_common.go` | `fetchAndRebaseRefCommon(ctx, target, ref) error` @ lines 345–474 |
+| **remote.Push** | `checkpoint/remote/git.go` | `Push(ctx, remote, refSpec) (PushResult, error)` @ lines 261–266 |
+| **remote.PushWithOptions** | `checkpoint/remote/git.go` | `PushWithOptions(ctx, opts PushOptions) (PushResult, error)` @ lines 270–291 |
+| **remote.Fetch** | `checkpoint/remote/git.go` | `Fetch(ctx, opts FetchOptions) ([]byte, error)` @ lines 68–98 |
+| **remote.FetchBlobs** | `checkpoint/remote/git.go` | `FetchBlobs(ctx, remote, hashes) error` @ lines 110–126 |
+| **remote.PushURL** | `checkpoint/remote/util.go` | `PushURL(ctx, pushRemoteName) (string, bool, error)` @ lines 140–240 |
+| **checkpoint.Open** | `checkpoint/open.go` | `Open(ctx, repo, opts OpenOptions) (*Stores, error)` @ lines 50–74 |
+| **BlobFetchFunc** | `checkpoint/fetching_tree.go` | Type alias @ line 18 |
+| **FetchBlobsByHash** | `git_operations.go` | `FetchBlobsByHash(ctx, hashes) error` @ lines 546–577 |
+| **GetGitCommonDir** | `session/state.go` | `GetGitCommonDir(ctx) (string, error)` @ lines 705–707 |
+| **flock.Acquire** | `internal/flock/flock_unix.go` | `Acquire(path) (release func(), err error)` @ lines 20–30 |
+| **newHooksGitPrePushCmd** | `hooks_git_cmd.go` | `newHooksGitPrePushCmd() *cobra.Command` @ lines 230–272 |</result>
+<usage><subagent_tokens>66662</subagent_tokens><tool_uses>33</tool_uses><duration_ms>92855</duration_ms></usage>
+</task-notification>
+
+---
+
+run canary
+
+---
+
+<task-notification>
+<task-id>ac43a75fe36a230e0</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/68fc4cd3-542e-47f4-812e-c60eaecaaeed/tasks/ac43a75fe36a230e0.output</output-file>
+<status>completed</status>
+<summary>Agent "Make e2e testutil backend-aware" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Committed. Reporting back.
+
+---
+
+**Task:** make the e2e harness backend-aware so the canary runs against both checkpoint stores.
+
+**Outcome:** harness work done and committed; git-branch fully green; git-refs is no longer blocked by the harness — the remaining failures are **real CLI read-path bugs** (stopped and reporting per directive, did not paper over).
+
+**Commit:** `b05d15d187` "Make e2e harness backend-aware (git-branch + git-refs)"
+- New `e2e/testutil/backend.go`: `checkpointStoreMode`/`UsingGitRefs` (reads `E2E_CHECKPOINT_STORE`/`ENTIRE_CHECKPOINTS_PRIMARY`), `CheckpointState` (advance digest — v1 hash vs `for-each-ref refs/entire/checkpoints/**`), `checkpointBlobSpec` (metadata read path), `checkpointRefName`/`checkpointShard`, `CheckpointsPresent`.
+- `e2e/testutil/{repo.go,assertions.go,artifacts.go}`: routed every v1-branch assumption through those helpers (advance detection, metadata reads, `CheckpointIDs`, `NewCheckpointCommits`, `PushCheckpointRefs`, `CurrentCheckpointRef`, artifact capture). Removed `CheckpointVerifyRef` in favor of `CheckpointsPresent`.
+- `e2e/tests/`: converted direct `rev-parse entire/checkpoints/v1` and `CheckpointVerifyRef` sites (`session_lifecycle`, `edge_cases`, `rewind`, `resume_remote`, `explain`, `attach`); skipped the v1-branch-specific `TestAlternates_RelativeObjectAlternate_CheckpointSync` under git-refs with a reason.
+
+**Verification (tails):**
+- `mise run test:e2e:canary` (git-branch): vogon **59/59**, roger-roger **4/4** — unchanged.
+- `E2E_CHECKPOINT_STORE=git-refs mise run test:e2e:canary`: roger-roger **4/4**; vogon **49/59, 1 skipped** (was 0 passing before this commit).
+- `go vet -tags e2e ./e2e/...` clean; `mise run fmt &amp;&amp; mise run lint` → 0 issues.
+
+**Real bugs surfaced under git-refs (NOT fixed — outside harness scope; flagging per directive).** All 9 vogon failures trace to two production read-path gaps:
+1. **`cmd/entire/cli/checkpointpolicy/format.go:24`** — `CheckpointFormat` parsing rejects `checkpoint_version "refs-1"` (`invalid checkpoint format "refs-1"`). Breaks `entire checkpoint explain` on every git-refs checkpoint. The git-refs store (PR2) stamps `refs-1` but the policy package only knows `branch-v1`.
+2. **`cmd/entire/cli/resume.go:823`** — resume/attach has a hardcoded `entire/checkpoints/v1`-branch availability check ("…the entire/checkpoints/v1 branch is not available locally…") instead of resolving the checkpoint through the store, so it never finds git-refs checkpoints.
+
+Failing tests (all attributable to the two above): `TestExplainCheckpoint`, `TestExplainCheckpointFromClonedRepo`, `TestAttachSessionCreatesCheckpoint`, `TestResumeFromClonedRepo`, `TestResumeFromFeatureBranch`, `TestResumeMetadataBranchAlreadyLocal`, `TestResumeOlderCheckpointWithNewerCommits`, `TestResumeSquashMergeMultipleCheckpoints`, `TestRewindSquashMergeMultipleCheckpoints`.
+
+**Suggested follow-up (separate, production CLI work):** teach `checkpointpolicy` to accept `refs-1`, and route resume/attach/explain checkpoint resolution through the store (`checkpoint.Open`) instead of the v1 branch. That should clear all 9.
+
+**Remaining v1-branch assumptions I did NOT convert (intentional):** `TestAlternates_…` (skipped under git-refs — exercises the v1 branch's non-fast-forward push/rebase-over-alternate sync, which has no analog in the force-pushed independent per-checkpoint refs).</result>
+<usage><subagent_tokens>485682</subagent_tokens><tool_uses>63</tool_uses><duration_ms>42285459</duration_ms></usage>
+</task-notification>
+
+---
+
+refs-v1 is good, what's the intentional vogon skip?
+
+---
+
+One more question: how does pulling missing refs works now?
+
+---
+
+why would we have a partial prefix, that's not really a scenario we need to support, or what do I miss?
+
+---
+
+but we should not truncate checkpoint ids anyway.
+
+---
+
+but we should not truncate checkpoint ids anyway it's not a commit sha where that makes sense, also bonus thing to check on all the work so far: using an ULID now is working in all places?
+
+---
+
+so should we reorganize this and first do support for ULIDs in a PR and then build on top of that?
+
+---
+
+The last one is a good question. Initial idea was to go with the new format for refs, this makes the lookup also easier. For ULIDs we only need to check refs stores for now, branch has the old format if you migrate the old id might also be in the refs. But that couples one design choice with a different one, right?
+
+---
+
+yes, so let's track this decision on the issue then maybe as a comment, and start working on that ULID understanding layer next and leave this until that is in?
+
+---
+
+<task-notification>
+<task-id>a3f4fe2daf730fa88</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/68fc4cd3-542e-47f4-812e-c60eaecaaeed/tasks/a3f4fe2daf730fa88.output</output-file>
+<status>completed</status>
+<summary>Agent "Build ULID understanding layer" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Task complete — the ULID "understanding" layer is in on `feat/checkpoint-ulid-support`, all green. Generation still emits hex (out of scope); this is purely additive recognition/validation/resolution of both formats.
+
+**Commits**
+- `f255f874d` Recognize ULID checkpoint IDs alongside legacy hex — id package: `ULIDPattern`/`ulidRegex`, `Kind`/`KindOf`/`CheckpointID.Kind`, `ShardFor` (first-2 hex / last-2 ULID), `CheckpointPattern` (hex|ULID), and widened `Validate`/`NewCheckpointID`/`UnmarshalJSON` (invalid only when `KindOf==KindUnknown`; empty-string handling unchanged). `Generate()` left at 12-hex with a comment that ULID emission is a separate store-coupled change. Tests added (KindOf table incl. excluded I/L/O/U, ShardFor, Validate-both, ULID JSON round-trip).
+- `44f24405d` Accept ULID checkpoint IDs in the trailer parser and e2e asserts — `checkpointTrailerRegex` now uses `id.CheckpointPattern`; e2e `AssertCheckpointIDFormat` (`hexIDPattern`→`checkpointIDPattern`) accepts hex or ULID. Trailer tests added (ULID trailer; mixed hex+ULID squash).
+
+**Verify tails**
+- `mise run fmt` — clean.
+- `mise run lint` — `0 issues`. (First attempt hit a transient "parallel golangci-lint is running" lock from a concurrent run; retried clean.)
+- `mise run test` — `DONE 6891 tests, 4 skipped`.
+- `mise run test:integration` — `DONE 375 tests`.
+- `go vet -tags e2e ./e2e/...` — clean.
+- `mise run test:e2e:canary` (git-branch default) — vogon 59/59, roger-roger 4/4 (unchanged, as expected: generation still hex).
+
+**Sweep findings** (grepped `{12}`, `id.Pattern`, "12 … hex" in cmd/ + e2e/):
+- **Widened (checkpoint IDs):** id package gates, the trailer regex, the e2e assert — all done above.
+- **Left hex (not checkpoint IDs):**
+  - `id.Pattern` itself — kept 12-hex by design; it's reused for *run IDs*.
+  - `investigate/state.go` + `provenance/env.go` `runIDPattern` — **run IDs**.
+  - `trail/trail.go` `idRegex` — the **trail** feature's own 12-hex `ID` type (separate concept).
+  - `explain.go` `abbreviateCommitHash` — **commit SHA** abbreviation.
+
+Nothing required ULID *generation* to test, and no ambiguity beyond the classifications above. Two commits on the branch; not pushed, no PR opened.</result>
+<usage><subagent_tokens>546548</subagent_tokens><tool_uses>32</tool_uses><duration_ms>461305</duration_ms></usage>
+</task-notification>
+
+---
+
+can you run /simplify on the ulid-support branch, also wondering should we have a bunch of tests work in table mode testing both old and new format or do we think the test shape is good?
+
+---
+
+<task-notification>
+<task-id>a14c0e1039941d689</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/68fc4cd3-542e-47f4-812e-c60eaecaaeed/tasks/a14c0e1039941d689.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplify review: efficiency" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Now I'll analyze the diff for efficiency issues, focusing on hot paths (Validate/KindOf/ShardFor called on every checkpoint read/write/trailer parse).
+
+## Efficiency Review Findings
+
+**Finding 1: Double regex matching in hot path**
+- **File:** `cmd/entire/cli/checkpoint/id/id.go`, line 123
+- **Summary:** `Validate()` calls `KindOf(s)` which runs both regex matchers; callers needing validation alone re-run both patterns.
+- **Cheaper form:** Cache `KindOf()` result: `kind := KindOf(s); if kind == KindUnknown { return error }` avoids re-matching in Validate when classification is already done upstream.
+
+**Finding 2: Double regex matching in ShardFor**
+- **File:** `cmd/entire/cli/checkpoint/id/id.go`, line 89
+- **Summary:** `ShardFor()` calls `id.Kind()` which runs both regex matchers. If caller already classified the ID (via `KindOf`), this re-matches both patterns unnecessarily on hot path.
+- **Cheaper form:** Add a `ShardForKind(kind Kind, s string) string` helper accepting pre-computed Kind, so callers doing `kind := KindOf(s); shard := ShardForKind(kind, s)` avoid re-matching.
+
+**Finding 3: Regex compiled per-call in e2e assertions (lower priority, not loop-critical)**
+- **File:** `e2e/testutil/assertions.go`, line 348
+- **Summary:** `checkpointIDPattern` is now a module-level var (correctly compiled once), so this is **already efficient**.
+
+**Summary:**
+Two actionable efficiency wins on the hot path:
+1. Validate → KindOf double-match (line 123): consider accepting pre-classified kinds
+2. ShardFor → Kind double-match (line 89): add a Kind-accepting variant for callers that already classified
+
+The diff's pattern constants and package-level regex vars (checkpointIDRegex, ulidRegex, checkpointTrailerRegex) are correctly optimized. The e2e assertion is also efficient. No correctness bugs found.</result>
+<usage><subagent_tokens>20525</subagent_tokens><tool_uses>7</tool_uses><duration_ms>16271</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a7c33e8ea13c94289</task-id>
+<tool-use-id>toolu_01GLujPS9aCayFFd6L7Td2kd</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/68fc4cd3-542e-47f4-812e-c60eaecaaeed/tasks/a7c33e8ea13c94289.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplify review: simplification" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect. Now I have all the context I need. Let me analyze the diff systematically for simplification opportunities.
+
+## Simplification Review
+
+Based on my analysis of the diff, here are the actionable simplification findings:
+
+**1. Redundant KindOf wrapper in Kind() method**
+- **File**: `cmd/entire/cli/checkpoint/id/id.go`, lines 76-79
+- **Issue**: The receiver method `Kind()` simply wraps `KindOf()` by converting to string and back. This indirection is unnecessary.
+- **Simpler form**: Remove the receiver method; have callers use `KindOf(string(id))` directly. If the method is for API aesthetics, add a comment explaining why it exists. Currently it adds a layer without benefit since `ShardFor()` (line 99) already calls `id.Kind()`, which calls `KindOf()` — three levels when one call suffices.
+
+**2. Pattern composition could be inlined in CheckpointPattern**
+- **File**: `cmd/entire/cli/checkpoint/id/id.go`, lines 27, 33, 38
+- **Issue**: `CheckpointPattern` is defined as a composition of `Pattern` and `ULIDPattern` constants. While this is intentional for reusability, the non-capturing group syntax `(?:...|...)` is only used in `CheckpointPattern` itself — no caller directly substitutes `Pattern` alone into a larger pattern anymore (except the regex variables which reference it directly).
+- **Assessment**: This is actually fine as-is — the composition is deliberate for clarity and avoids duplication. The comment warns against widening `Pattern` itself, which is the right design. No simplification needed here.
+
+**3. Redundant regex wrapping in KindOf**
+- **File**: `cmd/entire/cli/checkpoint/id/id.go`, lines 65-74
+- **Issue**: `KindOf()` calls `MatchString()` on pre-compiled regexes (`checkpointIDRegex`, `ulidRegex`). This is good practice, but the switch statement is the cleanest form already.
+- **Assessment**: Pattern is simple and necessary. No simplification.
+
+**4. ShardFor calls Kind() unnecessarily**
+- **File**: `cmd/entire/cli/checkpoint/id/id.go`, lines 84-93
+- **Issue**: Line 99 calls `id.Kind()` which calls `KindOf()` which runs both regex checks. But `ShardFor()` only needs to differentiate ULID from others. Running both regexes is wasteful — you could call `KindOf()` once and reuse the result, OR just check `ulidRegex` directly (since non-ULID defaults to prefix shard).
+- **Simpler form**: `func (id CheckpointID) ShardFor() string { s := string(id); if len(s) &lt; 2 { return s }; if ulidRegex.MatchString(s) { return s[len(s)-2:] }; return s[:2] }` — eliminates the `Kind()` call and one wasted regex check.
+
+**5. Test coverage for TestCheckpointID_Methods is redundant**
+- **File**: `cmd/entire/cli/checkpoint/id/id_test.go`, lines 11-36 (existing test)
+- **Issue**: Not in the diff itself, but the `Path()` test at line 29-35 is redundant since `TestCheckpointID_Path` (line 227+) covers it more thoroughly with table-driven tests including edge cases.
+- **Assessment**: This is pre-existing, not added by the diff, so outside scope.
+
+**6. Test case duplication in TestNewCheckpointID and TestValidateAcceptsBothFormats**
+- **File**: `cmd/entire/cli/checkpoint/id/id_test.go`, lines 244-254 and 38-103
+- **Issue**: `TestValidateAcceptsBothFormats()` tests the same inputs (`"a1b2c3d4e5f6"`, `sampleULID`, `"nope"`) that are already covered in `TestNewCheckpointID` table. The function adds no new validation logic beyond what `Validate()` already does in `NewCheckpointID()`.
+- **Simpler form**: Merge `TestValidateAcceptsBothFormats()` into the existing `TestNewCheckpointID` table or remove it entirely since the same cases are tested via the `NewCheckpointID` path.
+
+**7. Variable naming in assertions.go**
+- **File**: `e2e/testutil/assertions.go`, line 30 (was line 345 in old file, renamed from `hexIDPattern`)
+- **Issue**: Renamed from `hexIDPattern` to `checkpointIDPattern` is good, but the regex itself duplicates the pattern defined in `id.go` as `CheckpointPattern`. The string is inlined rather than imported.
+- **Assessment**: This is a test utility file, and re-defining the pattern avoids an import cycle risk. Acceptable trade-off.
+
+---
+
+## Summary
+
+**Real simplification opportunity:**
+
+| File | Line(s) | Finding | Simpler Form |
+|------|---------|---------|--------------|
+| `cmd/entire/cli/checkpoint/id/id.go` | 84-93 (`ShardFor`) | Calls `id.Kind()` which runs both regexes; only needs to check ULID | Check `ulidRegex.MatchString(s)` directly instead of `id.Kind() == KindULID` |
+
+The other findings (Kind() wrapper, test duplication, redundant validation tests) are minor style issues; the ShardFor optimization is the only one that reduces actual work (saves a regex pass per call).</result>
+<usage><subagent_tokens>36185</subagent_tokens><tool_uses>10</tool_uses><duration_ms>25016</duration_ms></usage>
+</task-notification>
+
+---
+
+let's open a PR for layer a then, this can be reviewed / merged independently, right?
+
+---
+
+can you look at the comment on 1546
+
+---
+
+Minor non-blocking cleanup:
+ - cmd/entire/cli/checkpoint/id/id.go still has a top-level comment saying CheckpointID is
+   a 12-character hex identifier; that should probably be updated to mention ULIDs.
+ - trailers.go’s CheckpointTrailerKey comment still says format is 12 hex characters.
+
+---
+
+since we are going to generate ULIDs in the future, I think it should be fine to directly pull in oklog/ulid/v2 and use that for validation?
+
+---
+
+Finding:
+ - e2e/testutil/assertions.go:29-32 / :168-173 — AssertCheckpointIDFormat still uses
+   CheckpointPattern, but CheckpointPattern is now intentionally a loose extraction regex.
+   It accepts ULID-shaped strings that production validation rejects, e.g. timestamp
+   overflow starting with 8-Z. Since this helper claims to assert a “valid checkpoint ID”,
+   it should probably call checkpointid.Validate(checkpointID) instead of regex matching.
+
+---
+
+const ULIDPattern = `[REDACTED]{26}`
+
+is this still needed after the switch to the ulid package?
+
+---
+
+can you double check if all the comments are still needed and relevant?
+
+---
+
+let's leave the ulid part, what's open with the other PRs?
+
+---
+
+yeah do a)
+
+---
+
+ok, PRs have merged, can you take a look what's the best next step
+
+---
+
+we have A,B,C,D all done as branches so just need to open them? is there value in keeping them separate apart from a devcycle point of view or is reviewing them together better anyway?
+
+---
+
+do the suggested 2 PR approach
+
+---
+
+<task-notification>
+<task-id>ad4fdd31f14618e3e</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/68fc4cd3-542e-47f4-812e-c60eaecaaeed/tasks/ad4fdd31f14618e3e.output</output-file>
+<status>completed</status>
+<summary>Agent "Reconstruct PR2 git-refs feature" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Both canary modes green — **git-refs 58/59 +1 expected skip, roger 4/4; git-branch unchanged 59/59 + 4/4.** PR 2 is complete and verified. Stopping per directive (not pushed, no PR opened).
+
+---
+
+**Task:** Build PR 2 (git-refs checkpoint backend) stacked on `feat/checkpoint-treewriter` (#1556), reconstructed from the parked branch against current main.
+
+**Branch:** `feat/checkpoint-git-refs` (on top of `feat/checkpoint-treewriter`), 7 commits:
+- `be6c71f69` ref resolver (ShardFor + Kind() + RefName/ParseRef)
+- `496c298ec` git-refs store + registry + shared tree-read helpers + push queue
+- `174ca5859` config-aware pre-push (queue drain + batch force-push)
+- `f8f714d61` on-demand ref fetch for reads
+- `06ddcba6c` refs-v1 read/write policy + explain-on-clone fetch
+- `3f418b77f` e2e backend-aware harness + `E2E_CHECKPOINT_STORE` + settings env override + CI workflow
+- `9c8e… ` (HEAD) flip strategy policy tests to refs-v2
+
+**Acceptance (all green):**
+- `mise run lint` — 0 issues (dupl quiet → treeWriter core genuinely shared from PR 1)
+- `mise run test` — 7145 pass, 4 skipped
+- `mise run test:integration` — 378 pass
+- `go vet -tags e2e ./e2e/...` — clean
+- canary git-branch — vogon 59/59, roger 4/4 (unchanged)
+- `E2E_CHECKPOINT_STORE=git-refs` canary — vogon 58/59 (+1 skip: TestAlternates), roger 4/4
+
+**Conflicts resolved (main wins, refs-delta re-applied):**
+- `id.go`/`registry.go`/`open.go`/`fetching_tree.go` — added ShardFor/Kind(), git-refs registration, RefFetcher field/factory, PrimaryIsRefs onto main's oklog-era versions.
+- `persistent.go` — re-applied the shared tree-read helper extraction (git-branch reader delegates to `readSummaryFromCheckpointTree`/`readSession*FromTree`) on top of PR 1's write refactor.
+- `settings/checkpoints.go` — env override (`ENTIRE_CHECKPOINTS_PRIMARY`/`_MIRRORS`) composes with main's `io/fs`/os.Root reads (override is `os.Getenv` only).
+- `checkpointpolicy/format.go` — `refsV1Format` added to both `readFormats` and `writeFormats` (main grew a `writeFormats`/`CanWrite` since the parked branch).
+- `e2e/testutil/assertions.go` — took the parked backend-aware version, then re-applied #1546's `Validate`-based `AssertCheckpointIDFormat` (dropped `hexIDPattern`/`regexp`, added `checkpointid` import). All other e2e files were wholesale-clean (main == base).
+- `CheckpointVersionRefsV1 = "refs-v1"` (not the stale `refs-1`).
+
+**Tests flipped refs-v1 → refs-v2** (refs-v1 is now read+write-supported, so the "unsupported stand-in" moved to refs-v2): cli (`checkpoint_policy_read/warning/_test`, `explain_export_test`, `explain_test`, `resume_test`, `attach_test`), `checkpointpolicy/*_test`, and `strategy/checkpoint_policy_test.go`. `checkpointpolicy/format_test` now positively asserts refs-v1 is read/write-supported.
+
+**Judgment calls:** made `refs-v1` write-supported (not just read) since the git-refs store writes it; folded the push queue into the store commit (the store's `setRef` enqueues, so it must compile together); `TestAlternates` skips under git-refs (v1-branch-specific alternate-object sync, no analog for force-pushed independent refs).
+
+**Not done (per scope):** not pushed, no PR opened — awaiting your review of the branch.</result>
+<usage><subagent_tokens>835993</subagent_tokens><tool_uses>85</tool_uses><duration_ms>13061131</duration_ms></usage>
+</task-notification>
+
+---
+
+hmm, I can't run .github/workflows/e2e-checkpoint-store.yml before actually merging, or?
+
+---
+
+do 2 and let's do a small PR adding the workflow on it's own, can we juszt merge it or will it break things ?
+
+---
+
+on 1556:
+
+sessionMetadataPath := fmt.Sprintf("%s%d/%s", basePath, latestIndex, paths.MetadataFileName)
+
+
+isn't there a / missing between basePath and latestIndex?
+
+---
+
+could we use something that just joins paths and does the right thing instead?
+
+---
+
+let's do the PR as you suggested, I can pass the link to the reviewer that just asked me about the current code
+
+---
+
+can you also rebase 1566 onto main, so we get the workflow change it and I can run the E2e suite
+
+---
+
+yeah let's do 1+2 as suggested on 1566
+
+---
+
+question: given that a "was changed on both ends" is pretty rare for a ref, and for sure it has no multiplayer problem as the single branch for the current branch store, we could also just do the same rebuilding, like fetch remote, put local on top instead. It should happen rarely but would just be an easy way out
+
+---
+
+I thought we changed it to a none force push in the changes before?
+
+---
+
+yes, please add
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>aa10b541e37ffe34c</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/68fc4cd3-542e-47f4-812e-c60eaecaaeed/tasks/aa10b541e37ffe34c.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplify review: reuse" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Now let me generate my findings. Let me create a summary document with all findings:
+
+## REUSE ANALYSIS: Checkpoint Git-Refs Backend Diff
+
+Based on my analysis of the codebase, here are the findings organized by focus area:
+
+### 1. **pushCheckpointRefWithRecovery (push_common.go, lines 65-88)**
+
+**Finding:** APPROPRIATE REUSE - No duplication detected.
+
+This function appropriately reuses existing helpers:
+- Calls `batchPushRefs()` (new function in same file) for the initial push
+- Calls `fetchAndRebaseRefCommon()` (existing at line 410) for fetch+replay recovery
+- Shares the timeout budget pattern via `checkpointPushBudget` (existing at line 145)
+
+The implementation mirrors `doPushRef()` (line 149) which handles branch refs with the same recovery pattern (fetch+rebase on non-fast-forward). This is intentional and correct — checkpoint refs reuse the shared recovery infrastructure rather than reimplementing it.
+
+**No action needed.**
+
+---
+
+### 2. **prePushCheckpointRefs batch-then-per-ref loop (manual_commit_push.go, lines 187-195)**
+
+**Finding:** APPROPRIATE PATTERN - No duplication detected.
+
+The per-ref loop in `prePushCheckpointRefs()` is a bespoke orchestration for checkpoint refs:
+- Lines 187-195: Per-ref push with recovery + selective queue removal
+- No existing helper loops this pattern across all strategy code
+
+The only other per-ref push loop is `PrePush()` at line 112, which calls `pushRefIfNeeded()` for the v1-branch path. That path is fundamentally different (different remote-tracking logic, different recovery) and doesn't apply to per-checkpoint refs.
+
+**No action needed.**
+
+---
+
+### 3. **Test helpers: `mustRefName`, `remoteRefHash`, `remoteRefFiles`, `runGit` (refs_push_test.go, lines 418-607)**
+
+**Finding:** PARTIAL DUPLICATION - Some reusable helpers exist; others are test-specific.
+
+Breakdown:
+
+a) **`mustRefName()` (lines 418-424)** — Duplicate exists
+   - Also defined at `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/checkpoint/refs_naming_test.go:89-95`
+   - Both wrap `RefName()` with a `require.NoError(t, err)` pattern
+   - **Action:** Use the existing `checkpoint.mustRefName()` from refs_naming_test.go in refs_push_test.go instead of redefining it. Since refs_push_test.go imports `checkpoint`, a single shared definition in checkpoint/refs_naming_test.go or checkpoint/testhelpers.go would eliminate duplication.
+
+b) **`remoteRefHash()` and `remoteRefFiles()` (lines 596-607 and 205-213)** — No duplicates found
+   - These are bare-remote inspection helpers specific to the refs_push_test context
+   - No existing equivalents in testutil or elsewhere
+   - **Action:** Acceptable to keep here; too test-specific to generalize.
+
+c) **`runGit()` (closure at line 515)** — Multiple variants exist
+   - Equivalent helpers: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/testutil/testutil.go` has `GitAdd()`, `GitCommit()`, `GitReset()` that call git
+   - Also: `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/fetch_no_config_pollution_test.go:94` has its own `runGit()`
+   - The inline closure is used only once (line 515-522) for git subcommands; testutil's helpers are higher-level (staged operations)
+   - **Action:** Acceptable. The inline closure is a low-level "run any git command" helper; testutil provides higher-level abstractions that don't fit this test's needs.
+
+**Actionable item:** Consolidate `mustRefName` definitions. Move one to a shared checkpoint testhelper or export from refs_naming_test.go.
+
+---
+
+### 4. **RefName() validation (refs_naming.go, lines 68-72)**
+
+**Finding:** APPROPRIATE PATTERN - Validation is new, no duplication.
+
+- The check `if cid.Kind() == id.KindUnknown` is the idiomatic validation pattern
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/checkpoint/id/id.go:92-93` defines `Kind()` method and `KindUnknown` constant
+- The validation follows the existing pattern used elsewhere in the codebase (e.g., `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/checkpoint/id/id.go:156` checks `KindOf(s) == KindUnknown`)
+
+No existing validator wraps this; the check is appropriately embedded at the trust boundary.
+
+**No action needed.**
+
+---
+
+### **Summary**
+
+| Area | Status | Action |
+|------|--------|--------|
+| `pushCheckpointRefWithRecovery` | OK | None — appropriately reuses `fetchAndRebaseRefCommon` |
+| `prePushCheckpointRefs` per-ref loop | OK | None — bespoke orchestration, no duplicate loop |
+| `mustRefName` test helper | **DRY violation** | Consolidate two definitions; use shared version |
+| `remoteRefHash` / `remoteRefFiles` | OK | None — test-specific, no duplicates |
+| `runGit` closure | OK | None — low-level, test-specific usage |
+| `RefName` validation | OK | None — idiomatic use of `Kind()` / `KindUnknown` |
+
+**One actionable duplication found:** The `mustRefName` test helper is defined in both `checkpoint/refs_naming_test.go` (line 90) and `strategy/refs_push_test.go` (line 419). Export or share one version to reduce duplication.</result>
+<usage><subagent_tokens>49320</subagent_tokens><tool_uses>10</tool_uses><duration_ms>37782</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a26fab967edaf98d3</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/68fc4cd3-542e-47f4-812e-c60eaecaaeed/tasks/a26fab967edaf98d3.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplify review: efficiency" came to rest</summary>
+<note>A task-notification fires each time this agent comes to rest with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Now I have the full picture. Let me analyze the efficiency issues:
+
+## Efficiency Analysis
+
+**Summary: The fallback strategy has inherent per-ref overhead that is acceptable for a cold path, but there is one real inefficiency to flag.**
+
+### Finding 1: Redundant push work when batch divergence occurs (ACCEPTABLE)
+
+**Location:** `manual_commit_push.go:188-195`
+
+When the batch push fails, the code re-pushes every ref individually:
+```go
+for _, ref := range existing {
+    if err := pushCheckpointRefWithRecovery(pushCtx, ps.pushTarget(), ref); err != nil {
+        // ...
+        continue
+    }
+    pushed = append(pushed, ref)
+}
+```
+
+Each `pushCheckpointRefWithRecovery` calls `batchPushRefs(ctx, target, []plumbing.ReferenceName{ref})` (line 398 in push_common.go), which spawns a subprocess `git push` per ref.
+
+**Why this is acceptable:** The batch push rejection is rare — it only occurs when a checkpoint has genuinely diverged (re-written on another machine). In that case, per-ref recovery is necessary because each ref may have different divergence patterns. While some refs *might* have succeeded in the batch, we don't have granular failure data from git, so replaying the entire loop is the pragmatic recovery strategy. This is documented in the comment as the "cold path," and the cost is acceptable.
+
+**However, see Finding 2 below.**
+
+---
+
+### Finding 2: Context timeout wrapping in per-ref recovery (REAL INEFFICIENCY)
+
+**Location:** `push_common.go:75-88` in `pushCheckpointRefWithRecovery`
+
+```go
+func pushCheckpointRefWithRecovery(ctx context.Context, target string, ref plumbing.ReferenceName) error {
+    ctx, cancel := context.WithTimeout(ctx, checkpointPushBudget)  // ← NEW TIMEOUT
+    defer cancel()
+
+    if err := batchPushRefs(ctx, target, []plumbing.ReferenceName{ref}); err == nil {
+        return nil
+    }
+    if err := fetchAndRebaseRefCommon(ctx, target, ref); err != nil {
+        return fmt.Errorf("sync diverged checkpoint ref %s: %w", ref, err)
+    }
+    return batchPushRefs(ctx, target, []plumbing.ReferenceName{ref})
+}
+```
+
+**The problem:** This function is called in a loop in `prePushCheckpointRefs` (line 189 in manual_commit_push.go), which already holds a shared `pushCtx` with a timeout budget (line 168). Each call to `pushCheckpointRefWithRecovery` then wraps that context with **another** `context.WithTimeout`, creating N nested timeouts for N refs.
+
+When the outer context has 2 minutes remaining and you enter the loop:
+- Ref 1: creates a 2-minute deadline (wall-clock, not relative) → could expire while processing refs 2-N
+- Ref 2: resets to a new 2-minute deadline (child context, but the parent already has a shorter deadline)
+- Result: The effective budget is the first deadline created, not the sum, so subsequent refs may fail spuriously if the first timeout is eaten by fetch+rebase
+
+**Cheaper alternative:** Move the timeout wrapping to the loop level, not the per-ref level:
+
+```go
+// In manual_commit_push.go, line 189 (replace the loop):
+pushCtx, cancel := context.WithTimeout(pushCtx, checkpointPushBudget)  // ONE budget for all recoveries
+defer cancel()
+
+for _, ref := range existing {
+    // pushCheckpointRefWithRecovery removes its own timeout wrapping
+    if err := pushCheckpointRefWithRecovery(pushCtx, ps.pushTarget(), ref); err != nil {
+        // ...
+    }
+}
+```
+
+And simplify `pushCheckpointRefWithRecovery` to remove the timeout wrapping:
+
+```go
+func pushCheckpointRefWithRecovery(ctx context.Context, target string, ref plumbing.ReferenceName) error {
+    // Runs under caller's deadline (already set in manual_commit_push.go)
+    if err := batchPushRefs(ctx, target, []plumbing.ReferenceName{ref}); err == nil {
+        return nil
+    }
+    if err := fetchAndRebaseRefCommon(ctx, target, ref); err != nil {
+        return fmt.Errorf("sync diverged checkpoint ref %s: %w", ref, err)
+    }
+    return batchPushRefs(ctx, target, []plumbing.ReferenceName{ref})
+}
+```
+
+This eliminates the nested timeout overhead and ensures a single deadline is shared across all per-ref recovery attempts, which is the intent.
+
+---
+
+### Other observations
+
+- **Repeated `ps.pushTarget()` calls** (line 189, 310): Cheap; the method is a field access, not a git invocation.
+- **Ref resolution**: No redundant git operations; `RefName()` validation is done once per ref at call time.
+- The design is otherwise sound: batch-first is the fast path, per-ref recovery is explicitly rare and necessary for divergence handling.</result>
+<usage><subagent_tokens>34381</subagent_tokens><tool_uses>7</tool_uses><duration_ms>25565</duration_ms></usage>
+</task-notification>
+
+---
+
+ok, last thing: can we add to the new E2E workflow that I can run it with blank -> kicking off all agents?
+
+---
+
+can you rebase 1580 on latest main
+
+---
+
+can you also check if 1580 is still correct?
+
+---
+
+can you look at the "entire trail finding" for 1580 via the entire cli
+
+---
+
+did the COPILOT_GITHUB_TOKEN thing got added recently on e2e.yml or in the PR from today?
+
+---
+
+ok, 1580 is merged, now make a new pr fixing the copilot issue for all e2e tests
+
+---
+
+can you rebase https://github.com/entireio/cli/pull/1566 onto latest main again
+
+---
+
+can you check https://github.com/entireio/cli/actions/runs/28465462293 I did run the full e2e suite with the new ref backend
+
+---
+
+yes, update the comment
+
+---
+
+can you rebase the stacked prs?
+
+---
+
+can you look at the comments on 1576
+
+---
+
+question on 1566: when this merges we just have the store but no exposure yet, you would need to manually enable it in settings.json first, right?
+
+---
+
+do a and b
+
+---
+
+for 1: we might allow a backfil of existing checkpoints to the new format and couldn't rewrite them to ulids, so in that case it might be fine to allow different ids there too.... so not sure we need to super tighten it now
+
+---
+
+how much work is it to support the backfill case today?
+
+---
+
+I don't want backfil, I just want that we support both formats for the identifier straight away. I could also argue that we shard the old checkpoints in the same way (last digits) if that makes things easier, but basically the code should be able to map old and new checkpoint id format to a proper ref
+
+---
+
+are the descriptions up2date
+
+---
+
+1566 has conflicts
+
+---
+
+sorry, continue
+
+---
+
+can we add: Compact on Drain so that we drop redundant entries
+
+---
+
+The push queue's Enqueue only appends, so a long-lived session re-enqueuing the same checkpoint ref across many writes (without pushing) would grow the file unboundedly — Remove was the only thing that ever rewrote it.
+
+can you explain me that more
+
+---
+
+hmm, is this a safe  approach in general when running multiple agents in parallel? also how does it work with worktrees?
+
+---
+
+can we do an artifact how the new refstore works now? (1566 is merged)
+
+---
+
+can you now look at the stacked PR it has merge conflicts
+
+---
+
+<task-notification>
+<task-id>bnvafi0fn</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/9e11aba3-87b7-4b24-ae83-5c1aa9fd4ba6/tasks/bnvafi0fn.output</output-file>
+<status>completed</status>
+<summary>Background command "Wait for lint+integration+canary" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+can you look at the comment on the pr?
+
+---
+
+ok, the next thing would now be doing a migration option (not sure yet where to place the command) that can convert a branch checkpoints to refs, it should be idempotent and the idea is to not map refs to the commits but rather create a commit based on the latest tree object for that checkpoint.
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>a9473a7c73a0219f8</task-id>
+<tool-use-id>toolu_01HNX2qNqYBEfZ5idVVoVDNq</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/9e11aba3-87b7-4b24-ae83-5c1aa9fd4ba6/tasks/a9473a7c73a0219f8.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect. Now let me analyze the actual code for simplification opportunities. I have a clear view of the files now. Let me write my findings:
+
+## Simplification Review - Checkpoint Migration Feature
+
+Based on my analysis of the added code, here are the actionable simplification opportunities:
+
+---
+
+### 1. **Redundant idempotency check with double git lookup**
+**File:** `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/checkpoint/migrate.go`  
+**Lines:** 79-85  
+**Summary:** Ref is resolved twice when it exists: once implicitly to get the hash, then again to fetch the commit object.
+
+**Current form:**
+```go
+parent := plumbing.ZeroHash
+if existing, err := repo.Reference(refName, true); err == nil {
+    parent = existing.Hash()
+    if commit, cerr := repo.CommitObject(parent); cerr == nil &amp;&amp; commit.TreeHash == cpTreeHash {
+        result.Skipped++
+        return nil
+    }
+}
+```
+
+**Cost:** Extra git object lookup on every existing ref. For repos with many migrated checkpoints, this compounds across multiple runs.
+
+**Simpler form:**
+```go
+parent := plumbing.ZeroHash
+if existing, err := repo.Reference(refName, true); err == nil {
+    if commit, cerr := repo.CommitObject(existing.Hash()); cerr == nil &amp;&amp; commit.TreeHash == cpTreeHash {
+        result.Skipped++
+        return nil
+    }
+    parent = existing.Hash()
+}
+```
+This resolves the commit once inline, avoiding the intermediate assignment to `parent` before the idempotency check.
+
+---
+
+### 2. **Over-parameterized flushCheckpointRefsQueue extraction**
+**File:** `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/strategy/manual_commit_push.go`  
+**Lines:** 200-264 (new function); 163, 373-376 (call sites)  
+**Summary:** The function takes `pushTarget` as a string parameter, but that value flows from `ps.pushTarget()` at both call sites, making it an avoidable coupling.
+
+**Current form:**
+```go
+func flushCheckpointRefsQueue(ctx context.Context, repo *git.Repository, pushTarget string) (int, error) {
+    // ...
+}
+
+// Call in prePushCheckpointRefs (line 163):
+if _, err := flushCheckpointRefsQueue(ctx, repo, ps.pushTarget()); err != nil { ... }
+
+// Call in PushMigratedCheckpointRefs (line 451 of original):
+ps := resolvePushSettings(ctx, remote)
+// ...
+return flushCheckpointRefsQueue(ctx, repo, ps.pushTarget())
+```
+
+**Cost:** The caller must resolve `ps` and extract its `pushTarget()`, passing an already-computed value. The function signature doesn't signal that this depends on push settings.
+
+**Simpler form:** Accept `pushSettings` instead and call `ps.pushTarget()` inside:
+```go
+func flushCheckpointRefsQueue(ctx context.Context, repo *git.Repository, ps pushSettings) (int, error) {
+    // ...
+    if err := batchPushRefs(pushCtx, ps.pushTarget(), existing); err == nil {
+        // ...
+    }
+    // ...
+    if err := pushCheckpointRefWithRecovery(pushCtx, ps.pushTarget(), ref); err != nil {
+```
+
+Then call sites become:
+```go
+// prePushCheckpointRefs:
+if _, err := flushCheckpointRefsQueue(ctx, repo, ps); err != nil { ... }
+
+// PushMigratedCheckpointRefs:
+return flushCheckpointRefsQueue(ctx, repo, ps)
+```
+
+This reduces parameter noise and self-documents the dependency on push settings.
+
+---
+
+### 3. **Unnecessary verb variable for single conditional output**
+**File:** `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/doctor_migrate.go`  
+**Lines:** 348-351  
+**Summary:** A `verb` variable is introduced and set conditionally just to format one output string.
+
+**Current form:**
+```go
+verb := "Migrated"
+if dryRun {
+    verb = "Would migrate"
+}
+fmt.Fprintf(out, "%s %d checkpoint(s) to refs (%d already up to date, %d total).\n",
+    verb, len(result.Migrated), result.Skipped, result.Total)
+```
+
+**Cost:** Extra variable assignment that doesn't compose or reuse. The conditional is already clear from context.
+
+**Simpler form:**
+```go
+action := "Migrated"
+if dryRun {
+    action = "Would migrate"
+}
+fmt.Fprintf(out, "%s %d checkpoint(s) to refs (%d already up to date, %d total).\n",
+    action, len(result.Migrated), result.Skipped, result.Total)
+```
+
+Or inline the ternary logic directly in the string (Go doesn't have ternary, but the conditional is transparent enough to consolidate):
+```go
+if dryRun {
+    fmt.Fprintf(out, "Would migrate %d checkpoint(s) to refs (%d already up to date, %d total).\n",
+        len(result.Migrated), result.Skipped, result.Total)
+} else {
+    fmt.Fprintf(out, "Migrated %d checkpoint(s) to refs (%d already up to date, %d total).\n",
+        len(result.Migrated), result.Skipped, result.Total)
+}
+```
+
+This eliminates the helper variable and makes the two paths explicit (though with string duplication).
+
+---
+
+## Summary
+
+| File | Lines | Finding | Cost | Simplification |
+|------|-------|---------|------|---|
+| migrate.go | 79–85 | Redundant ref → commit lookup during idempotency check | Extra git call per existing ref | Move `parent` assignment after idempotency check; resolve commit once inline |
+| manual_commit_push.go | 200, 163, 189 | Over-parameterized string instead of struct; caller must unpack pushSettings | Indirect dependency; parameter noise | Accept `pushSettings` struct; call `ps.pushTarget()` inside function |
+| doctor_migrate.go | 348–351 | Unnecessary `verb` variable for single output branch | Minor cognitive load | Inline conditional in two separate fprintf calls or keep variable (trade-off: current is clearest) |</result>
+<usage><subagent_tokens>34164</subagent_tokens><tool_uses>12</tool_uses><duration_ms>26989</duration_ms></usage>
+</task-notification>
+
+---
+
+can you look at the pr comments
+
+---
+
+ok, we will do another PR first removing the version and then continue here tomorrow. One question: if we do the first commit using the exiting tree object, could we easily do another commit ontop moving all files / folders up to the root removing the sharding folder?
+
+---
+
+can you review in this context: https://github.com/entireio/cli/pull/1620
+
+---
+
+ok, PR is merged can you pull main and rebase this work onto it
+
+---
+
+if I would want to use ref based storage with a new repo, could I already do that?
+
+---
+
+ok, can we refocus, I now want rather a new command under doctor that can just rewrite the whole branch as refs. Just new commits, copying data. The idea is also to keep the checkpoint id but otherwise: 
+
+- generate the transcript.json
+. move everything into root (so checkpoint has no shard folders)
+- commit should keep the author
+
+---
+
+I want it separate, I'm not sure we do the migrate at all and just use the rewrite as a test tooling for now
+
+---
+
+can you look at the pr comments and then run /simplify
+
+---
+
+<task-notification>
+<task-id>ad6aa8a9e5e19d838</task-id>
+<tool-use-id>toolu_01L2Y2rUf22NBpgTfCzG8gNh</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/9e11aba3-87b7-4b24-ae83-5c1aa9fd4ba6/tasks/ad6aa8a9e5e19d838.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Now I have a complete picture. Let me compile my findings on simplifications:
+
+## Simplification-Focused Code Quality Review
+
+Based on analysis of the diff and source files, here are the actionable simplifications:
+
+### 1. **Over-threaded `rewriteCheckpoint` parameters**
+**File:** `rewrite.go`, **Lines:** 134-149  
+**Summary:** Function accepts 9 parameters including both `fallbackName`/`fallbackEmail` AND a pre-computed `authors` map—this threads fallback state through when it could be encapsulated.  
+**Cost:** Hard to reason about author resolution; fallback duplication at call sites.  
+**Simpler form:** Extract a `func resolveAuthor(sessionID string, authors map[string]commitAuthor, fallbackName, fallbackEmail string) commitAuthor` helper. Pass just `cid, cpTreeHash, authors, fallback commitAuthor` to `rewriteCheckpoint`. Collapses 8→4 parameters.
+
+### 2. **Redundant `firstAuthor` tracking via initialization duplication**
+**File:** `rewrite.go`, **Lines:** 166, 172-179  
+**Summary:** Initialize `firstAuthor` to fallback (lines 166), then loop (line 173) and overwrite on idx==0 (line 178). The init is immediately shadowed when idx==0 fires.  
+**Cost:** Unused assignment; confusing intent.  
+**Simpler form:** Initialize `firstAuthor` to zero value; set it conditionally on idx==0 only. Or extract the first session's author once before the loop, eliminating the conditional branch.
+
+### 3. **`graftTasksSubtree` re-resolves ref it just wrote**
+**File:** `rewrite.go`, **Lines:** 257-272  
+**Summary:** `rewriteCheckpoint` line 234 writes commits via `refsStore.Write(...)` which internally calls `setRef` to point the ref (see `refs_store.go:161`). Then `graftTasksSubtree` line 262 calls `repo.Reference(refName, true)` to fetch what it just set, duplicating the resolution.  
+**Cost:** Unnecessary git lookup; could pass the commit hash directly.  
+**Simpler form:** Return the commit hash from `rewriteCheckpoint` (or capture it from the last `refsStore.Write` call), then pass `commitHash` to `graftTasksSubtree` instead of re-dereferencing.
+
+### 4. **Duplicated author-fallback logic: session loop vs. tasks graft**
+**File:** `rewrite.go`, **Lines:** 173-179 (session loop) and line 234 (graft call)  
+**Summary:** Session loop resolves author per-session (lines 173-179) and extracts `firstAuthor` on idx==0. Then `graftTasksSubtree` receives that `firstAuthor` but carries no context. If the tasks graft fails, you don't know if the author fallback was applied correctly.  
+**Cost:** Implicit coupling; author resolution split across two functions.  
+**Simpler form:** Create a struct `checkpointContext` holding `authors map, fallback commitAuthor, firstAuthor commitAuthor` and pass it through. Or have `rewriteCheckpoint` return the applied `firstAuthor` so callers (or tests) can validate it was set correctly.
+
+### 5. **Overzealous WriteOptions field forwarding**
+**File:** `rewrite.go`, **Lines:** 181-213  
+**Summary:** `WriteOptions` struct passed into `refsStore.Write` (line 181) explicitly copies ~30 metadata fields from `content.Metadata`. Lines 201-212 do unconditional forwarding of fields already present in `m` (e.g., `Attribution`, `PromptAttributionsJSON`, etc.).  
+**Cost:** Verbose; easy to miss or duplicate fields when metadata schema evolves.  
+**Simpler form:** Consider if `Session(WriteOptions{...})` constructor could accept `content.Metadata` and auto-forward unchanged fields. Or inject only the fields that differ (author, HasReview, HasInvestigation), leaving the rest implicit.
+
+### 6. **Redundant `RefName` resolution in `RewriteBranchToRefs` walk callback**
+**File:** `rewrite.go`, **Lines:** 67, 73  
+**Summary:** Line 73 calls `RefName(cid)` to check if ref exists (line 73), then line 83 calls `rewriteCheckpoint` which calls `RefName(cid)` again (line 154), and inside the graft it calls `RefName(cid)` a third time (line 264).  
+**Cost:** Three git ops for the same mapping.  
+**Simpler form:** Compute `refName` once in the callback (after line 67), pass it to `rewriteCheckpoint` instead of `cid`. Eliminates two redundant `RefName` calls.
+
+---
+
+**Summary of costs:** Parameters reduced from 8→4, one unnecessary init eliminated, two git lookups collapsed into one, author-resolution logic consolidated, metadata forwarding simplified, ref-name recomputation eliminated. Total impact: ~10% reduction in lines + meaningful reduction in cognitive load and re-resolution overhead.</result>
+<usage><subagent_tokens>32393</subagent_tokens><tool_uses>7</tool_uses><duration_ms>27857</duration_ms></usage>
+</task-notification>
+
+---
+
+ok, now one follow up: If I have the ref backend enabled but would run "entire explain <old checkpoint id>" and the branch exists, would that work? Do we have a "smart" read fallback without needing to enable this explicitly or would this need to be reflected in the config?
+
+---
+
+I think the easy thing is more: We know currently exactly where a checkpoint should be by looking at the id. That makes this super easy and not expensive. If the backend is branch, but the cli gets an ULID -> look for a ref, if we get an old checkpoint but the backend should be ref, still check the branch. That's in theory all that is needed? It might get more expensive in the future, especially if we would do the first migration approach
+
+---
+
+wait what? the ref backend should use ULIDs always, never old checkpoint ids, can you double check?
+
+---
+
+hmm, ok then we need to do that first, does this work from an asbtraction point of view?
+
+---
+
+yes, please do this as a PR
+
+---
+
+<task-notification>
+<task-id>bvsmtk1go</task-id>
+<tool-use-id>toolu_01N8wf8QdvzvMZD5h6BomNdc</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/9e11aba3-87b7-4b24-ae83-5c1aa9fd4ba6/tasks/bvsmtk1go.output</output-file>
+<status>completed</status>
+<summary>Background command "Wait for integration + canaries" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>a1eecfa4d751c797f</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/9e11aba3-87b7-4b24-ae83-5c1aa9fd4ba6/tasks/a1eecfa4d751c797f.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect. Now I have all the context. Let me analyze the code for simplification opportunities.
+
+## Simplification Findings
+
+Based on my analysis of the diff and surrounding code, here are the actionable simplification opportunities:
+
+---
+
+**1. Redundant nolint comments in generate.go**
+
+**File:** `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/checkpoint/generate.go`, lines 57-60
+
+**Summary:** The dispatcher pattern doesn't need wrapcheck nolints — the comments are boilerplate that obscure the real issue.
+
+**Cost:** Two identical nolint comments that make the code noisier without adding value. These are cargo-culted error-handling ceremony.
+
+**Simpler form:** Remove both `//nolint:wrapcheck` comments. The dispatcher's job is to route to the right generator; callers don't need to know about the internal delegation. Either wrap once at the dispatcher boundary with a meaningful context message, or don't wrap at all and let callers see the original error from `id.GenerateULID()` or `id.Generate()`.
+
+Example:
+```go
+func GenerateCheckpointID(ctx context.Context) (id.CheckpointID, error) {
+	if cfg, err := settings.LoadCheckpointsConfig(ctx); err == nil &amp;&amp; PrimaryIsRefs(cfg) {
+		return id.GenerateULID()  // No nolint needed
+	}
+	return id.Generate()  // No nolint needed
+}
+```
+
+---
+
+**2. Overcomplicated control flow in GenerateCheckpointID**
+
+**File:** `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/checkpoint/generate.go`, line 22
+
+**Summary:** The `if err == nil &amp;&amp; PrimaryIsRefs(cfg)` pattern requires mental parsing of the negation; a guard clause would be clearer.
+
+**Cost:** Readers must trace the logic: "only call GenerateULID if no error AND condition is true," which is a compound condition that's easy to misread.
+
+**Simpler form:** Invert to a guard clause pattern:
+```go
+func GenerateCheckpointID(ctx context.Context) (id.CheckpointID, error) {
+	cfg, err := settings.LoadCheckpointsConfig(ctx)
+	if err != nil || !PrimaryIsRefs(cfg) {
+		return id.Generate()  // Default: legacy hex
+	}
+	return id.GenerateULID()  // Git-refs primary: ULID
+}
+```
+This reads top-to-bottom: "if config load fails OR we're not on git-refs, use hex; otherwise use ULID."
+
+---
+
+**3. GenerateULID error return is dead ceremony**
+
+**File:** `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/checkpoint/id/id.go`, lines 157-168
+
+**Summary:** The `error` return from `GenerateULID()` is only reachable if `ulid.New()` fails on a direct `rand.Reader` call, which is vanishingly unlikely in the codebase's error-handling philosophy.
+
+**Cost:** Every call site wraps the error and all error paths assume the error might occur, but `crypto/rand` failures are not recoverable at the application level and are already documented as "extremely unlikely" in `resolveCheckpointID` (attach.go:596).
+
+**Simpler form:** Return no error, or document in the signature that the error is reserved for future use (never actually raised). If you want to keep the error for API forward-compatibility, add a comment at the function definition:
+```go
+// GenerateULID creates a new 26-character Crockford base32 ULID checkpoint ID.
+// The error return is reserved for future use and currently never raised by the
+// oklog/ulid library when rand.Reader succeeds.
+func GenerateULID() (CheckpointID, error) {
+	u, err := ulid.New(ulid.Timestamp(time.Now()), rand.Reader)
+	if err != nil {
+		return EmptyCheckpointID, fmt.Errorf("failed to generate ULID checkpoint ID: %w", err)
+	}
+	return CheckpointID(u.String()), nil
+}
+```
+Or simplify further by removing error entirely if the codebase has a panic-on-crypto-failure pattern elsewhere.
+
+---
+
+**4. Call-site error handling now unified but comments remain stale**
+
+**File:** `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/strategy/manual_commit_hooks.go`, lines 2114-2116
+
+**Summary:** The comment "Hook must be silent on failure" is now outdated because the nilerr applies equally to all ID generation failures, not specifically a hook concern.
+
+**Cost:** Misleading comment suggests the error handling is hook-specific when it's actually dispatcher-wide behavior.
+
+**Simpler form:** Either remove the comment (the nilerr intent is clear from its presence) or generalize it:
+```go
+cpID, err := checkpoint.GenerateCheckpointID(logCtx)
+if err != nil {
+	return nil //nolint:nilerr // Silent on ID generation failure
+}
+```
+
+The comment in manual_commit_condensation.go (line 1176-1179) is better: it's explicit about logging the error before failing open.
+
+---
+
+## Summary Table
+
+| File | Line | Issue | Cost | Fix |
+|------|------|-------|------|-----|
+| checkpoint/generate.go | 57-60 | Redundant nolint:wrapcheck comments | Boilerplate noise | Remove both comments; dispatcher pattern doesn't require wrapping justification |
+| checkpoint/generate.go | 22 | Compound if condition hard to parse | Cognitive load | Invert to guard clause: `if err != nil \|\| !PrimaryIsRefs(cfg) return id.Generate()` |
+| checkpoint/id/id.go | 157-168 | Unreachable error return | Cargo-cult error handling | Document that error is reserved/never raised, or remove entirely |
+| manual_commit_hooks.go | 2116 | Stale comment scope | Misleading context | Generalize comment or remove—intent is already clear from nilerr |</result>
+<usage><subagent_tokens>24084</subagent_tokens><tool_uses>11</tool_uses><duration_ms>28600</duration_ms></usage>
+</task-notification>
+
+---
+
+should we use utc for the timestamp?
+
+---
+
+- cmd/entire/cli/attach.go:561 checkpointPresentLocally still requires refs.Primary to
+    exist before reading the configured store. refs.Primary is the v1 branch, so in a refs-
+    only repo a valid ULID checkpoint stored at refs/entire/checkpoints/... is treated as
+    missing. ensureCheckpointAvailable then refreshes/suggests the v1 branch, so a later
+    entire attach on a commit that already has a new ULID trailer can fail even though the
+    checkpoint ref exists. This should read through the configured primary store directly,
+    and the refresh path should use checkpoint-ref fetching when the primary is git-refs.
+
+  - cmd/entire/cli/checkpoint/generate_test.go:23 The “default primary” test can read the
+    repo’s real .entire/settings*.json because it uses context.Background() and only sets
+    ENTIRE_CHECKPOINTS_PRIMARY to an empty string, which means “fall back to file.” A
+    developer dogfooding git-refs in local settings would get a false failure. Use an
+    isolated temp worktree context with no checkpoint config for the default case.
+
+---
+
+can you look at these: 1. cmd/entire/cli/attach.go:587 — attach routes presence/refresh/fetch-hint by current config, not by the checkpoint ID's kind (repo migrated git-branch → git-refs with a legacy hex trailer on HEAD: attach looks only at a per-checkpoint ref that never existed, and suggests a git fetch refs/entire/checkpoints/… command that can never succeed even though the data sits on the local v1 branch; reverse for a ULID trailer read under a git-branch config, which this PR's emission makes newly reachable). Verified CONFIRMED — but this is exactly the "id-kind read routing" follow-up the PR body names. Suggest linking these two concrete attach dead-ends (especially the unfixable fetch hints) in the follow-up issue so they don't get lost.
+2. cmd/entire/cli/checkpoint/generate.go:19 — the ULID⟹ref invariant is enforced nowhere at the write boundary (mint-time and write-time use two independent LoadCheckpointsConfig reads, often in different processes; git commit --amend preserves an existing trailer — manual_commit_hooks.go:454 — so a config flip or a missing ENTIRE_CHECKPOINTS_PRIMARY in the amending environment silently condenses a ULID checkpoint onto the v1 branch; zero Kind checks exist in any write path, and once readers route by kind that checkpoint becomes unresolvable). CONFIRMED. The right guard is asymmetric — the refs store must keep accepting hex (amends of pre-flip commits), but the branch store receiving a ULID should be rejected or at least logged. Fair as a fast follow.
+3. cmd/entire/cli/attribution.go:1027 — entire blame --long hard-truncates checkpointID/sessionID8 to 21 runes, sized for 12-hex IDs (a 26-char ULID alone overflows the column: the cell renders the first 21 ULID chars with no ellipsis and the /session suffix entirely dropped, so the long view's whole point — distinguishing sessions — is lost for ULID checkpoints, and the shown prefix looks like a complete ID but won't resolve). CONFIRMED; --json still carries full IDs.
+4. cmd/entire/cli/explain.go:2720 — the explain/checkpoint-list view truncates IDs to 12 chars, which for a ULID is the millisecond timestamp plus only 2 entropy chars (checkpoints minted the same second display near-identical prefixes; a same-millisecond pair collides in display with ~1/1024 probability. Resolution fails safely — ambiguous prefixes error with full IDs listed — so this is a UX regression, not wrong output; showing the full ULID or its tail would fix it). PLAUSIBLE.
+5. docs/architecture/sessions-and-checkpoints.md:369 — strategy checkpoint-emission behavior changed but the governing doc still says IDs are exclusively "12-hex-character random ID" (also line 29's "Stable 12-hex-char identifier"; repo CLAUDE.md requires "Keep this file and docs/architecture/sessions-and-checkpoints.md current when changing strategy behavior" — a reader will reintroduce fixed-width assumptions like the one this PR just removed from explain.go). CONFIRMED by direct inspection.
+6. cmd/entire/cli/attach.go:638 — suggestFetchCommand re-implements fetch-target resolution and can name a different target than the fetch attach actually ran (FetchCheckpointRef uses resolveCheckpointFetchTarget, which skips the remote.Configured gate; with ENTIRE_CHECKPOINT_TOKEN set, no checkpoint_remote, and an SSH origin, attach fetches over token HTTPS but the pasteable hint says git fetch origin …, which fails in a token-only environment). CONFIRMED, though the divergent logic is pre-existing code this PR only refactored — building the hint from resolveCheckpointFetchTarget(ctx) is a cheap cleanup while you're here.
+7. cmd/entire/cli/strategy/manual_commit_condensation.go:1175 — checkpoint IDs are minted (now costing an uncached config load) before the code that decides whether condensation happens at all (every no-op session stop pays it, and in PrepareCommitMsg the same perf span reads the settings files twice — GenerateCheckpointID at line 468, settings.Load at ~491). PLAUSIBLE but immaterial latency-wise — tens of microseconds next to repo opens; moving the mint inside the skip-check closure is the piece actually worth doing.
+8. cmd/entire/cli/checkpoint/id/id.go:54 — MaxIDLength hardcodes 26, a third independent encoding of the ULID width alongside ulidPattern's {26} and the library's constant (const MaxIDLength = ulid.EncodedSize ties it to the source of truth in the already-imported oklog/ulid). CONFIRMED trivially.
+
+---
+
+can you update / rebase the other PR
+
+---
+
+ok, what I actually mean is the "If ULID try to read from ref" automatic handling, but we didn't even build that yet, right? can we do this next, 1629 has merged and I just pulled main fresh
+
+---
+
+If ULID check ref, no matter which backend never check branch for ulid, if hex check active backend first, if active fallback is branch no need to check ref, if active backend is ref and hex is used, check branch too
+
+---
+
+/simplify
+
+---
+
+can you update the pr / comments
+
+---
+
+PR is also merged - ok, can we now do - and I think this should stay on a branch - as a complete validation test i want to have the migrate tooling to allow taking a repo with branch+hex, convert all checkpoints to ULIDs (rewriting history) and moving to refs. This way I could create a copy of one of our repos with more data that behaves as if it has been on refs the whole time and run test commands against it and also validate the UI works
+
+---
+
+sorry, can you ask again?
+
+---
+
+can you explain me both options more
+
+---
+
+yeah option a is fine
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>a607bd8296c5757bc</task-id>
+<tool-use-id>toolu_01E56w332EbDZX53kTbPRwQp</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/9e11aba3-87b7-4b24-ae83-5c1aa9fd4ba6/tasks/a607bd8296c5757bc.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Let me re-read the original diff content I already received at the beginning of my response. I have it available. Let me analyze what I captured:
+
+Based on my analysis of the diff provided, here are the **simplification opportunities** focusing on complexity reduction (not behavior changes):
+
+---
+
+## **Finding 1: Awkward 4-value return signature with redundant `ok` + error**
+
+**File:** `cmd/entire/cli/checkpoint/migrate_ulid.go` (lines 178–216)  
+**Function:** `restampMetadataAt`
+
+```go
+func restampMetadataAt(repo *git.Repository, treeHash plumbing.Hash, dir []string, newID id.CheckpointID) 
+  (plumbing.Hash, filemode.FileMode, bool, error)
+```
+
+**Issue:** Returns `(hash, mode, ok, error)` — the `ok` boolean AND an error. This is awkward: callers at line 162 check `!ok` to skip, but the function uses `(nil, 0, false, nil)` for both "file missing" (line 189) AND "no checkpoint_id" (line 201). This conflates two distinct absence cases into the same sentinel.
+
+**Simpler form:** Fold the "absent/no id" case into an error:
+```go
+func restampMetadataAt(...) (plumbing.Hash, filemode.FileMode, error)
+  // Return (ZeroHash, 0, nil) when file/id is absent — let the caller 
+  // check if hash != ZeroHash to know if patching happened
+```
+
+Then at the call site (line 162–164):
+```go
+if patched != plumbing.ZeroHash {  // patching occurred
+    current, err = UpdateSubtree(...)
+}
+```
+
+**Maintenance cost:** Callers already have a pattern for "no change" (skip the UpdateSubtree), so checking `hash != ZeroHash` is more idiomatic than `!ok`. Eliminates the cognitive load of parsing `(h, m, ok, err)` — just one type per return value.
+
+---
+
+## **Finding 2: `[][]string` path-building overhead in `restampCheckpointID`**
+
+**File:** `cmd/entire/cli/checkpoint/migrate_ulid.go` (lines 148–173)  
+**Function:** `restampCheckpointID`
+
+```go
+dirs := [][]string{nil}  // root
+for i := range sessionCount {
+    dirs = append(dirs, []string{strconv.Itoa(i)})
+}
+// ... then loop:
+for _, dir := range dirs {
+    patched, mode, ok, err := restampMetadataAt(repo, current, dir, newID)
+    // ... UpdateSubtree(repo, current, dir, ...)
+}
+```
+
+**Issue:** Builds a `[][]string` array-of-arrays where `dirs[0] = nil` (root) and `dirs[i] = []string{strconv.Itoa(i-1)}` (session i-1). Then reconstructs the path inside `restampMetadataAt` (lines 184–186): `path := dir[0] + "/" + paths.MetadataFileName` only when `len(dir) &gt; 0`. This is an artifact of trying to reuse `UpdateSubtree`, which expects `[]string` path segments.
+
+**Simpler form:** Loop directly over session indices without the intermediate array:
+
+```go
+// Handle root metadata.json
+if patched, mode, err := restampMetadataAt(repo, current, "", newID); patched != plumbing.ZeroHash {
+    current, _ = UpdateSubtree(repo, current, nil, ...)
+}
+// Handle each session
+for i := range sessionCount {
+    sessionDir := strconv.Itoa(i)
+    if patched, mode, err := restampMetadataAt(repo, current, sessionDir, newID); patched != plumbing.ZeroHash {
+        current, _ = UpdateSubtree(repo, current, []string{sessionDir}, ...)
+    }
+}
+```
+
+And simplify `restampMetadataAt` signature:
+```go
+func restampMetadataAt(repo *git.Repository, treeHash plumbing.Hash, sessionDir string, newID id.CheckpointID) 
+  (plumbing.Hash, filemode.FileMode, error)
+```
+
+Path construction becomes trivial:
+```go
+path := paths.MetadataFileName
+if sessionDir != "" {
+    path = sessionDir + "/" + paths.MetadataFileName
+}
+```
+
+**Maintenance cost:** Eliminates the `[][]string` allocation and simplifies the path-reconstruction logic. Avoids the index-counting indirection and makes it obvious you're iterating sessions 0..N.
+
+---
+
+## **Finding 3: Double-walk (dry-run + apply) creates fresh ULIDs twice**
+
+**File:** `cmd/entire/cli/doctor_migrate_ulid.go` (lines 437–466)  
+**Code flow:**
+```go
+// Preview always (dry-run mapping)
+preview, err := cpkg.MigrateBranchHexToULIDRefs(ctx, repo, true)  // walk 1, mint ULIDs
+// ... print plan ...
+if !apply { return }
+
+// 1. Write the ULID refs (applies the migration)
+result, err := cpkg.MigrateBranchHexToULIDRefs(ctx, repo, false)  // walk 2, mint DIFFERENT ULIDs
+```
+
+**Issue:** Every call to `MigrateBranchHexToULIDRefs` with `dryRun=false` calls `mintULIDAt()` (line 98 in migrate_ulid.go), which uses `crypto/rand` for entropy. So `preview` (walk 1) gets ULIDs `{A1, B1, C1}` and `result` (walk 2) gets ULIDs `{A2, B2, C2}`. The trailers are rewritten using `result.Mapping`, not `preview.Mapping`, so the printed plan shows *different* IDs than what actually gets written. This is confusing and wasteful.
+
+**Simpler form:** Cache the mapping from the dry-run and pass it to the apply phase, or pass `dryRun=false` once and cache the result:
+
+```go
+// Option A: Pass dryRun=false once, use the result for both preview &amp; apply
+result, err := cpkg.MigrateBranchHexToULIDRefs(ctx, repo, false)
+printMigrateToULIDPlan(out, result, userBranches, infraBranches)
+if !apply {
+    fmt.Fprintln(out, "\nDry run. Re-run with --yes to apply...")
+    return nil
+}
+// refs are already written; skip step 1
+fmt.Fprintf(out, "\nWrote %d ULID checkpoint ref(s).\n", len(result.Mapping))
+```
+
+Or modify `MigrateBranchHexToULIDRefs` to accept an optional pre-computed mapping:
+
+```go
+func MigrateBranchHexToULIDRefs(ctx context.Context, repo *git.Repository, dryRun bool, 
+  precomputedMapping *[]ULIDMapping) (ULIDMigrateResult, error) {
+  // If mapping is provided, use it instead of minting new ones
+}
+```
+
+**Maintenance cost:** Eliminates redundant work (two full tree walks + re-minting). Makes the printed plan match what actually gets written. The diff comment says the dry-run "preview" is "for the preview", but using fresh ULIDs defeats that purpose.
+
+---
+
+## **Finding 4: `printMigrateToULIDPlan` redundantly formats the same data twice**
+
+**File:** `cmd/entire/cli/doctor_migrate_ulid.go` (lines 493–516)  
+**Code:**
+```go
+for i, m := range preview.Mapping {
+    if i &gt;= sample {
+        fmt.Fprintf(out, "    ... and %d more\n", len(preview.Mapping)-sample)
+        break
+    }
+    fmt.Fprintf(out, "    %s -&gt; %s\n", m.OldID, m.NewID)
+}
+```
+
+**Issue:** The "sample first 5, then show count of remainder" pattern is fine, but it's duplicated logic: you iterate to `i &gt;= sample`, then compute `len(preview.Mapping)-sample` to print the tail count. A helper would be cleaner:
+
+**Simpler form:**
+```go
+func printTruncated(out io.Writer, items []string, sample int) {
+    for i := 0; i &lt; len(items) &amp;&amp; i &lt; sample; i++ {
+        fmt.Fprintf(out, "    %s\n", items[i])
+    }
+    if len(items) &gt; sample {
+        fmt.Fprintf(out, "    ... and %d more\n", len(items)-sample)
+    }
+}
+// Call:
+var mappingStrs []string
+for _, m := range preview.Mapping {
+    mappingStrs = append(mappingStrs, fmt.Sprintf("%s -&gt; %s", m.OldID, m.NewID))
+}
+printTruncated(out, mappingStrs, 5)
+```
+
+**Maintenance cost:** Small, but reduces repetition. If the sampling logic ever changes (e.g., sample=10), you fix it in one place.
+
+---
+
+## **Finding 5: Unused/over-defensive branch in `listRewritableBranches`**
+
+**File:** `cmd/entire/cli/doctor_migrate_ulid.go` (lines 520–533)  
+**Code:**
+```go
+func listRewritableBranches(ctx context.Context, repoRoot string) ([]string, error) {
+    refs, err := forEachRef(ctx, repoRoot, "refs/heads")
+    if err != nil {
+        return nil, err  // propagates immediately
+    }
+    var out []string
+    for _, r := range refs {
+        if strings.HasPrefix(r, "refs/heads/entire/") {
+            continue
+        }
+        out = append(out, r)
+    }
+    return out, nil
+}
+```
+
+**Issue:** `forEachRef` already returns full ref names (e.g., `refs/heads/my-branch`). The filter `strings.HasPrefix(r, "refs/heads/entire/")` is redundant if you're already prefixing the `forEachRef` call with `"refs/heads"`. Since `forEachRef` uses `--format=%(refname)`, it returns the **full** ref name, so the prefix is necessary. However, the function *is* correct but slightly verbose — could use a list comprehension-style helper.
+
+**Simpler form:** This is actually fine as-is (the logic is clear). **No simplification needed here.**
+
+---
+
+## **Summary Table**
+
+| Finding | File | Line(s) | Issue | Simplification | Maintenance Cost |
+|---------|------|---------|-------|----------------|-----------------|
+| 1 | migrate_ulid.go | 178 | 4-value return `(hash, mode, ok, error)` conflates two absence cases | Fold to 3-value `(hash, mode, error)`, use `hash != ZeroHash` to detect change | Low — idiomatic pattern |
+| 2 | migrate_ulid.go | 151–154 | `[][]string` array-of-arrays to build session paths | Loop directly over session indices; pass `sessionDir string` to `restampMetadataAt` | Low — clearer iteration, no array overhead |
+| 3 | doctor_migrate_ulid.go | 437–466 | Double-walk (dry + apply) re-mints different ULIDs each time | Cache mapping; pass dryRun=false once and reuse result, or supply pre-computed mapping | Low — eliminates waste, print matches reality |
+| 4 | doctor_migrate_ulid.go | 500–507 | Sample/truncation logic hardcoded inline | Extract helper `printTruncated(items, sample)` | Very low — DRY, single source of truth |
+| 5 | doctor_migrate_ulid.go | 520–533 | (No issue — logic is sound) | N/A | N/A |
+
+---
+
+No correctness bugs found. The code works as intended; these are complexity/clarity simplifications only.</result>
+<usage><subagent_tokens>34727</subagent_tokens><tool_uses>15</tool_uses><duration_ms>56129</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a067e88c1de562793</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/9e11aba3-87b7-4b24-ae83-5c1aa9fd4ba6/tasks/a067e88c1de562793.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect. Now I have all the context I need. Let me synthesize my findings:
+
+## EFFICIENCY REVIEW: `migrate-to-ulid`
+
+This is a one-shot test-tooling command, so overhead should be minimal and cosmetic cost is acceptable. Here are my findings:
+
+### 1. **REAL COST: Double checkpoint walk (lines 438 &amp; 463, doctor_migrate_ulid.go)**
+
+**File:** `/cmd/entire/cli/doctor_migrate_ulid.go`, lines 438 and 463  
+**Finding:** The command runs `MigrateBranchHexToULIDRefs()` twice — once for the dry-run preview (line 438, `dryRun=true`) and again to apply (line 463, `dryRun=false`). Each call walks the entire v1 checkpoint tree via `WalkCheckpointShards`, reading every checkpoint's tree and metadata.
+
+**Wasted work:** For a repo with N checkpoints, every checkpoint tree is read twice. Each read involves `repo.TreeObject(cpTreeHash)` (line 87 in migrate_ulid.go) and then potentially `repo.TreeObject()` again in `restampMetadataAt()` for the dry run.
+
+**Why it matters:** The dry run's ULIDs are NOT reusable because they are minted fresh with crypto-random entropy (line 137, `ulidpkg.New()` with `rand.Reader`). The apply pass mints different ULIDs. So you cannot cache the dry-run mapping.
+
+**Cheaper alternative:**
+- Return the mapping from the dry-run pass without minting fresh ULIDs in the apply phase: pre-mint all ULIDs in one pass, cache them, then use the same mapping for both preview and apply. This trades a single sort/output step for avoiding the second tree walk.
+- Or: mint ULIDs deterministically (e.g., seeded by checkpoint content hash or timestamp alone) so the preview mapping is identical and reusable. This requires `rand.Reader` to be replaced with deterministic entropy when generating the mapping.
+
+**Cost for one-shot:** Medium. This is not a hot path, but a repo with 500 checkpoints would walk 1000 checkpoint trees instead of 500. Acceptable as-is for test tooling, but worth mentioning if iterations or larger repos occur.
+
+---
+
+### 2. **REAL BUT ACCEPTABLE COST: Repeated tree reads in `restampCheckpointID` (lines 156–172, migrate_ulid.go)**
+
+**File:** `/cmd/entire/cli/checkpoint/migrate_ulid.go`, lines 156–172  
+**Finding:** For a checkpoint with N sessions, the function calls `restampMetadataAt()` N+1 times (root + N sessions). Each call invokes `repo.TreeObject(treeHash)` (line 179) to read the entire tree and `tree.File(path)` (line 187) to extract one file. Then `UpdateSubtree()` is called, which may re-read the tree during its recursive descent (see parse_tree.go lines 68–77, where `repo.TreeObject()` is called at each level).
+
+**Wasted work:** For a checkpoint with 5 sessions, you read the tree ~6 times in `restampMetadataAt()`, then UpdateSubtree reads it again during path traversal. The reads are mostly redundant — you're querying the same tree object from the git object database.
+
+**Why it's okay:** 
+- `repo.TreeObject()` likely caches in go-git; repeated calls on the same hash should be fast.
+- The tree is small (metadata.json files only; content is structured in shards by checkpoint ID).
+- This happens once per checkpoint during apply, not per session.
+
+**Cheaper alternative (if caching were needed):**
+- Read the checkpoint tree once at the outer loop, build a map of all metadata.json files, patch them in one pass, call `UpdateSubtree()` once with all changes. This requires collecting all `TreeChange` objects and applying them via `ApplyTreeChanges()` or similar batch operation. Current code reads the tree N+1 times but avoids building all changes upfront (trades latency for code simplicity).
+
+**Cost for one-shot:** Negligible. The total time is dominated by git object I/O and sed subprocess calls (line 581–587), not by redundant tree reads.
+
+---
+
+### 3. **NEGLIGIBLE COST: JSON unmarshal/remarshal (lines 196–208, migrate_ulid.go)**
+
+**File:** `/cmd/entire/cli/checkpoint/migrate_ulid.go`, lines 196–208  
+**Finding:** `restampMetadataAt()` unmarshals metadata.json to `map[string]json.RawMessage`, updates one key, then re-marshals. This reorders keys and re-encodes.
+
+**Wasted work:** The map iteration order is random; re-marshaling will likely produce a different key order than the original. This means the blob hash will differ even if only the ULID changed, triggering a new object in the git store. However, the file content is semantically identical; the reordering wastes no runtime, only adds a new blob variant.
+
+**Cheaper alternative:**
+- Use `json.RawMessage` slurping to avoid parse-and-reserialize: read the file as text, use a regex or manual string replacement to change `"checkpoint_id":"&lt;old&gt;"` to `"checkpoint_id":"&lt;new&gt;"`, write it back. This preserves the original key order and encoding. Trades safety (string replace is fragile) for blob deduplication.
+
+**Cost for one-shot:** Negligible. The remarshal is O(metadata.json size), which is ~1KB per session. One remarshal per checkpoint per apply is not measurable.
+
+---
+
+### 4. **EXPECTED &amp; ACCEPTED COST: `git filter-branch` with sed per-commit (lines 559–589, doctor_migrate_ulid.go)**
+
+**File:** `/cmd/entire/cli/doctor_migrate_ulid.go`, lines 559–589  
+**Finding:** `rewriteCheckpointTrailers()` writes a sed script to a temp file, then calls `git filter-branch -f --msg-filter "sed -f &lt;script&gt;"`. This forks sed once per commit on every rewritable branch. The sed script has one `s///` per checkpoint in the mapping (line 569).
+
+**Known cost:** This is acknowledged as a one-shot trade-off in the command's docstring (line 421, "It rewrites history irreversibly"). `git filter-branch` is deprecated but appropriate for throwaway repos.
+
+**Not wasteful:** The sed script is written once; filter-branch forks sed once per commit (unavoidable). The number of sed rules (one per ULID mapping) is proportional to checkpoint count, but linear and acceptable for test tooling. No re-reading happens.
+
+**No finding:** This is correct for the use case.
+
+---
+
+### 5. **MINOR EFFICIENCY: `deleteBranches` tolerates failures (lines 593–602, doctor_migrate_ulid.go)**
+
+**File:** `/cmd/entire/cli/doctor_migrate_ulid.go`, lines 593–602  
+**Finding:** `deleteBranches()` loops over refs and calls `git update-ref -d` per ref, silently continuing on failure. This is correct (a missing ref is not an error in idempotent cleanup).
+
+**No inefficiency:** One subprocess per branch is expected and acceptable.
+
+---
+
+## Summary
+
+| Issue | Severity | Mitigation | Cost for One-Shot |
+|-------|----------|-----------|-------------------|
+| Double checkpoint walk (dry-run + apply with different ULIDs) | **Real** | Pre-mint ULIDs once, cache, reuse | Medium (acceptable) |
+| Repeated tree reads in restampCheckpointID | **Real but cached** | Batch all metadata updates in one pass | Negligible (likely go-git cached) |
+| JSON remarshal reorders keys | **Negligible** | Use string-based replacement | Negligible (1KB per session) |
+| git filter-branch with sed | **Expected** | (None; correct for use case) | N/A |
+
+**Overall:** All costs are acceptable for a one-shot test-tooling command. The only worth mentioning is the double walk if the command is called iteratively or on very large repos. For a single run, the time is dominated by the sed/filter-branch rewrite, which is correct.</result>
+<usage><subagent_tokens>34250</subagent_tokens><tool_uses>12</tool_uses><duration_ms>46426</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a0f1ea01389164184</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/9e11aba3-87b7-4b24-ae83-5c1aa9fd4ba6/tasks/a0f1ea01389164184.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Perfect! Now I have all the context I need. Let me create my analysis report.
+
+## ALTITUDE REVIEW: `feat/checkpoint-migrate-to-ulid`
+
+This is test tooling (hidden command, one-shot use, intentionally not for main merge), so I'm applying the appropriate weight to over-engineering concerns. Here are my findings:
+
+---
+
+### 1. Hardcoded Trailer Key in `sed` Script (ACCEPTABLE FOR ONE-SHOT)
+
+**File:** `cmd/entire/cli/doctor_migrate_ulid.go`, lines 568-569  
+**Issue:** The string `"Entire-Checkpoint: "` is hardcoded in the sed script builder instead of deriving it from the `trailers` package.
+
+```go
+fmt.Fprintf(&amp;b, "s/Entire-Checkpoint: %s/Entire-Checkpoint: %s/g\n", m.OldID, m.NewID)
+```
+
+**Why it's acceptable here:** The `trailers` package exports `CheckpointTrailerKey = "Entire-Checkpoint"` (trailers.go:42), but importing and using it would require:
+- Importing `trailers` into the CLI command layer
+- Building the sed string at runtime with the constant
+- Added complexity for something that never changes (the trailer key is stable)
+
+For a one-shot test tool that will never be refactored or reused, this hardcoding is the right altitude — it avoids unnecessary coupling between test-tooling and the trailers contract for code that will be discarded after the migration. If this became a recurring migration need or merged to main, deriving the key from `trailers.CheckpointTrailerKey` would then be worth the extra import.
+
+**Verdict:** Appropriate depth for one-shot tooling. No change needed.
+
+---
+
+### 2. Split Between Checkpoint Package Migration and CLI Command History Rewrite (APPROPRIATE)
+
+**File:** `cmd/entire/cli/checkpoint/migrate_ulid.go` (migration logic) vs `cmd/entire/cli/doctor_migrate_ulid.go` (history rewrite + branch deletion)  
+**Issue:** The re-ID logic lives in the checkpoint package; history rewriting and branch deletion shell out to `git` from the CLI command.
+
+**Why the split is right:**
+- `MigrateBranchHexToULIDRefs` (checkpoint pkg) encapsulates the core concern: re-identifying checkpoints and writing new ULID refs. It's testable, reusable, and focused.
+- History rewriting + branch deletion are CLI orchestration concerns: they're destructive, one-shot, and don't belong in the checkpoint storage layer.
+- The CLI command layer is the right place for `git filter-branch` and `git update-ref` because those are user-facing, destructive git operations (not checkpoint semantics).
+
+Using go-git instead of shelling to git would add a ~200-line goggit-wrapper burden (go-git's filter-branch equivalent is non-trivial). For a one-shot hidden command, the shell-out is the right altitude.
+
+**Verdict:** Appropriate separation. No change needed.
+
+---
+
+### 3. Assumption About `checkpoint_id` Locations (CORRECT, WELL-TARGETED)
+
+**File:** `cmd/entire/cli/checkpoint/migrate_ulid.go`, lines 144-154  
+**Issue:** `restampCheckpointID` assumes only two places carry `checkpoint_id`:
+- Root `metadata.json` (CheckpointSummary, line 448)
+- Each session's `&lt;n&gt;/metadata.json` (Metadata, line 293)
+
+```go
+dirs := [][]string{nil} // root
+for i := range sessionCount {
+    dirs = append(dirs, []string{strconv.Itoa(i)})
+}
+```
+
+**Why it's correct:**
+- Verified in `/api/checkpoint/metadata.go`: Both `CheckpointSummary` (line 448) and `Metadata` (line 293) have `CheckpointID id.CheckpointID` with JSON tag `checkpoint_id`.
+- No other checkpoint tree files (`transcript.jsonl`, `prompt.txt`, task metadata dirs, etc.) embed the checkpoint_id; it's only in these two metadata.json files.
+- The code explicitly checks for checkpoint_id presence (line 200) and skips files without it, so it's defensive.
+
+This is not a fragile assumption—it's a correct, data-model-aware targeting. The comment at line 149-150 documents it clearly.
+
+**Verdict:** Appropriate altitude—correct and targeted. No change needed.
+
+---
+
+### 4. `mintULIDAt` vs `id.GenerateULID()` (MINOR CONCERN, ACCEPTABLE)
+
+**File:** `cmd/entire/cli/checkpoint/migrate_ulid.go`, lines 130-142  
+**Issue:** Defines a local `mintULIDAt(t time.Time)` that mints ULIDs with a custom timestamp, rather than using `id.GenerateULID()` (which uses `ulid.Now()`).
+
+```go
+func mintULIDAt(t time.Time) (id.CheckpointID, error) {
+    if t.IsZero() {
+        t = time.Now()
+    }
+    u, err := ulidpkg.New(ulidpkg.Timestamp(t.UTC()), rand.Reader)
+```
+
+**Why it's acceptable:**
+- `id.GenerateULID()` uses `ulid.Now()`, which doesn't accept a custom timestamp—it's locked to the call time.
+- The migration needs to preserve the checkpoint's original `CreatedAt` timestamp so ULIDs sort chronologically as if the repo had always used refs+ULIDs.
+- Adding `GenerateULIDAt(t time.Time)` to the `id` package *would* be the general solution, but for a one-shot tool duplicating the few lines is simpler and avoids a micro-API addition to `id` for migration-only functionality.
+
+The duplication is minimal (8 lines, same imports id already has), and it keeps migration concerns out of the stable `id` package.
+
+**Verdict:** Acceptable for one-shot use. If migrations become frequent, promote to `id.GenerateULIDAt()`. Current choice is the right altitude for ephemeral tooling.
+
+---
+
+### 5. Safety Guarding for Destructive History Rewrite (APPROPRIATE)
+
+**File:** `cmd/entire/cli/doctor_migrate_ulid.go`, lines 400-461  
+**Guarding layers:**
+1. `--yes` flag required (line 489) — explicit user intent
+2. Dry-run always runs first (line 438) — preview before impact
+3. `Hidden: true` (line 405) — not discoverable via `--help`
+4. Loud help text warning (lines 406-421)
+5. Clear "rewrites history" messaging at each step (output lines 467-480)
+
+```go
+if !apply {
+    fmt.Fprintln(out, "\nDry run. Re-run with --yes to apply (this rewrites history).")
+    return nil
+}
+```
+
+**Why it's appropriate:**
+- For a one-shot hidden test tool, this defense-in-depth is right: flag + dry-run default + loud copy is proportional to the risk.
+- Not over-engineered: no additional interactive confirmation, no backup automation (users are told "make a copy first").
+- Matches the tool's stated intent: test tooling for a throwaway copy, with git's `refs/original` as the safety net.
+
+**Verdict:** Appropriate depth. No change needed.
+
+---
+
+### Summary
+
+**All ALTITUDE findings:** No issues. The code is at the right depth for one-shot test tooling:
+
+- **Hardcoded trailer key:** acceptable (stable, one-shot, avoids coupling)
+- **Split between packages:** appropriate (storage vs orchestration)
+- **checkpoint_id assumption:** correct and targeted
+- **mintULIDAt:** acceptable duplication vs stable-API addition
+- **Safety guarding:** proportional (--yes + dry-run + loud help, no over-engineering)
+
+The diff shows disciplined engineering: it avoids unnecessary reuse/extensibility, separates concerns appropriately, and documents assumptions. No refactoring needed for a hidden, one-shot migration tool.</result>
+<usage><subagent_tokens>58972</subagent_tokens><tool_uses>29</tool_uses><duration_ms>890805</duration_ms></usage>
+</task-notification>
+
+---
+
+what's the exact command
+
+---
+
+hmm, I tried this now in ../git-sync-ref-store and it did not change all checkpoints, like see 1f6156204c437cf233220c56850cd9fbab47fa5c which has still hex and 7c0dfa64e634547fce40549508a6de4db6d6afad which is a ulid now
+
+---
+
+❯ git push
+Everything up-to-date
+
+is the new ref-store backend now outputting infos when pushing?
+
+---
+
+❯ git push
+Everything up-to-date
+
+can you check again? also I think we need to add some kind of progress / waiting indicator when the push runs, it took at least 30s

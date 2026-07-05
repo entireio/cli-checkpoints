@@ -1,0 +1,412 @@
+can you take a look at this https://github.com/entireio/cli/pull/1616 and the cell/jurisdiction logic, then the logic for the expert command (already merged) and what was started here https://github.com/entireio/cli/pull/1592
+
+You can also look at ../entiredb (which has the core logic) and ../entire-api (which has the cell logic)
+
+I wonder if we should build the foundation correctly now before merging this one
+
+---
+
+<task-notification>
+<task-id>a4409b5db8296c92e</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments-2/47b22b6e-eadc-4e6e-a6d3-01cee9413422/tasks/a4409b5db8296c92e.output</output-file>
+<status>completed</status>
+<summary>Agent "Analyze PR 1616 diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have everything needed. Here is my analysis of PR #1616.
+
+## Important meta-note first
+The Copilot review overview is stale/misleading: it says the PR touches "2 out of 2 changed files" (only the `codesearch` package) and hits `POST /search/api/search`. The actual diff is 4 files (~1,880 lines) and the client uses **GET**, not POST. The bulk of the PR — the multi-region orchestration in `search_cmd.go` (~500 lines) and its tests (~940 lines) — is not described by Copilot's summary at all. The two Copilot inline comments also appear to describe an earlier revision (details in section 5).
+
+Diff file line numbers below refer to the unified diff from `gh pr diff 1616`.
+
+---
+
+## 1. Orchestration in `search_cmd.go`
+
+**Flag/query pre-processing (RunE, diff lines 319-391).**
+- `--case-sensitive` without `--code` is rejected (323-325).
+- Under `--code`: rejects `--author`/`--date`/`--branch`/`--page` (327-340).
+- `extractInlineRepoFilters(query)` (diff 445-462) extracts ONLY `repo:` tokens, deliberately leaving `author:`/`date:`/`branch:` as literal search text (unlike `search.ParseSearchInput`).
+- Repo scoping logic (349-381): combines `--repo` + inline `repo:` values; `repo:*` or `--all-repos` → no filter (search everything); otherwise if empty, falls back to `currentRepoSlug(ctx)` (reused from `recap.go:236`), erroring if it can't be determined.
+- Calls `runCodeSearch(ctx, cmd, codeSearchOpts{...})`.
+
+**`runCodeSearch` (diff 467-498).** Gate via `codeSearchEnabled()` (`ENTIRE_CODE_SEARCH == "1"`, diff 417-420) → "code search is not yet available"; empty-query check; always delegates to `searchAllCells`; renders JSON (`writeCodeSearchJSON`) when `--json` or non-terminal, else `writeCodeSearchText`.
+
+**`searchAllCells(ctx, opts) (*codesearch.SearchResponse, error)` (diff 517-606)** — the core fan-out, 5 steps:
+1. Build control-plane client via `newCodeSearchCoreClient()` (→ `coreapi.New()`); maps `auth.ErrNotLoggedIn` to a login hint. `ListRepos` under a **10s** timeout; warns if `repoIndex.Truncated`.
+2. If filters present, `resolveRepoFilters` → resolved ULIDs + narrowed index subset; errors "no matching repositories found" (with truncation hint) if nothing matches.
+3. `groupReposByCell(indexRepos)` → `[]cellGroup`; empty → empty response.
+4. Step 3b: `ListClusters` under a **10s** timeout (best-effort; on error logs a warning and falls back to jurisdiction routing). Builds `slugToCluster` keyed by `strings.ToLower(cl.Slug)` and sets each `cells[i].baseURL = TrimRight(TrimSpace(cl.ApiUrl.Or("")), "/")`.
+5. Fan-out: `doSearch := searchCell` (overridable via `opts.searchCellFn` test seam). **Single cell → serial**; **multiple → one goroutine per cell + `sync.WaitGroup`**, writing into a pre-sized `results[]codeSearchCellResult` by index (no shared-mutation race). Then `mergeSearchResults`.
+
+**`groupReposByCell([]coreapi.RepoIndexEntry) []cellGroup` (diff 610-628).** Groups by lowercased/trimmed `r.Cell` (the grouping key, matching the BFF), carrying `jurisdiction` (lowercased `r.Jurisdiction`) and accumulating `repoIDs` (`r.ID`). One entry per distinct cell.
+
+**`resolveRepoFilters(filters, repos) (repoIDs, matched)` (diff 643-673).** Builds `byName`/`byID` maps; for each filter strips only a `gh/` prefix, then matches in BFF order `id===filter || full_name===slug || full_name===filter`; dedups by ID. Explicitly mirrors BFF `code-search.ts` lines 315-319.
+
+**`searchCell(ctx, opts, cg) (*codesearch.SearchResponse, error)` (diff 679-722).** Per-cell **30s** timeout (`codeSearchCellTimeout`, diff 465). Builds `*auth.CellTarget`: `baseURL != ""` → `{BaseURL, Jurisdiction}`; else `jurisdiction != ""` → `{Jurisdiction}`; else nil (home fallback). Calls `auth.NewEntireAPICellClient(cellCtx, opts.insecureHTTP, target)`. Passes per-cell `cg.repoIDs` only when a filter is active. Calls `codesearch.Search`.
+
+**`mergeSearchResults(ctx, limit, cells, results) (*codesearch.SearchResponse, error)` (diff 734-853).**
+- Sums `Stats.TotalMatches/TotalFiles/ReposSearched`; `DurationMs = max` ("wall-clock = slowest cell").
+- If `successCount == 0 &amp;&amp; lastErr != nil` → error `"code search failed: %w"`.
+- Tracks `failedJurisdictions` (cell name, else jurisdiction, else "home"); logs partial-failure warning.
+- `sort.SliceStable` by Score desc, tiebreak Repo→Path→Line (deterministic JSON).
+- Dedups results by key `repo\x00path\x00line:col`; dedups `RepoStats` by repo summing counts.
+- Caps `Results` to `limit`; sets `merged.FailedJurisdictions`.
+
+**Output:** `writeCodeSearchJSON` (diff 856-881) emits `{query, results, total, stats, repo_stats, failed_jurisdictions}` with `[]` for nil results; `writeCodeSearchText` (diff 889-913) is grep-style `repo:path:line: contextline`, truncating context lines &gt;200 chars (`maxContextLineLen`, diff 886) with an ellipsis, plus a summary line and partial-failure warning.
+
+---
+
+## 2. The `codesearch` package (diff 1-125)
+
+- **Endpoint:** `GET /api/v1/search/api/search?q=...&amp;max_results=...&amp;repo=...&amp;case_sensitive=true` — peregrine reached through the cell's entire-api gateway. Uses `client.Get` (diff 91), not POST.
+- **`Search(ctx, client *api.Client, req SearchRequest) (*SearchResponse, error)`** (diff 74).
+- **Types:** `SearchRequest{Query, Repos []string, MaxResults int, CaseSensitive bool}`; `Stats{TotalMatches, TotalFiles, DurationMs, ReposSearched}`; `RepoStats{Repo, MatchCount, FileCount}`; `Result{Repo, Path, Line, Column, ContextBefore/Line/After, Score}`; `SearchResponse{Query, Stats, RepoStats, Results, FailedJurisdictions}` — the last field is documented as CLI-merge-layer-only, not from peregrine (diff 66-68).
+- `case_sensitive` is sent "optimistically" with a `ponytail:` note (diff 81-84) since peregrine's proto doesn't define it yet.
+- **Auth expectation:** "The client must already be authenticated against the cell" (diff 73) — i.e. the caller supplies a cell-identity-token `api.Client` (built by `NewEntireAPICellClient`).
+- **Robustness:** 8 MiB response cap (`maxResponseBytes`, diff 21) via `io.LimitReader(body, max+1)` + overflow error; non-2xx wrapped in `*api.HTTPError` using `api.ErrorResponse.Message()`, falling back to `strings.TrimSpace(body)` (diff 105-116).
+
+---
+
+## 3. Generic/reusable vs. search-specific
+
+**Generic (any future multi-cell command would need this — currently inlined in `search_cmd.go`):**
+- `cellGroup` type and `groupReposByCell` (repo-index → per-cell groups).
+- `resolveRepoFilters` (slug/ULID/`gh/`-prefix → ULIDs + cell narrowing, BFF-parity matching).
+- The `searchAllCells` fan-out skeleton: list repos → group → resolve cluster `ApiUrl` via `ListClusters`/`slugToCluster` → parallel per-cell dispatch with `WaitGroup` and index-safe result collection → single-vs-multi handling.
+- Per-cell client construction from `cellGroup` → `auth.CellTarget` → `NewEntireAPICellClient` (`searchCell`'s target-building switch).
+- `codeSearchCoreClient` interface + `newCodeSearchCoreClient` swap seam; per-cell/per-op timeouts; partial-failure tracking (`FailedJurisdictions`, "all cells failed" escalation) and the warn-and-continue policy.
+
+**Genuinely search-specific:**
+- `codesearch.Search` call, `SearchRequest`/`SearchResponse`.
+- Score-based sort + result dedup key (`repo/path/line/col`) and Stats/RepoStats merge semantics.
+- Output rendering (`writeCodeSearchText`/`writeCodeSearchJSON`, `maxContextLineLen`).
+- `extractInlineRepoFilters`, `--code`/`--case-sensitive` flag gating, `codeSearchEnabled` env gate.
+
+All the "generic" logic lives inline in `search_cmd.go` with `codeSearch`-prefixed names, so a second multi-cell command would have to copy or refactor it.
+
+---
+
+## 4. Duplication with existing CLI code
+
+There is substantial conceptual overlap with `cmd/entire/cli/experts_cell_target.go`, which already does cell resolution — but the PR does **not** reuse it:
+
+- **Parallel interface + seam pattern:** `codeSearchCoreClient` + `newCodeSearchCoreClient` (diff 437-443) mirror `expertsCoreClient` + `newExpertsCoreClient` (`experts_cell_target.go:23-31`) almost exactly.
+- **Cluster→cell resolution is duplicated but keyed differently:** experts uses `matchClusterByHost` (matches on `cluster.PublicUrl` host, from a repo's `ClusterHost`); the PR builds `slugToCluster` keyed on `cluster.Slug`. Both then do the same `TrimRight(TrimSpace(ApiUrl.Or("")),"/")` + `ToLower(TrimSpace(Jurisdiction))` normalization (compare diff 577 vs `experts_cell_target.go:78-82`). Both produce an `auth.CellTarget{BaseURL, Jurisdiction}`.
+- **Single-repo vs multi-repo:** experts resolves ONE repo's cell (`resolveExpertsCellTarget`, used via `api_client.go:63`); the PR resolves ALL repos' cells from the `ListRepos` index. Different scale, same underlying concern — no shared helper.
+- **Mirror/placement filtering is NOT reused (and arguably a gap):** experts carefully filters placements via `isActiveMirror` / `distinctActiveClusterHosts` (excludes archived/failed/suspended, detects multi-region ambiguity). The PR ignores `RepoIndexEntry.Placements` entirely and groups solely on the single `RepoIndexEntry.Cell` field — so a repo mirrored across multiple cells is only searched in its index `Cell`, with no active/archived filtering.
+- **`CellTarget` construction differs:** experts always supplies both `BaseURL`+`Jurisdiction` (or nil); the PR adds an intermediate "jurisdiction-only target" tier (diff 694-695) when the cluster catalog lookup failed.
+- **Timeouts re-declared:** `codeSearchCellTimeout` (30s), plus two 10s control-plane timeouts, vs experts' `expertsCellResolveTimeout` (5s) — no shared constant.
+- **Properly reused:** `currentRepoSlug` (from `recap.go`), `auth.NewEntireAPICellClient`, `auth.CellTarget`, `api.HTTPError`/`api.ErrorResponse`, `search.AllReposFilter` — these are not duplicated.
+
+---
+
+## 5. Review comments
+
+Only the Copilot bot reviewed (state `COMMENTED`); no human review comments, no issue comments. Two inline comments, both of which appear to already be satisfied by the current diff (likely written against an earlier revision):
+
+1. `codesearch.go` line ~109: "When falling back to using the raw response body as the HTTPError message, the body isn't trimmed... Consider trimming and only setting Message when the trimmed body is non-empty." — The current code at diff 113-114 already does `if apiErr.Message == "" &amp;&amp; len(body) &gt; 0 { apiErr.Message = strings.TrimSpace(string(body)) }`. So this reads as already-addressed/outdated.
+
+2. `codesearch_test.go` line ~129: the non-JSON error test "only asserts that an error occurred"; suggests asserting the body text surfaces and that it wraps `*api.HTTPError` with status 502. — The current `TestSearch_NonJSONError` (diff 237-260) already asserts both `strings.Contains(err.Error(), "Bad Gateway")` and `errors.As(err, &amp;httpErr)` with `StatusCode == 502`. Also already-addressed/outdated.
+
+Net: no outstanding actionable review feedback; the substantive orchestration in `search_cmd.go` received no review coverage from Copilot at all.</result>
+<usage><subagent_tokens>64691</subagent_tokens><tool_uses>11</tool_uses><duration_ms>141577</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a975a91833cfd665f</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments-2/47b22b6e-eadc-4e6e-a6d3-01cee9413422/tasks/a975a91833cfd665f.output</output-file>
+<status>completed</status>
+<summary>Agent "Map CLI cell routing infra" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I now have a complete picture. Here is the structured map.
+
+---
+
+# Cell / Jurisdiction Routing Infrastructure Map (github.com/entireio/cli)
+
+Repo state note: working tree is clean on `main` (HEAD `4398a44c1`). **PR 1592 is NOT merged here.** Current `main` already contains the experts cell-routing stack (`experts_cell_target.go`, `api_client.go`, the `isActiveMirror` helper). PR 1592's net-new is the *activity/recap* wiring plus a few `cell_data_api.go` hardening fixes (details in §3). The `gh pr diff` for `experts_cell_target.go` is a stale-base artifact — that refactor already landed on `main`.
+
+## Layer overview (bottom to top)
+
+| Layer | File | Responsibility |
+|---|---|---|
+| Control plane (coreapi) | `internal/coreapi/client.go`, `cross_juris_transport.go` | Repo/mirror/cluster catalog. Cross-region reads via 421-follow + RFC 8693 (transparent). |
+| Cell auth / token exchange | `cmd/entire/cli/auth/cell_data_api.go` | Mint jurisdictional identity token, resolve which cell host to dial. |
+| Data-API auth (BFF/apex) | `cmd/entire/cli/auth/data_api.go` | Legacy path: bearer for the data API origin via `/.well-known` discovery. |
+| CLI cell-target resolver | `cmd/entire/cli/experts_cell_target.go` | Map a repo → its owning cluster host → cell `apiUrl` + jurisdiction. |
+| CLI client factories | `cmd/entire/cli/api_client.go` | `NewAuthenticatedAPIClient` (data) / `NewAuthenticatedEntireAPICellClient` (cell). |
+| Commands | `experts_cmd.go`, `api_cmd.go`, `activity_cmd.go`, `recap.go` | Decide repo identity, call a factory. |
+
+---
+
+## 1. `cmd/entire/cli/auth/cell_data_api.go` — the token-exchange + cell-resolution core
+
+This is the **single source of truth for "which cell host does a data-plane request dial, and what token does it carry."**
+
+### Entry point
+
+```go
+func NewEntireAPICellClient(ctx context.Context, insecureHTTP bool, target *CellTarget) (*api.Client, error)  // :99
+```
+Steps (`:99`–`:134`):
+1. `resolveStoredCellSubject` (`:205`) — deliberately ignores `ENTIRE_TOKEN`; resolves the active stored login context, discovers trusted login servers via `/.well-known/entire-api.json`, and refreshes the login JWT. Returns a `cellSubject{loginJWT, discoveredCore, dataOrigin, httpClient}` (`:183`).
+2. `targetJurisdiction` (`:300`) → `resolveJurisdiction` (`:314`): the `CellTarget.Jurisdiction` override, else the `home_jurisdiction` JWT claim. Validated against `jurisdictionLabelPattern = ^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$` (`:43`) so the claim can only name a sibling DNS label, never inject host/scheme.
+3. `jurisdictionCoreURL` (`:432`) — the entire-core origin to run the exchange at. Precedence: loopback discovered core verbatim → `ENTIRE_CORE_BASE_URL_TEMPLATE` → `https://{jurisdiction}.auth.&lt;family&gt;` → discovered core. `&lt;family&gt;` (`entire.io` / `partial.to`) comes from `environmentFamily` (`:397`).
+4. `resolveTargetCellBaseURL` (`:334`) — **the cell-host decision** (precedence doc at `:91`):
+   - `target.BaseURL` set → use it verbatim (the repo-scoped path).
+   - `dataOrigin` is not a BFF (host contains `.api.` or is loopback, `isBFFOrigin` `:351`) → keep verbatim.
+   - else BFF/apex → `resolveCellAPIBaseURL` home-jurisdiction fallback.
+5. `jurisdictionAudience` (`:411`) — the `aud` (`https://{jurisdiction}.&lt;family&gt;`), mirrors the BFF's `buildAudience`.
+6. `exchangeJurisdictionToken` (`:562`) — RFC 8693 exchange: `httputil.TokenExchangeForm(loginJWT, audience, scope=openid)` POSTed via `httputil.PostOAuthToken`. `JurisdictionIdentityScope = "openid"` (`:30`) — identity semantics only, authorization is per-request server-side (COR-666).
+7. Returns `api.NewClientWithBaseURL(token, cellBaseURL)`.
+
+### Jurisdiction → cell host mapping (`aws-us-east-2.api.entire.io`)
+
+Two independent resolvers produce the cell `apiUrl`:
+- **Repo-scoped (preferred):** CLI resolves it upfront in `experts_cell_target.go` (§2) and passes `CellTarget.BaseURL`.
+- **Home-jurisdiction fallback:** `resolveCellAPIBaseURL` (`:508`) hand-parses `GET /api/v1/clusters` (`clustersAPIPath` `:33`), filters rows by `jurisdiction`, prefers `isDefault`, returns `apiUrl`. It hand-rolls the HTTP call rather than reusing `coreapi.ListClusters` **to avoid an import cycle** (coreapi imports auth) — noted at `:502`–`:507`.
+
+### `home_jurisdiction` claim reader
+```go
+func HomeJurisdictionFromLoginJWT(loginJWT string) (string, error)  // :478
+```
+Decodes JWT payload **without signature verification** (routing only; server re-verifies). Shared with git-remote-entire. Returns `""` (no error) when absent.
+
+### `CellTarget`
+```go
+type CellTarget struct {           // :51
+	BaseURL      string  // e.g. https://aws-eu-west-1.api.entire.io
+	Jurisdiction string  // drives token audience + exchange core
+}
+```
+
+### `ErrNoCellForJurisdiction`
+**Does not exist on current `main`.** Today `resolveCellAPIBaseURL` returns plain `fmt.Errorf` strings (`:548`, `:550`). PR 1592 introduces the sentinel (§3).
+
+### Other entry point
+```go
+func JurisdictionToken(ctx, insecureHTTP bool, jurisdiction string) (string, error)  // :154
+```
+Raw-token variant used by `entire auth token --jurisdiction`; **does** honour `ENTIRE_TOKEN` (via `resolveCellSubject` `:195`), unlike `NewEntireAPICellClient`.
+
+---
+
+## 2. Experts command — cell targeting
+
+Call chain: `experts_cmd.go runExperts` → `newExpertsAPIClient` (`:32`) → `NewAuthenticatedEntireAPICellClient` (`api_client.go:62`) → `resolveExpertsCellTarget` (`experts_cell_target.go:53`) → `auth.NewEntireAPICellClient`.
+
+```go
+func NewAuthenticatedEntireAPICellClient(ctx context.Context, insecureHTTP bool, fullName, ulid string) (*api.Client, error)  // api_client.go:62
+func resolveExpertsCellTarget(ctx context.Context, fullName, ulid string) *auth.CellTarget                                   // experts_cell_target.go:53
+```
+
+`resolveExpertsCellTarget` (5s deadline, `expertsCellResolveTimeout` `:18`):
+1. `resolveRepoClusterHost` (`:93`): ULID → `coreapi.GetRepo().ClusterHost`; owner/repo → `listMirrorsForRepo` → `distinctActiveClusterHosts`.
+2. `c.ListClusters` → `matchClusterByHost` (`:168`, matches on `PublicUrl` host) → `cluster.ApiUrl` + `cluster.Jurisdiction` → `CellTarget`.
+
+**Single target only — no fan-out.** `resolveRepoClusterHost:113` bails to `nil` (home-jurisdiction fallback) when `len(hosts) != 1`, i.e. a repo mirrored in **multiple regions is explicitly treated as ambiguous and not fanned out** (`:117`). Every failure path returns `nil` → `NewEntireAPICellClient` falls back to home-jurisdiction routing (best-effort contract, `:39`–`:44`).
+
+`runExperts` (`experts_cmd.go:276`) selects **one** repo identity (ULID or owner/repo) and gets **one** client (`:282`). Cross-region misroute is handled reactively: a 404 with "region" in the body prints a region hint (`:316`–`:319`).
+
+```go
+func distinctActiveClusterHosts(mirrors []coreapi.Mirror) []string  // :143
+func isActiveMirror(m coreapi.Mirror) bool                          // :129  (archived / failed / suspended excluded)
+```
+
+---
+
+## 3. PR 1592 (`entireio/cli`) — what it adds
+
+Theme: route **activity/recap** through the same cell client as experts, with a data-API fallback; harden `cell_data_api.go`.
+
+**New file `cmd/entire/cli/entireapi_client.go`** (shared client seam):
+- `runAuthenticatedActivityAPI(ctx, errW, insecureHTTP, fn)` — tries `auth.NewEntireAPICellClient(ctx, insecureHTTP, nil)` (home cell); **any** error → `logCellClientFallback` + `runAuthenticatedDataAPI`. Both backends serve `/me/*`, so `fn` is backend-agnostic.
+- `logCellClientFallback` — silent for `ErrNoCellForJurisdiction` / `ErrNotLoggedIn` (normal during rollout), else debug-logs.
+- `forgeToMirrorProvider(forge)` — `gh`/`github` → `github`, else not-ok (GitHub-only today).
+- `currentRepoID(ctx)` — resolves origin remote → mirror → repo ULID (for `/me/recap?repo=`); `""` on any failure.
+- `firstActiveRepoID(mirrors)` — first `isActiveMirror` placement's `MirrorId`.
+
+**`activity_cmd.go`:** `runActivity` switches `runAuthenticatedDataAPI` → `runAuthenticatedActivityAPI`.
+
+**`recap.go`:** `newRecapClient` now returns `(*api.Client, repoSlug string, error)` — prefers the cell client (`currentRepoID` = ULID) and falls back to data API (`currentRepoSlug` = owner/repo slug), tolerating not-logged-in.
+
+**`cell_data_api.go` hardening:**
+- Adds `var ErrNoCellForJurisdiction` sentinel; `resolveCellAPIBaseURL` wraps it with `%w` (so `errors.Is` works for the fallback).
+- Fallback lists the cluster catalog against `selected.CoreURL` (the login core that signed `loginJWT`), not the templated jurisdiction core — renames param `coreURL`→`listCoreURL`; the exchange still uses `coreURL`.
+- `targetJurisdiction` case-folds the JWT claim (`strings.ToLower(TrimSpace)`) before the strict label check, so an uppercase `home_jurisdiction` routes instead of hard-failing.
+
+**Note:** the PR diff also *shows* adding `isActiveMirror` / refactoring `distinctActiveClusterHosts` in `experts_cell_target.go`, but those already exist on `main` — a stale-base overlap, not net-new.
+
+---
+
+## 4. Multi-cell fan-out audit
+
+**There is no data-plane fan-out anywhere in the CLI today.** Every path resolves exactly one target cell:
+- `distinctActiveClusterHosts` (`experts_cell_target.go:143`) is the only place that *computes* the set of clusters a repo lives on — and its sole consumer (`resolveRepoClusterHost:112`) **rejects** `len != 1`.
+- `selectCloneTarget` (`repo_clone.go:211`) enumerates a repo's placements but **picks one** (via `--cluster` or interactive prompt) — clone, not query.
+- The mirror-create wizard (`repo_mirror_create_wizard.go`) iterates the cluster catalog only to let the user *choose* a placement.
+- No `groupReposByCell`, no per-cluster query iteration, no "run request X against every cell" loop exists. `coreapi.ListRepos` (`internal/coreapi/oas_client_gen.go:4900`) is a single control-plane call.
+
+The **only** transparent cross-region mechanism is at the control-plane layer: `coreapi.New()` (`internal/coreapi/client.go:35`) wires `newCrossJurisHTTPClient` (`cross_juris_transport.go`), whose transport follows **421 cross-jurisdiction redirects** and does the RFC 8693 exchange a foreign core requires. So control-plane reads (repo/mirror/cluster) work across regions from a home login — but that is redirect-follow, not client-side fan-out, and it applies only to coreapi, not to entire-api cell data.
+
+---
+
+## 5. Repo → cell/cluster association (CLI's view)
+
+- **Cluster catalog** (`coreapi.Cluster`, `oas_schemas_gen.go:~655`): `ApiUrl OptString` (cell data host), `Jurisdiction string`, `PublicUrl string` (git/public host). `ListClusters` is the authoritative jurisdiction→`apiUrl` source.
+- **Repo placement**: `coreapi.Repo.ClusterHost OptString` (`:6493`) for the ULID path; `coreapi.Mirror.ClusterHost` (per placement) for the owner/repo path.
+- **`listMirrorsForRepo`** (`repo_clone.go:180`): lists all placements of a repo across clusters (server filters by provider+owner; repo matched client-side). Used by experts targeting, `api_cmd.go` `{repo_id}` expansion, PR 1592's `currentRepoID`, and clone.
+- **Join**: `matchClusterByHost` (`experts_cell_target.go:168`) links a placement's `ClusterHost` to a catalog cluster via `PublicUrl` host, yielding `ApiUrl` + `Jurisdiction`.
+- Default when unplaced: `defaultClusterHost = "aws-us-east-2.entire.io"` (`repo_mirror.go:55`).
+
+---
+
+## Single source of truth &amp; gaps
+
+**"Which cell does request X go to?"**
+- **Repo-scoped data-plane (experts, and recap-with-repo under PR 1592):** `resolveExpertsCellTarget` (CLI layer) → `CellTarget` → `NewEntireAPICellClient`. Authoritative catalog = `coreapi.ListClusters`.
+- **Personal/home data-plane (activity, recap personal side):** `home_jurisdiction` JWT claim → `resolveCellAPIBaseURL` fallback.
+- **Control-plane:** always the home core; cross-region handled by 421-follow transport.
+
+**Duplication / gaps observed:**
+1. **Two cluster-catalog parsers.** `resolveCellAPIBaseURL` (auth, `cell_data_api.go:508`) hand-parses `GET /api/v1/clusters`, duplicating `coreapi.ListClusters` — forced by the auth↔coreapi **import cycle**. The repo-scoped path sidesteps it by resolving in the CLI layer; the home-fallback cannot. This is the main structural wart.
+2. **Repo-ID resolution duplicated 3×:** `resolveCurrentRepoID` (`api_cmd.go:194`), `resolveExpertsRepoID` (`experts_cmd.go:387`), and PR 1592's `currentRepoID`/`firstActiveRepoID` — all "list mirrors → first active → MirrorId." PR 1592 partially consolidates via the shared `isActiveMirror`, but the three call sites remain.
+3. **Multi-region repos are a hard gap, not a feature.** Any repo mirrored across &gt;1 cluster silently degrades to home-jurisdiction routing and relies on a reactive 404-region hint. No fan-out, no "ask each cell." If cross-region querying is the goal, this is the layer to build on — `distinctActiveClusterHosts` already computes the needed host set but its callers throw it away.
+4. **`ENTIRE_TOKEN` asymmetry:** `NewEntireAPICellClient` ignores it; `JurisdictionToken` honours it (`cell_data_api.go:100`, `:154`). Intentional but a subtle footgun for anyone adding cell commands.
+
+### Key signatures (entry points)
+```go
+// auth layer
+func NewEntireAPICellClient(ctx context.Context, insecureHTTP bool, target *CellTarget) (*api.Client, error)
+func JurisdictionToken(ctx context.Context, insecureHTTP bool, jurisdiction string) (string, error)
+func HomeJurisdictionFromLoginJWT(loginJWT string) (string, error)
+type CellTarget struct { BaseURL string; Jurisdiction string }
+
+// cli layer
+func NewAuthenticatedEntireAPICellClient(ctx context.Context, insecureHTTP bool, fullName, ulid string) (*api.Client, error)
+func NewAuthenticatedAPIClient(ctx context.Context, insecureHTTP bool) (*api.Client, error)
+func resolveExpertsCellTarget(ctx context.Context, fullName, ulid string) *auth.CellTarget
+func listMirrorsForRepo(ctx context.Context, c mirrorLister, provider, owner, repo string) ([]coreapi.Mirror, error)
+func distinctActiveClusterHosts(mirrors []coreapi.Mirror) []string
+
+// PR 1592 (proposed)
+func runAuthenticatedActivityAPI(ctx context.Context, errW io.Writer, insecureHTTP bool, fn func(context.Context, *api.Client) error) error
+func newRecapClient(ctx context.Context, insecureHTTP bool) (*api.Client, string, error)
+var ErrNoCellForJurisdiction = errors.New("no entire-api cell configured for jurisdiction")
+```</result>
+<usage><subagent_tokens>61269</subagent_tokens><tool_uses>26</tool_uses><duration_ms>474752</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a538ffbdf75a68312</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments-2/47b22b6e-eadc-4e6e-a6d3-01cee9413422/tasks/a538ffbdf75a68312.output</output-file>
+<status>completed</status>
+<summary>Agent "Map backend cell model" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I now have a complete picture. Let me compile the report.
+
+---
+
+# Server-side cell/jurisdiction model — how a CLI should route/fan out
+
+Two-tier system. **entiredb (control plane, "core")** owns the global catalog: identities, the cluster/cell registry, repo placements, authz (SpiceDB), and all token minting. **entire-api (data plane, "cell")** is deployed once per jurisdiction and serves residency-safe activity/product reads for repos that live in that cell. There is **no server-side cross-cell aggregation in the Go services** — fan-out is the *client's* job, and today the entire.io Cloudflare-Workers BFF is the reference client that does it.
+
+Note: entire.io is a TypeScript/Hono monorepo (`api/`, `frontend/`, `website/`), not Rails — the BFF fan-out lives in `api/src/`.
+
+## 1. entiredb (core) — the catalog and token minting
+
+### Cluster / cell / jurisdiction model
+- `Cluster` struct: `core/cluster/cluster.go`. Fields: `Slug` (globally unique, embedded in JWT audiences `service:entiredb:&lt;slug&gt;`), `Jurisdiction` (e.g. `us`/`eu`/`au`), `PublicURL` (git data-plane host), `InternalURL` (mTLS, never exposed), `Cell` (physical cell, e.g. `aws-us-east-2`), `IsDefault`, `Hidden`. Stored in the `clusters` table; reconciled from an embedded fixture on deploy (`core/cluster/store.go`, `reconcile.go`). Lookups by public host / slug / slug-global / default-per-jurisdiction.
+- **Invariant**: `clusters.slug` is globally unique (migration 009), so a slug names exactly one cluster regardless of jurisdiction (`GetBySlugGlobal`). This lets one core render clone hosts for repos in any jurisdiction.
+
+### Data model (`core/model/types.go`)
+- `Account.HomeJurisdiction` — the account's residency (`accounts.home_jurisdiction`, global identity store). "Our Account is the architecture's *Person*."
+- `PrivateProfile` / `VerifiedEmail` — regional PII, resident in home jurisdiction, "never leaves the region."
+- `Repo` (jurisdictional record) carries `ClusterSlug` but **no** jurisdiction field — "every row lives in exactly the jurisdiction whose store it was read from."
+- `RepoRegistration` (global registry row): `ID`, `Jurisdiction`, `ClusterSlug` — "what exists and where it lives," used for id→jurisdiction routing.
+- **Invariant**: a repo/placement lives in exactly one cluster (one cell, one jurisdiction). A project is hosted in a single region and every repo it owns lives in that same region.
+
+### Catalog API endpoints (huma, `/api/v1`, `core/coreapi/`)
+- **`GET /api/v1/clusters`** (`coreapi/clusters.go`, wire `api/corev1/clusters.go`): lists all clusters across jurisdictions. Each entry: `slug`, `jurisdiction`, `publicUrl` (git host), `isDefault`, and `apiUrl` = the jurisdiction's **cell-bound entire-api host** (from `JURISDICTION_API_HOSTS`, keyed by jurisdiction). Comment explicitly names this "the BFF's /me proxy" consumer. Requires auth, no per-cluster authz (topology is shared infra).
+- **`GET /api/v1/repos`** — the consolidated **repo index / placement catalog** (`coreapi/repos.go` `ListRepos`, wire `api/corev1/repos.go` `RepoIndexEntry`/`RepoPlacement`). One entry per *logical* repo (mirrors collapsed); scalar fields describe the **canonical placement** (caller's home-jurisdiction copy, else lowest-ULID); `placements[]` lists every readable cell-local copy with `{id, jurisdiction, cell, mirror}`. `Cell` (e.g. `aws-eu-west-1`) is the **addressable** routing key ("the BFF forms `https://&lt;cell&gt;.api.partial.to`"); `clusterSlug` is a logical name. Not paginated — capped + alphabetical + `truncated` flag. This is *the* index a CLI should use to know which cells host which repos.
+- **`GET /api/v1/mirrors`** (`coreapi/mirrors.go`, wire `api/corev1/mirrors.go`): mirror placements the caller can pull (SpiceDB `repo#pull` reverse lookup, across all jurisdictions). Each `Mirror` carries `clusterHost`, `jurisdiction`, `cell`, status. "The optional cluster filter is just a filter, not a router: a single core returns mirrors on every cluster the caller can pull, regardless of jurisdiction." Create/Delete/collaborators address a placement by upstream coords + `clusterHost`.
+- **`GET /api/v1/repos/lookup?slug=` (`LookupBySlugOutput`)**: unauthenticated slug→`{repoId, cell, jurisdiction, owner, repo}` routing resolver.
+- Home jurisdiction surfaced on identity endpoints (`api/corev1/identity.go` `HomeJurisdiction`, `/accounts/{id}` internal mTLS).
+
+### home_jurisdiction claim minting &amp; RFC 8693 token exchange
+- **Token exchange endpoint** is the canonical OIDC `/oauth/token` with `grant_type=urn:ietf:params:oauth:grant-type:token-exchange` (`core/authn/oidcop/token_exchange.go`; URNs in `httputil/oauth.go`). It dispatches on the requested **audience** (`ValidateTokenExchangeRequest`):
+  - repo audience `https://&lt;cluster&gt;/git/repo/&lt;id&gt;` → scope `pull|push`
+  - `/admin`, `/debug`, deploy, `service:entiredb`
+  - **core/AS audience** → `entire:api-access` (narrowing) or SA-session
+  - **jurisdiction audience** (path-less origin, e.g. `https://us.partial.to`) → **identity token**: `validateIdentityExchange` mints an **identity-only access token with `scope=openid`**, subject's identity claims, and **`home_jurisdiction`** stamped via `stampHomeJurisdiction` (reads global `accounts` row). This is the **jurisdictional identity token** entire-api consumes. Input must carry `entire:session` (non-re-entry: the openid-only output can't bootstrap another exchange).
+- `home_jurisdiction` is stamped on **every identity-bearing token** — the login JWT (core audience branch) and the identity token (jurisdiction audience branch) — so any reader can route home-jurisdiction work off it.
+- Scopes: `core/authn/scopes.go`. `ScopeOpenID`, `ScopeEntireSession`, exchange-capability scopes `entire:repo-access|ops-access|api-access|sa-session`.
+- Relying-party verifier: `core/authn/jurisdiction_token.go` (`JurisdictionTokenVerifier`) — pins exact jurisdiction aud + `scope=openid`, delegates to the dependency-light `modules/jwtverify`.
+- **Cross-jurisdiction** (`validateForeignSessionExchange`, ADR 20260520): a sibling region's login JWT can exchange *only* for this core's login audience or its jurisdiction identity audience; to get repo/ops credentials the caller must "foreign-session first, then re-exchange at the new home." Chained cross-juris hops are barred (`foreign_iss`). Repo-audience exchange additionally pins the audience host to the repo's actual hosting cluster (`assertAudienceHostOwnsRepo`) — a repo token can't be replayed at another cluster.
+- **Invariant**: identity tokens are **per-jurisdiction, not per-cell** — the aud is the jurisdiction host, and *every cell in a jurisdiction reports the same `apiUrl`*, so any cluster row in the jurisdiction is an acceptable route target.
+
+## 2. entire-api (cell) — what a cell serves and how it authenticates
+
+### Auth: jurisdictional identity token only
+- `internal/auth/auth.go`: **bearer-only, no cookies**. The `Authenticator` verifies against Core JWKS, **pins the token aud to this cell's jurisdiction host** and requires `scope=openid` (ADR 20260612). It reads `home_jurisdiction`, `handle`, `provider` straight off the token — no callback to Core. Read-time authz is a live query to the **regional read-only SpiceDB** (`internal/authz`), not a Core call. This is *not* the control-plane bearer — it's specifically the jurisdictional identity token minted by core's identity exchange. The gateway's `requireBearer` (below) forwards the caller bearer; the workload mТLS cert is only the pipe, never the authorization.
+
+### Endpoints (`internal/httpapi/`, huma under `/api/v1`, `router.go`)
+- `/me/*` — two surfaces. The **drop-in** owns bare `/me/*`; the forward-looking residency-safe pointer contract is under **`/experimental/me*`** (`experimental_me.go`): `GET /me` (identity + jurisdictions the caller has data in), `/me/commits`, `/me/checkpoints`, `/me/activity`, `/me/recap`. All read the **local region's `my_activity`** store and filter by the caller's currently-pullable repos (fail-closed via SpiceDB). Aggregation math in `me_aggregate.go`.
+- `/me/recap` — per-agent recap; team column signals `team_stats_foreign_region` when the repo isn't local (client should federate to the repo's region).
+- Sessions/preferences: `me_sessions.go`, `preferences.go`, `repo_preferences.go`.
+- **Experts** (`experts.go`): `POST /api/v1/repos/{repo_id}/experts` — repo-scoped (gated on repo pull), returns residency-safe agent-provenance pointers. Natural-language `query` mode returns **503** because a cell's activity-api doesn't run the code-search index (see search below).
+- **Search / peregrine**: not served by activity-api directly — it's a **separate cell-local upstream aggregated by the gateway**. In `internal/gateway/config/topology.go`, `peregrine` is a cell service (`PEREGRINE_SPEC_URL`, `PathPrefix: /search`), so its surface is exposed at **`/api/v1/search/...`** (the BFF calls `search/api/search` and `search/api/symbols`). Optional per cell.
+
+### Cell scoping — strictly local, with two residency mechanisms
+- **Repo data is strictly scoped to repos placed in that cell.** `docs/architecture.md`: "A repo's full history lives only in the repo's own jurisdiction." The repo store holds only repos that live in this region; project aggregates are complete because a project + all its repos co-locate. Git content isn't replicated — it's **read through to the regional entiredb** at request time (bearer forwarded, re-authorized against SpiceDB), cached by branch tip.
+- **User activity is consolidated into the user's HOME cell** (not per-repo). The `forwarder` (`internal/forwarder/subjects.go`) publishes `user_activity_v1.{home_jurisdiction}` residency-safe metadata into the **recipient's home-region NATS island**. There is explicitly **no NATS supercluster** — cross-region delivery is a direct publish per region. So `/me` on a user's home cell already sees their cross-cell activity as *forwarded pointers*.
+- Last-resort foreign repo naming (`me_foreign_repo.go`): a `/me` row for a repo with no local placement is named via a read-time Core batch call (shown-not-stored, best-effort) — reinforces that the cell holds no metadata for foreign repos.
+
+## 3. Server-side fan-out / aggregation across cells — NONE in Go; the BFF does it
+
+Neither core nor entire-api aggregates across cells. Core returns *catalogs* spanning jurisdictions (repos/mirrors/clusters) but never proxies to cells. Each cell is strictly local. **Fan-out is the client's responsibility.** The reference implementation is the entire.io BFF (`entire.io/api/src/`).
+
+### The documented BFF pattern (multi-region fan-out)
+Reference: `entire.io/api/src/routes/code-search.ts` — `POST /code-search/stream`, SSE cross-jurisdiction code search. Its own comment: "Same fan-out pattern as `/repos/stream`: index → group by cell → per-cell search → stream. Each cell settles independently." Steps:
+1. **Index**: `listReposIndex` calls core `GET /api/v1/repos` (`api/src/lib/repos-federation/list-repos-index.ts`) — authority for the row set + placement (`jurisdiction`, `cell`), canonical placement + `placements[]`, plus `truncated`.
+2. **Group by cell**: `byCell = Map&lt;cell, {jurisdiction, repoIds}&gt;` — one request per cell, each cell searches only its own repos.
+3. **Per-jurisdiction token mint** (single-flighted per jurisdiction, cached): login JWT → RFC 8693 exchange at the **regional** core (`ENTIRE_CORE_BASE_URL_TEMPLATE`, COR-666) for a jurisdiction identity token whose aud = that cell's `ENTIRE_API_AUDIENCE_TEMPLATE`. `api/src/lib/entire-core/jurisdiction-token.ts`.
+4. **Fetch per cell**: base URL `buildBaseUrl(template, cell)` (`https://&lt;cell&gt;.api...`), path `search/api/search`, bearer = the jurisdiction token. `max_results` divided across cells.
+5. **Stream + settle independently**: `fanOutStream` (`api/src/lib/sse-fan-out.ts`) emits `ready`/`fill`/`error`/`done` frames; a failing/slow cell (30s budget) emits an error frame while healthy cells stream through.
+
+Two routing helpers make the repo-vs-user distinction explicit:
+- **Repo-scoped** (`resolve-cell.ts` / `proxy.ts`): resolve a repo to its `{cell, jurisdiction, repoId}` via core's mirror/repo listing, mint a jurisdiction token, call that one cell. Multi-cell → fan out and merge.
+- **User-scoped `/me`** (`resolve-home.ts` / `me-proxy.ts`): "Personal activity is consolidated in the user's home jurisdiction … a single point-to-point call to that one cell — **no repo, no fan-out, no merge**." Home jurisdiction read from the `home_jurisdiction` login-JWT claim; api base from the cluster listing's `apiUrl`. (CLI/bearer callers fall through — CLI home routing is a separate CLI-side change: "point its data base at the home entire-api directly.")
+
+## 4. Future direction (docs/ADRs)
+- **entiredb `docs/adrs/`**: `20260612-regional-authz-service-list-queries.md` (the identity-token + regional-SpiceDB model), `20260520-cross-juris-token-exchange.md`, `20260424-regional-repo-metadata.md`, `20260403-regional-login-flow.md`, `20260620-identity-first-auth.md`, `20260529-entire-core-crdb-read-locality.md`, `20260527-three-tier-session-tokens-and-fid-liveness.md`. `docs/architecture.md`, `docs/auth.md`, `docs/replication-flows.md`.
+- **entire-api `docs/`**: `architecture.md` (the residency model — "Data has a residence"; "The API never serves content"), `adr/0001-store-boundary-via-roles.md`, `0002-commit-author-account-resolution.md`, `0003-session-sharing-encrypted-snapshot.md`, `mirror-origin-rollout.md`.
+- The `/experimental/me` prefix in `experimental_me.go` is explicitly "a forward-looking contract, not the BFF's current one" — the residency-safe pointer + cross-region federation model the CLI should target.
+- The forwarder doc reference `docs/multi-region/multi-region-fanout-design.md` (mirror-pipeline's `cmd/fanout`) is cited as the model for per-region NATS islands.
+
+## Key invariants for CLI routing
+1. **A repo/placement lives in exactly one cell** (one cluster, one jurisdiction); a "logical repo" may have several placements (native + mirrors) across cells — core's `GET /api/v1/repos` collapses them with a `placements[]` list.
+2. **`cell` is the addressable routing key** (`aws-eu-west-1` → `https://&lt;cell&gt;.api...`); `clusterSlug` is a logical name; `publicUrl` is the git data-plane host; `apiUrl` (per jurisdiction) is the entire-api host.
+3. **Tokens are per-jurisdiction, not per-cell.** One identity token (aud = jurisdiction host, `scope=openid`) is accepted by *every cell in that jurisdiction*. Mint once per jurisdiction, reuse across its cells.
+4. **The `home_jurisdiction` claim** rides on both the login JWT and the identity token — it's the routing key for user-scoped `/me` reads.
+5. **User (`/me`) reads = single call to the home cell** (activity is forwarded home). **Repo/search reads = fan out to each cell that hosts the caller's repos, then merge.** No server-side aggregator exists — the CLI must fan out itself.
+6. **Cells are strictly local + fail-closed.** A cell only holds/serves data for repos placed in it; authz is live regional SpiceDB; git content is read-through to the regional entiredb (forward the caller's bearer).
+7. **Cross-jurisdiction credential rule**: you cannot mint a repo/ops token in region B from region A's session directly — foreign-session to B first, then re-exchange. For a CLI this means: get an identity/login token valid at the target jurisdiction's core before hitting its cells.</result>
+<usage><subagent_tokens>178622</subagent_tokens><tool_uses>46</tool_uses><duration_ms>4387928</duration_ms></usage>
+</task-notification>
+
+---
+
+the issue is that 1592 is currently red and has open comments, so merging is not straight forward, so let's fix that and build the routing package extraction on top?
+
+---
+
+continue, sorry

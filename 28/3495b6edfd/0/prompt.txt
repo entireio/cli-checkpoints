@@ -1,0 +1,135 @@
+<task-notification>
+<task-id>af1b59c6aa51bf2f8</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/cfc00e65-2a26-4afb-ac20-fc1509c10742/tasks/af1b59c6aa51bf2f8.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement PR3 divergence matrix" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>All work complete and verified. Tree is clean.
+
+## Final Report — PR 3: D-group divergence &amp; recovery matrix
+
+### Commits (on `soph/git-remote-test-coverage`, not pushed)
+
+| Hash | Subject |
+|---|---|
+| `ea4cc219b` | test: add git-branch divergence matrix + replay fidelity guards (D1, D4, D5) |
+| `c1a1af8bb` | test(integration): add git-refs per-checkpoint ref divergence &amp; recovery (D2, D3) |
+| `d93c1e3d5` | test(integration): add git-refs push-queue semantics (D6 multi-worktree, D7 two-remote pin) |
+
+Split matches the suggested grouping: (1) git-branch v1 family, (2) git-refs divergence, (3) queue semantics.
+
+### Verification (all green)
+- `mise run fmt &amp;&amp; mise run lint`: 0 issues (rerun after every fmt).
+- `go test ./cmd/entire/cli/strategy/ -count=1`: pass (19s).
+- `mise run test:integration`: **444 tests pass** (ran after commits 1 and 3, which touch shared `testenv.go`).
+- `mise run test:e2e:canary`: 4/4 pass.
+- `E2E_CHECKPOINT_STORE=git-refs mise run test:e2e:canary`: 4/4 pass.
+- Did NOT run `mise run test:e2e`.
+
+### New files
+- `cmd/entire/cli/strategy/replay_fidelity_test.go` — D4/D5 unit tests.
+- `cmd/entire/cli/integration_test/divergence_matrix_test.go` — D1.
+- `cmd/entire/cli/integration_test/refs_divergence_test.go` — D2/D3.
+- `cmd/entire/cli/integration_test/refs_queue_semantics_test.go` — D6/D7.
+- `cmd/entire/cli/integration_test/testenv.go` — added `AddWorktree` + `commitMsgPath` helpers (test-only).
+
+### D1 matrix coverage (git-branch integration)
+`TestDivergedV1_PrePushMatrix` covers **pre-push (real hook) × {ahead, behind, diverged, disconnected}**: base survives; ahead→FF; diverged→both sides + linear tip (double-replay guard #1260); disconnected→cherry-pick; plus an idempotency assertion (repeated pre-push leaves the remote byte-identical). `TestDivergedV1_ExplainFetchOnMiss` covers **explain fetch-on-miss × {behind, diverged}**. `TestDivergedV1_DoctorReconcilesDisconnected` covers **doctor × disconnected**.
+
+Already covered elsewhere (not duplicated):
+- explain fetch-on-miss × **{missing, ahead}** — `explain_test.go` (`...FetchesFromRemoteWhenMissingLocally`, `...FetchDoesNotRewindLocalAheadBranch`).
+- The reconcile engine per state — `strategy/safely_advance_local_ref_test.go` (all 5 states) and `metadata_reconcile_test.go` (disconnected).
+- **resume** trigger: uses the same `SafelyAdvanceLocalRef` engine as explain fetch-on-miss (`resume.go:878` / `git_operations.go:439` both call it after fetching the tracking ref); I exercised that engine end-to-end via explain rather than duplicating through resume's heavier branch-resolution path.
+
+One legitimate matrix subtlety documented in the test: pre-push in the **behind** state with stale tracking is a correct no-op (`hasUnpushedBranchRef` sees local==tracking), so behind-reconcile is a read-path property, asserted via the explain test instead.
+
+### KNOWN BUG pins (reported prominently)
+1. **D4(c) — &gt;1000-commit replay cap is still active.** `4cf01edb3` ("Drop commit-count cap") is **not** in this branch — it lives on unmerged `origin/no-limit` and touches `push_signing.go`, which no longer exists in this lineage. Verified `git merge-base --is-ancestor 4cf01edb3 HEAD` → false. `collectCommitsSince` still errors at &gt;`MaxCommitTraversalDepth` (1000). `TestCollectCommitsSince_CommitCapPinsCurrentBehavior` pins the capped behavior with a flip-when-fixed note. (`743c43f4c`, the no-op tree-clobber fix, is likewise not in the branch, but the current replay path `cherryPickOnto` already skips no-op commits correctly — D4(a) verifies that invariant and passes.)
+2. **D7 — two-remote queue-clearing gap (plan decision D-2).** `TestGitRefsQueue_TwoRemotesQueueClearedByFirstPush` pins that a push to remote A drains the queue so remote B never receives the refs. Asserts current behavior; comment says flip to `require.True` when per-remote tracking lands. No production change.
+
+### D5 approach chosen
+**Strategy-level integration test** (`TestFetchAndRebaseRefCommon_UsesFetchedRemoteHash`), not a pure unit with injected seams. Rationale: the literal ls-remote-before-fetch seam that `1e8628ade` patched no longer exists (the fix **is** an ancestor of this branch; the reconcile path now always reads the post-fetch remote-tracking/temp ref). So the test drives the real `fetchAndRebaseRefCommon` against a bare remote that advanced after the local repo last saw it, and proves the reconciled local tip descends from the *fetched* hash (both sides' content survive) — pinning the behavioral invariant rather than a dead code path.
+
+### D2 note
+A pure content-level cherry-pick conflict is **not deterministically reproducible** at the integration layer (the tree-delta apply is last-writer, not a 3-way merge), so D2's "genuine conflict → stays queued, remote untouched, retry" is realized via a bare-side `pre-receive` hook that declines the checkpoint namespace — exercising the same queue-safety property. The primary D2 case (remote-ref-ahead amend → fetch+replay+non-force retry, both sides survive) is fully deterministic.
+
+### Flags for remaining phases (B / E / F)
+- **B (remote-name/upstream resolution):** untouched. Blocked on product decision D-1 (non-origin reads). Not started here.
+- **E (OPF pre-push rewrite):** untouched; git-branch-only, all unit-level today.
+- **F (degraded remotes/protocol edges):** untouched. Note: my D2 queue-safety test uses a bare `pre-receive` rejection hook — F1 (GH013 protected-ref banner) can reuse that mechanism; the `installRejectCheckpointRefsHook` pattern is a ready building block.
+- **Test-harness enabler surfaced:** `AddWorktree` + the `commitMsgPath` git-dir resolution now make worktree+remote scenarios (plan I-3 / G2) tractable. One observation worth a follow-up: full worktree *session condensation* through the simulated-hook harness needs distinct session IDs across worktrees (session state is common-dir-shared, keyed by `test-session-&lt;n&gt;`); `AddWorktree` offsets the counter to avoid the collision.</result>
+<usage><subagent_tokens>294413</subagent_tokens><tool_uses>79</tool_uses><duration_ms>3479601</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>adc0ee9d36fa7b046</task-id>
+<tool-use-id>toolu_01SFX6uNeDX5LbowxVniwGt1</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/cfc00e65-2a26-4afb-ac20-fc1509c10742/tasks/adc0ee9d36fa7b046.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement PR5 OPF+degraded+e2e" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>All changes are confined to test files, integration test infrastructure (`testenv.go`, `integration` build tag), and the e2e test-helper package — no production code touched.
+
+## Done — PR 5 test coverage delivered across 4 commits
+
+All on branch `soph/git-remote-test-coverage`, not pushed.
+
+| Commit | Subject |
+|---|---|
+| `b200241b1` | test: add OPF pre-push rewrite coverage over a real remote (E1-E5) |
+| `b9e9dc92f` | test: add degraded-remote &amp; protocol-edge coverage (F1, F2, F4, F5) |
+| `696390d2d` | test: add shallow &amp; partial user-clone coverage (C5, C6) |
+| `7093889ad` | test(e2e): add worktree-remote and unreachable-remote scenarios (G2, G3) |
+
+### Verification (all green)
+- `mise run fmt &amp;&amp; mise run lint` — 0 issues after every commit.
+- `mise run test:integration` — 457 tests pass (was 448 at start).
+- `go test ./cmd/entire/cli/strategy/ -count=1` — pass.
+- `mise run test:e2e:canary` — exit 0; `E2E_CHECKPOINT_STORE=git-refs mise run test:e2e:canary` — exit 0 (61 vogon + 4 roger-roger both backends). Did **not** run `mise run test:e2e`.
+
+### Scope delivered vs deferred
+
+**E-group (OPF, git-branch only)** — `cmd/entire/cli/integration_test/opf_prepush_test.go`, `cmd/entire/cli/strategy/manual_commit_opf_rewrite_test.go`
+- **E1** ✅ integration: OPF enabled via committed settings → real hook → remote v1 tip carries `Entire-OPF-Applied: true`; fake `opf` binary invocation proven via marker file; branch + checkpoint land.
+- **E2** ✅ integration: diverged v1 → `V1DivergedError` aborts the user push (non-zero exit, "diverged" message); remote branch tip does not advance.
+- **E3** ✅ **strategy layer** (documented in-test): the CAS `V1RefMovedError` seam is impossible to hit deterministically from a spawned hook, so it's driven by a fake OPF runtime (`fakeOPFMovesRefOnce`) that advances the local v1 ref mid-rewrite; a re-run succeeds.
+- **E4** ✅ integration: bootstrap cap exceeded → typed abort before OPF runs; nothing pushed; `opf` binary never executed.
+- **E5** ✅ integration: non-TTY push (`execx.NonInteractive`, no controlling terminal) completes &lt; 60s without hang and ships the trailer.
+- **OPF runtime note:** the in-process `ConfigurePrivacyFilterWithRuntime` seam can't cross the hook process boundary, so integration tests point the settings `command` at a fake `opf` script (`writeFakeOPFScript`) emitting empty `detected_spans`. That's sufficient — the trailer is applied only on a successful OPF run, and a broken binary would trip the breaker and abort. Content-level redaction stays unit-covered.
+
+**F-group** — `cmd/entire/cli/integration_test/degraded_remotes_test.go`, `cmd/entire/cli/strategy/push_common_budget_unix_test.go`
+- **F1** ✅ (git-branch): GH013-style `pre-receive` rejection → loud `BLOCKED` banner, user push unaffected, no retry-loop.
+- **F2** ✅ (git-refs slice) **strategy layer**: added `REDACTED` alongside the pre-existing git-branch `TestDoPushRef_SharedBudget_BoundsTotalWallClock`. `checkpointPushBudget` is a package `var` with no env seam, so the spawned-binary integration path can't shrink it — the strategy layer is the correct home.
+- **F4** ✅ (git-refs): a blocked local checkpoint policy skips the ref push (refs stay queued) without aborting the user push.
+- **F5** ✅ (git-branch): detached-HEAD session + `git push origin HEAD:&lt;branch&gt;` via real hook syncs and is readable from a fresh clone. **No bug — current behavior works**, so no KNOWN BUG pin.
+- **F6** ⏸ **deferred** (as planned): `entire://` provider-host routing needs an injectable provider host table / fake provider mapping that doesn't exist yet.
+
+**C5/C6** — `cmd/entire/cli/integration_test/shallow_partial_clone_test.go` (+ `testenv.go` `cloneFromWithArgs` refactor), both backends
+- **C5** ✅ `--depth=1` user clone: full session→commit→real-hook push→read; repo stays shallow (no self-inflicted `.git/shallow`); read tolerates the boundary.
+- **C6** ✅ `--filter=blob:none` user clone reading a remote-only checkpoint lazily fetches omitted blobs; no new promisor config stamped on `[remote "origin"]` — enforced by both an inline snapshot and the existing `.git/config` cleanup guard.
+
+**G2/G3 (e2e, vogon)** — `e2e/tests/worktree_remote_test.go` (+ `e2e/entire/entire.go` `DoctorCtx`)
+- **G2** ✅ agent session in a linked worktree → commit → plain push (real hook) → clone → `entire resume`; uses `AssertCheckpointsOnRemote`; reuses existing prompt phrasing so vogon parsing is untouched.
+- **G3** ✅ `doctor` against an unreachable (hermetic missing-path) origin completes without hang/crash and still reports the local session scan.
+
+### KNOWN BUG pins
+None. Every planned scenario produced a passing test; no genuine production bug surfaced.
+
+### For the B-group (when unblocked) to reuse
+- `remoteBranchTip` / `remoteMetadataTipMessage` (`opf_prepush_test.go`) for asserting exactly what landed on a bare remote.
+- `env.cloneFromWithArgs` (`testenv.go`) — parameterized clone now supports any transport/flags, directly usable for upstream-only / fork-triangle topologies.
+- `seedBlockedCheckpointPolicy` and `localGitRevParse` (`degraded_remotes_test.go`).
+- `installProtectV1BranchHook` pattern for server-side ref rejection, and the F2 `checkpointPushBudget` + `GIT_SSH_COMMAND` hang recipe.</result>
+<usage><subagent_tokens>301099</subagent_tokens><tool_uses>120</tool_uses><duration_ms>3175039</duration_ms></usage>
+</task-notification>
+
+---
+
+let's do stacked PRs, can you open issues for d1+d2
+
+---
+
+can you go through the copilot/bugbot review comments on the PR

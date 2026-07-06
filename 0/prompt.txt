@@ -1,0 +1,255 @@
+Can you pull in main and fix the merge conflicts?
+
+---
+
+commit the changes
+
+---
+
+/pfleidi:review
+
+---
+
+<task-notification>
+<task-id>a8864fb0fe80c3ebb</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoint-migrate/bd0430d2-6e5a-41d2-a42e-bce6f4b55711/tasks/a8864fb0fe80c3ebb.output</output-file>
+<status>completed</status>
+<summary>Agent "De-slop review of diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Review complete. I read the taxonomy, the full diff, and verified each candidate against the surrounding source (`refs_store.go`, `checkpoint_remote.go`, `doctor.go`, callers of the new exports).
+
+## Findings
+
+**1. Medium — `cmd/entire/cli/checkpoint/migrate.go:78-84` — hand-rolls the existing `gitRefsStore.refBase` and, unlike it, silently swallows real ref-lookup failures.**
+
+The block
+
+```go
+parent := plumbing.ZeroHash
+if existing, err := repo.Reference(refName, true); err == nil {
+    parent = existing.Hash()
+    if commit, cerr := repo.CommitObject(parent); cerr == nil &amp;&amp; commit.TreeHash == cpTreeHash {
+```
+
+reimplements `refBase` (same package, `refs_store.go:75-98`), which already resolves a checkpoint ref's tip commit and tree, distinguishing "absent ref → orphan" from real lookup/IO failures. The hand-rolled version treats *any* `Reference`/`CommitObject` error as "no ref", so an IO/corruption failure silently produces a `ZeroHash` parent and re-orphans the ref history — exactly the hazard `refBase`'s own comment documents ("surface it rather than silently starting a fresh orphan history over the ref"). Migrate already constructs `refsStore := newGitRefsStore(repo)`, so `parent, existingTree, err := refsStore.refBase(cid)` is directly usable; the idempotency check becomes `existingTree != nil &amp;&amp; existingTree.Hash == cpTreeHash`. The malformed-id warn-and-skip path is unaffected because `RefName` is still checked first at line 66. This also deletes the "Resolve the existing ref once" narration comment. (Call sites verified: `MigrateBranchToRefs` has one caller, `doctor_migrate.go`; error surfacing there is the desired contract.)
+
+**2. Low — `cmd/entire/cli/checkpoint/migrate.go:22` — `MigrateResult.Migrated []id.CheckpointID` is computed but no consumer ever reads the IDs.**
+
+Every use is a length: `doctor_migrate.go` uses `len(result.Migrated)` (output line, `== 0` guard, prompt title) and the tests use only `assert.Len`/`assert.Empty` (verified via rg — no iteration or element access anywhere). An `int` count matching `Skipped`/`Total` is sufficient; collecting the IDs is data computed but never read.
+
+**3. Low — `cmd/entire/cli/checkpoint/migrate.go:92-94` — inline comment restates the function's doc comment.**
+
+"Wrap the checkpoint's current subtree in a fresh commit — parenting on the existing ref when present (re-migration fast-forwards) or as an orphan for a brand-new ref…" repeats, nearly verbatim, the contract already stated in `MigrateBranchToRefs`'s doc comment (lines 26-42: "wraps it in a fresh commit… the new commit parents on the existing ref (a fast-forward)…"). One of the two suffices; the inline one is the redundant copy.
+
+## Explicitly not flagged (verified, judged not slop)
+
+- `PushMigratedCheckpointRefs` (single caller): it is the required package-boundary export — `resolvePushSettings`/`flushCheckpointRefsQueue` are unexported to `strategy`, so it's a seam, not a needless wrapper.
+- `flushCheckpointRefsQueue` extraction: genuine two-caller dedup with a real contract difference (fail-soft pre-push vs error-surfacing opt-in push); the `firstErr` aggregation is a reasonable stdlib-level pattern.
+- `migrateCheckpointsPushRemote` const / the `remote` parameter with one constant call site: borderline YAGNI, but it mirrors the existing `resolvePushSettings(ctx, remote)` shape and keeping the remote choice at the command layer is a defensible trade-off — no clear winner.
+- Reuse elsewhere is good: `WalkCheckpointShards`, `CreateCommit`, `GetGitAuthorFromRepo`, `setRef`, `confirmDoctorFix`, and test helpers `setupBranchTestRepo`/`subtreeObjAt` are all pre-existing mechanisms, correctly reused rather than reinvented.
+- Tests assert behavior (byte-identical trees, fast-forward parentage, dry-run non-writes, idempotency), not implementation detail — no weak-test findings.</result>
+<usage><subagent_tokens>71099</subagent_tokens><tool_uses>12</tool_uses><duration_ms>143052</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a03a42be26350928f</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoint-migrate/bd0430d2-6e5a-41d2-a42e-bce6f4b55711/tasks/a03a42be26350928f.output</output-file>
+<status>completed</status>
+<summary>Agent "Readability review of diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Review complete. I read the full diff (`git diff origin/main`), the new files, and the surrounding context in `manual_commit_push.go`, `parse_tree.go` (`WalkCheckpointShards`), and `doctor.go` (`confirmDoctorFix`).
+
+## Findings
+
+**1. `cmd/entire/cli/checkpoint/migrate.go:79` — Medium — `err == nil` on `repo.Reference` conflates "ref absent" with "ref lookup failed", silently breaking the documented no-loss guarantee.**
+
+The doc comment promises "the new commit parents on the existing ref (a fast-forward) rather than orphaning, so no prior state is lost from history." But the code treats *any* `repo.Reference` error as ref-absent (`parent` stays `ZeroHash`), so a transient storage/IO error on an existing ref produces an orphan commit and `setRef` then discards the prior chain — the exact outcome the doc rules out. Maintenance cost: a reader auditing the fast-forward guarantee must know go-git's error taxonomy to spot that the guarantee holds only for `ErrReferenceNotFound`; the shorthand hides a policy decision inside a comma-ok-looking pattern that isn't comma-ok. Small fix: name the error and branch explicitly —
+
+```go
+existing, refErr := repo.Reference(refName, true)
+switch {
+case refErr == nil:
+    parent = existing.Hash()
+    ...
+case !errors.Is(refErr, plumbing.ErrReferenceNotFound):
+    return fmt.Errorf("resolve ref for checkpoint %s: %w", cid, refErr)
+}
+```
+
+This mirrors how the same distinction is already handled for the v1 branch at the top of the function (line 51), so it also makes the two lookups consistent.
+
+**2. `cmd/entire/cli/strategy/manual_commit_push.go:222-248` — Low — the shared `flushCheckpointRefsQueue` hardcodes hook-flavored progress UI on `os.Stderr`, and its inline comment describes only the pre-push caller.**
+
+The comment ("Written to stderr, which git shows during the pre-push hook") and the `[entire] Pushing ...` prefix made sense when this code had one caller; now the interactive `doctor migrate-checkpoints` path also runs it, where user-facing output otherwise flows through `cmd.OutOrStdout()`/`confirmDoctorFix(ctx, out, ...)`. Maintenance cost: anyone adjusting doctor UX or testing the command through cobra's buffers must discover that a strategy-internal helper writes progress directly to the process's `os.Stderr`, and the comment actively misleads them about who the audience is. Small fix: accept a progress `io.Writer` parameter (pre-push passes `os.Stderr`, the doctor command passes `cmd.ErrOrStderr()`), and reword the comment to cover both callers. This also matches the existing `opfPrePushProgressWriter` precedent in the same file for making stderr progress injectable.
+
+**3. `cmd/entire/cli/strategy/manual_commit_push.go:179-185` — Low — `PushMigratedCheckpointRefs` silently bypasses the checkpoint-policy gate that the other caller of the same queue flush enforces.**
+
+`prePushCheckpointRefs` runs `syncCheckpointPolicyForPrePush` + `checkpointPolicyAllowsGitHook` before flushing, and its doc explains the policy gates on checkpoint *format* compatibility "independent of the storage backend." `PushMigratedCheckpointRefs` flushes the identical queue with no gate and no mention of it. Maintenance cost: a reader comparing the two entry points cannot tell whether the migration path deliberately exempts itself (explicit user opt-in) or the gate was forgotten — and the diverged-format scenario the policy exists for is plausible right after a migration. Small fix: either apply the same gate, or add one doc-comment line stating the policy check is intentionally skipped and why.
+
+## Notes (not findings)
+
+- `migrate_test.go` is well-scoped: it verifies the byte-identical-subtree contract, idempotency, fast-forward parenting, dry-run, and the no-branch no-op, using shared helpers (`setupBranchTestRepo`, `seedBranchCheckpoint`, `refHash`). No test findings.
+- The `doctor_migrate.go` RunE is linear early-return style at one abstraction level; fine as-is.
+- The per-checkpoint `ctx.Err()` check inside the walk callback duplicates `WalkCheckpointShards`'s per-shard check, but the finer granularity is harmless — not flagged.</result>
+<usage><subagent_tokens>70305</subagent_tokens><tool_uses>8</tool_uses><duration_ms>134727</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ae0bca5a6e199388f</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoint-migrate/bd0430d2-6e5a-41d2-a42e-bce6f4b55711/tasks/ae0bca5a6e199388f.output</output-file>
+<status>completed</status>
+<summary>Agent "Clean/modern Go review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result># Clean Go Review — `feat/checkpoint-migrate` vs `origin/main`
+
+Target Go version: **1.26.4** (from `go.mod`). Diff reviewed: `cmd/entire/cli/checkpoint/migrate.go` + test (new), `cmd/entire/cli/doctor_migrate.go` (new), `cmd/entire/cli/doctor.go` (1-line wiring), `cmd/entire/cli/strategy/manual_commit_push.go` (extraction of `flushCheckpointRefsQueue` / `PushMigratedCheckpointRefs`).
+
+Verified against source: `setRef` is an unconditional `Storer.SetReference` (force move) that enqueues for push (`refs_store.go:104-114`); `WalkCheckpointShards` only yields IDs that passed `id.NewCheckpointID` (`parse_tree.go:378`); `Validate` rejects `KindUnknown` (`id.go:177-182`); `RefName` errors only on `KindUnknown` (`refs_naming.go:27-32`); existing push tests cover only the sub-helpers (`refs_push_test.go`: `partitionLocalRefs`, `batchPushRefs`, `pushCheckpointRefWithRecovery`); the `checkpoint` package convention is `context.Background()` in tests (no `t.Context()` usage), so I did not flag that.
+
+### Required
+
+| # | Severity | Location | Classification | Autofix | Issue | Impact |
+|---|----------|----------|----------------|---------|-------|--------|
+| 1 | Medium | `cmd/entire/cli/checkpoint/migrate.go:79` | Required | Eligible | Non-not-found errors from `repo.Reference` are collapsed into "ref absent" (`if existing, err := ...; err == nil`), so the migration proceeds with `parent = ZeroHash`. | On a transient/storage read error for an existing ref, `CreateCommit` builds an orphan commit and `setRef` force-moves the ref, silently discarding the prior commit chain — directly contradicting the function's documented "no prior state is lost from history" fast-forward guarantee. |
+| 2 | Medium | `cmd/entire/cli/strategy/manual_commit_push.go:179,195` | Required | Needs decision | The new exported `PushMigratedCheckpointRefs` and the new error-surfacing semantics of `flushCheckpointRefsQueue` (wrapped drain errors, `firstErr` aggregation, pushed count, fail-soft-at-caller split) have no tests in the diff. | A future regression in the fail-soft/fail-loud split — pre-push starting to propagate errors and blocking the user's `git push`, or the doctor push silently swallowing failures / miscounting — would go uncaught, even though `refs_push_test.go` already has the local bare-remote infrastructure to test this at low cost. |
+
+| # | Evidence | Suggested fix | Trade-offs |
+|---|----------|---------------|------------|
+| 1 | `setRef` (`refs_store.go:109`) is a plain `SetReference` — no CAS — so a missed existing ref is force-overwritten. Only `plumbing.ErrReferenceNotFound` means "no ref". | `existing, err := repo.Reference(refName, true)` then `if err != nil &amp;&amp; !errors.Is(err, plumbing.ErrReferenceNotFound) { return fmt.Errorf(...) }`; keep the current flow for the found/not-found cases. (`cerr` from `CommitObject` being ignored is fine — it conservatively keeps the existing hash as parent.) | None |
+| 2 | `rg` over `strategy/` shows `flushCheckpointRefsQueue`/`PushMigratedCheckpointRefs` referenced only from production code; `refs_push_test.go:62-160` tests only the helpers beneath the changed orchestration. | Add a focused test seeding `PushQueueForRepo` and a local bare remote: assert `PushMigratedCheckpointRefs` returns the pushed count and clears the queue on success, and returns a non-nil error with refs left queued when the remote rejects. | Test design has a couple of reasonable shapes (unit around `flushCheckpointRefsQueue` vs the exported wrapper), hence Needs decision. |
+
+### Improvements (follow-up)
+
+| # | Severity | Location | Classification | Autofix | Issue | Impact |
+|---|----------|----------|----------------|---------|-------|--------|
+| 3 | Low | `cmd/entire/cli/checkpoint/migrate.go:67-74` | Improvement | n/a | The `RefName`-error warn-and-skip branch is unreachable: `WalkCheckpointShards` only yields IDs that passed `NewCheckpointID`, and `RefName` fails only on `KindUnknown`, which `Validate` already rejects. | Dead defensive code implies malformed IDs can reach this point, misleading future readers. |
+| 4 | Low | `cmd/entire/cli/checkpoint/migrate_test.go` | Improvement | n/a | Tests don't assert that migrated refs land in the push queue, though the doc comment promises it and the doctor command's "push now" step depends on it. | A regression in the migrate→enqueue link would make the doctor's interactive push a silent no-op ("Pushed 0 checkpoint ref(s)"). |
+| 5 | Low | `cmd/entire/cli/strategy/manual_commit_push.go:179` | Improvement | n/a | `PushMigratedCheckpointRefs` pushes the *entire* queued set (including refs queued by ordinary git-refs writes), so the name overstates specificity and the doctor's "Pushed N" can exceed "Migrated N". | Mildly confusing output/name; behavior itself is fine (doc comment is accurate). `PushQueuedCheckpointRefs` would match behavior — exported-name change, so caller's call. |
+
+| # | Evidence | Suggested fix | Trade-offs |
+|---|----------|---------------|------------|
+| 3 | Chain verified in `parse_tree.go:378`, `id.go:128-133,177-182`, `refs_naming.go:27-32`. | Replace the warn-skip branch with a plain `return err` (or drop the branch and let the error propagate). | Loses a skip-don't-abort posture for a case that cannot currently occur. |
+| 4 | `setRef` enqueues via `enqueueForPush` (`refs_store.go:112`); no queue assertion in `migrate_test.go`. | In `TestMigrateBranchToRefs`, read the queue via `PushQueueForRepo` and assert both refs are present (and absent after dry-run). | None |
+| 5 | Doc comment at `manual_commit_push.go:174-178` says "pushes any queued checkpoint refs". | Rename to `PushQueuedCheckpointRefs` and adjust the doctor prompt/output wording. | Exported-name churn for a cosmetic gain. |
+
+**Summary:** 2 required findings (1 autofix-eligible error-classification fix in the migration's ref-existence check; 1 test-coverage gap on the new exported push path) and 3 low-priority improvements. Main pattern: the new code is generally clean and well-documented — the gaps are around error-class collapse on a rare path and untested new error-surfacing semantics. Per my brief I only report; no fixes were applied.</result>
+<usage><subagent_tokens>87791</subagent_tokens><tool_uses>27</tool_uses><duration_ms>225417</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a880e0c3be1e2ff31</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoint-migrate/bd0430d2-6e5a-41d2-a42e-bce6f4b55711/tasks/a880e0c3be1e2ff31.output</output-file>
+<status>completed</status>
+<summary>Agent "Correctness review of diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Review complete. I read the full diff, the extracted function against the origin/main original, and all supporting helpers (`PushQueue.Drain/Remove`, `setRef`/`enqueueForPush`, `startProgressDots`, `resolvePushSettings`, `checkpointPolicyAllowsGitHook`, `CleanupPushedShadowBranches`, `WalkCheckpointShards`, `CreateCommit`, `getSessionsBranchTree`). Build passes (`go build ./cmd/entire/...`) and the new tests pass (`go test ./cmd/entire/cli/checkpoint/ -run TestMigrateBranchToRefs -count=1` → ok).
+
+**Merge-resolution check (requested scrutiny):** the hand-merged `flushCheckpointRefsQueue` faithfully preserves origin/main's `prePushCheckpointRefs` body — progress-dot `stop()` is called on every path (fast-path success, batch failure, per-ref loop end), so no goroutine leak; fail-soft is preserved in `prePushCheckpointRefs` (errors logged, `nil` returned). Two intentional-looking deltas, both benign: `cleanupPushedShadowBranches` now also runs on early-skip paths (empty queue / drain failure) — safe because cleanup independently verifies session-ended + fully-condensed state before deleting; and the perf span now starts before `partitionLocalRefs` (trivial). No merge bug found.
+
+## Findings
+
+**1. Medium — `PushMigratedCheckpointRefs` bypasses the checkpoint policy gate the pre-push path enforces.**
+`cmd/entire/cli/strategy/manual_commit_push.go:179-185`. The pre-push git-refs path runs `syncCheckpointPolicyForPrePush` + `checkpointPolicyAllowsGitHook` before flushing (lines 158-161), and its own doc comment says the policy gates on checkpoint *format* compatibility "independent of the storage backend", so a blocked policy "skips the ref push (leaving refs queued) rather than pushing". `PushMigratedCheckpointRefs` calls `flushCheckpointRefsQueue` directly with no policy check. Failure scenario: a repo whose checkpoint policy requires a newer CLI (`checkpointpolicy.CanSatisfyPolicy` false) — the pre-push hook correctly refuses to push refs and warns to upgrade, but the same user runs `entire doctor migrate-checkpoints`, confirms the prompt, and pushes those refs anyway, defeating the gate other collaborators rely on. May be an intentional opt-in escape hatch, but nothing in code or docs acknowledges the divergence.
+
+**2. Low — confirmed push silently no-ops when `push_sessions` is disabled.**
+`cmd/entire/cli/doctor_migrate.go:67-86` + `manual_commit_push.go:181-183`. With `push_sessions: false`, the command still prompts "Push N migrated checkpoint ref(s) now?"; on confirm, `PushMigratedCheckpointRefs` returns `(0, nil)` before touching the queue and the user sees "Pushed 0 checkpoint ref(s)." with no explanation. Worse, the follow-up hint elsewhere ("they push on the next `git push`") is also false in this configuration since pre-push is disabled too — the refs stay queued indefinitely. The disabled case should skip the prompt or say pushing is disabled.
+
+**3. Medium — the changed push behavior and the migrate→queue contract have no tests.**
+- `cmd/entire/cli/checkpoint/migrate_test.go` verifies refs, trees, idempotency, and dry-run, but never asserts that migrated refs land in the push queue — the exact contract `MigrateBranchToRefs`'s doc states ("enqueued for push like any git-refs write") and that the doctor command's push path depends on (`enqueueForPush` is best-effort/log-only inside `setRef`, so a regression here would be silent).
+- `flushCheckpointRefsQueue`'s new error surfacing — `firstErr` aggregation, the `"%d of %d checkpoint refs failed to push"` wrap, and the returned pushed-count (`manual_commit_push.go:250-271`) — plus `PushMigratedCheckpointRefs` itself are untested; the existing `refs_push_test.go` covers only the lower-level primitives (`batchPushRefs`, `pushCheckpointRefWithRecovery`, `partitionLocalRefs`). This is precisely the behavior the migration command surfaces to users.
+
+**4. Low — hardcoded `"origin"` push remote produces a misleading failure when the remote has another name.**
+`cmd/entire/cli/doctor_migrate.go:15`. When no checkpoint-remote is configured, `resolvePushSettings(ctx, "origin")` makes `"origin"` the literal push target (`checkpoint_remote.go:35-40`). In a repo whose only remote is e.g. `upstream`, `batchPushRefs` fails, the code prints "[entire] Some checkpoint refs diverged; syncing N ref(s) individually..." (wrong diagnosis), retries each ref with fetch+replay against a nonexistent remote, and finally surfaces an error. Refs stay queued, so it's recoverable, and the constant carries an explanatory comment — flagging only because the interim "diverged" message actively misleads in this scenario.
+
+Non-findings I explicitly verified: `errors.Is(err, plumbing.ErrReferenceNotFound)` works through `getSessionsBranchTree`'s `%w` wrapping (`persistent.go:2019-2030`); `CreateCommit` handles `ZeroHash` as orphan (`persistent.go:2276-2278`); `Drain` intentionally does not remove entries (removal happens post-push, `pushqueue.go:85-111`); dry-run performs no writes and no enqueues; the unmappable-ID skip makes `Total &gt; Migrated+Skipped` but the doctor output ("N total") stays truthful.</result>
+<usage><subagent_tokens>96275</subagent_tokens><tool_uses>34</tool_uses><duration_ms>312824</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a90ddb074349e0fcf</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoint-migrate/bd0430d2-6e5a-41d2-a42e-bce6f4b55711/tasks/a90ddb074349e0fcf.output</output-file>
+<status>completed</status>
+<summary>Agent "Security review of diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Review complete. I traced the full migration and push paths (migrate.go → refs_naming/id validation → refs_store.setRef → pushqueue → remote.PushWithOptions) plus the doctor command wiring. No injection, no path traversal, no credential leakage: checkpoint IDs off the v1 branch tree are strictly validated (`id.NewCheckpointID` in `WalkCheckpointShards`, parse_tree.go:378; `RefName` rejects `KindUnknown`, refs_naming.go:27-32), all git invocations use argv arrays (no shell), and fetch errors redact remote URLs. The findings below are policy/redaction-boundary and check-then-act issues.
+
+## Findings
+
+**1. High — OPF redaction bypass: migrated checkpoint content reaches the remote without the OPF pre-push rewrite**
+- `cmd/entire/cli/checkpoint/migrate.go:96-101`, `cmd/entire/cli/doctor_migrate.go:79-83`, `cmd/entire/cli/strategy/manual_commit_push.go:179-185`
+- Issue: With `redaction.openai_privacy_filter.enabled`, v1-branch checkpoints are deliberately only 7-layer redacted locally; the 8th OPF layer is applied at pre-push by rewriting unpushed v1 commits before they leave the machine (`PrePush` → `RewriteUnpushedV1WithOPF`, manual_commit_push.go:77-117). `MigrateBranchToRefs` copies the **local** v1 tip subtrees (persistent.go:2019-2030 reads `refs.Read` locally first) byte-identical into per-checkpoint refs, and `PushMigratedCheckpointRefs` pushes them with zero OPF handling — there is no `redact`/OPF reference anywhere in the migration path (verified via rg), the git-refs flush explicitly descopes OPF (manual_commit_push.go:139-140), and the push runs `git push --no-verify` (remote/git.go:155) so no hook re-checks.
+- Failure scenario: user with OPF enabled has unpushed v1 checkpoints containing content the OPF layer would scrub; runs `entire doctor migrate-checkpoints`, confirms "push now" → the pre-OPF trees land on the remote, silently bypassing the configured privacy filter. Even declining the prompt only defers the leak: the refs stay queued and flush on a later pre-push, which also never applies OPF to refs.
+- Fix direction: refuse or warn on migration push when `redact.OPFEnabled()`, or run the OPF rewrite over unpushed v1 commits before reading the branch tree.
+
+**2. Medium — checkpoint-policy gate bypassed by the opt-in push**
+- `cmd/entire/cli/strategy/manual_commit_push.go:179-185`
+- Issue: the pre-push queue flush honors the checkpoint policy "exactly like the v1 path" — `syncCheckpointPolicyForPrePush` + `checkpointPolicyAllowsGitHook` skip the push and leave refs queued when the policy is diverged or requires a newer CLI (manual_commit_push.go:155-161, checkpoint_policy.go:25-36). `PushMigratedCheckpointRefs` checks only `pushDisabled` and flushes the same queue with no policy sync or gate.
+- Failure scenario: on a repo whose remote checkpoint policy the local CLI cannot satisfy (or has diverged from), the git hooks correctly refuse to push checkpoint data, but `doctor migrate-checkpoints` + confirm pushes it anyway — writing checkpoint refs the shared repo's policy was supposed to block.
+
+**3. Medium — check-then-act ref update can regress checkpoint refs to stale v1-branch content (and clobber concurrent writes)**
+- `cmd/entire/cli/checkpoint/migrate.go:78-101`
+- Issue: the only skip condition is exact tree equality (`commit.TreeHash == cpTreeHash`, line 81); any difference — including the ref being *newer* than the branch — produces a fresh commit carrying the **branch** tree, parented on the current ref, and an unconditional `SetReference` (refs_store.go:104-113, no CAS).
+- Failure scenario: user migrates, sets `checkpoints.primary.type: git-refs`; subsequent writes (summary/transcript backfills, new sessions) advance refs while the v1 branch stays frozen (mirroring is optional/best-effort). Re-running `migrate-checkpoints` — which the help text calls "safe to re-run" — sees tree inequality and advances each such ref to the stale branch tree. All read paths read the ref tip tree (refs_store.go:241-263), so post-migration content silently disappears from reads, and because the regressing commit parents on the current tip it fast-forwards to the remote on the next push, propagating the regression. The same read-then-set gap loses a concurrent session write to the same ref during migration.
+- Fix direction: skip when the branch tree is already reachable in the ref's history (or when the ref commit descends from the last migration commit for that tree), and/or use go-git's `CheckAndSetReference` for the update.
+
+**4. Low — push confirmation scope mismatch: prompt names N migrated refs, flush pushes the whole queue**
+- `cmd/entire/cli/doctor_migrate.go:70-83`, `cmd/entire/cli/strategy/manual_commit_push.go:195-205`
+- Issue: the confirm title is "Push N **migrated** checkpoint ref(s) now?" but `flushCheckpointRefsQueue` drains and pushes every queued ref, including refs enqueued earlier by other writers (e.g. a git-refs mirror under git-branch primary, whose queue never flushes at pre-push because `prePushCheckpointRefs` only runs when refs is primary — manual_commit_push.go:53-55). The user can consent to pushing N refs and actually push more. Impact is limited (same-repo checkpoint data, actual count printed afterward), but the consent text and the action don't match.
+
+Not flagged (verified benign): queue entries are name-checked against local refs before pushing (`partitionLocalRefs`, push_common.go:29-45) and live inside the git common dir — same trust boundary as hooks; hardcoded `"origin"` in doctor_migrate.go:15 is a correctness/UX quirk for non-origin remotes, not a security issue; `RefName` failure branch in migrate.go:71-77 is unreachable defensive code since the walk pre-validates IDs.</result>
+<usage><subagent_tokens>122857</subagent_tokens><tool_uses>30</tool_uses><duration_ms>369421</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a5ded83f98e06923f</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoint-migrate/bd0430d2-6e5a-41d2-a42e-bce6f4b55711/tasks/a5ded83f98e06923f.output</output-file>
+<status>completed</status>
+<summary>Agent "Coverage sweep review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>No more source needed — I have traced all changed paths. Here are my findings.
+
+## Findings
+
+**1. High — `migrate-checkpoints` has no guard against running when git-refs is already the primary; a lagging git-branch mirror silently regresses checkpoint refs to stale content.**
+- Evidence: `cmd/entire/cli/checkpoint/migrate.go:78-104` — the only skip condition is `commit.TreeHash == cpTreeHash`; on any mismatch the ref is unconditionally advanced to a commit wrapping the **v1-branch** subtree. `cmd/entire/cli/doctor_migrate.go` never consults `settings.LoadCheckpointsConfig` / `checkpoint.PrimaryIsRefs` (compare `manual_commit_push.go:53`, which does). Git-refs-primary + git-branch-mirror is a supported topology with *best-effort* mirror writes (`cmd/entire/cli/checkpoint/open.go:55` "best-effort writes to mirrors"; `manual_commit_push.go:51-52` references "a configured git-branch mirror's v1 ref").
+- Failure scenario: user completes migration, flips primary to git-refs with a git-branch mirror (the documented downgrade-safety setup). One mirror write fails (best-effort by design), so the v1 subtree for checkpoint X is one write behind the ref. The user re-runs `entire doctor migrate-checkpoints` — the help text says "idempotent … safe to re-run" — and the command commits the **stale** v1 tree onto the ref and moves it. Reads serve the tip, so checkpoint X's newest transcript/summary/attribution silently reverts, and the regressed tip is enqueued and pushed. Fix: refuse (or hard-warn) when `PrimaryIsRefs(cfg)` is true.
+
+**2. High — migration + opt-in push exports pre-OPF v1 content to the remote, bypassing the OPF privacy filter the user enabled.**
+- Evidence: OPF re-redaction runs only at **pre-push of the v1 branch** on unpushed commits (`strategy/manual_commit_opf_rewrite.go:204-245`), so the local v1 tip between condensation and the next push holds 7-layer-only content. `MigrateBranchToRefs` reads the local v1 tip (`migrate.go:48-49` → `persistent.go:2019-2030`, local ref first) and copies that subtree into refs (`migrate.go:96-102`); `rg` shows zero OPF references in `migrate.go` or `doctor_migrate.go`. The git-refs push path applies no OPF either (`manual_commit_push.go:139-140`, "OPF is not applied (descoped)").
+- Failure scenario: a user with `redaction.openai_privacy_filter.enabled: true` condenses a session (v1 tip now un-OPF'd), runs `doctor migrate-checkpoints`, and confirms "Push now" — un-OPF-redacted transcripts land on the remote under `refs/entire/checkpoints/*`, exactly the content the pre-push OPF layer exists to catch. The pre-existing descope covered native git-refs writes; this command newly routes v1-authored data (which had the OPF guarantee) around it with no warning or `redact.OPFEnabled()` check.
+
+**3. Medium — `PushMigratedCheckpointRefs` skips the checkpoint-policy gate that both pre-push paths honor.**
+- Evidence: `manual_commit_push.go:179-185` goes straight to `flushCheckpointRefsQueue`; the git-refs pre-push path first runs `syncCheckpointPolicyForPrePush` + `checkpointPolicyAllowsGitHook` (`manual_commit_push.go:158-161`), as does the v1 path (`:65-69`). The policy gates on checkpoint-format compatibility independent of backend (comment at `manual_commit_push.go:142-145`; `strategy/checkpoint_policy.go:25-36`).
+- Failure scenario: the remote's checkpoint policy requires a newer CLI (or is diverged); every `git push` correctly skips checkpoint pushes, but the doctor's "push now" pushes old-format refs to that remote anyway.
+
+**4. Medium — `migrate.go:79` swallows non-NotFound ref-lookup errors and silently rebuilds the ref as an orphan.**
+- Evidence: `if existing, err := repo.Reference(refName, true); err == nil { … }` treats a real storer/IO error the same as an absent ref: `parent` stays `ZeroHash`, the idempotency check is bypassed, and `setRef` repoints the ref at a fresh orphan commit, dropping the ref's history linkage. The store's own `refBase` (`checkpoint/refs_store.go:84-88`) deliberately surfaces exactly this case ("rather than silently starting a fresh orphan history over the ref"). The migration duplicates `refBase`'s resolve-parent-and-tree logic minus its guard instead of reusing it (de-slop + correctness in one).
+
+**5. Medium — no tests for the new exported push entry point or the flush error contract.**
+- Evidence: `rg` shows `PushMigratedCheckpointRefs`/`flushCheckpointRefsQueue` appear only in `manual_commit_push.go` and `doctor_migrate.go`; `strategy/refs_push_test.go` covers only lower-level helpers (`batchPushRefs`, `partitionLocalRefs`, `pushCheckpointRefWithRecovery`). The behavior this branch changed — resolve/drain failures now returned as errors, the partial-failure `"%d of %d checkpoint refs failed to push"` aggregation (`manual_commit_push.go:267-270`), pushDisabled no-op, pushed-count return — is untested, and there is no test for the `doctor migrate-checkpoints` command at all (e.g. the non-interactive never-push path, which is the command's documented contract).
+
+**6. Low — misleading output when `push_sessions` is disabled.**
+- Evidence: with push disabled, `PrePush` returns before any ref flush (`manual_commit_push.go:46-48`) and `PushMigratedCheckpointRefs` silently returns `(0, nil)` (`:181-183`). Yet `doctor_migrate.go:68` prints "Refs are queued; they push on the next `git push` …" (they never will), and after an explicit user confirmation the command prints "Pushed 0 checkpoint ref(s)." with no explanation. Related nit: the prompt offers to push `len(result.Migrated)` refs but the flush pushes the *entire* queue, so the printed pushed-count can exceed what the user consented to.
+
+**7. Low — `prePushCheckpointRefs` now runs shadow-branch cleanup unconditionally, against the helper's documented precondition.**
+- Evidence: `manual_commit_push.go:163-171` calls `cleanupPushedShadowBranches` even when the flush errored (nothing pushed) or the queue was empty; `CleanupPushedShadowBranches` documents "Intended to be called only after a successful push so the caller knows any condensed checkpoint data already reached the remote" (`strategy/cleanup.go:131-137`). Practical risk is low (condensed data remains in local refs and stays queued), but the new code widens the old behavior (previously skipped on empty/all-stale queue) and contradicts the stated contract — either gate cleanup on `pushed &gt; 0`/`err == nil` or update the helper's doc.
+
+Findings 1 and 2 are the ones I'd treat as Required before this ships; 3-5 are strong candidates; 6-7 are polish.</result>
+<usage><subagent_tokens>105418</subagent_tokens><tool_uses>27</tool_uses><duration_ms>353384</duration_ms></usage>
+</task-notification>

@@ -1,0 +1,104 @@
+which endpoint are we calling now for the sessions
+
+---
+
+yeah sorry I meant the activity page for example, because it lists different sessions then what entire.io lists who uses GET /api/v1/me/sessions?timeframe=<tf>&limit=<n>
+
+---
+
+yes, cli should do the same as the entire.io page, but we should stack it onto https://github.com/entireio/cli/pull/1641
+
+---
+
+<task-notification>
+<task-id>a5b0df9b6ebb314ec</task-id>
+<tool-use-id>toolu_019BindJqKex1dC92tjLqVCh</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/1b0292dc-2cb1-49e9-91f5-41188abf9147/tasks/a5b0df9b6ebb314ec.output</output-file>
+<status>completed</status>
+<summary>Agent "Find entire.io activity page rendering" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have everything needed. Here is the complete picture.
+
+## Summary
+
+The `/me/sessions` data is rendered only on the **Overview** (dashboard/home) page. The React frontend does not call `/me/sessions` directly — it calls the BFF cache route `GET /api/v1/cache/user/sessions?timeframe=…&amp;limit=…`, which proxies to the home API's `me/sessions` (`maybeProxyHomeMe(c, "me/sessions")`) and otherwise serves the identical handler locally.
+
+## 1. Which route/page renders the list
+
+- Route: `/Users/soph/Work/entire/devenv/entire.io/frontend/src/routes/_app/_authenticated/overview.index.tsx` — route `/_app/_authenticated/overview/`, renders `&lt;OverviewPage&gt;`. Its loader prefetches `userCheckpointsQueryOptions("last-month")` and `userSessionsQueryOptions("last-month", USER_OVERVIEW_RECENT_SESSIONS_LIMIT)`.
+- Page: `/Users/soph/Work/entire/devenv/entire.io/frontend/src/domains/platform/users/pages/OverviewPage.tsx` — renders a `Sessions` section that mounts `&lt;RecentSessionsList sessions={recentSessions} /&gt;`.
+- The list component (the row rendering): `/Users/soph/Work/entire/devenv/entire.io/frontend/src/domains/platform/users/components/RecentSessionsList.tsx`.
+- Data fetch + type mapping: `/Users/soph/Work/entire/devenv/entire.io/frontend/src/domains/platform/users/api.ts` (`fetchUserSessions`, `userSessionsQueryOptions`, `USER_OVERVIEW_RECENT_SESSIONS_LIMIT = 50`).
+- Data hook: `/Users/soph/Work/entire/devenv/entire.io/frontend/src/domains/platform/users/hooks/useUserDashboardData.ts`.
+- API layer: BFF route handler `handleUserSessions` in `/Users/soph/Work/entire/devenv/entire.io/api/src/routes/cache.ts` (~line 1846), backed by `listSessionsForUser` in `/Users/soph/Work/entire/devenv/entire.io/api/src/lib/planetscale/sessions.ts` (line 620). Types in `/Users/soph/Work/entire/devenv/entire.io/api/src/lib/db/db-types.ts` (`SessionListItem` / `UserSessionListItem`, lines 187–219).
+
+## 2. Fields displayed per session ROW
+
+Important: although the API envelope carries token and attribution fields, the **frontend `UserSession` type drops them** — `api.ts` only maps: `sessionId, displayName, isPublic, agent, model, prompt, startedAt, lastActivityAt, checkpointCount, stepCount, org, repo, repoFullName, isPrivate`. And of those, the row renders only a subset. `prompt`, `stepCount`, `startedAt`, `customName`, `firstCommitAuthorUsername`, and all token/attribution counts are **not shown** in the row.
+
+The row JSX (RecentSessionsList.tsx lines 67–104), with the visible fields:
+
+```tsx
+const agentConfig = getAgent(session.agent)
+const modelLabel = formatModel(session.model)
+const title =
+  session.displayName.length &gt; 120
+    ? `${session.displayName.slice(0, 120)}...`
+    : session.displayName
+
+&lt;ListViewItem
+  href={`/gh/${org}/${repo}/session/${sessionId}`}
+  ...
+&gt;
+  &lt;span className="flex min-w-0 flex-1 items-center gap-2 md:flex-initial"&gt;
+    &lt;span className="truncate text-sm font-medium text-default"&gt;{title}&lt;/span&gt;
+    {session.isPublic &amp;&amp; &lt;PublicSessionBadge /&gt;}
+  &lt;/span&gt;
+  &lt;span className="shrink-0 text-xs text-muted"&gt;{session.repoFullName}&lt;/span&gt;
+  &lt;span aria-hidden className="basis-full md:hidden" /&gt;
+  &lt;span className="... font-mono text-xs text-muted md:ml-auto ..."&gt;
+    &lt;AgentBadge agent={session.agent} className="shrink-0" /&gt;
+    &lt;span className="shrink-0 md:w-28 md:truncate md:text-right" title={modelLabel || undefined} ...&gt;
+      {modelLabel ?? ""}
+    &lt;/span&gt;
+    &lt;span className="shrink-0 md:w-28 md:text-right"&gt;
+      {session.checkpointCount}{" "}
+      {session.checkpointCount === 1 ? "checkpoint" : "checkpoints"}
+    &lt;/span&gt;
+  &lt;/span&gt;
+&lt;/ListViewItem&gt;
+```
+
+Visible columns, left → right (no column header labels; it's a flex row):
+1. **Title** — `displayName`, truncated to 120 chars with a trailing `...`. Bold, `text-sm`. The whole row links to `/gh/{org}/{repo}/session/{sessionId}`.
+2. **Public badge** — `&lt;PublicSessionBadge /&gt;` rendered only when `isPublic` is true.
+3. **Repo** — `repoFullName` (e.g. `org/repo`), muted `text-xs`.
+4. **Agent badge** — `&lt;AgentBadge agent={agent} /&gt;` shows `getAgent(agent).label` (e.g. "Claude Code", "Gemini", "Amp", "Codex", "OpenCode", "Copilot", "Pi", "Cursor", "Factory AI Droid", "Kiro", "Goose", "Antigravity", fallback "Unknown"), monospace, colored per agent.
+5. **Model** — `formatModel(model)` (e.g. `claude-opus-4-6` → "Opus 4.6", `gpt-4o` → "GPT-4o", `gemini-2.0-flash` → "Gemini 2.0 Flash"; unknown passes through; null → empty). Fixed width `w-28`, right-aligned, truncated, monospace.
+6. **Checkpoint count** — `{checkpointCount} checkpoint` / `checkpoints` (singular/plural). Monospace, right-aligned.
+
+The `aria-label` also composes: `"{agent label} session using {model} in {repoFullName}: {title}[, public], {n} checkpoint(s)"`.
+
+## 3. Ordering, grouping, count/pagination
+
+- **Ordering (server):** `listSessionsForUser` orders `ORDER BY rs.last_activity_at DESC, rs.session_id ASC` — newest lastActivityAt first. Authorship filter: `first_commit_author_username = &lt;github login&gt;`; window filtered on `last_activity_at` between start/end of timeframe.
+- **Grouping (client):** `groupByDay` buckets sessions by the **local calendar day of `lastActivityAt`** (`toLocalDateString`; null → "unknown"). Day groups are sorted by date **descending**. Within a day, sessions keep the API order (i.e. lastActivityAt desc, preserved via `_index`).
+- **Section header per day:** `formatDisplayDate(date)` renders as `en-GB` "Weekday, D Mon" (e.g. "Monday, 6 Jul"); "unknown" → "Unknown Date". Header also shows a count: `"{n} session"` / `"{n} sessions"`.
+- **Count / pagination:** No pagination and no "load more". The overview fetches at most `USER_OVERVIEW_RECENT_SESSIONS_LIMIT = 50` (server hard-caps at 1000). All fetched sessions are rendered. Empty state: a FloatingShell reading "No activity in this timeframe".
+
+## 4. displayName vs customName, and the timeframe selector
+
+- **Row title uses `displayName` only.** The choice between customName and other names is made **server-side** in `resolveSessionName` (`sessions.ts` line 471): `custom_name?.trim() || generated_name?.trim() || display_name`. So precedence is customName → AI generated_name → heuristic display_name. `customName` is also returned raw in the envelope (so a client can detect/clear an override), but the overview row does not use it — it just renders `displayName`, then truncates to 120 chars.
+- **Timeframe selector:** None on the overview page. `useUserDashboardData("last-month", …)` is hardcoded to `"last-month"`; there is no `useState`/selector for timeframe and no pagination controls in `OverviewPage.tsx` or `RecentSessionsList.tsx`.
+
+## 5. What else the page shows (from related data)
+
+Everything else on the Overview page comes from the **checkpoints** endpoint (`/api/v1/cache/user/checkpoints?timeframe=last-month`), not from `/me/sessions`. In `OverviewPage.tsx`, below a greeting header ("Morning/Afternoon/Evening, {firstName}" + "Here's an overview of your recent activity."):
+- `&lt;StatsGrid stats={stats} /&gt;` — computed stats: tasks (checkpoint count), orchestration, iteration, throughput, continuity (hours + current/longest streak). See `computeStats` in the hook.
+- `&lt;ContributionsSection chartData hourlyChartData totalCheckpoints={stats.tasks} /&gt;` — the contribution charts / heatmap (daily `chartData` and hourly `hourlyChartData`), built from checkpoints in `computeChartData`/`computeHourlyChartData`. Files: `.../users/components/ContributionsSection.tsx`, `ContributionChart.tsx`.
+- `&lt;CheckpointsByRepo data={repoData} maxRepos={5} /&gt;` — top 5 repos by checkpoint count (`computeRepoData`). File: `.../users/components/CheckpointsByRepo.tsx`.
+- Onboarding/empty branch: if the user has no checkpoints, the page shows `CliInstallationSteps` instead of the dashboard; while loading it shows `OverviewSkeleton` / `SessionsListSkeleton`.
+
+So the sessions list itself is a lightweight recency feed (title, public flag, repo, agent, model, checkpoint count grouped by day); the richer stats/heatmap/per-repo breakdown are derived from checkpoints, a sibling data source.</result>
+<usage><subagent_tokens>52173</subagent_tokens><tool_uses>28</tool_uses><duration_ms>1578447</duration_ms></usage>
+</task-notification>

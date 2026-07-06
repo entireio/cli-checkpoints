@@ -1,0 +1,128 @@
+/simplify
+
+---
+
+<task-notification>
+<task-id>a998a74c43e5e5d31</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoint-migrate/bd0430d2-6e5a-41d2-a42e-bce6f4b55711/tasks/a998a74c43e5e5d31.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review of diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Findings
+
+**1. cmd/entire/cli/checkpoint/migrate.go, lines 60–66 (the `RefName(cid)` precheck inside the walk callback) — unreachable defensive branch**
+
+- Summary: the "malformed id on the branch can't map to a ref; skip" branch can never fire.
+- Verified: `WalkCheckpointShards` (`cmd/entire/cli/checkpoint/parse_tree.go:378`) only invokes the callback with IDs that passed `id.NewCheckpointID` → `Validate` → `KindOf(s) != KindUnknown`. `RefName` (`cmd/entire/cli/checkpoint/refs_naming.go:28`) errors on exactly the same predicate, `cid.Kind() == id.KindUnknown`. Identical condition, so the skip path is dead code — and no test covers it (only mention of "unmappable" in the repo is this line).
+- Cost: seven lines plus a warn-log path and a comment describing an impossible case; a future reader must reason about "when do we skip vs abort on a bad id" when the answer is "never". It also keeps the `logging`/`log/slog` imports alive in this file for that one call.
+- Simpler form: delete the precheck entirely. If the impossible ever happened, `refsStore.refBase` and `setRef` both call `RefName` themselves (`refs_store.go:76,105`) and would surface the error through the existing `fmt.Errorf("resolve ref for checkpoint %s: %w", ...)` wrap — no behavior change on any reachable input.
+
+**2. cmd/entire/cli/checkpoint/migrate.go, `MigrateResult.Total` — derivable state (minor, follows from finding 1)**
+
+- Summary: once the unreachable skip branch is gone, `Total == len(Migrated) + Skipped` always.
+- Cost: a third counter incremented separately that a reader must confirm stays consistent with the other two.
+- Simpler form: drop the field and derive it at the two call sites (`doctor_migrate.go` uses it for the "nothing to migrate" check and the summary line; the tests assert it). Keeping it is defensible for caller readability, so this is optional — but only valid together with finding 1.
+
+**3. cmd/entire/cli/checkpoint/migrate.go, lines 88–90 (inline comment "Wrap the checkpoint's current subtree in a fresh commit — parenting on the existing ref when present (re-migration fast-forwards) or as an orphan for a brand-new ref — then point the ref at it and enqueue it.") — comment restating the function doc**
+
+- Summary: the exported doc comment on `MigrateBranchToRefs` (lines 42–49) already states all of this (fresh commit wrapping the subtree, fast-forward re-migration parenting, enqueue-not-push).
+- Cost: two prose descriptions of the same mechanism to keep in sync.
+- Simpler form: delete the inline comment; the doc comment plus the `msg` string right below it carry the same information.
+
+## Explicitly checked and passed
+
+- `flushCheckpointRefsQueue` extraction in `manual_commit_push.go`: genuine dedup — `prePushCheckpointRefs` and `PushMigratedCheckpointRefs` now share the drain/prune/batch-push/recovery body and differ only in error posture (fail-soft log vs surface). The four-line policy-gate repetition between them is intentional (skip-silently vs error) and not worth abstracting.
+- `migratedCheckpointTree`'s `FlattenTree` + `BuildTreeFromEntries` round-trip to replace one root file: this is the established pattern in the package (`persistent.go`, `strategy/common.go`); no simpler existing helper exists, and the test asserts session subtrees stay byte-identical, which this preserves.
+- The `CanPromptInteractively()` gate in `doctor_migrate.go` is not redundant with `confirmDoctorFix` — the huh form would open the TTY otherwise; the gate is required for the non-interactive path.
+- `migrateCheckpointsPushRemote` const (single use) and the small repeated setup block across the three new `TestPushMigratedCheckpointRefs*` tests are below the bar I'd flag.</result>
+<usage><subagent_tokens>92075</subagent_tokens><tool_uses>15</tool_uses><duration_ms>180267</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>adea47493551fd740</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoint-migrate/bd0430d2-6e5a-41d2-a42e-bce6f4b55711/tasks/adea47493551fd740.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review of diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Review complete. I read the full diff plus the helpers it calls (`FlattenTree`, `BuildTreeFromEntries`, `refBase`, `setRef`/`enqueueForPush`, `PushQueueForRepo`, `resolveGitCommonDir`). Findings, ordered by impact:
+
+**1. Per-checkpoint enqueue spawns a `git` subprocess and takes a file lock — N times in one loop**
+- File: `/Users/pfleidi/entire/cli/.worktrees/feat-checkpoint-migrate/cmd/entire/cli/checkpoint/migrate.go`, line 106 (`refsStore.setRef` inside the walk callback)
+- Summary: each `setRef` calls `enqueueForPush` → `PushQueueForRepo` → `resolveGitCommonDir`, which forks `git rev-parse --git-common-dir` (`git_common_dir.go:24`), then `flock.Acquire` + open/append/close on the queue file (`pushqueue.go:62-81`) — once per migrated checkpoint.
+- Cost: N subprocess spawns + N lock/open/append cycles for an N-checkpoint migration. At ~5-10ms per `git` fork, a few hundred checkpoints adds seconds of pure overhead; the existing `setRef` path was designed for one write per condensation, and the diff amplifies it into a bulk loop.
+- Cheaper: resolve the queue once before the walk (one `PushQueueForRepo`) and batch-enqueue the migrated refs after the walk under a single lock (an `EnqueueAll`/loop-inside-one-lock variant), or set the ref via `repo.Storer.SetReference` directly in the migration and enqueue `result.Migrated` in one pass at the end.
+
+**2. Whole-subtree flatten + rebuild to replace a single root-level file**
+- File: `/Users/pfleidi/entire/cli/.worktrees/feat-checkpoint-migrate/cmd/entire/cli/checkpoint/migrate.go`, lines 149-157 (`migratedCheckpointTree`)
+- Summary: to swap the root `metadata.json` blob, the code recursively flattens the entire checkpoint subtree (`FlattenTree` reads every nested tree object) and rebuilds + re-stores every tree object bottom-up (`BuildTreeFromEntries`/`buildTreeObject`), even though every child subtree hash is unchanged.
+- Cost: per checkpoint, several redundant tree-object reads and rewrites (sessions/&lt;id&gt;/… levels) instead of one; since legacy metadata virtually always carries `checkpoint_version`, this runs for essentially every checkpoint — and runs again in full on every idempotent re-run just to compute the comparison hash for the `Skipped` check.
+- Cheaper: copy `subtree.Entries`, replace (or insert) the `metadata.json` entry with the new blob hash, and store one new root tree object — child directory entries keep their existing hashes. This is both less code and O(1 tree write) per checkpoint.
+
+**3. `--dry-run` writes git objects for every checkpoint it reports**
+- File: `/Users/pfleidi/entire/cli/.worktrees/feat-checkpoint-migrate/cmd/entire/cli/checkpoint/migrate.go`, line 77 (tree built) vs line 93 (dry-run checked after)
+- Summary: the `dryRun` early-return sits after `migratedCheckpointTree`, so a dry run still writes the normalized metadata blob (`CreateBlobFromContent`) and all rebuilt tree objects into `.git/objects` for every checkpoint; only the commit/ref writes are skipped.
+- Cost: a "report only" invocation performs nearly the full object-write I/O of the real migration, leaving loose objects behind (they are reused on a subsequent real run, but a dry run against a repo that never migrates leaves them as garbage until gc).
+- Cheaper: compute the would-be hashes without storing — encode the blob/tree into a `plumbing.MemoryObject` and read its `Hash()` instead of calling the storing helpers. With finding 2 applied, the dry-run write shrinks to one blob + one tree per checkpoint anyway, making this cheap to fix or arguably tolerable; as written, it is most of the migration's write work done for a read-only flag.
+
+Not flagged: the triple `RefName(cid)` computation per checkpoint (loop check, `refBase`, `setRef`) is pure string work — negligible. The `flushCheckpointRefsQueue` refactor in `manual_commit_push.go` is cost-neutral (same operations, reordered inside the perf span), and `PushMigratedCheckpointRefs`'s policy sync mirrors the existing pre-push path for a one-shot command. Test files introduce no meaningful waste.</result>
+<usage><subagent_tokens>75917</subagent_tokens><tool_uses>14</tool_uses><duration_ms>187454</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a1537efbc44ee4cc4</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoint-migrate/bd0430d2-6e5a-41d2-a42e-bce6f4b55711/tasks/a1537efbc44ee4cc4.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review of diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Verification complete. I read the full diff and the relevant shared modules (`parse_tree.go`, `refs_store.go`, `ephemeral.go`, `persistent.go`, `push_common.go`, `jsonutil`, `doctor.go`, existing test helpers). Most of the branch reuses the right mechanisms: `refBase`/`setRef`/`CreateCommit`/`WalkCheckpointShards`/`GetGitAuthorFromRepo` in migrate.go, `confirmDoctorFix` and `interactive.CanPromptInteractively` in the doctor command, and the strategy change is a genuine extraction (`flushCheckpointRefsQueue`) shared between pre-push and the new push entry point. I found one real reuse miss, with a test-helper echo of it.
+
+## Findings
+
+1. **`/Users/pfleidi/entire/cli/.worktrees/feat-checkpoint-migrate/cmd/entire/cli/checkpoint/migrate.go`, lines 148–158 (`migratedCheckpointTree`)** — re-implements single-file tree replacement via `FlattenTree` + `BuildTreeFromEntries`.
+   - **Cost**: recursively flattens the entire checkpoint subtree and rebuilds every tree object just to swap one root-level `metadata.json` entry. O(all files) per checkpoint, and the byte-identity of session subtrees (which `TestMigrateBranchToRefs` asserts) is only preserved incidentally by rebuilding, not structurally.
+   - **Existing mechanism**: `ApplyTreeChanges` (`parse_tree.go:203`). Its own doc comment names this exact case: "this is the key optimization over FlattenTree + BuildTreeFromEntries for sparse changes", and `ephemeral.go:362`/`:771` document the same preference at call sites. Verified fit: `ApplyTreeChanges(ctx, repo, cpTreeHash, []TreeChange{{Path: paths.MetadataFileName, Entry: &amp;object.TreeEntry{Name: paths.MetadataFileName, Mode: filemode.Regular, Hash: blobHash}}})` replaces the root entry and structurally leaves all sibling subtree hashes untouched. It also has a `git ls-tree` fallback for partial-clone repos that the hand-rolled path lacks.
+
+2. **`/Users/pfleidi/entire/cli/.worktrees/feat-checkpoint-migrate/cmd/entire/cli/checkpoint/migrate_test.go`, lines 58–64 (`mutateBranchCheckpointMetadata`)** — same pattern duplicated in the test helper: `FlattenTree` + full-map entry swap + `BuildTreeFromEntries` to replace one file at `cid.Path()+"/metadata.json"` on the branch tip.
+   - **Cost**: second copy of the same hand-rolled tree surgery; flattens the whole branch tree.
+   - **Existing mechanism**: same `ApplyTreeChanges` call with the nested path (`TreeChange{Path: metaPath, Entry: ...}`) — nested paths are handled via its `subChanges` recursion (parse_tree.go:247–296).
+
+## Checked and deliberately not flagged
+
+- `sessionPathFields` duplicating `SessionFilePaths` JSON tags (`api/checkpoint/metadata.go:412`): the struct exists, but round-tripping through it would drop unknown fields, which `normalizeMigratedMetadata` explicitly preserves; no existing raw-JSON rewrite helper exists (`jsonutil` has only marshal/write helpers). The raw-map edit is justified.
+- `migrateCheckpointsPushRemote = "origin"`: `checkpoint/remote/util.go:18` has `originRemote` but it is unexported in another package — not reusable.
+- Test helpers `seedBranchCheckpoint`/`enqueueRefs`: closest existing helper `writeSingleSession` (`checkpoint_test.go:1321`) creates its own repo per call, so it cannot seed multiple checkpoints into one repo — the new helpers are not duplicates.
+- OPF rewrite's `rebuildTreeWithCachedRedaction`: different semantics (recursive all-blob rewrite), not a fit for the migration's single-file change.</result>
+<usage><subagent_tokens>107379</subagent_tokens><tool_uses>26</tool_uses><duration_ms>255287</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a656d8af793ea4614</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoint-migrate/bd0430d2-6e5a-41d2-a42e-bce6f4b55711/tasks/a656d8af793ea4614.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review of diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Review complete. I traced the migration code against the writer mechanics (`persistent.go` treeWriter/basePath), the refs store (`refs_store.go` refBase/setRef), the metadata schema (`api/checkpoint/metadata.go`), and both push paths in `manual_commit_push.go`.
+
+Overall the altitude is good: the migration lives in the `checkpoint` package and reuses the refs store's own `refBase`/`setRef` write pattern plus existing tree plumbing (`FlattenTree`, `BuildTreeFromEntries`, `CreateCommit`); the doctor command is a thin orchestrator; and the pre-push refactor is a genuine generalization (`flushCheckpointRefsQueue` shared by both callers with deliberately different error semantics) rather than a bolt-on. On the prompt's explicit question — writer basePath mechanics vs. migration normalizer both knowing path shapes — I think the split is defensible: the writer produces typed metadata going forward, while the migration must edit raw JSON in place to preserve unmodeled fields (tested via `future_field`), so it can't round-trip through the typed writer without losing that guarantee. The prefix rule itself ("branch path = `/` + `cid.Path()` + refs path") is three lines and pinned by tests. What is *not* defensible is duplicating the field inventory, which is finding 1.
+
+**Findings:**
+
+1. **`cmd/entire/cli/checkpoint/migrate.go:168` — `sessionPathFields` hardcodes the JSON tags of `SessionFilePaths` as a parallel string list.**
+   The authoritative field set lives in `api/checkpoint/metadata.go:412-425` (`metadata`, `transcript`, `compact_transcript`, `content_hash`, `prompt`). Cost: when the next path field is added to `SessionFilePaths` — recent precedent: `compact_transcript` was added exactly this way — the migration silently leaves that field carrying the branch-prefixed path, refs-store readers can't resolve it, and no test fails because the migration's list is self-consistent. Better home: give the field set one home. Either (a) export the list (or a small method) next to the struct in `api/checkpoint` so an addition is adjacent to the knowledge that consumes it, or (b) drop the list entirely and rebase *every* string value in the session object that starts with `branchPrefix + "/"` — the prefix contains the checkpoint's own shard/id, so false positives are implausible, and the normalizer stops needing to know the schema at all. Option (b) is the smaller, deeper fix.
+
+2. **`cmd/entire/cli/strategy/manual_commit_push.go:180` — `PushMigratedCheckpointRefs` names a generic strategy-layer mechanism after its single command-layer caller.** (Minor.)
+   The function is caller-agnostic: "flush queued checkpoint refs now, surfacing errors" (vs. the fail-soft pre-push). The name and doc comment ("It is the opt-in 'push now' invoked by the checkpoint migration command") bake upper-layer vocabulary into the domain layer, so a future caller (e.g. a plain `doctor push-checkpoints`) either misuses a misleading name or duplicates the function. Better: rename to something like `PushQueuedCheckpointRefs` and document the contract (error-surfacing, policy-gated, queue-preserving) rather than the caller; the migration reference can stay as at most a "currently used by" aside.
+
+No other altitude issues: `migrateCheckpointsPushRemote = "origin"` in the command layer matches the repo-wide convention (same hardcoding in `doctor.go:363`, `api_cmd.go:173`, etc.); the `checkpoint_version` drop is correctly homed in the normalizer since no current CLI code models that field; `dryRun` in the domain function is the right depth because it shares the walk/compare logic; and the doctor command properly reuses `confirmDoctorFix` and `interactive.CanPromptInteractively()` instead of re-rolling prompt gating.</result>
+<usage><subagent_tokens>94959</subagent_tokens><tool_uses>26</tool_uses><duration_ms>253988</duration_ms></usage>
+</task-notification>

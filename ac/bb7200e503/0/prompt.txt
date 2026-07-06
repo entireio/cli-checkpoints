@@ -1,0 +1,120 @@
+let's say we do "git clone entire://gh/entire.io/cli" then the host is missing, could now the entire git helper provide a dialog letting you pick the right mirror?
+
+---
+
+<task-notification>
+<task-id>ab254f3befc7c34d2</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/c5140eea-f6c5-44e7-8208-c61eae5b8fc7/tasks/ab254f3befc7c34d2.output</output-file>
+<status>completed</status>
+<summary>Agent "Find git remote helper implementation" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I now have a complete picture. Here is my report.
+
+## Overview: how the `entire://` remote helper works
+
+The helper is a standalone binary `git-remote-entire` (not part of the cobra command tree). Git resolves `git clone entire://.../...` by exec'ing this binary on PATH as `git-remote-entire &lt;remote-name&gt; &lt;url&gt;`, then speaks the git remote-helper protocol over stdin/stdout.
+
+---
+
+### 1. Where the remote helper is implemented
+
+Binary entry point and protocol driver:
+
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/git-remote-entire/main.go` — the binary `main`/`run` (lines 50–176). Package doc (lines 1–19) explains it is a dedicated binary and that "nothing here may write to stdout except the helper protocol itself" (diagnostics go to stderr).
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/git-remote-entire/jurisdictionauth.go` — token minting / keychain reuse for auth.
+- `/Users/soph/Work/entire/devenv/cli_experiments/internal/remotehelper/name.go` — `BinaryName = "git-remote-entire"` (line 10).
+
+The remote-helper protocol commands (`capabilities`, `list`, `option`, `connect`, `stateless-connect`, `push`) live in:
+
+- `/Users/soph/Work/entire/devenv/cli_experiments/internal/remotehelper/githelper/run.go` — `Run()` is the protocol loop (lines 31–102). It advertises `stateless-connect`+`push` for protocol v2, or `connect` for v0/v1 (lines 50–58), and dispatches `list` (line 60, `handleList`), `stateless-connect` (line 69), `connect` (line 76), `push` (line 87). Sibling files in that dir: `list.go`, `push.go`, `stateless.go`, `transport.go`, `consts.go`, `agent.go`.
+- `/Users/soph/Work/entire/devenv/cli_experiments/internal/remotehelper/transport/proxy.go` — the HTTP data-plane transport (`Proxy`), failover, redirect/auth-carry policy.
+- `/Users/soph/Work/entire/devenv/cli_experiments/internal/remotehelper/transport/inforefs.go` — cold/warm info/refs probe.
+
+Separately, the main `entire` CLI has URL utilities and the `entire repo clone` wrapper (which synthesizes `entire://` URLs and shells out to `git clone`):
+
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/gitremote/gitremote.go` — `ParseURL`, `splitForgePrefix`, forge/host mapping.
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/repo_clone.go` — the `entire repo clone` command.
+
+---
+
+### 2. How the URL is parsed
+
+The helper parses the raw URL with Go's `net/url` in `main.go` (lines 83–95):
+
+```go
+rawURL := args[2]
+parsedURL, err := url.Parse(rawURL)
+switch {
+case err != nil:
+    fmt.Fprintf(os.Stderr, "fatal: invalid URL %q: %v\n", rawURL, err)
+    return 128
+case parsedURL.Scheme != "entire":
+    fmt.Fprintf(os.Stderr, "fatal: unsupported URL scheme %q (expected 'entire')\n", parsedURL.Scheme)
+    return 128
+case parsedURL.Host == "":
+    fmt.Fprintf(os.Stderr, "fatal: missing host in URL %q\n", rawURL)
+    return 128
+}
+```
+
+So the helper cares about three parts: `Scheme` (must be `entire`), `Host` (the **Entire cluster host**, must be non-empty), and `Path` (the repo path). The canonical form is `entire://&lt;cluster-host&gt;/&lt;forge&gt;/&lt;owner&gt;/&lt;repo&gt;` — documented in `repo_clone.go` line 73 and by example at line 84: `entire://aws-us-east-2.entire.io/gh/entirehq/entire-api`. The first path segment (`gh`, `et`, legacy `git`) is a **forge prefix**, not the host.
+
+Path handling: `main.go` passes `parsedURL.Path` straight to the transport (line 154) and to `replicas.Resolve`. The repo cache key is derived in `/Users/soph/Work/entire/devenv/cli_experiments/internal/remotehelper/replicas/replicas.go`, `ExtractRepoPath` (lines 71–73), which just trims slashes — documented (lines 62–70) as `entire://host/gh/owner/repo -&gt; "gh/owner/repo"`. The forge-prefix split for the trails API is `splitForgePrefix` in `gitremote.go` (lines 160–165).
+
+**What `entire://gh/entire.io/cli` decomposes into:** Under `url.Parse`, `Host="gh"`, `Path="/entire.io/cli"`, `Scheme="entire"`. Note this is **not** the canonical shape — here `gh` is taken as the *cluster host*, and `entire.io/cli` as the path. This is the ambiguous case: the helper will accept it (host is non-empty) and then try cluster discovery against `https://gh/.well-known/entire-cluster.json` (see section 3), which fails with `ErrUnreachable`. The correct form would be `entire://&lt;cluster&gt;.entire.io/gh/entire.io/cli` (forge `gh`, owner `entire.io`, repo `cli`).
+
+**Missing host** (`entire:///gh/...`): caught at `main.go` line 92 → `fatal: missing host in URL` and exit code 128. `repo_clone.go` line 262 explicitly calls this out as "the `entire:///gh/...` empty-host bug" that the CLI guards against (it returns a `SilentError` on a cancelled interactive picker rather than cloning a zero-value host).
+
+---
+
+### 3. How the helper resolves the actual host / mirror / cluster
+
+Two layers:
+
+**(a) Data-plane replica/node resolution** — `replicas.Resolve(parsedURL)` in `main.go` line 102, implemented in `replicas/replicas.go` (lines 44–60):
+
+```go
+func Resolve(parsedURL *url.URL) NodeConfig {
+    clusterHost := parsedURL.Host
+    repoPath := ExtractRepoPath(parsedURL.Path)
+    entryURL := "https://" + clusterHost
+    cached := LoadFresh(clusterHost, repoPath)
+    ...
+    return NodeConfig{InitialNodes: cached, EntryURL: entryURL, ClusterHost: clusterHost, RepoPath: repoPath}
+}
+```
+
+The **entry URL is just `https://&lt;cluster-host&gt;`**. Actual replica nodes come from the on-disk cache (`nodes.json`, per `(cluster, repoPath)`) or, on a cold miss, from the `X-Entire-Replicas` response header on the first info/refs request. That warm/cold failover and header-driven refresh is in `transport/proxy.go`: `refreshReplicas` (lines 441–464) reads `X-Entire-Replicas` and persists via `replicas.Persist`; `doWithFailover` (lines 323–391) rotates across nodes with 5xx/connection failover; `checkRedirect` (lines 189–206) carries `Authorization` only on same-cluster redirects (e.g. entry-domain → hosting replica 307), stripping it off-cluster. Cached/attacker-influenceable replica lists are scoped to the cluster trust domain via `filterReplicas`/`replicaInCluster` (lines 227–251).
+
+**(b) Auth/cluster discovery** — `resolveCreds` in `main.go` (lines 278–325). It resolves *which login context and core* authenticates the target cluster host:
+- If `ENTIRE_TOKEN` is set → `resolveEnvTokenCreds` (lines 349–371). The core is derived from the token's `aud`, then trust-gated against the cluster's advertised cores.
+- Otherwise → `clusterdiscovery.ResolveClusterAuth(...)` (line 301) selects the context from `contexts.json` / `cluster_cores.json`.
+
+Cluster discovery itself is `/Users/soph/Work/entire/devenv/cli_experiments/internal/entireclient/clusterdiscovery/discovery.go`: it fetches `https://&lt;host&gt;/.well-known/entire-cluster.json` (`Path`, line 20; `fetchWellKnownJSON`, lines 83–117 — HTTPS-only, no redirects, as a trust root) to get `core_urls`, `jurisdiction_audience`, `jurisdiction_core_url`.
+
+**Wrong-cluster / mirror redirection:** if the data plane reports the repo lives elsewhere, `fatalMessage` in `main.go` (lines 185–211) parses the OAuth `invalid_target` error (`wrongClusterRe = 'lives on "([^"]+)"'`), rewrites the host in the user's URL, and prints an actionable "it lives on `&lt;host&gt;` … `git clone entire://&lt;host&gt;/...`" message.
+
+The **mirror lookup** (repo mirrored on N clusters → which cluster host) is done by the CLI wrapper, not the helper: `repo_clone.go` `listMirrorsForRepo` (lines 180–205) queries the control-plane `ListMirrors` API, `selectCloneTarget` (lines 211–273) picks a `ClusterHost`, and `mirrorCloneURL` (lines 47–49) synthesizes `entire://&lt;host&gt;/gh/&lt;owner&gt;/&lt;repo&gt;` before shelling out to `git clone`.
+
+---
+
+### 4. Interactive context / TTY
+
+**The `git-remote-entire` helper never prompts and does no TTY detection.** There is no `IsTerminal`/`isatty`/prompt/survey/`huh` usage anywhere in `cmd/git-remote-entire/`. `os.Stdin`/`os.Stdout` are reserved strictly for the git pkt-line protocol (`main.go` line 170, `githelper.Run(ctx, proxy, protocolVersion, os.Stdin, os.Stdout)`), and the package doc (lines 9–12) warns that any stray stdout write corrupts the transfer; diagnostics go to stderr only.
+
+Auth is fully non-interactive: it reuses already-persisted credentials — in-process memo → OS keychain → a fresh `/oauth/token` exchange using a refresh-token-backed login JWT (`jurisdictionauth.go` lines 40–43; `NewRefreshingLoginProvider` at `main.go` line 310), or `ENTIRE_TOKEN` in CI. When no context exists, it does **not** prompt — it returns a fatal error telling the user to run `entire login` (`clusterdiscovery`/`renderLoginHint`, `discovery.go` lines 154–159). The "interactive path" phrase in `jurisdictionauth.go` (lines 9, 43) refers only to *where the token was originally persisted* (via `entire login`), not to the helper prompting.
+
+The only interactive prompting is in the separate CLI command `entire repo clone` (`repo_clone.go` `selectCloneTarget`, lines 241–267), which calls `interactive.CanPromptInteractively()` (`/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/interactive/interactive.go:34`) and falls back to a `--cluster`-flag hint when there is no terminal. That runs *before* `git clone` is invoked, so it is outside the remote-helper process.
+
+Signal handling in the helper (`installSignals`, `main.go` lines 446–455) ties HTTP request lifetimes to the parent git process (SIGINT/SIGTERM) — it aborts in-flight transfers, it does not read from a terminal.</result>
+<usage><subagent_tokens>65435</subagent_tokens><tool_uses>18</tool_uses><duration_ms>135953</duration_ms></usage>
+</task-notification>
+
+---
+
+yes, let's do that just in case.
+
+---
+
+/simplify

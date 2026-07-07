@@ -1,0 +1,100 @@
+can you tell me which repository endpoints are used against core or cell from the cli
+
+---
+
+<task-notification>
+<task-id>a8c44f300a78ffa7f</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/2239be02-4253-4eaf-96ac-3097eea016c7/tasks/a8c44f300a78ffa7f.output</output-file>
+<status>completed</status>
+<summary>Agent "Map repo endpoints core vs cell" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>All paths are confirmed. Here is the complete map.
+
+# Repository endpoint map — Entire CLI
+
+## How the two planes are wired
+
+- **Control-plane core (`coreapi`)**: `coreapi.New()` dials the active-context login core; `coreapi.NewForCluster(ctx, host)` dials the core *fronting a specific cluster* (discovered via `/.well-known/entire-cluster.json`). Base path is `&lt;core-host&gt;/api/v1` (`internal/coreapi/client.go:18`, `apiBasePath = "/api/v1"`). All the `entire repo …` commands run through the `runCore*` helpers in `cmd/entire/cli/corecmd.go` (`runCore`:394, `runCoreForCluster`:405, `runCoreList`:152, `runCoreListForCluster`:159, `runCoreObject`:217, `runCoreMutation`:367, `runControlPlaneDelete`:73), which all take a `*coreapi.Client`.
+- **Data-plane / entire-api cell (`api.Client`)**: two flavors — the data-API/BFF client `NewAuthenticatedAPIClient` targeting `api.BaseURL()` (`cmd/entire/cli/api_client.go:21`), and the per-cell client `auth.NewEntireAPICellClient` / `NewAuthenticatedEntireAPICellClient` (`cmd/entire/cli/api_client.go:62`) that dials a specific entire-api cell directly with a jurisdictional identity token. Cell targeting logic lives in `cell_target.go` (single repo) and `cell_fanout.go` (multi-repo).
+
+---
+
+## CORE (coreapi) — the entire `repo` command group
+
+Every subcommand of `entire repo` hits the control-plane core. Command wiring is in `cmd/entire/cli/repo.go:21` (`newRepoCmd`).
+
+| Command | HTTP method + path | CLI call site | coreapi send fn |
+|---|---|---|---|
+| `entire repo create &lt;name&gt;` | `POST /api/v1/repos` | `repo.go:137` (`c.CreateRepo`) | `oas_client_gen.go:955` |
+| `entire repo list &lt;project&gt;` | `GET /api/v1/projects/{projectId}/repos` | `repo.go:176` (`c.ListProjectRepos`) | `oas_client_gen.go:4476` |
+| `entire repo get &lt;repo&gt;` | `GET /api/v1/repos/{repoId}` | `repo.go:199` (`c.GetRepo`) | `oas_client_gen.go:2388` |
+| `entire repo delete &lt;repo&gt;` | `DELETE /api/v1/repos/{repoId}` | `repo.go:219` (`c.DeleteRepo`) | `oas_client_gen.go:1667` |
+| `entire repo visibility get &lt;repo&gt;` | `GET /api/v1/repos/{repoId}/visibility` | `repo.go:283` (`c.GetRepoVisibility`) | `oas_client_gen.go:2488` |
+| `entire repo visibility set &lt;repo&gt; &lt;vis&gt;` | `PUT /api/v1/repos/{repoId}/visibility` | `repo.go:316` (`c.SetRepoVisibility`) | `oas_client_gen.go:6413` |
+
+**Mirror subtree** (`cmd/entire/cli/repo_mirror.go:121`, `newRepoMirrorCmd`) — also all core:
+
+| Command | HTTP method + path | CLI call site | coreapi send fn |
+|---|---|---|---|
+| `entire repo mirror create &lt;github-url&gt; [cluster]` | `POST /api/v1/mirrors` | `repo_mirror.go:247` (`c.CreateMirror`), dialed via `runCoreForCluster` (`repo_mirror.go:182`) | `oas_client_gen.go:700` |
+| ↳ clone-readiness poll after create | `GET /api/v1/mirrors/{mirrorId}` | `repo_mirror_probe.go:121` (`c.GetMirror` in `awaitMirrorReady`); also `repo_mirror.go:275` | `oas_client_gen.go:1949` |
+| `entire repo mirror create` (no-arg wizard) | `POST /api/v1/mirrors` per (repo,region) | `repo_mirror_create_wizard.go:588→createAndAwaitMirror`, cluster clients built with `coreapi.NewForCluster` at `:531` | `oas_client_gen.go:700` |
+| `entire repo mirror list` | `GET /api/v1/mirrors` | `repo_mirror.go:401` (`c.ListMirrors`) | `oas_client_gen.go:3620` |
+| `entire repo mirror list --show-available` | `GET /api/v1/mirrors/available` | `repo_mirror.go:366` (`c.ListAvailableMirrors`) | `oas_client_gen.go:3157` |
+| `entire repo mirror get &lt;mirror&gt;` | `GET /api/v1/mirrors/{mirrorId}` (+ `GET /api/v1/mirrors` to resolve a clone-URL ref → ULID) | `repo_mirror.go:433` (`c.GetMirror`); resolver `resolveMirrorRef` at `:462` (`c.ListMirrors`) | `oas_client_gen.go:1949` / `:3620` |
+| `entire repo mirror remove &lt;github-url&gt; [cluster]` | `DELETE /api/v1/mirrors?provider&amp;owner&amp;repo&amp;clusterHost` | `repo_mirror.go:548` (`c.DeleteMirror`), via `runCoreForCluster` (`:535`) | `oas_client_gen.go:1326` |
+| `entire repo mirror collaborators list &lt;github-url&gt; [cluster]` | `GET /api/v1/mirrors/collaborators` | `repo_mirror_collaborators.go:73` (`c.ListMirrorCollaborators`), via `runCoreListForCluster` (`:72`) | `oas_client_gen.go:3479` |
+
+**Cluster catalog** (used by the mirror-create wizard and by cell resolution):
+
+| Where | HTTP method + path | CLI call site | coreapi send fn |
+|---|---|---|---|
+| mirror create wizard region picker | `GET /api/v1/clusters` | `repo_mirror_create_wizard.go:57` (`c.ListClusters` via `availableRegions`); also one-shot `:218` | `oas_client_gen.go:3397` |
+
+Note: `entire repo clone` does **not** itself make the data-plane request. It resolves placements against core (`GET /api/v1/mirrors` via `listMirrorsForRepo`, `repo_clone.go:189`; optionally over `NewForCluster` when `--cluster` names a foreign federation, `repo_clone.go:137`), then shells out to `git clone` (`runGitClone`, `repo_clone.go:295`). The actual smart-HTTP data-plane transfer is performed by the separate `git-remote-entire` helper (repo-scoped STS exchange in `internal/entireclient/repocreds/repocreds.go`), not by the `entire` process. A full `entire://…` URL skips the lookup entirely (`repo_clone.go:106`).
+
+---
+
+## CELL (entire-api) — repo-scoped calls against a specific cell
+
+These reach a data-plane cell via `auth.NewEntireAPICellClient` / `NewAuthenticatedEntireAPICellClient`. The `api.Client` paths are plain strings (no ogen); base is the cell's `apiUrl` + `/api/v1`.
+
+| Command | HTTP method + path | CLI call site |
+|---|---|---|
+| `entire experts …` (resolve owner/repo → ULID) | `GET /api/v1/repos` (paginated, SpiceDB-filtered) | `experts_cmd.go:413` (`expertsReposListPath`, defined `:60`), via `listExpertsAccessibleRepos` / `resolveExpertsRepoID` `:388` |
+| `entire experts …` (main call) | `POST /api/v1/repos/{repoId}/experts` | `experts_cmd.go:296` (`client.Post(ctx, expertsAPIPath(repoID), …)`); path builder `expertsAPIPath` at `:378` |
+| `entire activity` / `entire recap` | `GET /api/v1/me/recap?repo={ulid}` | recap client built in `recap.go:206` (`auth.NewEntireAPICellClient`); `?repo=` scope from `currentRepoRef`. Confirmed path `…/api/v1/me/recap` (`recap.go:187` doc, `recap_test.go:341`). `activity_cmd.go:66` routes through `runAuthenticatedActivityAPI` (`entireapi_client.go:34`). |
+| `entire api --to cell &lt;path&gt;` (raw passthrough) | any `/api/v1/…` on the home cell | `api_cmd.go:135` (`auth.NewEntireAPICellClient(ctx, insecure, nil)`) |
+
+Cell client construction/routing internals: `NewAuthenticatedEntireAPICellClient` → `resolveRepoCellTarget` (`cell_target.go:53`) picks the cell hosting a specific repo; `runAuthenticatedActivityAPI`/`newRecapClient` pass `nil` target = home-jurisdiction cell, falling back to the data API on any cell failure (`entireapi_client.go:34-41`, `recap.go:205-233`).
+
+Not-yet-wired scaffolding: `cell_fanout.go` (`groupReposByCell`:55, `resolveCellBaseURLs`:95, `fanOutCells`:188) implements multi-cell fan-out but has **no production caller** — only referenced within `cell_fanout.go` and tests. It's the intended machinery for querying all of a caller's repos across cells (mirrors the BFF's `code-search.ts`).
+
+---
+
+## DATA-API / BFF (`api.BaseURL()`) — repository-related, not a per-cell dial
+
+These use the data-API client (`NewAuthenticatedAPIClient`, `api_client.go:21`) against `api.BaseURL()` (the entire.io BFF), which is data-plane but distinct from the direct per-cell client:
+
+| Command | HTTP method + path | CLI call site | client method |
+|---|---|---|---|
+| `entire search` (`--repo` completion) &amp; `entire dispatch` wizard | `GET /api/v1/repositories?sort=recent` | `search_cmd.go:255` (`completeRepoFlag`), `dispatch_wizard.go:36` | `api/repositories.go:30` (`ListRepositories`) |
+| `entire enable` (records the repo) | `POST /api/v1/cli/enable` (`{remote_url}`) | `api/enable.go:35` (`ReportEnable`) → `:36` | `api/enable.go:36` |
+| `entire search` (code search) | search service on the data-API host | `search_cmd.go:123` (`api.BaseURL()`), `search.Search` at `:172` | `search` package |
+
+---
+
+## Endpoints called against BOTH planes (core to resolve, then cell)
+
+These are the cases you flagged — a repo is resolved to a cell/ULID via **core catalog/mirrors first**, then the actual call hits the **cell**:
+
+1. **`entire experts`** — core `GET /api/v1/mirrors` (via `resolveRepoCellTarget` → `resolveRepoClusterHost`, `cell_target.go:107`) + `GET /api/v1/clusters` (`cell_target.go:68`) to pick the owning cell, **then** cell `GET /api/v1/repos` + `POST /api/v1/repos/{repoId}/experts`. Best-effort: any core-resolution failure falls back to home-jurisdiction routing (`cell_target.go:53-88`).
+
+2. **`entire recap` / `entire activity`** — core `GET /api/v1/mirrors` via `currentRepoRef` → `listMirrorsForRepo` (`entireapi_client.go:90`) to turn `origin` into the repo ULID, **then** cell `GET /api/v1/me/recap?repo={ulid}` (`recap.go:206-211`).
+
+3. **`entire api … {repo_id}`** — core `GET /api/v1/mirrors` via `resolveCurrentRepoID` → `listMirrorsForRepo` (`api_cmd.go:198-205`, using `coreapi.New()`) to expand the `{repo_id}` placeholder, **then** the templated request against `--to core` or `--to cell` (`api_cmd.go:134-140`).
+
+In all three, the core mirror lookup is the same `listMirrorsForRepo` helper (`repo_clone.go:180`), reused as the repo→cell resolver.</result>
+<usage><subagent_tokens>115339</subagent_tokens><tool_uses>38</tool_uses><duration_ms>2694211</duration_ms></usage>
+</task-notification>

@@ -1,0 +1,125 @@
+<task-notification>
+<task-id>a5ac817684f80868e</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/27223555-55fc-47d9-892f-dbb48c2ab21a/tasks/a5ac817684f80868e.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse angle" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Based on my investigation, here are the reuse findings for PR #1287, most severe first.
+
+```json
+[
+  {
+    "file": "cmd/entire/cli/agent/antigravity/hooks.go",
+    "line": 210,
+    "summary": "New writeJSONMapFile helper uses os.WriteFile (non-atomic) to write agy's GLOBAL settings.json and .agents/hooks.json, instead of the existing jsonutil.WriteFileAtomic which was built exactly for config files.",
+    "failure_scenario": "jsonutil.WriteFileAtomic (cmd/entire/cli/jsonutil/write.go) writes via temp-file + fsync + rename precisely so 'config files like .entire/settings.json remain parseable across interrupted writes' (its own doc comment), and is already used in 7 places (settings/settings.go:628/795/1477, investigate/manifest.go, investigate/state.go, trail_context_cache.go, checkpoint/fsstore/fsstore.go). writeJSONMapFile bypasses it with a plain os.WriteFile. A crash or SIGKILL mid-write leaves agy's GLOBAL ~/.gemini/antigravity-cli/settings.json truncated/corrupt. That file's title slot is shared across every repo on the machine (per title_install.go's own comments), so one interrupted write corrupts token tracking for all repos and can leave agy spawning a broken title command on every state change. Route writeJSONMapFile's final write through jsonutil.WriteFileAtomic(path, output, 0o600)."
+  },
+  {
+    "file": "cmd/entire/cli/agent/antigravity/title_install.go",
+    "line": 91,
+    "summary": "shellSingleQuote re-implements POSIX single-quote escaping that already exists verbatim in at least three other places; this is the 4th/5th byte-identical copy.",
+    "failure_scenario": "shellSingleQuote is `return \"'\" + strings.ReplaceAll(s, \"'\", `'\\''`) + \"'\"` — byte-for-byte identical logic to shellQuote in cmd/entire/cli/strategy/hooks.go:476, cmd/entire/cli/resume_picker.go:405, and e2e/agents/tmux.go:252 (all `\"'\" + strings.ReplaceAll(s, \"'\", \"'\\\\''\") + \"'\"`). All existing copies are unexported in separate packages so none is importable as-is, but the correct fix is to export one shared helper (e.g. in a small shellutil/jsonutil-adjacent package) rather than add a fifth. Maintenance cost: five independent implementations of the same shell-quoting invariant that must all be fixed identically if an escaping bug is ever found; each has its own test (TestShellQuote in strategy/hooks_test.go:790 and resume_picker_test.go:176), multiplying the surface."
+  },
+  {
+    "file": "cmd/entire/cli/agent/antigravity/transcript.go",
+    "line": 77,
+    "summary": "forEachNonBlankLine's non-blank-line counting is hand-duplicated in the strategy package's countTranscriptItems Antigravity branch; the two must stay byte-identical but are separate implementations kept in sync only by a test.",
+    "failure_scenario": "forEachNonBlankLine (transcript.go:77, used by GetTranscriptPosition/ExtractPrompts/ExtractModifiedFilesFromOffset) counts non-blank JSONL lines with 'skip blank BEFORE counting' semantics. strategy/manual_commit_condensation.go:1090-1094 re-implements the exact same loop (`for _, line := range strings.Split(content,\"\\n\") { if strings.TrimSpace(line) != \"\" { count++ } }`) in its own Antigravity branch, and codex/transcript.go:514 splitJSONL is a third variant of the same idea. The value flows between packages (countTranscriptItems -&gt; CheckpointTranscriptStart -&gt; fed back as fromOffset to forEachNonBlankLine), so the two counters MUST agree exactly; a change to one silently shifts prompt/file extraction. Correctness rests entirely on strategy/count_transcript_antigravity_test.go. There is no shared exported line-counter (the agent package only exposes ChunkJSONL/ReassembleJSONL), so this should be lifted into one shared helper both packages call rather than two hand-synced loops. (The PR author acknowledges the coupling in comments, but the duplication is real.)"
+  },
+  {
+    "file": "cmd/entire/cli/agent/antigravity/statusline.go",
+    "line": 268,
+    "summary": "readStatusSnapshots and readLastStatusSnapshot duplicate ~12 lines of identical JSONL scanner scaffolding (open + Buffer(1MB) + scan-loop + Err-check) within the same file.",
+    "failure_scenario": "readLastStatusSnapshot (statusline.go:235) and readStatusSnapshots (statusline.go:268) share near-identical bodies: os.Open, `scanner := bufio.NewScanner(f); scanner.Buffer(make([]byte,1024*1024),1024*1024)`, the per-line scan loop, and the `scanner.Err()` handling — only the accumulation differs (keep last line vs append all). This ~12-line block is exactly the kind of copy the repo's dupl linter targets (advisory threshold 50; may approach the CI threshold 75). Extract a small `scanJSONLLines(filePath, fn)` (or have readLastStatusSnapshot's non-perf callers reuse readStatusSnapshots) so the 1MB buffer size and blank/error handling live in one place. Lower severity: the separate O(1)-memory last-line reader is a deliberate, documented perf choice, so only the scanner scaffolding — not the whole function — is the reuse target."
+  }
+]
+```
+
+Notes on things I checked that are NOT reuse violations (so you don't re-investigate):
+- `decodeAgyString`/`decodeAgyBool` (lifecycle.go): no existing JSON double-decode/coercion helper exists anywhere in the tree; these are genuinely agy-specific (agy double-encodes tool args). Not a duplication.
+- `discovery.go`: correctly reuses `skilldiscovery.ScanSkillsDir` + `skilldiscovery.Dedupe` (the good pattern the prompt expected). No unshared scan logic.
+- `IsManagedHookCommand`: properly reused from the shared `agent` package (hook_command.go:137) — same as claudecode/cursor/codex/copilotcli/geminicli/factoryaidroid. The hooks.json read-into-`map[string]json.RawMessage` + preserve-unknown-keys + idempotency-compare pattern is duplicated across every agent's hooks.go inline, but there is no shared helper for it (each agent's hook schema differs), so the only cleanly reusable piece is the file write — captured in finding #1.
+- `transcript.go` ChunkTranscript/ReassembleTranscript correctly reuse `agent.ChunkJSONL`/`agent.ReassembleJSONL`.</result>
+<usage><subagent_tokens>102759</subagent_tokens><tool_uses>23</tool_uses><duration_ms>453440</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a0625206b6d1716c8</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/27223555-55fc-47d9-892f-dbb48c2ab21a/tasks/a0625206b6d1716c8.output</output-file>
+<status>completed</status>
+<summary>Agent "Angle B: removed-behavior auditor" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I've completed a thorough removed-behavior audit of the five flagged areas plus the surrounding changed Go files. My findings:
+
+- **resolveCondensedTokenUsage** — byte-for-byte identical extraction of the inline backfill (same order, same which-usage-wins). Safe.
+- **lifecycle `filterToUncommittedFiles`** — `git show main` confirms it was *always* applied only to `relModifiedFiles`; the comment now documents pre-existing behavior. No regression.
+- **claudecode discovery rewiring** — `skilldiscovery.ScanSkillsDir/Dedupe/InvocationName/ParseFrontmatter` are identical to the deleted local versions (only a debug-log string changed); scan order/precedence unchanged. Safe.
+- **hooks `len(filesTouchedBefore) &gt; 0` gate** — verified `SaveStep` only writes a checkpoint when files change (`result.Skipped` otherwise) and `state.FilesTouched` is only cleared during that session's own condensation, so "has uncondensed checkpoint on branch ⟹ FilesTouched &gt; 0". The newly-excluded case (0 files) has nothing on the branch. Safe for all agents.
+- **empty-transcript degrade** — other agents still error (retry invariant preserved); Antigravity advances `CheckpointTranscriptStart=0` so the late-written transcript is fully recaptured next condensation. No state corruption.
+
+Two genuine (lower-severity) residual candidates below.
+
+```json
+[
+  {
+    "file": "cmd/entire/cli/strategy/manual_commit_condensation.go",
+    "line": 515,
+    "summary": "For Antigravity, CheckpointTranscriptStart is a NON-blank line count (countTranscriptItems, line 1090-1097), but generateSummary feeds it to transcript.SliceFromLine (line 515), which counts RAW lines including blanks (transcript/parse.go:114). The two coordinate systems only agree when the transcript has zero interior blank lines. ExtractPrompts/GetTranscriptPosition use non-blank coords and stay consistent; SliceFromLine is the lone raw-line consumer. The PR comment claims 'worst case the summary scope shifts by a line' — it actually shifts by B non-blank lines when B interior blank lines exist.",
+    "failure_scenario": "An agy transcript that contains B&gt;0 blank lines before a checkpoint boundary (e.g. a future agy build that pretty-prints or double-spaces JSONL records). At condensation, offset N (non-blank count) is passed to SliceFromLine, which skips only N raw lines and thus lands B non-blank lines short — the generated summary for checkpoint K includes the tail of checkpoint K-1's transcript. Summary is best-effort so prompts/rewind are unaffected, but the summary scope is silently wrong and grows with the number of interior blanks. The whole safety of the change rests on the empirically-asserted-but-unenforced 'no interior blank lines' invariant."
+  },
+  {
+    "file": "cmd/entire/cli/strategy/manual_commit_condensation.go",
+    "line": 997,
+    "summary": "The Antigravity empty-transcript degrade (line 997-1002) is meant to avoid stranding the already-stamped Entire-Checkpoint trailer on a mid-turn commit. But it only sets an empty transcript and then relies on FilesTouched to keep the checkpoint alive. When FilesTouched resolves to 0 (resolveFilesTouched at line 1016 falls back to transcript extraction, which is empty), CondenseSession's skip gate (`len(Transcript)==0 &amp;&amp; len(FilesTouched)==0`, ~line 199) returns a Skipped result BEFORE filterFilesTouched can assign committed files — so no checkpoint is written and the trailer still dangles. The removed error path had the same net outcome, so this is an incomplete fix rather than a regression.",
+    "failure_scenario": "First-turn agy flow where the committed files were produced outside agy's Edit/Write tools (e.g. agy ran a build script or `git add` of pre-existing changes via a Bash tool, so PreToolUse-&gt;RecordFilesTouched never captured them) and no SaveStep has run yet (no shadow branch). prepare-commit-msg stamps Entire-Checkpoint on the commit; condensation takes the live-transcript branch, degrades on the empty transcript, computes FilesTouched=0, and the skip gate returns Skipped. The commit permanently references a checkpoint that was never written — `entire checkpoint explain &lt;commit&gt;` / trailer resolution finds nothing, the exact symptom the degrade was added to prevent."
+  }
+]
+```
+
+Both are low/medium severity and edge-conditioned; the core replacements the task flagged all re-establish their prior invariants correctly. Relevant absolute paths: `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/strategy/manual_commit_condensation.go`, `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/transcript/parse.go`.</result>
+<usage><subagent_tokens>140941</subagent_tokens><tool_uses>33</tool_uses><duration_ms>731894</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a11926017142976c7</task-id>
+<tool-use-id>toolu_012vkNTvKXyekJ5KkAi4FCQK</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/27223555-55fc-47d9-892f-dbb48c2ab21a/tasks/a11926017142976c7.output</output-file>
+<status>completed</status>
+<summary>Agent "Angle C: cross-file tracer" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have completed the cross-file trace. Here are my findings.
+
+```json
+[
+  {
+    "file": "cmd/entire/cli/strategy/manual_commit_hooks.go:2087",
+    "summary": "Dangling Entire-Checkpoint trailer for Antigravity mid-turn commits: the prepare-commit-msg fast-path treats a session as 'has content' whenever state.TranscriptPath != \"\" (a path string, always set), but agy writes its transcript AFTER Stop, so at a mid-turn commit the live transcript is empty. If FilesTouched is also empty (files edited via a tool other than the 3 recognized names: write_to_file/replace_file_content/multi_replace_file_content — e.g. a shell/terminal edit), the fast-path still stamps the trailer, yet condensation's skip gate (manual_commit_condensation.go:201) fires because the EXTRACTED transcript is empty and FilesTouched is empty. The empty-transcript path was changed to DEGRADE (not error) for Antigravity (manual_commit_condensation.go:997), so unlike other agents there is no error-&gt;retry, and because the skip gate deliberately runs BEFORE filterFilesTouched (line 212), the committed-files fallback that would normally rescue a mid-turn commit never runs.",
+    "failure_scenario": "First agy turn: agy modifies a file via a shell/terminal command (no write_to_file ToolUse fires, so state.FilesTouched stays empty), then commits mid-turn. prepare-commit-msg fast path sees TranscriptPath != \"\" -&gt; stamps Entire-Checkpoint: &lt;id&gt;. PostCommit condensation reads the not-yet-flushed (empty) live transcript, degrades instead of erroring, resolveFilesTouched returns empty, so len(Transcript)==0 &amp;&amp; len(FilesTouched)==0 -&gt; newSkippedResult. The checkpoint &lt;id&gt; is never written to the metadata branch, but the commit permanently carries the trailer. `entire explain`/rewind on that commit finds no checkpoint, and the file changes are never attributed. For every non-Antigravity agent the transcript is non-empty at commit time so this never triggers."
+  },
+  {
+    "file": "cmd/entire/cli/lifecycle.go:1379",
+    "summary": "shouldSuppressConditionalTurnStart drops a resumed conditional TurnStart whenever the session is Phase.IsActive() &amp;&amp; !IsStuckActive(). IsStuckActive is purely time-based (1h StuckActiveThreshold) and it never consults OwnerExited(). The doc comment explicitly says a crashed/killed ACTIVE session 'must NOT suppress: otherwise every resume of a crashed conversation would run untracked' — but the implementation only excludes crashes OLDER than 1 hour. Worse for Antigravity specifically: it has no SessionStart hook (parsePreInvocation emits TurnStart, never SessionStart), so the session Owner is never recorded and OwnerExited() would be unusable even if it were checked — leaving the 1h heuristic as the sole guard.",
+    "failure_scenario": "An agy process crashes/is killed mid-turn (Stop with fullyIdle never fires), leaving session state stuck ACTIVE. Within an hour the user runs `agy --continue &lt;same-conv&gt;`. Its first PreInvocation has invocationNum&gt;0, so parsePreInvocation sets SuppressIfSessionActive=true. State is still ACTIVE and IsStuckActive()==false (&lt;1h) -&gt; shouldSuppressConditionalTurnStart returns true -&gt; the resumed TurnStart is dropped. handleLifecycleTurnStart never runs: no fresh TokenBaseline, no untracked-file snapshot, no transcript-offset capture. The eventual TurnEnd computes the token delta/file changes against the stale crashed-turn PrePromptState (or none), corrupting token accounting and file attribution for the resumed turn."
+  },
+  {
+    "file": "cmd/entire/cli/agent/antigravity/statusline.go:66",
+    "summary": "statusDir() resolves the OOB token-snapshot directory via os.UserCacheDir() directly instead of the mandated single resolver internal/entireclient/userdirs.Cache() (see CLAUDE.md 'Config/Cache/Keyring Isolation in Tests'). This bypasses the userdirs go-test throwaway-dir safety net, and on macOS os.UserCacheDir() ignores XDG_CACHE_HOME. Both AppendStatusSnapshot (title-tee shim, spawned globally by agy) and the OOB read path (SnapshotTokenBaseline/CalculateTokenUsageSince, spawned in-repo by hooks) go through this. In production both processes resolve to the same real dir so the feature works, but any test that spawns the binary and triggers a snapshot without setting ENTIRE_ANTIGRAVITY_STATUS_DIR writes to the developer's real ~/Library/Caches/entire on macOS.",
+    "failure_scenario": "The antigravity-specific integration test at antigravity_test.go:347 sets ENTIRE_ANTIGRAVITY_STATUS_DIR on the child env, but the integration/e2e TestMains that set XDG_CACHE_HOME process-wide do NOT set ENTIRE_ANTIGRAVITY_STATUS_DIR. On macOS a future test (or e2e run) that exercises the Antigravity title-tee or OOB token read without the per-test override writes/reads ~/Library/Caches/entire/antigravity/status, polluting a developer's real cache and risking cross-test contamination — the exact isolation failure CLAUDE.md forbids."
+  },
+  {
+    "file": "cmd/entire/cli/lifecycle.go:917",
+    "summary": "The two computeOutOfBandTokenUsage call sites in handleLifecycleTurnEnd are correctly mutually exclusive (the zero-changes branch returns early at ~928), and neither both Accumulates AND passes to SaveStep — so the primary double-count concern is CLEAN. However the branches diverge on event.TokenUsage precedence: the normal branch (line 957) does `tokenUsage := event.TokenUsage; if nil { CalculateTokenUsage }; if nil { computeOutOfBandTokenUsage }`, whereas the zero-changes branch (line 917) calls computeOutOfBandTokenUsage directly and never consults event.TokenUsage. Benign today because Antigravity is the only OutOfBandTokenSource and its Stop hook never populates event.TokenUsage.",
+    "failure_scenario": "A future agent that is BOTH an OutOfBandTokenSource AND reports authoritative per-turn tokens via its stop-hook payload (event.TokenUsage) would, on a turn that ends with a clean tree (all work committed mid-turn), silently ignore the hook-provided counts and instead recompute from the out-of-band store — potentially producing zero or a wrong delta while the accurate event.TokenUsage is discarded. Latent, not reachable with the current agent set."
+  }
+]
+```
+
+Key traces confirmed clean (no findings): the shared helpers `resolveAgySymlinks`/`decodeAgyString` produce identical symlink-resolved absolute path shapes in both `lifecycle.go:extractFilesFromToolCall` (from `ToolCall.Args json.RawMessage`) and `transcript.go:ExtractModifiedFilesFromOffset` (from `agyStepToolCall.Args map[string]json.RawMessage`), both flowing through `FilterAndNormalizePaths`+`mergeUnique` so dedup works; the `forEachNonBlankLine` offset metric is consistently used as writer (`countTranscriptItems`→`CheckpointTranscriptStart`) and reader (`ExtractPrompts`/`GetTranscriptPosition`); `AccumulateSessionTokenUsage` and `SaveStep` accumulate into `CheckpointTokenUsage` on mutually-exclusive paths so `resolveCondensedTokenUsage` picks up the delta exactly once (deferred, not lost — documented limitation); registration is via `init()`+`agent.Register` with `AgentNameAntigravity`/`AgentTypeAntigravity` used consistently; and `InstallTitleTee`/`UninstallTitleTee` are correctly wired into `InstallHooks`/`runRemoveAgent` with matching install/detect markers.</result>
+<usage><subagent_tokens>172658</subagent_tokens><tool_uses>63</tool_uses><duration_ms>1019642</duration_ms></usage>
+</task-notification>

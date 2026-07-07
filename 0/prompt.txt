@@ -1,0 +1,405 @@
+which endpoints is the cli using against core and cell
+
+---
+
+<task-notification>
+<task-id>a865972ad609a8500</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/3813090c-9892-4ed4-9218-0829d87291b1/tasks/a865972ad609a8500.output</output-file>
+<status>completed</status>
+<summary>Agent "Find cell (entire-api) endpoints" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have a complete picture. Here is the exhaustive findings report.
+
+---
+
+# CLI → Data-Plane (entire-api "cell") Endpoint Inventory
+
+## 1. Cell client type(s) and construction
+
+There is **one** client type used for cells: **`*api.Client`** (`/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/api/client.go:23`). It is a generic authenticated HTTP client (verbs `Get`/`GetStream`/`Post`/`Put`/`Patch`/`Delete`/`Request`); the cell *paths* are string literals built at each call site. "Cell-ness" is determined solely by the `baseURL` it is constructed with (a cell `apiUrl` like `https://aws-eu-west-1.api.entire.io`) and the jurisdictional identity token it carries.
+
+Construction chain (all in `auth` + `cli` packages):
+
+- **`auth.NewEntireAPICellClient(ctx, insecureHTTP, *CellTarget)`** — `auth/cell_data_api.go:100`. Single-cell convenience wrapper → builds a factory and calls `ClientFor`.
+- **`auth.NewEntireAPICellClientFactory(ctx, insecureHTTP)` → `*CellClientFactory`** — `auth/cell_data_api.go:141`. Resolves the exchange subject once, mints ≤1 identity token per jurisdiction.
+- **`CellClientFactory.ClientFor(ctx, *CellTarget)`** — `auth/cell_data_api.go:152`; the actual client is built at `auth/cell_data_api.go:180` via `api.NewClientWithBaseURL(token, cellBaseURL)`.
+- **`NewAuthenticatedEntireAPICellClient(ctx, insecureHTTP, fullName, ulid)`** — `cli/api_client.go:62`. Repo-scoped wrapper: resolves the repo's owning cell via `resolveRepoCellTarget` (`cli/cell_target.go:53`) then calls `NewEntireAPICellClient`.
+
+Base URL semantics: the cell `BaseURL` is an **origin only** (e.g. `https://aws-eu-west-1.api.entire.io`); the `/api/v1/...` prefix is part of the caller-supplied path. Cell origin precedence is documented at `auth/cell_data_api.go:92-99` (explicit target → already-a-cell host containing `.api.` → loopback → BFF-apex fallback that resolves the home cell from the cluster catalog).
+
+Cell routing resolvers (control-plane lookups, cli layer):
+- `resolveRepoCellTarget` (one repo → one cell) — `cli/cell_target.go:53`
+- `groupReposByCell` + `resolveCellBaseURLs` + `fanOutCells` (repo-set fan-out) — `cli/cell_fanout.go:55,95,188`
+
+---
+
+## 2 &amp; 3. Endpoints called against a cell, grouped by routing shape
+
+### Shape A — Repo-scoped, single cell (routed to the cell that HOSTS the repo)
+Client: `NewAuthenticatedEntireAPICellClient(…, fullName, ulid)` → `resolveRepoCellTarget`.
+Feature: **`entire experts`** (`cli/experts_cmd.go`).
+
+| Method | Path | Location | Notes |
+|---|---|---|---|
+| GET | `/api/v1/repos` (+ `?page_token=`) | const `expertsReposListPath` `experts_cmd.go:60`; called `experts_cmd.go:413-417` | Lists caller's accessible repos to map owner/repo → repo ULID (`resolveExpertsRepoID` `:388`) |
+| POST | `/api/v1/repos/{repoID}/experts` | path builder `expertsAPIPath` `experts_cmd.go:378-380`; called `experts_cmd.go:296` | Body = `expertsRequest` (scopes/query/branch/limit). Handles 503 (no code search) and 404 "region" (repo homed in another cell) |
+
+### Shape B — User-scoped `/me/*` on the caller's HOME cell
+Client: `NewEntireAPICellClient(ctx, insecureHTTP, nil)` (nil target ⇒ home-jurisdiction cell). **Best-effort**: any cell-client failure falls back to the data API, which serves the same `/me/*` paths (`cli/entireapi_client.go:34` `runAuthenticatedActivityAPI`; `cli/recap.go:202` `newRecapClient`).
+
+Feature: **`entire activity`** (`cli/activity_cmd.go`, via `runAuthenticatedActivityAPI`):
+
+| Method | Path | Location |
+|---|---|---|
+| GET | `/api/v1/me/activity?timezone=&amp;timeframe=last-month&amp;limit=1000` | `activity_cmd.go:140-142` (`fetchActivity`) |
+| GET | `/api/v1/me/commits?timeframe=last-month&amp;limit=1000` | `activity_cmd.go:160` (`fetchCommits`, `--commits`) |
+| GET | `/api/v1/me/sessions?timeframe=last-month&amp;limit=50` | `activity_cmd.go:182` (`fetchSessions`, default view) |
+
+Feature: **`entire recap`** (`cli/recap.go` → `recap/me_recap.go`):
+
+| Method | Path | Location |
+|---|---|---|
+| GET | `/api/v1/me/recap?since=&amp;until=&amp;repo=&amp;limit=` | `recap/me_recap.go:143` (`FetchMeRecap`) |
+
+`recap` is user-scoped (home cell) but carries an **optional repo-scoped `?repo=` filter**: `repo` is the current repo's **repo_id ULID** when talking to a cell (resolved by `currentRepoRef` `cli/entireapi_client.go:74` → control-plane mirror lookup), or the owner/repo slug on the data-API fallback (`recap.go:229-231`).
+
+### Shape C — Arbitrary path escape hatch
+Feature: **`entire api --to cell &lt;path&gt;`** (`cli/api_cmd.go`). `resolveAPIClient` case `"cell"` builds `NewEntireAPICellClient(ctx, insecure, nil)` (home cell) at `api_cmd.go:134-139`; the user supplies method + path. Documented examples (`api_cmd.go:54-55`): `/api/v1/me/activity`, `/api/v1/me/recap?repo={repo_id}`. Supports `{repo_id}` placeholder expansion (`expandAPIPlaceholders` `api_cmd.go:164`, `resolveCurrentRepoID` `:194`).
+
+### Shape D — Repo-set fan-out (infrastructure only; NO production caller yet)
+`cli/cell_fanout.go`: `groupReposByCell` (`:55`) groups the caller's repo index by hosting cell, `resolveCellBaseURLs` (`:95`) fills baseURLs from the cluster catalog, and `fanOutCells` (`:188`) calls a per-cell `fn(ctx, group, *api.Client)` concurrently via `CellClientFactory.ClientFor`. **Grep confirms `fanOutCells`/`groupReposByCell` have only test callers** — this is prebuilt to mirror the BFF's code-search fan-out (`cell_fanout.go:16-22`); no command currently issues a concrete per-cell path through it.
+
+---
+
+## Supporting endpoints used to RESOLVE cells (NOT on the cell — hit control-plane/core/auth host)
+
+These are part of the cell-routing flow but target entire-**core** / the login host, not the cell data plane:
+
+| Method | Path / RPC | Location | Purpose |
+|---|---|---|---|
+| GET | `/api/v1/clusters` | const `clustersAPIPath` `auth/cell_data_api.go:34`; hand-rolled request `:594` | Home-jurisdiction cell resolution (auth layer, avoids import cycle) |
+| — | `coreapi.ListClusters` | `cell_target.go:68`, `cell_fanout.go:99` | Cluster catalog → cell apiUrl + jurisdiction (generated coreapi client) |
+| — | `coreapi.GetRepo` | `cell_target.go:95` | ULID → `Repo.ClusterHost` |
+| — | `coreapi.ListMirrors` (`listMirrorsForRepo`) | `cell_target.go:107`, `entireapi_client.go:90` | owner/repo → active cluster host / repo_id |
+| POST | `{coreURL}/oauth/token` | `httputil/oauth.go:124`; `exchangeJurisdictionToken` `auth/cell_data_api.go:650-656` | RFC 8693 exchange of login JWT → jurisdictional identity token (`scope=openid`, aud=jurisdiction host) |
+
+---
+
+## Endpoints that LOOK like cell endpoints but are NOT cell-routed (flagged to avoid confusion)
+
+These share the `/api/v1/...` shape but are built with `NewAuthenticatedAPIClient` (data-API BFF at `api.BaseURL()`), the login/core host, or a separate search service — never with a cell client:
+
+| Method | Path | Location | Actual target |
+|---|---|---|---|
+| GET | `/api/v1/repositories` (+`?sort=`) | `api/repositories.go:31` | Data API BFF (`search_cmd.go:255`, `dispatch_wizard.go:36`) |
+| GET | `/api/v1/trails/{forge}/{owner}/{repo}?limit=1` | `api/trails.go:14` | Data API BFF (`TrailsEnabled` probe: `setup.go:1021`, `trail_context_cache.go:228`) |
+| POST | `/api/v1/cli/enable` | `api/enable.go:36` | Data API BFF (`setup.go:1014`) |
+| GET/… | auth-session list/revoke (via `WithAuthSessionsPath`) | `api/auth_sessions.go`; `logout.go:119,130,136`, `auth.go:378` | Login/core host |
+| GET | `/search/v1/search?q=…` | `search/search.go:502` | Separate search service (`DefaultServiceURL`) |
+| — | various `/api/v1/trails/...` in `trail_cmd.go` | `trail_cmd.go:793` uses `NewAuthenticatedAPIClient` | Data API BFF |
+
+---
+
+### Bottom line
+Distinct **cell** (entire-api data-plane) endpoints actually invoked by CLI commands today:
+- `GET /api/v1/repos` and `POST /api/v1/repos/{repoID}/experts` — repo-scoped (`experts`)
+- `GET /api/v1/me/activity`, `GET /api/v1/me/commits`, `GET /api/v1/me/sessions` — home cell (`activity`)
+- `GET /api/v1/me/recap` (optional repo_id `?repo=`) — home cell + repo filter (`recap`)
+- Arbitrary path via `entire api --to cell` — home cell
+- (Fan-out machinery exists but is not yet wired to any concrete cell path.)</result>
+<usage><subagent_tokens>95403</subagent_tokens><tool_uses>25</tool_uses><duration_ms>178395</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a286be90972e55f02</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/3813090c-9892-4ed4-9218-0829d87291b1/tasks/a286be90972e55f02.output</output-file>
+<status>completed</status>
+<summary>Agent "Find core (control-plane) endpoints" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I now have a complete picture. Here is the exhaustive report.
+
+---
+
+# Control-plane ("core") endpoints called by the CLI
+
+## 1. The coreapi package
+
+- Location: `/Users/soph/Work/entire/devenv/cli/internal/coreapi/`
+- Client type: `coreapi.Client` — an **ogen-generated** OpenAPI client (`oas_client_gen.go`), wrapped by hand-written constructors in `internal/coreapi/client.go`.
+- Constructors (`client.go`):
+  - `New()` (`client.go:35`) — dials the active login context's core.
+  - `NewForCluster(ctx, clusterHost)` (`client.go:58`) — dials the core discovered from a cluster's `/.well-known/entire-cluster.json`.
+  - `NewWithBearer(coreBaseURL, token)` (`client.go:146`) — fixed origin + fixed bearer (used by `entire auth status`'s `/me` probe).
+- Base path: every operation is served under **`/api/v1`** (`apiBasePath`, `client.go:18`). Origin comes from `auth.ResolveControlPlaneTarget`; bearer is minted per-request from the stored refresh token (`providerSource`, `client.go:176`).
+- Auth model: bearer-only. The generated `sessionAuth` (cookie) scheme is deliberately skipped (`client.go:197`).
+- Cross-jurisdiction transport (`cross_juris_transport.go`): on a `421 Misdirected Request` it follows the home core and re-runs an RFC 8693 exchange at that core's `/oauth/token` (`cross_juris_transport.go:154`). No new API surface — it re-issues the same request against another origin.
+
+All paths below are relative to `&lt;core-origin&gt;/api/v1`. File:line references point to the send-function in `oas_client_gen.go` (method) and the caller.
+
+## 2. Endpoints actively used by CLI commands
+
+### Identity / "me" (auth status, wizard)
+| Method | Path | Operation (oas_client_gen.go) | Caller |
+|---|---|---|---|
+| GET | `/me` | `GetMe` `oas_client_gen.go:1862/1874` | `auth.go:359` (`entire auth status` profile+liveness probe), `repo_mirror_create_wizard.go` |
+
+### Orgs (`org.go`)
+| Method | Path | Operation | Caller |
+|---|---|---|---|
+| POST | `/orgs` | `CreateOrg` `:780/792` | `org.go:49` (`entire org create`) |
+| GET | `/orgs` | `ListOrgs` `:4197/4263` | `org.go:66,73`, `resolveref.go` |
+| GET | `/orgs/{org}` | `GetOrg` `:2044/2074` | `org.go:95` |
+| DELETE | `/orgs/{org}` | `DeleteOrg` `:1462/1492` | `org.go:112` |
+
+### Projects (`project.go`)
+| Method | Path | Operation | Caller |
+|---|---|---|---|
+| POST | `/projects` | `CreateProject` `:865/877` | `project.go:80` |
+| GET | `/projects` | `ListProjects` `:4626/4692` | `project.go:135,149,165`, `resolveref.go:135` |
+| GET | `/projects/{project}` | `GetProject` `:2283/2313` | `project.go:174` |
+| DELETE | `/projects/{project}` | `DeleteProject` `:1562/1592` | `project.go:191` |
+| GET | `/orgs/{org}/projects` | `ListOrgProjects` `:4042/4127` | `project.go:113,127` |
+
+### Repos (`repo.go`, `repo_clone.go`, `cell_target.go`, `resolveref.go`)
+| Method | Path | Operation | Caller |
+|---|---|---|---|
+| POST | `/repos` | `CreateRepo` `:950/962` | `repo.go:137` |
+| GET | `/repos/{repo}` | `GetRepo` `:2383/2413` | `repo.go:199`, `cell_target.go:95` |
+| DELETE | `/repos/{repo}` | `DeleteRepo` `:1662/1692` | `repo.go:219` |
+| GET | `/repos/{repo}/visibility` | `GetRepoVisibility` `:2483/2514` | `repo.go:283` |
+| PUT | `/repos/{repo}/visibility` | `SetRepoVisibility` `:6408/6439` | `repo.go:316` |
+| GET | `/projects/{project}/repos` | `ListProjectRepos` `:4471/4556` | `repo.go:176,197`, `resolveref.go:176` |
+
+### Mirrors / cells (`repo_mirror.go`, `repo_mirror_create_wizard.go`, `repo_mirror_collaborators.go`, `repo_mirror_probe.go`, `repo_clone.go`, `cell_target.go`, `cell_fanout.go`)
+| Method | Path | Operation | Caller |
+|---|---|---|---|
+| POST | `/mirrors` | `CreateMirror` `:695/707` | `repo_mirror.go:247` |
+| GET | `/mirrors` | `ListMirrors` `:3615/3715` | `repo_mirror.go:401,462`, `repo_clone.go:189` |
+| DELETE | `/mirrors` | `DeleteMirror` `:1321/1392` | `repo_mirror.go:548` |
+| GET | `/mirrors/{mirror}` | `GetMirror` `:1944/1974` | `repo_mirror.go:275,433`, `repo_mirror_probe.go:121` |
+| GET | `/mirrors/available` | `ListAvailableMirrors` `:3152/3184` | `repo_mirror.go:366`, `repo_mirror_create_wizard.go:353` |
+| GET | `/mirrors/collaborators` | `ListMirrorCollaborators` `:3474/3545` | `repo_mirror_collaborators.go:73` |
+| GET | `/clusters` | `ListClusters` `:3392/3404` | `cell_target.go:57,99`, `repo_mirror_create_wizard.go:68`, `cell_fanout.go` |
+
+Note: `ListClusters` (`GET /api/v1/clusters`) is also fetched **by hand** (not via ogen) in `cmd/entire/cli/auth/cell_data_api.go:594` using a raw `http.NewRequestWithContext` against `clustersAPIPath = "/api/v1/clusters"` (`cell_data_api.go:34`) — used during cell/data-API subject resolution.
+
+### Access grants / membership (`grant.go`)
+| Method | Path | Operation | Caller |
+|---|---|---|---|
+| POST | `/orgs/{org}/members` | `AddOrgMember` `:402/433` | `grant.go:140` |
+| GET | `/orgs/{org}/members` | `ListOrgMembers` `:3904/3972` | `grant.go:168` |
+| DELETE | `/orgs/{org}/members/{member}` | `RemoveOrgMember` `:5461/5529` | `grant.go:197` |
+| POST | `/projects/{project}/grants` | `GrantProjectAccess` `:2721/2752` | `grant.go:249` |
+| GET | `/projects/{project}/members` | `ListProjectMembers` `:4333/4401` | `grant.go:278` |
+| DELETE | `/projects/{project}/grants/{grant}` | `RevokeProjectAccess` `:5718/5786` | `grant.go:317` |
+| DELETE | `/projects/{project}/grants/account/{provider}` | `RevokeProjectAccessByProvider` `:5856/5924` | `grant.go:324` |
+| POST | `/repos/{repo}/grants` | `GrantRepoAccess` `:2825/2856` | `grant.go:397` |
+| GET | `/repos/{repo}/grants` | `ListRepoGrants` `:4762/4830` | `grant.go:428` |
+| DELETE | `/repos/{repo}/grants/{grant}` | `RevokeRepoAccess` `:5994/6062` | `grant.go:470` |
+| DELETE | `/repos/{repo}/grants/account/{provider}` | `RevokeRepoAccessByProvider` `:6132/6200` | `grant.go:477` |
+
+### Identity resolution (`resolveref.go`)
+| Method | Path | Operation | Caller |
+|---|---|---|---|
+| GET | `/identity/handles/{provider}/{handle}` | `ResolveHandle` `:5599/5648` | `resolveref.go:92,127` |
+
+## 3. Generated coreapi operations NOT called by the CLI
+
+These exist in the ogen client but have **no caller** anywhere in `cmd/`, `internal/`, or `perf/` (confirmed by grep). Listed for completeness of the coreapi surface:
+
+- `PATCH /me` — `UpdateMe` `:6512/6524`
+- `DELETE /me` — `DeleteMe` `:1239/1251`
+- `POST /lookup` — `BatchLookup` `:506/518`
+- `GET /version` — `GetVersion` `:2684/2696`
+- `GET /audit` — `ListAuditEvents` `:3033/3082`
+- `GET /oidc-providers` — `ListOIDCProviders` `:3785/3834`
+- `GET /repos` — `ListRepos` `:4900/4912`
+- `GET /repos/lookup-by-slug` — `LookupRepoBySlug` `:5253/5282`
+- `GET /access/{subjectType}/{subjectId}` — `GetPermissions` `:2144/2213`
+- `GET /access/{subject}` — `LookupResources` `:5307/5391`
+- Service accounts (entire family unused): `POST /service-accounts` `CreateServiceAccount`; `GET /service-accounts` `ListServiceAccounts`; `GET /service-accounts/{id}` `GetServiceAccount`; `DELETE /service-accounts/{id}` `DeleteServiceAccount`; `POST /service-accounts/{id}/bindings` `CreateBinding`; `GET /service-accounts/{id}/bindings` `ListBindings`; `DELETE /service-accounts/{id}/bindings/{bid}` `DeleteBinding`; `POST /service-accounts/{id}/grants` `GrantServiceAccountAccess`; `GET /service-accounts/{id}/grants` `ListServiceAccountGrants`; `DELETE /service-accounts/{id}/grants/{grant}` `RevokeServiceAccountAccess`.
+
+## 4. Auth-related core endpoints OUTSIDE coreapi
+
+These hit the same entire-core login server but are called through the OAuth/session stack, not the ogen client.
+
+### OAuth / login / token exchange
+Path constants in `cmd/entire/cli/auth/provider.go:12-18`; wired into the auth-go `deviceflow`/`authcode`/`tokenmanager` libraries in `auth/client.go` and `auth/refresh.go`.
+
+| Method | Path | Purpose | Wiring / caller |
+|---|---|---|---|
+| POST | `/device_authorization` | Start device-code login | `oauthDeviceCodePath` `provider.go:14`, `client.go:78`; `StartDeviceAuth` `client.go:141` ← `login.go:160` (`entire login`) |
+| GET | `/authorize` | Loopback authorization-code login | `oauthAuthorizePath` `provider.go:15`, `client.go:88` |
+| POST | `/oauth/token` | Device/auth-code token grant + refresh | `oauthTokenPath` `provider.go:16`; `client.go:79,89`; `RefreshPath` `refresh.go:127`; poll via `PollDeviceAuth`/`Exchange` (`login.go:310,413`) |
+| POST | `/oauth/token` | RFC 8693 STS token exchange (cross-region + resource-scoped) | `oauthSTSPath`/`STSPath` `provider.go:17`, `refresh.go:126`; also `cross_juris_transport.go:154` |
+| POST | `/oauth/token` | Repo-scoped credential exchange (git push/pull, data API) | `httputil.PostOAuthToken` (`internal/entireclient/httputil/oauth.go:123`) ← `repocreds.go:169` and `auth/cell_data_api.go:656` |
+
+`httputil.PostOAuthToken` composes `coreURL+"/oauth/token"` (`oauth.go:124`).
+
+### Login sessions (`entire logout`, `entire auth status`)
+Base path `coreAuthSessionsPath = "/api/auth/tokens"` (`cmd/entire/cli/auth.go:28`), reached via the `cmd/entire/cli/api` REST client (`newAuthSessionsClient` `auth.go:54`). Implementations in `cmd/entire/cli/api/auth_sessions.go`:
+
+| Method | Path | Operation | Caller |
+|---|---|---|---|
+| GET | `/api/auth/tokens` | `ListAuthSessions` `auth_sessions.go:43` | `auth.go:378` (auth status), `logout.go:130` (`entire logout --all`) |
+| DELETE | `/api/auth/tokens/current` | `RevokeCurrentAuthSession` `auth_sessions.go:67` | `logout.go:119` (`entire logout`) |
+| DELETE | `/api/auth/tokens/{id}` | `RevokeAuthSession` `auth_sessions.go:85` | `logout.go:136` (`entire logout --all`) |
+
+### Trust-root / discovery documents (`.well-known`, GET)
+Fetched with raw `http.NewRequestWithContext`, no auth:
+
+| Method | Path | Purpose | Location |
+|---|---|---|---|
+| GET | `/.well-known/entire-cluster.json` | Discover a cluster's core(s) (used by `NewForCluster`, git clone routing) | `internal/entireclient/clusterdiscovery/discovery.go:20,85` |
+| GET | `/.well-known/entire-api.json` | Discover a data-API host's trusted login servers | `internal/entireclient/clusterdiscovery/api_discovery.go:20,42` |
+| GET | `/.well-known/openid-configuration` | Referenced as the OIDC discovery model for the OAuth endpoints above | `auth/provider.go:7` (documentation reference) |
+
+## Notes / caveats
+- The user asked about gRPC too: **there is no gRPC** against core — the control-plane surface is entirely HTTP/JSON (ogen REST client + OAuth). The only "RPC-like" methods are the ogen operations enumerated above.
+- The `cmd/entire/cli/api` package also has data-plane endpoints (`repositories.go`, `trails.go`, `enable.go`) that target the **data API host**, not the control plane — excluded here as out of scope, except `auth_sessions.go` which targets core.
+- Query parameters (e.g., pagination on the `List*` ops, `mirror`/`repo` selectors on `GetMirror`/`DeleteMirror`) are built in `oas_parameters_gen.go`; I reported canonical paths only.</result>
+<usage><subagent_tokens>59268</subagent_tokens><tool_uses>28</tool_uses><duration_ms>258585</duration_ms></usage>
+</task-notification>
+
+---
+
+can you also check the repo/mirror list commands in public cli, they do strict enum validation in the marshaling
+
+---
+
+the "public cli" is this repo, sorry, like can you check this repos implementation
+
+---
+
+<task-notification>
+<task-id>a4b54af9e63271dde</task-id>
+<tool-use-id>toolu_01BiW7SA7hb7dsZnmhChRuPt</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/3813090c-9892-4ed4-9218-0829d87291b1/tasks/a4b54af9e63271dde.output</output-file>
+<status>completed</status>
+<summary>Agent "Check enum validation in list marshaling" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have the complete picture. Here is my report.
+
+## Summary
+
+The forward-compat hazard is **real** for both `entire repo list` and `entire mirror list`, but the failure mechanism is **not** where the task premise expected it. The ogen `Decode` methods in this repo are **lenient** (they accept unknown enum values); the hard failure comes instead from the **`Validate()`** methods, which the response decoders call unconditionally immediately after decoding. Those `Validate()` methods use the strict `default: return errors.Errorf("invalid value: %v", s)` pattern. There is no tolerance path, no "unknown" enum member, and no way to skip validation.
+
+## Call chain
+
+- `mirror list`: `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/repo_mirror.go:401` calls `c.ListMirrors` → `oas_client_gen.go:3615` → `decodeListMirrorsResponse` (`oas_response_decoders_gen.go:2574`). Response type `ListMirrorsOutputBody`, items `[]coreapi.Mirror`.
+- `repo list`: `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/repo.go:176` calls `c.ListProjectRepos` → `oas_client_gen.go:4471` → `decodeListProjectReposResponse` (`oas_response_decoders_gen.go:3117`). Response type `ListProjectReposOutputBody`, items `[]coreapi.Repo`.
+
+Errors propagate straight up with no catch: `fetchAllPages` (`corecmd.go:195`) returns the error, `renderCoreList` (`corecmd.go:170`) returns it, the command fails.
+
+## Enum fields
+
+### Mirror (`mirror list`)
+Only one enum field on `Mirror` (`oas_schemas_gen.go:4691`): `Status OptMirrorStatus` (JSON `status`). Note that `Provider`, `Owner`, `Cell`, `Jurisdiction`, `ClusterHost` are plain `string`/`OptString` — **not** enums, so they are forward-compat safe.
+
+- **`MirrorStatus`** (`oas_schemas_gen.go:4938`) — allowed values: `processing`, `ready`, `failed`, `suspended`.
+
+### Repo (`repo list`)
+`Repo` (`oas_schemas_gen.go:6490`) has three enum fields:
+
+- **`RepoObjectFormat`** (JSON `objectFormat`, `oas_schemas_gen.go:6865`) — allowed: `sha1`, `sha256`.
+- **`RepoState`** (JSON `state`, `oas_schemas_gen.go:6976`) — allowed: `provisioning`, `active`, `failed`.
+- **`RepoVisibility`** (JSON `visibility`, `oas_schemas_gen.go:7024`) — allowed: `public`, `private`.
+
+There is no `role` or `cluster status` enum on either response type.
+
+## Decode is lenient (contrary to the premise)
+
+The jx-based `Decode` methods — the ones actually used for response body decoding — fall through to assigning the raw string on an unknown value, and return `nil`. Example, `MirrorStatus.Decode` (`/Users/soph/Work/entire/devenv/cli/internal/coreapi/oas_json_gen.go:13271`):
+
+```go
+switch MirrorStatus(v) {
+case MirrorStatusProcessing:
+    *s = MirrorStatusProcessing
+...
+default:
+    *s = MirrorStatus(v)   // accepts unknown value, no error
+}
+return nil
+```
+
+Identical lenient `default: *s = T(v)` pattern in `RepoObjectFormat.Decode` (`oas_json_gen.go:16060`), `RepoState.Decode` (`oas_json_gen.go:16324`), and `RepoVisibility.Decode` (`oas_json_gen.go:16366`). The `Opt*` wrappers (`OptMirrorStatus.Decode` at `oas_json_gen.go:14012`, etc.) just delegate to the inner `Decode`, so they are lenient too.
+
+(The strict `errors.Errorf("invalid value: %q", ...)` string the premise described *does* exist, but only on the `UnmarshalText` / `MarshalText` methods, e.g. `MirrorStatus.UnmarshalText` at `oas_schemas_gen.go:4974`. Those are **not** on the ogen response decode path, so they are irrelevant here.)
+
+## The actual hard-failure point: `Validate()`
+
+The response decoder calls `response.Validate()` unconditionally right after `Decode`. From `decodeListMirrorsResponse` (`oas_response_decoders_gen.go:2574`):
+
+```go
+d := jx.DecodeBytes(buf)
+var response ListMirrorsOutputBody
+if err := ... response.Decode(d) ...; err != nil { ... }
+// Validate response.
+if err := func() error {
+    if err := response.Validate(); err != nil {
+        return err
+    }
+    return nil
+}(); err != nil {
+    return res, errors.Wrap(err, "validate")
+}
+```
+
+`decodeListProjectReposResponse` (`oas_response_decoders_gen.go:3117`) has the same structure.
+
+`ListMirrorsOutputBody.Validate` (`oas_validators_gen.go:1243`) iterates every mirror and calls `elem.Validate()`; `Mirror.Validate` (`oas_validators_gen.go:1834`) validates `Status` via `MirrorStatus.Validate` (`oas_validators_gen.go:1864`):
+
+```go
+func (s MirrorStatus) Validate() error {
+    switch s {
+    case "processing": return nil
+    case "ready":      return nil
+    case "failed":     return nil
+    case "suspended":  return nil
+    default:
+        return errors.Errorf("invalid value: %v", s)   // HARD FAILURE
+    }
+}
+```
+
+Same strict pattern for the repo enums:
+
+- `RepoObjectFormat.Validate` (`oas_validators_gen.go:2002`) — `default: return errors.Errorf("invalid value: %v", s)`
+- `RepoState.Validate` (`oas_validators_gen.go:2013`) — `default: return errors.Errorf("invalid value: %v", s)`
+- `RepoVisibility.Validate` (`oas_validators_gen.go:2026`) — `default: return errors.Errorf("invalid value: %v", s)`
+
+`ListProjectReposOutputBody.Validate` (`oas_validators_gen.go:1407`) → `Repo.Validate` (`oas_validators_gen.go:1913`) validates all three of `objectFormat`, `state`, `visibility`.
+
+## Tolerance / fallback: none
+
+- **No decode-error catch in the CLI:** the error flows `Client.sendXxx` → `fetchAllPages` (`corecmd.go:195`, returns `nil, err`) → `renderCoreList` (`corecmd.go:170`) → command `RunE`. It is surfaced as a top-level command failure (wrapped as `"validate: ..."`). This is true for both table output and `--json`.
+- **No "unknown"/"unspecified" enum member** in any of the four enum constant blocks.
+- **No custom `UnmarshalJSON` override** beyond the generated ones (which delegate to the lenient `Decode`) — but the lenient decode is moot because `Validate()` runs afterward and rejects.
+- **No `x-ogen` extension, no `SkipValidation`/`infer-types` option** anywhere in `internal/coreapi/` (grep found nothing). Validation is hard-wired into every response decoder.
+
+## Conclusion
+
+Both commands are exposed to a **hard failure** if the server returns a newer enum value:
+
+- `mirror list` fails if any mirror's `status` is not one of `processing|ready|failed|suspended`.
+- `repo list` fails if any repo's `objectFormat` ∉ `{sha1,sha256}`, `state` ∉ `{provisioning,active,failed}`, or `visibility` ∉ `{public,private}`.
+
+Because these are optional (`Opt*`) fields, a value being *absent* is safe; the hazard is strictly an unknown *present* value. A single offending item aborts the entire list request (the whole page fails to decode/validate), and pagination is not partially recoverable. The failure originates in `oas_validators_gen.go`, not `oas_json_gen.go` as the premise assumed — the Decode methods here are lenient, so any future mitigation (e.g. skipping validation, or treating unknown as passthrough) would need to address the `Validate()` call in the response decoders rather than the `Decode` methods.</result>
+<usage><subagent_tokens>36696</subagent_tokens><tool_uses>21</tool_uses><duration_ms>122448</duration_ms></usage>
+</task-notification>
+
+---
+
+which host is GET /api/v1/repos run against?
+
+---
+
+ok, back to the enum: yeah we should harden (loose?) this that new values are actually allowed especially if they are just use for display.
+
+---
+
+let's do tier 1 first, do commits and open a PR

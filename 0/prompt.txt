@@ -1,0 +1,167 @@
+I'm working on entire repo mirror list command. Right now, it just prints a list with all the visible mirrors by the loged in user. I do need to make that list more usable in terms of making easier to find what you need to find or just explore. Those are the 2 use cases I reckon an user will need to perform over this command. Before starting a proposal, I need to know if we have in code any other command that manages a long list of elements with sort/filter actions on it.
+
+---
+
+<task-notification>
+<task-id>ace59c1d57792087d</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-cli/720f6b47-08c0-41d4-9bde-e278935e7c15/tasks/ace59c1d57792087d.output</output-file>
+<status>completed</status>
+<summary>Agent "Find list commands with sort/filter" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have a thorough picture of the codebase. Here is my inventory.
+
+---
+
+## Inventory: list commands with sort / filter / JSON / TUI in the `entire` CLI
+
+All paths under `/Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/`.
+
+### 1. `repo mirror list` — the command you asked about
+- File: `repo_mirror.go`, function `newRepoMirrorListCmd()` (line 345).
+- Data structs: `coreapi.Mirror` and `coreapi.AvailableMirror`. Column/row mappers are package-level: `mirrorColumns` + `mirrorRow()` (lines 25-35) and `availableMirrorColumns` + `availableMirrorRow()` (lines 44-48).
+- Printing: delegates entirely to the shared generic `runCoreList[T]` (in `corecmd.go`), which renders an aligned table OR raw JSON.
+- Sort: NONE. Order is whatever the server returns (paged via `fetchAllPages`).
+- Filter: server-side only, via flags `--cluster`, `--provider`, `--owner`, and a mode toggle `--show-available` (lines 410-413). No client-side filter/sort.
+- JSON: YES, inherited `--json` persistent flag (see `addControlPlaneFlags`).
+- TUI: NONE. Pure table/JSON. Pagination handled by `fetchAllPages` (corecmd.go:195).
+
+### 2. The shared control-plane list helper (primary reusable pattern)
+- File: `corecmd.go`.
+  - `runCoreList[T]` (152) / `renderCoreList[T]` (168): fetch → if `--json` print JSON, else if empty print sentence, else `printTable`.
+  - `runCoreObject[T]` (217): single-item detail view (`printFields`), same column defs as the list — this is the "list prints IDs + detail command by ID" convention.
+  - `printTable[T]` (275), `printFields` (297), `columnWidths` (325), `writeTableRow` (343): ANSI-safe aligned table renderer with `tableStyles` (235).
+  - `fetchAllPages[T]` (195): generic keyset pagination driver.
+  - `jsonRequested` (39), `addControlPlaneFlags` (28): the `--json` plumbing.
+- This is used by `repo mirror`, org/project/repo, mirror collaborators, etc. No sort/filter layer exists here — a sortable/filterable list would extend this.
+
+### 3. `search` / `checkpoint search` — richest sort/filter/TUI reference
+- Files: `search_cmd.go` (`newSearchCmd()` line 21), `search_tui.go` (bubbletea model), package `search/search.go` (config/filter logic). `checkpoint search` is literally `newSearchCmd()` (checkpoint_group.go:48). `entire search` is the same command (root.go:126).
+- Filter: extensive. Flags `--author`, `--date`, `--branch`, `--repo`, `--all-repos` (search_cmd.go:208-212) PLUS inline query filters `author:`/`date:`/`branch:`/`repo:` parsed by `search.ParseSearchInput` / `parseListFilter` (search.go:361, 423). `search.Config.HasFilters()` (search.go:345). In the TUI, live type filtering via `typeFilter` tabs and `filteredResults()` (search_tui.go:104-151).
+- Sort: server-ranked; no user sort flag.
+- Pagination: `--limit`, `--page` (search_cmd.go:206-207); client-side paging in TUI (`pageResults`, `totalPages`, search_tui.go:159-186).
+- JSON: YES, `--json` + `writeSearchJSON` (search_cmd.go:269).
+- TUI + fallback: EXEMPLARY three-way branch (search_cmd.go:151-201): (a) `--json` or non-TTY → `writeSearchJSON`; (b) `IsAccessibleMode()` → `renderSearchStatic`; (c) interactive → bubbletea `newSearchModel`. Guard also refuses empty-query non-interactive with a helpful error (search_cmd.go:90).
+
+### 4. `session list` (`sessions list`)
+- File: `sessions.go`, `newListCmd()` (324), `runSessionList()` (346).
+- Sort: fixed — `sort.Slice` by `StartedAt` descending (line 360). No sort flag.
+- Filter: `filterActiveSessions` helper exists (285); list itself filters nil/invalid. No user filter flag.
+- JSON: YES, `--json` → `writeSessionListJSON` (400); shared JSON shape via `buildSessionInfoJSON` (597), also used by `session info`/`session current`.
+- TUI: none for list; uses `huh` multi-select only in `stop` flow (`runStopMultiSelect`, 793). Detail command `session info &lt;id&gt;` is the by-ID fallback.
+
+### 5. `checkpoint list`
+- File: `checkpoint_group.go`, `newCheckpointListCmd()` (55) → `runExplainBranchWithFilter` in `explain.go` (2344).
+- Sort: fixed by time — `sort.Slice` in explain.go:2160, 2174.
+- Filter: `--session` (session id/prefix) (checkpoint_group.go:73).
+- JSON: via the underlying `explain --json` path (`runExplainListJSON`); `explain.go` has `--json` (line 403) and `--limit` (406, only meaningful with `--json`).
+- Pager: `--no-pager` (checkpoint_group.go:74, explain.go:396) — this is the canonical pager-bypass pattern.
+- TUI: none (prose + pager).
+
+### 6. `experts` / `experts --tui`
+- Files: `experts_cmd.go` (`newExpertsCmd()` 182, `runExperts` 206), `experts_tui.go`.
+- Filter: `--repo`, `--branch`, `--staged`, `--limit` (193-198).
+- Sort: none user-facing.
+- JSON: YES, `--json` → encodes `decoded` (experts_cmd.go:331).
+- TUI + fallback: EXEMPLARY. `--tui` is opt-in and gated: `f.tui &amp;&amp; len&gt;0 &amp;&amp; IsTerminalWriter(out) &amp;&amp; !IsAccessibleMode()` else `renderExperts` deterministic plain text (experts_cmd.go:344-349). Called out as a good pattern in CLAUDE.md.
+
+### 7. `agent list`
+- File: `agent_group.go`, `newAgentListCmd()` (58) → `runAgentList` (68). Simple: `agent.StringList()`, no sort/filter flags, no `--json`, no TUI. Not a strong reference.
+
+### 8. `auth contexts`
+- File: `auth_context.go`, `newAuthContextsCmd()` (72) → `runAuthContexts` (83), `renderContextsTable` (100).
+- Sort: none (contexts.json order). Related `sortAuthSessionsByRecency` (auth.go:578) is a good multi-key `sort.Slice` example (last-used, then created, then id).
+- Filter: none. JSON: NO. TUI: NO. Uses its own `renderAlignedTable` (auth.go:517) — a second, older table renderer distinct from corecmd's `printTable`.
+
+### 9. `investigate --findings`
+- File: `investigate/findings.go`, `runInvestigateFindings` (19), `printInvestigateFindingsList` (55).
+- Prints a complete plain-text list with `view:`/`fix:`/`path:` hints — the reference for "list prints stable IDs + a show command". Detail: `investigate/show.go`. Pickers (`investigate/picker.go`, `multipicker.go`) are `huh`-based and interactive-only, but the `--findings` list + `show &lt;run-id&gt;` is the non-interactive fallback. Sort in `eligibleAgentsForInvestigate` (picker.go:79) is by name. No `--json`.
+
+### 10. `activity` (bonus, sortable grouped list)
+- File: `activity_cmd.go`, `newActivityCmd()` (49), `runActivity` (65).
+- Filter: `--commits` mode toggle. Sort/grouping: `groupItemsByDay` + `sort.Slice` (266-298). TUI (`activity_tui.go`) with non-TTY/accessible static fallback `runActivityStatic` (68-76). No `--json`.
+
+---
+
+## The "Agent-Safe CLI Fallbacks" convention
+Documented in `/Users/gtrrz-victor/wks/cli/cli/CLAUDE.md` lines 603-651. Rule: never make output TUI-only; provide `--json` (structured, preferred), a plain-text list of stable IDs + a show-by-ID command, or a direct-select flag; long text must offer a `--no-pager` bypass. Terminal gates to watch: `interactive.IsTerminalWriter` / `CanPromptInteractively` (`interactive/interactive.go`:34,86), `IsAccessibleMode` (`utils.go`:20). Cited good patterns: `investigate --findings`, `experts --tui`, `explain --no-pager`, and `--json` on `status`/`agent-help`/`sessions list`/`search`.
+
+---
+
+## Best reference implementations to model a sortable/filterable list on
+
+1. **`entire search` — richest interactive + non-interactive list.** Files `search_cmd.go` (`newSearchCmd`, `writeSearchJSON`), `search_tui.go` (`searchModel`, `filteredResults`, `pageResults`, `totalPages`, `updateBrowseMode`), and package `search/search.go` (`Config.HasFilters`, `ParseSearchInput`, `parseListFilter`). Copy its three-way output branch (search_cmd.go:151-201): JSON/non-TTY → accessible static → TUI, plus flag-based AND inline filters and client-side pagination. This is the template if you want live filtering and browsing.
+
+2. **`runCoreList` in `corecmd.go` — the canonical table/JSON list scaffold** that `repo mirror list` already uses. To add sorting/filtering to mirror list, the natural move is to extend this generic helper (or add a client-side sort/filter step before `printTable` in `renderCoreList`, corecmd.go:168-186) so every control-plane list gets it uniformly, while keeping the existing `--json` and `printFields` detail-by-ID convention. Pair with `runCoreObject` (corecmd.go:217) for the show-by-ID fallback.
+
+For the specific goal of making `repo mirror list` sortable/filterable while staying agent-safe: model the output shape on `runCoreList` (already in use) and borrow the filter-flag + client-side-refinement + JSON approach from `search`.</result>
+<usage><subagent_tokens>84236</subagent_tokens><tool_uses>34</tool_uses><duration_ms>187452</duration_ms></usage>
+</task-notification>
+
+---
+
+what other control-plane list do we have ?
+
+---
+
+lets plan to improve the filter for all those commands at once.
+
+---
+
+How is entire search doing the filter?
+
+---
+
+quick question, does the backend that list the repo mirror list allows server filtering ?
+
+---
+
+lets be first focus on improving repo mirror list as this list might get quite long soon, so, it's best to filter on server side than having filter options on all the commands.
+
+---
+
+let's keep the focus just on this project
+
+---
+
+ups, add what you dropped after kiss was applied
+
+---
+
+give me a script to test it, so I will run it manually
+
+---
+
+great, while sorting, we might have multiple entries for the same repo, If that happens I do also want to filter by cluster host
+
+---
+
+Do not display host as column, it is implicit into clone url. it is orderer des? whereas the repo is asc ?
+
+---
+
+after playing with it, I notice we have server side filters like, cluster, owner and provider. I would replace out new --filter with just --repo which is what is missing, and do that on client side as server does not implement it. And also, display the cluster/owner./provider columns into the table.
+
+---
+
+I do like more the old way to print the repo which is, owner/repo. Lets delete the owner,provider and cluster columns as they all are infered from repo and clone url columns
+
+---
+
+Could we use bubbletea to make the repo name copiable? I want to, if the user clicks on it copy into the clipboard the entire repo clone <url>
+
+---
+
+revert last change, this copy feature would be for a future ticket, not this one.
+
+---
+
+ship it
+
+---
+
+yes create a PR against main
+
+---
+
+add small change, ship it

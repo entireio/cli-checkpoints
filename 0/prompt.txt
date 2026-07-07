@@ -1,0 +1,63 @@
+<task-notification>
+<task-id>aa767697b99a0305c</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/27223555-55fc-47d9-892f-dbb48c2ab21a/tasks/aa767697b99a0305c.output</output-file>
+<status>completed</status>
+<summary>Agent "Conventions (CLAUDE.md) angle" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I've completed a thorough conventions review of the PR diff. The test discipline is exceptionally high — every new test either calls `t.Parallel()` or uses `t.Chdir`/`t.Setenv` (with explanatory comments), config isolation uses the sanctioned overrides (`ENTIRE_ANTIGRAVITY_STATUS_DIR`, `ENTIRE_ANTIGRAVITY_CONFIG_DIR`, `ENTIRE_TEST_ANTIGRAVITY_BRAIN_DIR`), no logging call emits user content, no direct reads of entire's `.entire/settings.json`, no `git.PlainInit`/raw `git init`, and no unjustified swallowed errors.
+
+The one clear violation I found is a cache-dir resolver in source code.
+
+```json
+[
+  {
+    "file": "/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/agent/antigravity/statusline.go",
+    "line": 66,
+    "summary": "statusDir() derives entire's own cache path via os.UserCacheDir() instead of going through userdirs.Cache(), the mandated single resolver.",
+    "failure_scenario": "CLAUDE.md (repo root), 'Config/Cache/Keyring Isolation in Tests' &gt; 'Single resolver': \"internal/entireclient/userdirs is the only place that resolves the per-user config dir (userdirs.Config()) and cache dir (userdirs.Cache(): $XDG_CACHE_HOME/entire else ~/.cache/entire). Never derive these paths anywhere else.\" statusline.go:66-70 does exactly that: `cacheDir, err := os.UserCacheDir()` then `filepath.Join(cacheDir, \"entire\", \"antigravity\", \"status\")`. Two concrete consequences: (1) os.UserCacheDir() ignores $XDG_CACHE_HOME on macOS (it returns ~/Library/Caches), so the harness-wide isolation the integration TestMain sets up — setup_test.go:43 `XDG_CACHE_HOME=&lt;tmp&gt;/entire-cache`, the CLAUDE.md pattern for spawned binaries — does NOT redirect statusDir on darwin; userdirs.Cache() honors XDG_CACHE_HOME and would have. (2) userdirs.Cache() also carries the documented in-process go-test safety net (`testdirs.Dir(\"cache\")` fallback to a throwaway temp dir); statusDir() has none, so any in-process test reaching statusDir() without setting ENTIRE_ANTIGRAVITY_STATUS_DIR writes to the developer's real ~/Library/Caches/entire (or ~/.cache/entire), exactly what the section forbids: \"Tests must never read or write the developer's real ... ~/.cache/entire. The developer may be using entire for real while tests run.\" Evidence it is a real gap: the one integration test that needs this store (TestAntigravity_TokenUsageInCheckpointMetadata) has to inject its own `ENTIRE_ANTIGRAVITY_STATUS_DIR=` per-test rather than relying on the harness XDG_CACHE_HOME isolation that covers every other cache path."
+  }
+]
+```
+
+Note on scope: the other `os.UserHomeDir()`/`os.UserCacheDir()` calls in the diff (discovery.go, title_install.go, antigravity.go GetSessionDir, and the e2e agent files) resolve *third-party* paths (agy's `~/.gemini/...` config/brain, or other agents' caches in `e2e/agents/*`), which the `userdirs` rule does not govern — those tests isolate correctly via `HOME`/dedicated `ENTIRE_*` overrides. Only `statusline.go` derives a path under entire's own `entire/` cache namespace, so it is the sole offender against that rule.</result>
+<usage><subagent_tokens>144683</subagent_tokens><tool_uses>29</tool_uses><duration_ms>981119</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ac93b34b6b1174376</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/27223555-55fc-47d9-892f-dbb48c2ab21a/tasks/ac93b34b6b1174376.output</output-file>
+<status>completed</status>
+<summary>Agent "Angle A: line-by-line correctness" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I've completed an exhaustive line-by-line review of the PR's hot files (reading each enclosing function via `git show pr-1287-review:`). This is an unusually well-defended PR — most edge cases I probed are already commented and handled. Below are the genuine, nameable-scenario issues I found, most severe first.
+
+```json
+[
+  {
+    "file": "cmd/entire/cli/strategy/manual_commit_condensation.go",
+    "line": 1327,
+    "summary": "CheckpointTranscriptStart lags Antigravity's async-written transcript, so each checkpoint's late-flush prompt extraction reads the wrong (earlier) turn's prompt slice",
+    "failure_scenario": "Antigravity's normal flow commits all work mid-turn (before its Stop hook), but agy writes transcript_full.jsonl only AFTER Stop. At a mid-turn commit, extractSessionDataFromLiveTranscript sees an empty/placeholder transcript, so result.TotalTranscriptLines is the count of only the *previously flushed* turns (0 on turn 1). That value is stored as state.CheckpointTranscriptStart (line 1327, and 1208 in the by-ID path). On the NEXT turn's condensation, resolvePromptsFromLateFlushedTranscript(offset=CheckpointTranscriptStart) (lines 1012 / 949) reads the now-populated transcript from that lagging offset. Concretely, in a 3-prompt interactive agy session where each turn commits mid-turn: turn 1's checkpoint gets no prompt (empty transcript), turn 2's checkpoint extracts prompt 1 (offset 0, only turn 1 flushed), turn 3's checkpoint extracts prompt 2, etc. — every checkpoint's recorded prompt is shifted by ~one turn, so `entire explain`/checkpoint metadata attributes the wrong user prompt to each checkpoint."
+  },
+  {
+    "file": "cmd/entire/cli/hooks_antigravity_title.go",
+    "line": 50,
+    "summary": "title-tee --wrap runs the user's original title command via `sh -c`, which fails on Windows and silently drops their window title",
+    "failure_scenario": "A user on Windows (Antigravity CLI is cross-platform) who already had a custom `title` command in ~/.gemini/antigravity-cli/settings.json: InstallTitleTee preserves it via `--wrap '&lt;orig&gt;'`. On every agy state change the tee runs `exec.CommandContext(ctx, \"sh\", \"-c\", wrap)`. There is no `sh` on a stock Windows PATH, so wrapped.Run() errors; the error is deliberately swallowed (`_ = wrapped.Run()`), so the user's original title command never executes and their window title silently stops updating, with no diagnostic. Token capture (the AppendStatusSnapshot tee) still works, so nothing surfaces the breakage."
+  },
+  {
+    "file": "cmd/entire/cli/agent/antigravity/statusline.go",
+    "line": 121,
+    "summary": "Dedup on the full context_window can suppress a distinct API-call snapshot, undercounting CacheReadTokens/CacheCreationTokens/APICallCount",
+    "failure_scenario": "AppendStatusSnapshot suppresses a new snapshot whenever its context_window JSON is byte-identical to the previous line's. If two consecutive agy state changes carry an identical context_window — e.g. a follow-up model invocation that is a pure cache read leaving total_input_tokens/total_output_tokens AND current_usage unchanged — the second line is dropped. CalculateTokenUsageSince then sums current_usage.cache_read/creation over one fewer line and increments APICallCount one fewer time than the real number of calls, so a turn's reported cache-token usage and API-call count come out low. (Totals-derived InputTokens/OutputTokens stay exact; the comment acknowledges lines 'can be missed', so this is a known-but-real accuracy gap.)"
+  }
+]
+```
+
+Notes on scope: I verified several things that initially looked risky but are actually correct — the `conversationId` (hook, camelCase) vs `conversation_id` (statusline, snake_case) key difference is an intentional, fixture-tested assumption that the same UUID value flows through both; `sessionID` stays the raw agy UUID end-to-end so status-file lookups line up; the non-blank-line offset metric is kept byte-consistent across `forEachNonBlankLine`/`countTranscriptItems`; `decodeAgyString`'s double-unwrap only misfires for filenames literally wrapped in quotes (negligible); the mid-turn-commit empty-checkpoint dedup via `filterToUncommittedFiles` is sound; and the OOB token accumulation paths (SaveStep vs the zero-changes `AccumulateSessionTokenUsage`) are mutually exclusive, so no double-count. The nil-baseline over-count on resumed conversations is explicitly documented in `SnapshotTokenBaseline`, so I did not flag it.</result>
+<usage><subagent_tokens>183844</subagent_tokens><tool_uses>41</tool_uses><duration_ms>1148669</duration_ms></usage>
+</task-notification>

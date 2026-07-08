@@ -1,0 +1,249 @@
+After reviewing this PR I've got the following feedback:
+- Inconsistent sortSpec handling between the two list paths.
+
+
+The --show-available branch passes the raw sortSpec to sortRows (repo_mirror.go:446), while the main mirror branch passes the trimmed normalizedSort. Since sortRows computes 'desc := strings.HasPrefix(spec, "-")' on the raw spec, a leading-whitespace spec diverges: --show-available --sort " -repo" errors as an unknown column, while --sort " -repo" on the main list sorts descending. Unlikely input, but trivial to align by trimming once at the top of sortRows (or before both call sites).
+
+
+- Non-repo column sorts reintroduce the nondeterministic tie ordering this PR set out to fix.
+
+
+Only the default (no --sort) and --sort repo/-repo get the (owner/repo, clusterHost) tiebreak via sortMirrorsDefault. Any other column (--sort private, --sort "clone url") falls through to sortRows -- a single-key stable sort with no secondary key -- so ties stay in whatever order the server/pagination returned. The code's own comment calls that order 'arbitrary', so e.g. entire repo mirror list --sort private over an all-private list can emit different orderings across runs.
+
+
+Suggest threading the owner/repo secondary key into sortRows, or documenting that only the default / --sort repo ordering is fully deterministic. Related: no command-level test covers this sortRows branch for existing mirrors -- only the sortMirrorsDefault branch (--sort repo/-repo) is exercised end-to-end.
+After checking the sort code, it is hard to believe that we need that amount of code for doing something that trivial as sorting an array of elements, by just 3 different columns which are already known and not generic. I would rather having less generic methods.
+
+---
+
+<task-notification>
+<task-id>a678fb5657e0ea0d6</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-release-nightly/89c0eaf0-fefd-4eda-ab50-0c9edb353537/tasks/a678fb5657e0ea0d6.output</output-file>
+<status>completed</status>
+<summary>Agent "Explore mirror list sort code" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have a complete picture. Here is the full report.
+
+## File locations
+- Command + sort logic: `/Users/gtrrz-victor/wks/cli/release-nightly/cmd/entire/cli/repo_mirror.go`
+- Tests: `/Users/gtrrz-victor/wks/cli/release-nightly/cmd/entire/cli/repo_mirror_test.go`
+- Data structs: `/Users/gtrrz-victor/wks/cli/release-nightly/internal/coreapi/oas_schemas_gen.go`
+
+---
+
+## 1. `sortRows` (repo_mirror.go, lines 56-86)
+
+```go
+56	// sortRows orders items in place by one column's rendered value, ascending
+57	// case-insensitive string order. spec is a header name; a leading '-' sorts
+58	// descending. An empty spec sorts by the first column. An unknown column name
+59	// is an error naming the valid columns. Stable, so rows equal on the sort
+60	// column keep their input order. row must return one cell per header, which the
+61	// mirror/available row funcs do.
+62	func sortRows[T any](items []T, headers []string, row func(T) []string, spec string) error {
+63		desc := strings.HasPrefix(spec, "-")
+64		name := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(spec, "-")))
+65		idx := 0
+66		if name != "" {
+67			idx = -1
+68			for i, h := range headers {
+69				if strings.EqualFold(h, name) {
+70					idx = i
+71					break
+72				}
+73			}
+74			if idx &lt; 0 {
+75				return fmt.Errorf("unknown sort column %q; valid columns: %s", name, strings.ToLower(strings.Join(headers, ", ")))
+76			}
+77		}
+78		sort.SliceStable(items, func(a, b int) bool {
+79			ka, kb := strings.ToLower(row(items[a])[idx]), strings.ToLower(row(items[b])[idx])
+80			if desc {
+81				return ka &gt; kb
+82			}
+83			return ka &lt; kb
+84		})
+85		return nil
+86	}
+```
+
+Key behaviors relevant to your refactor:
+- `desc` is computed from the **raw, un-trimmed** `spec` (`strings.HasPrefix(spec, "-")` at line 63). So a spec like `" -repo"` (leading space) would set `desc=false` but the column-name parse on line 64 trims and would still find `repo` — an inconsistency between direction detection and name detection.
+- `name` is trimmed and lowercased (line 64). Empty name -&gt; `idx=0` (first column).
+- Generic over any header set; column match is `strings.EqualFold` against the provided `headers` slice.
+- Sort key is the rendered cell string, case-insensitive. Stable sort, single key only — **no secondary tiebreak**.
+
+---
+
+## 2. `sortMirrorsDefault` (repo_mirror.go, lines 40-54)
+
+```go
+40	// sortMirrorsDefault orders mirrors by the owner/repo name ascending (matching
+41	// the REPO column and an explicit `--sort repo`), breaking ties by cluster host
+42	// ascending. It's the default (no --sort) ordering: a repo mirrored on several
+43	// clusters would otherwise sit in arbitrary server order. Case-insensitive,
+44	// matching sortRows.
+45	func sortMirrorsDefault(mirrors []coreapi.Mirror) {
+46		sort.SliceStable(mirrors, func(i, j int) bool {
+47			ri := strings.ToLower(mirrors[i].Owner + "/" + mirrors[i].Repo)
+48			rj := strings.ToLower(mirrors[j].Owner + "/" + mirrors[j].Repo)
+49			if ri != rj {
+50				return ri &lt; rj
+51			}
+52			return strings.ToLower(mirrors[i].ClusterHost) &lt; strings.ToLower(mirrors[j].ClusterHost)
+53		})
+54	}
+```
+
+Tiebreak: primary `owner/repo` ascending, secondary `ClusterHost` ascending, both lowercased. This is the only place the (owner/repo, clusterHost) tiebreak exists — `sortRows` does NOT have it.
+
+---
+
+## 3. Both call sites of `sortRows`
+
+### `--show-available` branch (line 446)
+Passes the **raw** `sortSpec` (no trim):
+
+```go
+445	avail := filterByRepo(out.Available, func(m coreapi.AvailableMirror) string { return m.Repo }, repo)
+446	if err := sortRows(avail, availableMirrorColumns, availableMirrorRow, sortSpec); err != nil {
+447		return nil, err
+448	}
+449	return avail, nil
+```
+
+### Main mirror branch (lines 489-502)
+Computes `normalizedSort := strings.TrimSpace(sortSpec)` on line 490, then branches: default/`repo` -&gt; `sortMirrorsDefault` (with manual reverse for descending); otherwise `sortRows` with the **trimmed** `normalizedSort`:
+
+```go
+489	mirrors = filterByRepo(mirrors, func(m coreapi.Mirror) string { return m.Repo }, repo)
+490	normalizedSort := strings.TrimSpace(sortSpec)
+491	repoSort := strings.EqualFold(strings.TrimSpace(strings.TrimPrefix(normalizedSort, "-")), "repo")
+492	if normalizedSort == "" || repoSort {
+493		sortMirrorsDefault(mirrors)
+494		if strings.HasPrefix(normalizedSort, "-") {
+495			for i, j := 0, len(mirrors)-1; i &lt; j; i, j = i+1, j-1 {
+496				mirrors[i], mirrors[j] = mirrors[j], mirrors[i]
+497			}
+498		}
+499	} else if err := sortRows(mirrors, mirrorColumns, mirrorRow, normalizedSort); err != nil {
+500		return nil, err
+501	}
+502	return mirrors, nil
+```
+
+**The trim inconsistency you flagged:** the main branch passes `normalizedSort` (trimmed via line 490), while the `--show-available` branch passes the raw `sortSpec` (line 446). So whitespace handling differs between the two paths.
+
+Note also the descending-repo path (lines 494-497) reverses the *entire* slice in place rather than sorting descending, so the cluster tiebreak is reversed too — a repo's clusters come out in descending host order under `-repo`.
+
+Flag registration (line 510):
+```go
+510	cmd.Flags().StringVar(&amp;sortSpec, "sort", "", "Sort by column (header name; prefix '-' for descending). Default: repo name ascending")
+```
+
+---
+
+## 4. Sortable columns / valid names
+
+Columns are the table headers; the accepted `--sort` values are the header names, case-insensitively matched (via `strings.EqualFold`), optionally prefixed with `-` for descending. There are two distinct column sets depending on mode:
+
+Existing-mirror mode (`mirrorColumns`, line 28):
+```go
+28	var mirrorColumns = []string{"REPO", "CLONE URL", "PRIVATE"}
+```
+Valid: `repo`, `clone url`, `private` (note `clone url` contains a space — passing it as one `--sort` value requires quoting).
+
+`--show-available` mode (`availableMirrorColumns`, line 118):
+```go
+118	var availableMirrorColumns = []string{"REPO", "ACCESS", "STATUS"}
+```
+Valid: `repo`, `access`, `status`.
+
+There are no aliases — the only accepted names are the exact header strings (case-insensitive, trimmed). Empty spec = first column (`REPO`). Unknown names produce `unknown sort column %q; valid columns: &lt;lowercased headers joined&gt;`.
+
+The test at test line 603 sorts `--show-available` by `access`, confirming non-REPO columns are usable there.
+
+---
+
+## 5. Row / mirror data structures
+
+### Row renderers (repo_mirror.go)
+
+`mirrorRow` (lines 30-37) — maps to `mirrorColumns`:
+```go
+30	func mirrorRow(m coreapi.Mirror) []string {
+31		repo := m.Owner + "/" + m.Repo
+32		cloneURL := mirrorCloneURL(m.ClusterHost, m.Owner, m.Repo)
+33		private := "no"
+34		if m.IsPrivate.Or(false) {
+35			private = "yes"
+36		}
+37		return []string{repo, cloneURL, private}
+```
+
+`availableMirrorRow` (lines 120-122):
+```go
+120	func availableMirrorRow(m coreapi.AvailableMirror) []string {
+121		return []string{m.Owner + "/" + m.Repo, string(m.Access), string(m.Status)}
+122	}
+```
+
+Note: REPO cell is the composed `Owner + "/" + Repo`; CLONE URL is synthesized via `mirrorCloneURL(m.ClusterHost, m.Owner, m.Repo)`. `ClusterHost` is NOT a column but IS embedded inside the clone URL, which is why sorting by `clone url` roughly orders by cluster then owner/repo.
+
+### `coreapi.Mirror` (oas_schemas_gen.go, lines 4691-4712)
+Relevant fields:
+```go
+4697	ClusterHost    string    `json:"clusterHost"`
+4701	IsPrivate      OptBool   `json:"isPrivate"`
+4704	Owner          string    `json:"owner"`
+4705	Provider       string    `json:"provider"`
+4706	Repo           string    `json:"repo"`
+```
+(Also: `Cell`, `CreatedAt`, `InstallationId`, `IsArchived`, `Jurisdiction`, `MirrorId`, `Status`, `SuspendedAt`.) `IsPrivate` is an `OptBool`, read via `.Or(false)`.
+
+### `coreapi.AvailableMirror` (oas_schemas_gen.go, lines 244-255)
+```go
+246	Access     AvailableMirrorAccess `json:"access"`
+248	IsPrivate  OptBool               `json:"isPrivate"`
+249	Owner      string                `json:"owner"`
+250	Repo       string                `json:"repo"`
+253	Status          AvailableMirrorStatus `json:"status"`
+```
+Note: `AvailableMirror` has **no** `ClusterHost` field (the onboardable set is cluster-agnostic), so the (owner/repo, clusterHost) tiebreak is not applicable in `--show-available` mode.
+
+---
+
+## 6. Existing sort tests (repo_mirror_test.go)
+
+Two test functions cover sorting:
+
+### `TestSortRows` (lines 1067-1110) — unit tests of `sortRows` directly
+Fixture: `sortRowsRow{repo, private}` with headers `{"REPO", "PRIVATE"}` (lines 1050-1057). Subtests:
+- `"empty spec sorts by first column ascending"` (1070)
+- `"leading dash sorts descending"` (1077)
+- `"sorts by named column"` (1084) — sorts by `private`, a non-REPO column
+- `"stable for equal keys"` (1092)
+- `"unknown column errors naming valid columns"` (1103)
+
+Coverage gaps: **no whitespace/trim edge case** (e.g. `" -repo"` or `"repo "`) is tested. The non-first-column case is covered (`private`), but nothing exercises a secondary tiebreak (sortRows has none).
+
+### `TestRepoMirrorList_FilterSort` (lines 506-607) — end-to-end through the command
+Subtests:
+- `"--repo narrows the table by repo-name substring"` (513)
+- `"default output is owner/repo sorted"` (521)
+- `"--sort -repo reverses the order"` (529)
+- `"--repo applies to --json and keeps [] not null"` (536)
+- `"unknown --sort column errors naming valid columns"` (548)
+- `"default order breaks duplicate-repo ties by cluster ascending"` (555) — tests the `sortMirrorsDefault` cluster tiebreak
+- `"explicit --sort repo keeps the cluster tiebreak (matches default)"` (570) — asserts `--sort repo` routes through `sortMirrorsDefault` (with `-repo` reversal), guarding the tiebreak
+- `"--repo/--sort apply under --show-available"` (598) — sorts available list by `access`
+
+Coverage gaps for your refactor:
+- **No test asserts the cluster tiebreak for a non-repo column sort** (e.g. `--sort private` or `--sort "clone url"` on duplicate-repo rows) — exactly the missing-secondary-tiebreak case you want to fix. `sortRows` only has a single key today.
+- **No test for the trim inconsistency** between the two call sites (raw `sortSpec` under `--show-available` vs trimmed `normalizedSort` in the main branch). Nothing passes leading/trailing whitespace in `--sort`.
+- The `--show-available` sort test only checks `--sort access` filtering interplay, not ordering correctness or tiebreaks.
+
+Helper functions used by these tests (for reference when adding cases): `serveMirrorList`, `runMirrorList`, and `runMirrorListErr` (documented near test lines 383, 492).</result>
+<usage><subagent_tokens>33108</subagent_tokens><tool_uses>14</tool_uses><duration_ms>160870</duration_ms></usage>
+</task-notification>

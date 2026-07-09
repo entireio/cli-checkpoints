@@ -1,0 +1,117 @@
+Using the brainstorming skill, I'd like to introduce a new command called `entire checkpoint resume` hoping it would fully replace `entire session resume` someday. I'd like it to behave the same as `entire session resume` with some differences:
+
+- It should behave similar to `entire explain` in the sense that it should have `--checkpoint` and `--commit` flags and by default takes a checkpoint ID, a  commit sha and a branch (like entire session resume)
+- It should re-use as much of the existing code as we have and the lookup should be somewhat performant. Investigate how `explain` manages to figure out commit shas or checkpoint IDs. I'm assuming there's a pattern we can apply to figure out which input is which
+- The command should allow to be fully driven by an agent if necessary
+
+---
+
+Ask me again since I accidentally clicked on an option and selected it but didn't want to
+
+---
+
+Yes?
+
+---
+
+I personally don't think that checking out a given branch would be very helpful. We could check out the provided branch or the git sha associated with a particular checkpoint but that state might be super outdated and not particularly helpful. What other options do we have?
+
+---
+
+I think I've come to a few conclusions:
+
+- The `--branch` option doesn't make any sense if we won't be checking out any changes into the current worktree
+- Given that `trail resume` and `session resume` already exist and both check out work in progress, I don't think that `resume` as a name would be fitting for this command if it didn't mirror the existing behavior
+- If we don't check out files in git, this command wouldn't work as a drop-in replacement for `session resume`
+
+So the question for me here is:
+
+- Would this command still be useful
+- Should it allow checking out a git sha to it can actually
+
+---
+
+First and foremost, I don't think we currently are resuming sessions. Last time I checked `entire session resume` specifically restored all sessions in a particular checkpoint. Is that still the case. Second, I think it must be possible for an AI agent to drive the checkpoint resume. I'm tempted to say: When in an interactive shell, open a selection showing the last X number of checkpoints (similar to session resume with the same number of items). When no interactive shell is present, we should list the same checkpoints without a TUI.
+
+---
+
+Sounds good so far
+
+---
+
+Sounds good
+
+---
+
+I approve
+
+---
+
+Continue
+
+---
+
+1
+
+---
+
+commit and continue
+
+---
+
+commit and continue
+
+---
+
+Can you undo all changes to claude.md?
+
+---
+
+Commit and continue
+
+---
+
+<task-notification>
+<task-id>ab06ef7c5fe9cf445</task-id>
+<tool-use-id>toolu_018vAzp4MJQKnuw2ALATk83w</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-checkpoint-resume/32ec1d17-fac5-45b1-9bb6-83860bacb40b/tasks/ab06ef7c5fe9cf445.output</output-file>
+<status>completed</status>
+<summary>Agent "Final whole-branch review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>### Verdict per issue
+
+**Issue 1 (HEAD misrouted as branch): Fixed.** The new order in `resumeAutoTarget` (`checkpoint_resume.go`) — local checkpoint prefix → `branchExistsLocally` (local refs only, resolved via `plumbing.NewBranchReferenceName`, no `origin/` fallback) → remote checkpoint fallback → commit — eliminates the `refs/remotes/origin/HEAD` route entirely; "HEAD" now falls through to `resolveCommitUnambiguous`. The help text and the function comment were updated to match, and remote-only branches remain reachable via explicit `--branch` (which goes straight to `runResume`). The precedence guarantee the original tests pin (local checkpoint beats same-named local branch) is preserved because the local prefix match still runs first.
+
+**Issue 2 (worktree-clash pointer): Fixed.** The message now names the exact recovery command `cd &lt;path&gt; &amp;&amp; entire checkpoint resume &lt;cpID&gt;` with the path shell-quoted via the existing `shellQuote`; `cpID` is always a store/trailer-validated checkpoint ID, so nothing unquoted-and-attacker-shaped lands in the copy-paste line. Built locally in `resumeResolvedCheckpoint` — `resume_picker.go` untouched, as intended.
+
+**Issue 3 (hex-named local branches pay a remote fetch): Fixed** for the reported case — a local branch check now precedes the remote fallback, so `resume abcdef` with a local branch of that name never fetches. Residual (see below): hex-shaped targets that are *commit SHA prefixes* still pay the remote checkpoint fetch before commit resolution. Acceptable.
+
+**Issue 5 (silent picker cancel): Fixed.** Explicit Cancel and esc/Ctrl+C both print "Resume cancelled." (the sibling session picker only prints on explicit Cancel; printing on abort too is a harmless, arguably better divergence).
+
+**Issue 6 (sentinel wording): Fixed.** Message now says "checkpoint prefix … matches N checkpoints"; `errors.Is` compatibility kept.
+
+**Triage item 3 (label test): Fixed.** `TestCheckpointResumeOptionLabel_Fallbacks` covers both the "no local branch" and unknown-agent fallbacks plus the indexed-branch case — exactly the cheap pure-function test I asked for.
+
+**Issue 4: correctly deferred** per my recommendation (belongs in `switchToBranchForResume`, deliberately-unmodified file; follow-up issue).
+
+### New concerns introduced by the fixes
+
+1. **The regression test doesn't actually pin the Issue 1 fix** — `checkpoint_resume_test.go`, `TestCheckpointResumeAuto_HeadResolvesAsCommit`. The test repo has no origin remote, so `refs/remotes/origin/HEAD` doesn't exist; on the **old** code, `branchCommit(repo, "HEAD")` fails both ref lookups and falls through to commit resolution anyway — the test passes pre-fix. It verifies the desired end behavior but would not catch the bug regressing. One-line-ish strengthening: seed the trigger condition in setup with `repo.Storer.SetReference(plumbing.NewSymbolicReference(plumbing.NewRemoteHEADReferenceName("origin"), plumbing.NewRemoteReferenceName("origin", "master")))` plus an `origin/master` hash ref, which makes the test fail against the old resolution order. Minor, but worth doing while the file is hot.
+
+2. **Residual from Issue 3 (pre-existing shape, not a regression):** a target that is a *commit SHA prefix* (hex, ≤12 chars) and matches no local checkpoint or branch still triggers `matchCheckpointPrefixWithRemoteFallback`'s network fetch + spinner before commit resolution — e.g. `entire checkpoint resume abc1234`. Correctness is fine; it's latency plus a momentarily misleading spinner. Fine to leave for the soft launch.
+
+Everything else in the diff is clean: the split of the picker's `err != nil || !ok` preserves error propagation while adding the cancel message; the lookup-lifecycle contract is unchanged (the swapped lookup is still returned/assigned and the deferred double-close guard still holds — the early local-only `matchCheckpointPrefix` call never swaps).
+
+### Final verdict
+
+**Ready to merge? Yes.** Both Important issues are correctly and minimally fixed, no new correctness issues were introduced, and the two remaining notes (a regression test that doesn't fail on the old code, and a residual spinner on SHA-prefix targets) are minor polish appropriate for a follow-up — though the test strengthening is cheap enough to fold in before merge if the window is still open.</result>
+<usage><subagent_tokens>151997</subagent_tokens><tool_uses>2</tool_uses><duration_ms>69061</duration_ms></usage>
+</task-notification>
+
+---
+
+commit and continue
+
+---
+
+/simplify

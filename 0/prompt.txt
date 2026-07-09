@@ -1,0 +1,1899 @@
+Don't post any comments on my behalf, investigate the issue brought up here: https://github.com/entireio/cli/issues/1697
+
+---
+
+Don't post any comments on my behalf, investigate the issue brought up here: https://github.com/entireio/cli/issues/1697
+
+---
+
+<task-notification>
+<task-id>abd4415f69d45466d</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/91fa7c44-6634-48ab-ae5f-d394502f50d5/tasks/abd4415f69d45466d.output</output-file>
+<status>completed</status>
+<summary>Agent "Claude Code/Codex hook surfaces" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have enough to answer definitively. Here is my analysis.
+
+## Summary: Does Entire capture agent sessions from IDE/desktop/plugin surfaces vs terminal?
+
+### (a) How hooks are wired for each agent
+
+**Claude Code** — `cmd/entire/cli/agent/claudecode/hooks.go`
+- Writes hooks into the **project-level** `.claude/settings.json` at the repo/worktree root (`settingsPath := filepath.Join(repoRoot, ".claude", ClaudeSettingsFileName)`, hooks.go:74; `ClaudeSettingsFileName = "settings.json"`, hooks.go:32).
+- Installs these hook types (hooks.go:113-180): `SessionStart`, `SessionEnd`, `Stop`, `UserPromptSubmit`, `PreToolUse[Task]`, `PostToolUse[Task]`, `PostToolUse[TodoWrite]`. Each hook entry is a `{"type":"command","command":"entire hooks claude-code &lt;verb&gt;"}` (hooks.go:141-147).
+- Lifecycle mapping (docs/architecture/agent-guide.md:432-438): `SessionStart`→session-start, `UserPromptSubmit`→TurnStart, `Stop`→TurnEnd, `PreToolUse[Task]`/`PostToolUse[Task]`→subagent tracking.
+- Also adds a `permissions.deny` rule `Read(./.entire/metadata/**)` (hooks.go:35, 190-198).
+
+**Codex** — `cmd/entire/cli/agent/codex/hooks.go`
+- Writes hooks into the **project-level** `.codex/hooks.json` at the repo root (`hooksPath := filepath.Join(repoRoot, ".codex", HooksFileName)`, hooks.go:37; `HooksFileName = "hooks.json"`, hooks.go:17).
+- Installs `SessionStart`, `UserPromptSubmit`, `Stop`, `PostToolUse`, each as `entire hooks codex &lt;verb&gt;` (hooks.go:59-118).
+- Additionally must enable a per-repo feature flag: writes `hooks = true` under `[features]` in `.codex/config.toml` (`ensureProjectFeatureEnabled`, hooks.go:161-165, 378-412). Codex hooks do nothing unless this flag is set. Handles the renamed-flag migration from `codex_hooks = true` to `hooks = true` (Codex 0.129.0).
+
+Both use `entire hooks &lt;agent&gt; &lt;verb&gt;` commands that read the native hook JSON from stdin, translate it via `ParseHookEvent`, and dispatch normalized lifecycle events (agent-guide.md:7-13, 428).
+
+### (b) Do IDE / desktop / plugin surfaces fire those hooks?
+
+**The Entire codebase is completely surface-agnostic and contains no logic that distinguishes terminal vs IDE vs desktop.** I searched the claudecode and codex packages for any entrypoint/surface/tty/background detection and found none. Entire's only mechanism is:
+1. Write hook commands into the agent's standard config file (`.claude/settings.json`, `.codex/hooks.json`).
+2. Passively process whatever hook invocations the agent runtime chooses to send.
+
+Therefore, whether a session is captured **depends entirely on whether that surface's runtime (i) reads the project-level hook config and (ii) actually executes those hooks.** That is a property of Claude Code / Codex themselves, not of Entire, and **cannot be proven from this repo.** What the code does establish:
+
+- **This is proven by the code:** live capture is 100% hook-dependent. The import design doc states plainly: *"Entire only captures session data when hooks fire during a live session"* (docs/superpowers/specs/2026-06-25-import-claude-code-transcripts-design.md:9). If a surface doesn't fire the configured hooks, Entire captures nothing live from it.
+- **Proven:** hooks are installed at project scope only (repo `.claude/`/`.codex/`), not into any global/user IDE-extension or desktop config. Entire does nothing to register itself with a VS Code extension, JetBrains plugin, or the claude.ai desktop app.
+- **Uncertain (external behavior):** whether the Claude Code VS Code/JetBrains extension or the claude.ai desktop app read repo-local `.claude/settings.json` hooks and run them. Historically Claude Code's `settings.json` hooks are a terminal-CLI feature; the IDE extensions/desktop app have generally not executed the same project hook pipeline. The repo does not assert either way, so I cannot confirm from code that IDE/desktop surfaces fire these hooks. The safe, code-supported conclusion is: **Entire reliably captures the terminal-CLI surface (where these hooks are known to fire); any other surface is captured only if that surface independently executes the project hook config, which Entire neither controls nor detects.**
+
+### (c) What the import command covers (the fallback for un-captured sessions)
+
+Yes — there is `entire import &lt;agent&gt;`, a hidden/experimental command (import_cmd.go:14-27, `Hidden: true`). It exists precisely to recover sessions that were **not captured live** (design doc:7-18).
+
+- Orchestration is in `cmd/entire/cli/agentimport/agentimport.go`. Supported importers (agentimport.go:67-75): **claude-code, codex, cursor, pi, factory, copilot, gemini** — one subcommand each, auto-wired from the registry (import_cmd.go:22-25).
+- **Claude Code import** reads transcripts from `~/.claude/projects/&lt;slug&gt;/*.jsonl` (agentimport/claude.go:16, 27-33; source dir from `GetSessionDir` → `~/.claude/projects/&lt;sanitized-repo-path&gt;`, claude.go:95-108).
+- **Codex import** walks `CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl` (a global, per-day store) and keeps only sessions whose `session_meta.cwd` is inside the repo (agentimport/codex.go:21-79; GetSessionDir → `~/.codex/sessions`, codex.go:78-87).
+- Behavior: fixed **30-day lookback** (agentimport.go:30), splits each transcript into per-user-prompt **turns** (claude.go:39-65, codex.go:109-126), redacts, and writes each as a **read-only, commit-less "imported" checkpoint** on the v1 metadata branch (`Kind: "imported"`, `Strategy: "import"`; agentimport.go:173-190). Idempotent via a deterministic checkpoint ID derived from `sessionID/turnUUID` (agentimport.go:103-106, 147-150). Supports `--path`, `--dry-run`, `--session` (import_cmd.go:85-87).
+- **What it produces:** checkpoints only (searchable/explainable/token-aggregatable), **not sessions and not rewindable**, local-only/never pushed (import_cmd.go:37-43; design doc:27-31). `entire enable` also offers an interactive import when it detects existing transcripts (design doc:25-26; spec 2026-07-01-offer-session-import-on-enable-design.md).
+
+**Key implication for your question:** Import is filesystem-based — it works on any session whose transcript file landed in `~/.claude/projects/...` or `~/.codex/sessions/...` on the local machine, regardless of which surface produced it. So even if an IDE/desktop surface did *not* fire live hooks, its sessions can still be pulled in via `entire import` **provided that surface wrote a transcript to those local directories.** Whether the VS Code/JetBrains extension or claude.ai desktop app write to `~/.claude/projects` is, again, external behavior not proven by this repo (a browser-based claude.ai session with no local CLI would leave nothing on disk to import).
+
+### Bottom line
+- Entire hooks into Claude Code via repo `.claude/settings.json` and Codex via repo `.codex/hooks.json` + `.codex/config.toml` `[features] hooks=true`.
+- Live capture fires only when the agent runtime executes those project hooks. The code guarantees this for the terminal CLI; it neither targets nor detects IDE/desktop/plugin surfaces, and does not prove they fire these hooks (they generally do not run project `settings.json` hooks the same way — but that's outside this repo's evidence).
+- `entire import` (claude-code, codex, + 5 others) is the offline fallback that reconstructs read-only checkpoints from on-disk transcripts within a 30-day window, covering any session whose transcript exists locally regardless of surface.</result>
+<usage><subagent_tokens>96848</subagent_tokens><tool_uses>21</tool_uses><duration_ms>113598</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>abd4415f69d45466d</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/91fa7c44-6634-48ab-ae5f-d394502f50d5/tasks/abd4415f69d45466d.output</output-file>
+<status>completed</status>
+<summary>Agent "Claude Code/Codex hook surfaces" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have enough to answer definitively. Here is my analysis.
+
+## Summary: Does Entire capture agent sessions from IDE/desktop/plugin surfaces vs terminal?
+
+### (a) How hooks are wired for each agent
+
+**Claude Code** — `cmd/entire/cli/agent/claudecode/hooks.go`
+- Writes hooks into the **project-level** `.claude/settings.json` at the repo/worktree root (`settingsPath := filepath.Join(repoRoot, ".claude", ClaudeSettingsFileName)`, hooks.go:74; `ClaudeSettingsFileName = "settings.json"`, hooks.go:32).
+- Installs these hook types (hooks.go:113-180): `SessionStart`, `SessionEnd`, `Stop`, `UserPromptSubmit`, `PreToolUse[Task]`, `PostToolUse[Task]`, `PostToolUse[TodoWrite]`. Each hook entry is a `{"type":"command","command":"entire hooks claude-code &lt;verb&gt;"}` (hooks.go:141-147).
+- Lifecycle mapping (docs/architecture/agent-guide.md:432-438): `SessionStart`→session-start, `UserPromptSubmit`→TurnStart, `Stop`→TurnEnd, `PreToolUse[Task]`/`PostToolUse[Task]`→subagent tracking.
+- Also adds a `permissions.deny` rule `Read(./.entire/metadata/**)` (hooks.go:35, 190-198).
+
+**Codex** — `cmd/entire/cli/agent/codex/hooks.go`
+- Writes hooks into the **project-level** `.codex/hooks.json` at the repo root (`hooksPath := filepath.Join(repoRoot, ".codex", HooksFileName)`, hooks.go:37; `HooksFileName = "hooks.json"`, hooks.go:17).
+- Installs `SessionStart`, `UserPromptSubmit`, `Stop`, `PostToolUse`, each as `entire hooks codex &lt;verb&gt;` (hooks.go:59-118).
+- Additionally must enable a per-repo feature flag: writes `hooks = true` under `[features]` in `.codex/config.toml` (`ensureProjectFeatureEnabled`, hooks.go:161-165, 378-412). Codex hooks do nothing unless this flag is set. Handles the renamed-flag migration from `codex_hooks = true` to `hooks = true` (Codex 0.129.0).
+
+Both use `entire hooks &lt;agent&gt; &lt;verb&gt;` commands that read the native hook JSON from stdin, translate it via `ParseHookEvent`, and dispatch normalized lifecycle events (agent-guide.md:7-13, 428).
+
+### (b) Do IDE / desktop / plugin surfaces fire those hooks?
+
+**The Entire codebase is completely surface-agnostic and contains no logic that distinguishes terminal vs IDE vs desktop.** I searched the claudecode and codex packages for any entrypoint/surface/tty/background detection and found none. Entire's only mechanism is:
+1. Write hook commands into the agent's standard config file (`.claude/settings.json`, `.codex/hooks.json`).
+2. Passively process whatever hook invocations the agent runtime chooses to send.
+
+Therefore, whether a session is captured **depends entirely on whether that surface's runtime (i) reads the project-level hook config and (ii) actually executes those hooks.** That is a property of Claude Code / Codex themselves, not of Entire, and **cannot be proven from this repo.** What the code does establish:
+
+- **This is proven by the code:** live capture is 100% hook-dependent. The import design doc states plainly: *"Entire only captures session data when hooks fire during a live session"* (docs/superpowers/specs/2026-06-25-import-claude-code-transcripts-design.md:9). If a surface doesn't fire the configured hooks, Entire captures nothing live from it.
+- **Proven:** hooks are installed at project scope only (repo `.claude/`/`.codex/`), not into any global/user IDE-extension or desktop config. Entire does nothing to register itself with a VS Code extension, JetBrains plugin, or the claude.ai desktop app.
+- **Uncertain (external behavior):** whether the Claude Code VS Code/JetBrains extension or the claude.ai desktop app read repo-local `.claude/settings.json` hooks and run them. Historically Claude Code's `settings.json` hooks are a terminal-CLI feature; the IDE extensions/desktop app have generally not executed the same project hook pipeline. The repo does not assert either way, so I cannot confirm from code that IDE/desktop surfaces fire these hooks. The safe, code-supported conclusion is: **Entire reliably captures the terminal-CLI surface (where these hooks are known to fire); any other surface is captured only if that surface independently executes the project hook config, which Entire neither controls nor detects.**
+
+### (c) What the import command covers (the fallback for un-captured sessions)
+
+Yes — there is `entire import &lt;agent&gt;`, a hidden/experimental command (import_cmd.go:14-27, `Hidden: true`). It exists precisely to recover sessions that were **not captured live** (design doc:7-18).
+
+- Orchestration is in `cmd/entire/cli/agentimport/agentimport.go`. Supported importers (agentimport.go:67-75): **claude-code, codex, cursor, pi, factory, copilot, gemini** — one subcommand each, auto-wired from the registry (import_cmd.go:22-25).
+- **Claude Code import** reads transcripts from `~/.claude/projects/&lt;slug&gt;/*.jsonl` (agentimport/claude.go:16, 27-33; source dir from `GetSessionDir` → `~/.claude/projects/&lt;sanitized-repo-path&gt;`, claude.go:95-108).
+- **Codex import** walks `CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl` (a global, per-day store) and keeps only sessions whose `session_meta.cwd` is inside the repo (agentimport/codex.go:21-79; GetSessionDir → `~/.codex/sessions`, codex.go:78-87).
+- Behavior: fixed **30-day lookback** (agentimport.go:30), splits each transcript into per-user-prompt **turns** (claude.go:39-65, codex.go:109-126), redacts, and writes each as a **read-only, commit-less "imported" checkpoint** on the v1 metadata branch (`Kind: "imported"`, `Strategy: "import"`; agentimport.go:173-190). Idempotent via a deterministic checkpoint ID derived from `sessionID/turnUUID` (agentimport.go:103-106, 147-150). Supports `--path`, `--dry-run`, `--session` (import_cmd.go:85-87).
+- **What it produces:** checkpoints only (searchable/explainable/token-aggregatable), **not sessions and not rewindable**, local-only/never pushed (import_cmd.go:37-43; design doc:27-31). `entire enable` also offers an interactive import when it detects existing transcripts (design doc:25-26; spec 2026-07-01-offer-session-import-on-enable-design.md).
+
+**Key implication for your question:** Import is filesystem-based — it works on any session whose transcript file landed in `~/.claude/projects/...` or `~/.codex/sessions/...` on the local machine, regardless of which surface produced it. So even if an IDE/desktop surface did *not* fire live hooks, its sessions can still be pulled in via `entire import` **provided that surface wrote a transcript to those local directories.** Whether the VS Code/JetBrains extension or claude.ai desktop app write to `~/.claude/projects` is, again, external behavior not proven by this repo (a browser-based claude.ai session with no local CLI would leave nothing on disk to import).
+
+### Bottom line
+- Entire hooks into Claude Code via repo `.claude/settings.json` and Codex via repo `.codex/hooks.json` + `.codex/config.toml` `[features] hooks=true`.
+- Live capture fires only when the agent runtime executes those project hooks. The code guarantees this for the terminal CLI; it neither targets nor detects IDE/desktop/plugin surfaces, and does not prove they fire these hooks (they generally do not run project `settings.json` hooks the same way — but that's outside this repo's evidence).
+- `entire import` (claude-code, codex, + 5 others) is the offline fallback that reconstructs read-only checkpoints from on-disk transcripts within a 30-day window, covering any session whose transcript exists locally regardless of surface.</result>
+<usage><subagent_tokens>96848</subagent_tokens><tool_uses>21</tool_uses><duration_ms>113598</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a0fdaef49de5d83bd</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/91fa7c44-6634-48ab-ae5f-d394502f50d5/tasks/a0fdaef49de5d83bd.output</output-file>
+<status>completed</status>
+<summary>Agent "How checkpoints relate to sessions" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I now have a complete picture. Here are my findings.
+
+## Summary
+
+`entire checkpoint list` and `entire session list` read from two entirely separate stores. Checkpoints live in **git refs** (the `entire/checkpoints/v1` branch, per-checkpoint `refs/entire/checkpoints/...` refs, and ephemeral shadow branches `entire/&lt;hash&gt;`); sessions are listed only from the local filesystem state files in `.git/entire-sessions/`. Nothing keeps them in sync, so several code paths legitimately produce checkpoints with no listable session.
+
+---
+
+### 1. Where `entire checkpoint list` reads checkpoints from
+
+Command wiring: `newCheckpointListCmd` → `runExplainBranchWithFilter` → `getBranchCheckpoints`.
+
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/checkpoint_group.go:55-76` — `list` subcommand calls `runExplainBranchWithFilter`.
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/explain.go:2394` — formats whatever `getBranchCheckpoints` returns.
+
+The enumeration in `getBranchCheckpoints` (`/Users/ninawork/entire/devenv/cli/cmd/entire/cli/explain.go:2043-2184`) pulls from **three git-backed sources**, none of which is the session-state directory:
+
+1. Committed checkpoints via the persistent store (line 2054): `committedInfos, err := store.List(ctx)` — `store = stores.Persistent`.
+2. A DAG/first-parent commit walk that matches commits carrying the `Entire-Checkpoint` trailer and joins them against `committedByID` (lines 2081-2148).
+3. Ephemeral shadow-branch checkpoints (line 2155): `getReachableTemporaryCheckpoints(ctx, repo, stores.Ephemeral(), ...)`.
+4. Additionally, **imported** checkpoints are surfaced directly from the persistent store regardless of any commit (line 2173 → `getImportedRewindPoints`, `explain.go:2190-2223`), which filters `stores.Persistent.List(ctx)` for `info.Imported`.
+
+The persistent `store.List` is a `kindRoutingStore` that merges two git backends and dedups (`/Users/ninawork/entire/devenv/cli/cmd/entire/cli/checkpoint/routing_store.go:103-130`):
+- `GitStore.List` — walks the sharded tree of the `entire/checkpoints/v1` branch (`/Users/ninawork/entire/devenv/cli/cmd/entire/cli/checkpoint/persistent.go:1544-1570`, comment at line 1540: "lists all committed checkpoints from the entire/checkpoints/v1 branch").
+- `gitRefsStore.List` — iterates git refs and keeps those matching `refs/entire/checkpoints/...` via `ParseRef` (`/Users/ninawork/entire/devenv/cli/cmd/entire/cli/checkpoint/refs_store.go:362-396`; prefix constant at `refs_naming.go:16`).
+
+So `checkpoint list` is entirely git-ref/branch driven. It never reads `.git/entire-sessions/`.
+
+### 2. Confirmation of the store split
+
+`session list` reads only the filesystem state dir:
+
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/sessions.go:346-373` — `runSessionList` → `strategy.ListSessionStates`; prints "No sessions." when the result is empty.
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/session_state.go:117-128` — `ListSessionStates` → `session.NewStateStore(ctx).List(ctx)`.
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/session/state.go:678-708` — `StateStore.List` does `os.ReadDir(s.stateDir)` over `*.json` files.
+- `state.go:500-508` — `stateDir = &lt;gitCommonDir&gt;/entire-sessions`; dir name constant `SessionStateDirName = "entire-sessions"` (`state.go:27`).
+
+This matches CLAUDE.md (`/Users/ninawork/entire/devenv/cli/CLAUDE.md:575, 582`): condensed checkpoints go to the `entire/checkpoints/v1` branch, while session state lives in `.git/entire-sessions/`. The two stores are independent — deleting a `.git/entire-sessions/*.json` file has no effect on git refs, and vice versa.
+
+### 3. Import path creates checkpoints with NO local session
+
+`entire import &lt;agent&gt;` (hidden/experimental) is exactly this scenario.
+
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/import_cmd.go:29-89` — one subcommand per registered importer (claude, codex, copilot, cursor, gemini, pi). Short help: "Import existing … transcripts as **read-only checkpoints**." It calls `agentimport.Run`.
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/agentimport/agentimport.go:111-191` — `Run` iterates transcript turns and, for each, calls `writeTurn`, which writes **only** to the persistent checkpoint store:
+
+```go
+// agentimport.go:173-189
+func writeTurn(...) error {
+    if err := stores.Persistent.Write(ctx, cp.Session(cp.WriteOptions{
+        CheckpointID: cid,
+        SessionID:    sf.SessionID,
+        ...
+        Kind:         string(session.KindImported),
+        ...
+    })); err != nil {
+```
+
+There is no `StateStore.Save` / `.git/entire-sessions/` write anywhere in `agentimport`. The checkpoints are flagged `Imported` (`Kind: KindImported`) and are surfaced in `checkpoint list` purely through `getImportedRewindPoints` (explain.go:2190-2223). So after `entire import claude-code`, `checkpoint list` shows entries while `session list` shows "No sessions."
+
+### 4. Stopped / aged-out sessions leave checkpoints behind
+
+Two lifecycle facts combine here:
+
+a. **Ended sessions still list** — `session list` does not hide ended sessions; `sessionPhaseLabel` returns `"ended"` when `EndedAt != nil` (`sessions.go:313-322`). So merely stopping/condensing a session does not by itself make it disappear.
+
+b. **Session state is auto-deleted after 7 days; checkpoints are not.** On every load/list, stale state files are removed:
+
+```go
+// session/state.go:549-556 (inside Load, called by List)
+if state.IsStale() {
+    ...
+    _ = s.Clear(ctx, sessionID) // best-effort delete of the .json
+    return nil, nil             // treated as not found
+}
+```
+
+`IsStale` returns true when the last interaction (or start) is older than `StaleSessionThreshold = 7 * 24 * time.Hour` (`state.go:475-483`, constant at `state.go:29-31`). `StateStore.List` skips such entries (`state.go:701-703`, "Not found or stale (Load handles cleanup)").
+
+Meanwhile the checkpoints those sessions produced were condensed to the permanent `entire/checkpoints/v1` branch on user commits (CLAUDE.md:575) and persist in git indefinitely. So a session that ran, was committed, then went untouched for 7+ days has its `.git/entire-sessions/&lt;id&gt;.json` purged, yet its checkpoints remain listable.
+
+Related cleanup asymmetry worth noting: CLAUDE.md:584 documents the reverse pruning only — an **orphaned shadow branch** (ephemeral) without a session-state file is reset on next session start. That governs ephemeral shadow branches, not committed `v1`/refs checkpoints, which are never pruned by session lifecycle. `entire clean` (`clean.go:26-30`) can delete session state files as an explicit user action too.
+
+---
+
+### Scenarios where checkpoints exist but no session is listed (all code-backed)
+
+1. **Imported history** — `entire import &lt;agent&gt;` writes `Imported` checkpoints to the persistent git store and never creates a `.git/entire-sessions/` entry (import_cmd.go / agentimport.go:173-189).
+2. **Aged-out sessions** — session-state files older than 7 days are auto-deleted on list/load (`IsStale`, state.go:475-483, 549-556), while their committed checkpoints persist on `entire/checkpoints/v1` (CLAUDE.md:575).
+3. **`entire clean` / manual removal** — deleting the `entire-sessions/` files (clean.go:26-30) leaves git checkpoints untouched.
+4. **Fetched/other-worktree or cloned checkpoints** — because `checkpoint list` reads git refs while `session list` reads a local per-machine directory, checkpoints that arrived via the v1 branch (pushed by pre-push, CLAUDE.md:585, then fetched) exist in refs with no corresponding local session file. (Structural consequence of the store split; not a single function.)
+
+One caveat on evidence: scenario 4's "fetched from remote" variant is inferred from the store architecture (git refs vs. local files) plus the documented pre-push behavior, not from a single dedicated code path. Scenarios 1-3 are each directly backed by the quoted code.</result>
+<usage><subagent_tokens>62657</subagent_tokens><tool_uses>35</tool_uses><duration_ms>172932</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a0fdaef49de5d83bd</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/91fa7c44-6634-48ab-ae5f-d394502f50d5/tasks/a0fdaef49de5d83bd.output</output-file>
+<status>completed</status>
+<summary>Agent "How checkpoints relate to sessions" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I now have a complete picture. Here are my findings.
+
+## Summary
+
+`entire checkpoint list` and `entire session list` read from two entirely separate stores. Checkpoints live in **git refs** (the `entire/checkpoints/v1` branch, per-checkpoint `refs/entire/checkpoints/...` refs, and ephemeral shadow branches `entire/&lt;hash&gt;`); sessions are listed only from the local filesystem state files in `.git/entire-sessions/`. Nothing keeps them in sync, so several code paths legitimately produce checkpoints with no listable session.
+
+---
+
+### 1. Where `entire checkpoint list` reads checkpoints from
+
+Command wiring: `newCheckpointListCmd` → `runExplainBranchWithFilter` → `getBranchCheckpoints`.
+
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/checkpoint_group.go:55-76` — `list` subcommand calls `runExplainBranchWithFilter`.
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/explain.go:2394` — formats whatever `getBranchCheckpoints` returns.
+
+The enumeration in `getBranchCheckpoints` (`/Users/ninawork/entire/devenv/cli/cmd/entire/cli/explain.go:2043-2184`) pulls from **three git-backed sources**, none of which is the session-state directory:
+
+1. Committed checkpoints via the persistent store (line 2054): `committedInfos, err := store.List(ctx)` — `store = stores.Persistent`.
+2. A DAG/first-parent commit walk that matches commits carrying the `Entire-Checkpoint` trailer and joins them against `committedByID` (lines 2081-2148).
+3. Ephemeral shadow-branch checkpoints (line 2155): `getReachableTemporaryCheckpoints(ctx, repo, stores.Ephemeral(), ...)`.
+4. Additionally, **imported** checkpoints are surfaced directly from the persistent store regardless of any commit (line 2173 → `getImportedRewindPoints`, `explain.go:2190-2223`), which filters `stores.Persistent.List(ctx)` for `info.Imported`.
+
+The persistent `store.List` is a `kindRoutingStore` that merges two git backends and dedups (`/Users/ninawork/entire/devenv/cli/cmd/entire/cli/checkpoint/routing_store.go:103-130`):
+- `GitStore.List` — walks the sharded tree of the `entire/checkpoints/v1` branch (`/Users/ninawork/entire/devenv/cli/cmd/entire/cli/checkpoint/persistent.go:1544-1570`, comment at line 1540: "lists all committed checkpoints from the entire/checkpoints/v1 branch").
+- `gitRefsStore.List` — iterates git refs and keeps those matching `refs/entire/checkpoints/...` via `ParseRef` (`/Users/ninawork/entire/devenv/cli/cmd/entire/cli/checkpoint/refs_store.go:362-396`; prefix constant at `refs_naming.go:16`).
+
+So `checkpoint list` is entirely git-ref/branch driven. It never reads `.git/entire-sessions/`.
+
+### 2. Confirmation of the store split
+
+`session list` reads only the filesystem state dir:
+
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/sessions.go:346-373` — `runSessionList` → `strategy.ListSessionStates`; prints "No sessions." when the result is empty.
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/session_state.go:117-128` — `ListSessionStates` → `session.NewStateStore(ctx).List(ctx)`.
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/session/state.go:678-708` — `StateStore.List` does `os.ReadDir(s.stateDir)` over `*.json` files.
+- `state.go:500-508` — `stateDir = &lt;gitCommonDir&gt;/entire-sessions`; dir name constant `SessionStateDirName = "entire-sessions"` (`state.go:27`).
+
+This matches CLAUDE.md (`/Users/ninawork/entire/devenv/cli/CLAUDE.md:575, 582`): condensed checkpoints go to the `entire/checkpoints/v1` branch, while session state lives in `.git/entire-sessions/`. The two stores are independent — deleting a `.git/entire-sessions/*.json` file has no effect on git refs, and vice versa.
+
+### 3. Import path creates checkpoints with NO local session
+
+`entire import &lt;agent&gt;` (hidden/experimental) is exactly this scenario.
+
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/import_cmd.go:29-89` — one subcommand per registered importer (claude, codex, copilot, cursor, gemini, pi). Short help: "Import existing … transcripts as **read-only checkpoints**." It calls `agentimport.Run`.
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/agentimport/agentimport.go:111-191` — `Run` iterates transcript turns and, for each, calls `writeTurn`, which writes **only** to the persistent checkpoint store:
+
+```go
+// agentimport.go:173-189
+func writeTurn(...) error {
+    if err := stores.Persistent.Write(ctx, cp.Session(cp.WriteOptions{
+        CheckpointID: cid,
+        SessionID:    sf.SessionID,
+        ...
+        Kind:         string(session.KindImported),
+        ...
+    })); err != nil {
+```
+
+There is no `StateStore.Save` / `.git/entire-sessions/` write anywhere in `agentimport`. The checkpoints are flagged `Imported` (`Kind: KindImported`) and are surfaced in `checkpoint list` purely through `getImportedRewindPoints` (explain.go:2190-2223). So after `entire import claude-code`, `checkpoint list` shows entries while `session list` shows "No sessions."
+
+### 4. Stopped / aged-out sessions leave checkpoints behind
+
+Two lifecycle facts combine here:
+
+a. **Ended sessions still list** — `session list` does not hide ended sessions; `sessionPhaseLabel` returns `"ended"` when `EndedAt != nil` (`sessions.go:313-322`). So merely stopping/condensing a session does not by itself make it disappear.
+
+b. **Session state is auto-deleted after 7 days; checkpoints are not.** On every load/list, stale state files are removed:
+
+```go
+// session/state.go:549-556 (inside Load, called by List)
+if state.IsStale() {
+    ...
+    _ = s.Clear(ctx, sessionID) // best-effort delete of the .json
+    return nil, nil             // treated as not found
+}
+```
+
+`IsStale` returns true when the last interaction (or start) is older than `StaleSessionThreshold = 7 * 24 * time.Hour` (`state.go:475-483`, constant at `state.go:29-31`). `StateStore.List` skips such entries (`state.go:701-703`, "Not found or stale (Load handles cleanup)").
+
+Meanwhile the checkpoints those sessions produced were condensed to the permanent `entire/checkpoints/v1` branch on user commits (CLAUDE.md:575) and persist in git indefinitely. So a session that ran, was committed, then went untouched for 7+ days has its `.git/entire-sessions/&lt;id&gt;.json` purged, yet its checkpoints remain listable.
+
+Related cleanup asymmetry worth noting: CLAUDE.md:584 documents the reverse pruning only — an **orphaned shadow branch** (ephemeral) without a session-state file is reset on next session start. That governs ephemeral shadow branches, not committed `v1`/refs checkpoints, which are never pruned by session lifecycle. `entire clean` (`clean.go:26-30`) can delete session state files as an explicit user action too.
+
+---
+
+### Scenarios where checkpoints exist but no session is listed (all code-backed)
+
+1. **Imported history** — `entire import &lt;agent&gt;` writes `Imported` checkpoints to the persistent git store and never creates a `.git/entire-sessions/` entry (import_cmd.go / agentimport.go:173-189).
+2. **Aged-out sessions** — session-state files older than 7 days are auto-deleted on list/load (`IsStale`, state.go:475-483, 549-556), while their committed checkpoints persist on `entire/checkpoints/v1` (CLAUDE.md:575).
+3. **`entire clean` / manual removal** — deleting the `entire-sessions/` files (clean.go:26-30) leaves git checkpoints untouched.
+4. **Fetched/other-worktree or cloned checkpoints** — because `checkpoint list` reads git refs while `session list` reads a local per-machine directory, checkpoints that arrived via the v1 branch (pushed by pre-push, CLAUDE.md:585, then fetched) exist in refs with no corresponding local session file. (Structural consequence of the store split; not a single function.)
+
+One caveat on evidence: scenario 4's "fetched from remote" variant is inferred from the store architecture (git refs vs. local files) plus the documented pre-push behavior, not from a single dedicated code path. Scenarios 1-3 are each directly backed by the quoted code.</result>
+<usage><subagent_tokens>62657</subagent_tokens><tool_uses>35</tool_uses><duration_ms>172932</duration_ms></usage>
+</task-notification>
+
+---
+
+I think this has to do with the user importing their existing sessions and expecting `entire sessions list` to show them.
+
+---
+
+I think this has to do with the user importing their existing sessions and expecting `entire sessions list` to show them.
+
+---
+
+<task-notification>
+<task-id>a7a775a7ff88b5bf6</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/91fa7c44-6634-48ab-ae5f-d394502f50d5/tasks/a7a775a7ff88b5bf6.output</output-file>
+<status>completed</status>
+<summary>Agent "How session list resolves sessions" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have a complete picture. Here is my report.
+
+## `entire session list` — code path trace
+
+### 1. Command implementation
+- Command tree: `newSessionsCmd()` at `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/sessions.go:157` registers `Use: "session"` with `Aliases: []string{"sessions"}`, wired into root at `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/root.go:88`.
+- `list` subcommand: `newListCmd()` at `sessions.go:324`, which calls `runSessionList(...)` at `sessions.go:346`.
+- The `PersistentPreRunE` (sessions.go:184) requires being inside a git repo (`paths.WorktreeRoot`), else it errors "not a git repository" — it does not affect which sessions list.
+
+### 2. Where it reads session state from disk
+`runSessionList` → `strategy.ListSessionStates(ctx)` (`/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/session_state.go:117`) → `session.NewStateStore(ctx).List(ctx)`.
+
+Storage location: `&lt;git-common-dir&gt;/entire-sessions/&lt;session-id&gt;.json`. The dir name is `SessionStateDirName = "entire-sessions"` (`session/state.go:27`). `NewStateStore` (`session/state.go:500`) sets `stateDir = filepath.Join(commonDir, "entire-sessions")` where `commonDir` comes from `git rev-parse --git-common-dir` (`session/state.go:740`). This is the git *common* dir, so it is shared across all worktrees (main repo's `.git/`, not `.git/worktrees/&lt;name&gt;/`).
+
+The enumeration code — `StateStore.List` (`/Users/ninawork/entire/devenv/cli/cmd/entire/cli/session/state.go:678`):
+
+```go
+func (s *StateStore) List(ctx context.Context) ([]*State, error) {
+	entries, err := os.ReadDir(s.stateDir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to read session state directory: %w", err)
+	}
+
+	var states []*State
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		if strings.HasSuffix(entry.Name(), ".tmp") {
+			continue // Skip temp files
+		}
+
+		sessionID := strings.TrimSuffix(entry.Name(), ".json")
+		state, err := s.Load(ctx, sessionID)
+		if err != nil {
+			continue // Skip corrupted state files
+		}
+		if state == nil {
+			continue // Not found or stale (Load handles cleanup)
+		}
+
+		states = append(states, state)
+	}
+	return states, nil
+}
+```
+
+`Load` (`session/state.go:519`) does the per-file filtering: validates the session ID (`validation.ValidateSessionID`), unmarshals JSON, and — critically — **if `state.IsStale()`, it deletes the file and returns `(nil,nil)`** (state.go:549-556), so stale sessions are excluded *and removed*.
+
+`IsStale()` (`session/state.go:475`): true when `time.Since(LastInteractionTime) &gt; 7 days`, falling back to `StartedAt` when `LastInteractionTime` is nil. `StaleSessionThreshold = 7 * 24 * time.Hour` (state.go:31).
+
+`runSessionList` (sessions.go:346-373) then only drops `nil` entries — no other filter — sorts by `StartedAt` desc, and prints "No sessions." (sessions.go:371) only when the filtered slice is empty.
+
+### 3. Necessary + sufficient conditions for a session to appear
+All must hold:
+- A file named exactly `&lt;session-id&gt;.json` exists directly in `&lt;git-common-dir&gt;/entire-sessions/` (not a subdir).
+- The name does not end in `.tmp`.
+- `&lt;session-id&gt;` (the name minus `.json`) passes `validation.ValidateSessionID` — otherwise `Load` errors and List skips it. (This is why the `&lt;uuid&gt;.trail-scope.json` sidecar files are skipped: their trimmed name `&lt;uuid&gt;.trail-scope` is not a valid ID.)
+- The file contains JSON that unmarshals into `session.State` (corrupt/unparseable → skipped).
+- The session is **not stale**: last interaction (or `StartedAt` if none) within the last 7 days. Stale files are auto-deleted on read.
+
+Notably NOT filtered:
+- Phase is irrelevant — ended sessions ARE listed (`phase: ended` / `ended_at` set still show). `session list` intentionally includes ended sessions; the doc says "For active sessions only, use `entire status`" (sessions.go:332).
+- No worktree/branch filter.
+
+### 4. Scope: global, not per-worktree
+`session list` is **global across all worktrees**. It reads the git *common* dir (shared) and applies no worktree filter. The command help even says "List all sessions across all worktrees" (sessions.go:165, 335). Worktree scoping helpers exist (`sessionStatesForCurrentWorktree`, session_state.go:160) but are used only by `FindMostRecentSession`/resume/log-routing — never by `list`.
+
+---
+
+## Why your repo shows checkpoints but "No sessions" — grounded in this repo's disk state
+
+I inspected the live directory `/Users/ninawork/entire/devenv/cli/.git/entire-sessions/`:
+
+- 127 entries total, but only **3 valid `&lt;uuid&gt;.json` session-state files** exist:
+  - `1bee7bcc-…` started 2026-07-06, last interaction 2026-07-06, phase idle
+  - `dc1edbe1-…` phase ended, ended_at 2026-07-08
+  - `91fa7c44-…` started/interacted 2026-07-09 (this is the current session)
+- The other ~120 entries are only **hint/sidecar files** (`.agent`, `.banner`, `.model`, `.trail-scope.json`) with **no matching `&lt;uuid&gt;.json` state file**. These sessions can never appear in `session list` — there is no `.json` state file for them. (The `.trail-scope.json` files do end in `.json` but are rejected by `ValidateSessionID`.)
+
+Two structural reasons a session has hint files but no `.json` state file:
+- The `.json` state file is written at TurnStart (`InitializeSession`/`SaveSessionState`), whereas `.agent`/`.banner`/`.model` hints are written earlier at SessionStart. A session that started but never reached a full turn leaves only hints.
+- `Load`/`List` **auto-delete** any state file older than 7 days (`IsStale`), leaving the hint files behind (`Clear` removes matching prefixes, but stale-deletion in `Load` only removes via `Clear` which does remove hints too — however sessions that never got a `.json` were never subject to it).
+
+The contrast with `checkpoint list`: checkpoints are stored in a completely separate location — the git branch **`entire/checkpoints/v1`** (`/Users/ninawork/entire/devenv/cli/cmd/entire/cli/checkpoint/persistent.go:1540`, "List lists all committed checkpoints from the entire/checkpoints/v1 branch"), i.e. git object storage, not `.git/entire-sessions/`. So checkpoints persist in the metadata branch indefinitely while session `.json` state files are ephemeral (never written past SessionStart, or auto-pruned after 7 days). That is the mechanism by which `checkpoint list` can be populated while `session list` returns "No sessions."
+
+One caveat on the current snapshot: as of today (system clock 2026-07-09) there ARE 3 non-stale valid session files in this repo, so a fresh `entire session list` run *now* from this repo root should print those 3, not "No sessions." If you are still seeing "No sessions," the remaining candidates are: running from a directory whose `git rev-parse --git-common-dir` resolves elsewhere, or a stale/older `entire` binary — but the three state files themselves meet every listing condition above.</result>
+<usage><subagent_tokens>74721</subagent_tokens><tool_uses>13</tool_uses><duration_ms>496312</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a7a775a7ff88b5bf6</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/91fa7c44-6634-48ab-ae5f-d394502f50d5/tasks/a7a775a7ff88b5bf6.output</output-file>
+<status>completed</status>
+<summary>Agent "How session list resolves sessions" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have a complete picture. Here is my report.
+
+## `entire session list` — code path trace
+
+### 1. Command implementation
+- Command tree: `newSessionsCmd()` at `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/sessions.go:157` registers `Use: "session"` with `Aliases: []string{"sessions"}`, wired into root at `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/root.go:88`.
+- `list` subcommand: `newListCmd()` at `sessions.go:324`, which calls `runSessionList(...)` at `sessions.go:346`.
+- The `PersistentPreRunE` (sessions.go:184) requires being inside a git repo (`paths.WorktreeRoot`), else it errors "not a git repository" — it does not affect which sessions list.
+
+### 2. Where it reads session state from disk
+`runSessionList` → `strategy.ListSessionStates(ctx)` (`/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/session_state.go:117`) → `session.NewStateStore(ctx).List(ctx)`.
+
+Storage location: `&lt;git-common-dir&gt;/entire-sessions/&lt;session-id&gt;.json`. The dir name is `SessionStateDirName = "entire-sessions"` (`session/state.go:27`). `NewStateStore` (`session/state.go:500`) sets `stateDir = filepath.Join(commonDir, "entire-sessions")` where `commonDir` comes from `git rev-parse --git-common-dir` (`session/state.go:740`). This is the git *common* dir, so it is shared across all worktrees (main repo's `.git/`, not `.git/worktrees/&lt;name&gt;/`).
+
+The enumeration code — `StateStore.List` (`/Users/ninawork/entire/devenv/cli/cmd/entire/cli/session/state.go:678`):
+
+```go
+func (s *StateStore) List(ctx context.Context) ([]*State, error) {
+	entries, err := os.ReadDir(s.stateDir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to read session state directory: %w", err)
+	}
+
+	var states []*State
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		if strings.HasSuffix(entry.Name(), ".tmp") {
+			continue // Skip temp files
+		}
+
+		sessionID := strings.TrimSuffix(entry.Name(), ".json")
+		state, err := s.Load(ctx, sessionID)
+		if err != nil {
+			continue // Skip corrupted state files
+		}
+		if state == nil {
+			continue // Not found or stale (Load handles cleanup)
+		}
+
+		states = append(states, state)
+	}
+	return states, nil
+}
+```
+
+`Load` (`session/state.go:519`) does the per-file filtering: validates the session ID (`validation.ValidateSessionID`), unmarshals JSON, and — critically — **if `state.IsStale()`, it deletes the file and returns `(nil,nil)`** (state.go:549-556), so stale sessions are excluded *and removed*.
+
+`IsStale()` (`session/state.go:475`): true when `time.Since(LastInteractionTime) &gt; 7 days`, falling back to `StartedAt` when `LastInteractionTime` is nil. `StaleSessionThreshold = 7 * 24 * time.Hour` (state.go:31).
+
+`runSessionList` (sessions.go:346-373) then only drops `nil` entries — no other filter — sorts by `StartedAt` desc, and prints "No sessions." (sessions.go:371) only when the filtered slice is empty.
+
+### 3. Necessary + sufficient conditions for a session to appear
+All must hold:
+- A file named exactly `&lt;session-id&gt;.json` exists directly in `&lt;git-common-dir&gt;/entire-sessions/` (not a subdir).
+- The name does not end in `.tmp`.
+- `&lt;session-id&gt;` (the name minus `.json`) passes `validation.ValidateSessionID` — otherwise `Load` errors and List skips it. (This is why the `&lt;uuid&gt;.trail-scope.json` sidecar files are skipped: their trimmed name `&lt;uuid&gt;.trail-scope` is not a valid ID.)
+- The file contains JSON that unmarshals into `session.State` (corrupt/unparseable → skipped).
+- The session is **not stale**: last interaction (or `StartedAt` if none) within the last 7 days. Stale files are auto-deleted on read.
+
+Notably NOT filtered:
+- Phase is irrelevant — ended sessions ARE listed (`phase: ended` / `ended_at` set still show). `session list` intentionally includes ended sessions; the doc says "For active sessions only, use `entire status`" (sessions.go:332).
+- No worktree/branch filter.
+
+### 4. Scope: global, not per-worktree
+`session list` is **global across all worktrees**. It reads the git *common* dir (shared) and applies no worktree filter. The command help even says "List all sessions across all worktrees" (sessions.go:165, 335). Worktree scoping helpers exist (`sessionStatesForCurrentWorktree`, session_state.go:160) but are used only by `FindMostRecentSession`/resume/log-routing — never by `list`.
+
+---
+
+## Why your repo shows checkpoints but "No sessions" — grounded in this repo's disk state
+
+I inspected the live directory `/Users/ninawork/entire/devenv/cli/.git/entire-sessions/`:
+
+- 127 entries total, but only **3 valid `&lt;uuid&gt;.json` session-state files** exist:
+  - `1bee7bcc-…` started 2026-07-06, last interaction 2026-07-06, phase idle
+  - `dc1edbe1-…` phase ended, ended_at 2026-07-08
+  - `91fa7c44-…` started/interacted 2026-07-09 (this is the current session)
+- The other ~120 entries are only **hint/sidecar files** (`.agent`, `.banner`, `.model`, `.trail-scope.json`) with **no matching `&lt;uuid&gt;.json` state file**. These sessions can never appear in `session list` — there is no `.json` state file for them. (The `.trail-scope.json` files do end in `.json` but are rejected by `ValidateSessionID`.)
+
+Two structural reasons a session has hint files but no `.json` state file:
+- The `.json` state file is written at TurnStart (`InitializeSession`/`SaveSessionState`), whereas `.agent`/`.banner`/`.model` hints are written earlier at SessionStart. A session that started but never reached a full turn leaves only hints.
+- `Load`/`List` **auto-delete** any state file older than 7 days (`IsStale`), leaving the hint files behind (`Clear` removes matching prefixes, but stale-deletion in `Load` only removes via `Clear` which does remove hints too — however sessions that never got a `.json` were never subject to it).
+
+The contrast with `checkpoint list`: checkpoints are stored in a completely separate location — the git branch **`entire/checkpoints/v1`** (`/Users/ninawork/entire/devenv/cli/cmd/entire/cli/checkpoint/persistent.go:1540`, "List lists all committed checkpoints from the entire/checkpoints/v1 branch"), i.e. git object storage, not `.git/entire-sessions/`. So checkpoints persist in the metadata branch indefinitely while session `.json` state files are ephemeral (never written past SessionStart, or auto-pruned after 7 days). That is the mechanism by which `checkpoint list` can be populated while `session list` returns "No sessions."
+
+One caveat on the current snapshot: as of today (system clock 2026-07-09) there ARE 3 non-stale valid session files in this repo, so a fresh `entire session list` run *now* from this repo root should print those 3, not "No sessions." If you are still seeing "No sessions," the remaining candidates are: running from a directory whose `git rev-parse --git-common-dir` resolves elsewhere, or a stale/older `entire` binary — but the three state files themselves meet every listing condition above.</result>
+<usage><subagent_tokens>74721</subagent_tokens><tool_uses>13</tool_uses><duration_ms>496312</duration_ms></usage>
+</task-notification>
+
+---
+
+So if a user runs `entire import` manually, the sessions appear..?
+
+---
+
+So if a user runs `entire import` manually, the sessions appear..?
+
+---
+
+what is required for them to show up as sessions?
+
+---
+
+what is required for them to show up as sessions?
+
+---
+
+so the session has to be attached to a commit?
+
+---
+
+so the session has to be attached to a commit?
+
+---
+
+So why wouldn't import allow session list to be populated?
+
+---
+
+So why wouldn't import allow session list to be populated?
+
+---
+
+Find `peytonalt` and `soph`'s branches and see if they're working on anything related to this. There was discussing in slack about it but I'm not sure if they're working on it yet
+
+---
+
+Find `peytonalt` and `soph`'s branches and see if they're working on anything related to this. There was discussing in slack about it but I'm not sure if they're working on it yet
+
+---
+
+<task-notification>
+<task-id>a8c8f269b20ccab53</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/91fa7c44-6634-48ab-ae5f-d394502f50d5/tasks/a8c8f269b20ccab53.output</output-file>
+<status>completed</status>
+<summary>Agent "Parse saved Slack search file" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I've read 100% of the file (1319 lines, all 20 results). Here is the extraction.
+
+## Most relevant: the "imported sessions don't show in the UI / session list" thread
+
+This is the thread most directly tied to issue #1697. All in **#entire-cli (channel_id `C0A095SNK32`), thread_ts `1783439576.563929`**, dated 2026-07-07/08. Pull the full thread with that channel_id + thread_ts.
+
+**Peyton Montei** (peyton@entire.io), 2026-07-07 09:33:59 PDT, message_ts `1783442039.899879`
+Permalink: https://entireio.slack.com/archives/C0A095SNK32/p1783442039899879?thread_ts=1783439576.563929&amp;cid=C0A095SNK32
+&gt; "For imported sessions, I guess the benefit is really the read only, so can search/explain in CLI and use in agent sessions, but I do think it would be helpful to see them in the UI too"
+
+**Peyton Montei**, thread parent, 2026-07-07 09:12:56 PDT, message_ts `1783439576.563929` (the trail announcement that started the thread)
+&gt; "feat(onboarding): guided setup ladder — enable walks login/mirror/import, status shows the checklist, re-enable resumes
+&gt; • `enable` prompts users to set up end to end - 1. agent picker (unchanged), 2. login, 3. mirror, import
+&gt; • `status` shows which steps are not complete (if skip Y/N prompt to setup)
+&gt; • run `enable` again to finish setup"
+Trail link: https://entire.io/gh/entireio/cli/trails/742/feat-onboarding-guided-setup-ladder-enable-walks-login
+
+**Stefan Haubold** (stefan@entire.io, `soph/` branches), 2026-07-07 09:28 PDT, message_ts `1783441687.098139` — tested it and hit the empty/inconsistent state:
+&gt; "I just tested this... Did run claude and let it create a script, commit... Did run 'entire enable'... Result:
+&gt; ```
+&gt; Imported 2 turn(s) from 2 session(s) (0 already imported).
+&gt; Setup 2/4 complete
+&gt;   ✓ Agent hooks    Claude Code
+&gt;   ✓ Logged in      Soph
+&gt;   ? Repo mirrored  couldn't check — retry with `entire repo mirror list`
+&gt;   ✗ History        2 claude-code sessions found, not imported
+&gt; → Run `entire enable` to finish setup (1 step left)
+&gt;   run later: entire import claude-code
+&gt; ```
+&gt; It says "Imported" but then at the bottom it says "✗ History""
+
+**Stefan Haubold**, 2026-07-07 09:29:59 PDT, message_ts `1783441799.070769` (this is also Result 10) — the core question behind #1697:
+Permalink: https://entireio.slack.com/archives/C0A095SNK32/p1783441799070769?thread_ts=1783439576.563929&amp;cid=C0A095SNK32
+&gt; "but what I still try to parse is: what do I do now with the imported sessions, since entire.io will also not show them without a linked checkpoint 🤔"
+
+**Stefan Haubold**, message_ts `1783442106.249379` and `1783442112.253059`:
+&gt; "I was reading this 'Imports existing agent history so your work shows up in the web UI.'"
+&gt; "which it does not, right? 🤔"
+
+**Peyton Montei**, message_ts `1783442148.499309`:
+&gt; "Correct it doesn't - wrong assumption on my end, fixing"
+
+**Stefan Haubold**, message_ts `1783441875.029889` / `1783441902.615169`:
+&gt; "in any case: I would love to not merge this before we do the release tomorrow"
+&gt; "or we integrate only mirroring if we want this 🤔"
+
+**Nina** (nina@entire.io), 2026-07-08 08:58:57 PDT, message_ts `1783526337.442239` — importer scoping decision:
+Permalink: https://entireio.slack.com/archives/C0A095SNK32/p1783526337442239?thread_ts=1783439576.563929&amp;cid=C0A095SNK32
+&gt; "I made a decision for the importer to only show the agents that a user selected to enable. So if they didn't select enable for Gemini for example, we wouldn't offer to then import Gemini sessions"
+(Stefan noted in the same thread, ts `1783525929.647679`: "it's still in, only thing I changed (last minute) is that we detect the agent but then only preselect it in the picker but still show the picker"; "good thing: it works with the ref backend" ts `1783441773.616509`.)
+
+## The origin of the import feature (design discussion)
+
+**Group DM `C0B951VDPRT`** (participants: Stefan, Peyton, Sven, Alisha, Paulo, Nina), 2026-06-10, around message_ts `1781156541.131989` (Result 15):
+- Nina, ts `1781156498.430099`: "I wonder if we can detect transcripts on people's pre-entire-enabled repos locally and import them to entire when they enable it. If claude for example pushed on people's behalf, it would have the commit id in the transcript.."
+- Alisha, ts `1781156541.131989`: "I think a user requested this. We should definitely have some sort of import" → links **https://github.com/entireio/cli/issues/1336**
+- Nina, ts `1781156562.442909`: "that would 📈 checkpoint creation straightaway when people onboard their repos"
+- Stefan, ts `1781156639.110239` / `1781156641.892609` / `1781156647.859019`: "but it means rewriting their history" / "in their main branch" / "to add the trailers"
+- Nina, ts `1781157057.036139`: "After chatting with Alisha and Peyton, I realized that search and explain are used a lot more than I initially thought. That and it helps with users not seeing an empty overview page when they enable entire.."
+- Paulo Gomes, ts `1781156949.658109`: "we could do that, but then we have the exponential problem of checkpoints vs refs..." and ts `1781157064.254429` on git `refs/replace/&lt;oid&gt;` redirection.
+
+## The import command announcement (Result 3)
+
+**Nina**, #entire-cli `C0A095SNK32`, 2026-06-25 16:11:55 PDT, message_ts `1782429115.924769`, thread_ts `1782429115.924769`:
+Permalink: https://entireio.slack.com/archives/C0A095SNK32/p1782429115924769?thread_ts=1782429115.924769&amp;cid=C0A095SNK32
+&gt; ":review: Another change I've been working on post summit: a new hidden CLI command to allow for importing existing Claude code sessions (other agents to follow) from prior to when Entire was enabled: [trail 668]... There was a user request for this as well that I found here: https://github.com/entireio/cli/issues/1336 ... Enabling entire for the first time does not offer the user to import their sessions yet. It's a hidden command for now so we can validate it internally first. I tested it on a test repo and I was able to import untracked Claude sessions and run checkpoint explain on them. Rerunning the import command doesn't cause duplicates."
+Sven replies in-thread that cross-agent `entire session resume` requires existing entire checkpoints (ts `1782430782.144869`: "Yeah you have to have entire checkpoints already").
+
+## The #ships public announcement (Result 2)
+
+**Nina**, #ships `C0APUHMSG6P`, 2026-07-07 13:37:50 PDT, message_ts `1783456670.537329`, thread_ts `1783456670.537329`:
+Permalink: https://entireio.slack.com/archives/C0APUHMSG6P/p1783456670537329?thread_ts=1783456670.537329&amp;cid=C0APUHMSG6P
+&gt; "As of CLI version 0.8.1, entire enable on a new project now prompts users to import their previous/existing agent sessions..."
+&gt; (reply ts `1783458415.587249`) "`import` generates read-only checkpoints on a user's machine so they or their agents can run commands on checkpoints generated by their sessions from before entire was enabled: `checkpoint explain`, `investigate` etc. There are new changes coming soon that will allow folks to push up the checkpoints to the UI as well and be able to search against them etc."
+&gt; (reply ts `1783458627.581739`) "A new update to this conversation though: we're discussing in #entire-cli now what the imported checkpoint experience should be. Depending on how that goes, we might hold off on `entire enable` calling import for the launch tomorrow."
+&gt; Links back to the #entire-cli thread: https://entireio.slack.com/archives/C0A095SNK32/p1783439576563929
+
+## Import scope expansion (Result 20 — marvin bot digest)
+
+**marvin [BOT]**, #entire-cli, 2026-06-29 15:01:05 PDT, message_ts `1782770465.268739`:
+&gt; ":inbox_tray: *Import &amp; explain* — Nina • #1540 expands the session importer to cursor, pi, factory, codex, copilot, and gemini. • #1560 enriches `entire explain` JSON output."
+(PRs: https://github.com/entireio/cli/pull/1540 , https://github.com/entireio/cli/pull/1560)
+
+## Desktop/plugin/IDE capture — Codex-within-Claude transcript capture (attach vs capture debate)
+
+A long April thread about **capturing sessions from the plugin surface** (Codex run inside Claude Code via plugin fires its own hooks → separate Entire session, metadata written but no transcript). Directly relevant to "capturing Claude/Codex sessions from desktop/IDE/plugin surfaces."
+
+Thread in **#entire-cli `C0A095SNK32`, thread_ts `1776171109.426409`** (Results 1, 4) and a parallel **DM `D0AJ84WJKM1`, thread_ts `1776190354.335599`** (Results 6, 13, 19):
+
+- **Sven Pfleiderer** (sven@entire.io), 2026-04-14 10:58:48 PDT, msg_ts `1776189528.564589` (Result 1): hypothesis that "When Codex runs inside Claude Code (via the plugin), it fires its own lifecycle hooks... These create a separate Entire session with its own session ID, independent of the Claude Code parent session" — metadata captured, transcript missing.
+- Sven, ts `1776189878.274129`: "What this boils down to for me is two things we should try to address: • Running codex from within claude currently doesn't seem to properly persist the codex logs • Running an agent for research/review purposes (without updating actual files)... results in a similar situation where we capture some metadata but not the full transcripts. I can work on addressing them"
+- **Sven**, #entire-cli 2026-04-15 16:09:31 PDT, msg_ts `1776294571.871759` (Result 4): "here's a PR with a fix: https://github.com/entireio/cli/pull/958 ... codex isn't creating any transcript files for the sessions created by running it via the claude plugin. I opted to not persist any sessions in such cases..."
+- The DM thread (Result 6, D0AJ84WJKM1) is a long Nina↔Sven debate on **options A/B/C**: (A) attach/capture research-only + metadata-only sessions [technically correct], (B) don't attach metadata-only stubs [privacy-preserving], (C) best-effort. Key: Sven ts `1776191536.391979` "Whatever we do needs to fixed on both sides, eventually. Even if we wanted to fix it on the UI level, we can't without the CLI capturing the data." Nina proposed (ts `1776192670.478509`) "if we do a condensation and don't find a transcript for a checkpoint, can we call `attach` and attach it using that metadata session id?" Confirmed (ts `1776193015.802489`) metadata.json IS written for read-only sessions.
+
+## Web-side session display bug (Result 11)
+
+**Pavel Prichodko** (pavel@entire.io), #entire-web `C0A0K3BFDL3`, 2026-04-10 06:29:11 PDT, msg_ts `1775827751.680419`, thread_ts `1775744349.967619`:
+&gt; "it looks like the fix worked and is now showing Codex session correctly cc @Paulo Gomes — however there seem to be another issue when labels in the list do not match sessions in the detail"
+
+## Peripheral / low relevance
+
+- **Result 9** (Pavel, #entire `C095MMM9YHG`, 2026-03-18, ts `1773856482.107229`): product-strategy long-read on the "self-learning flywheel" and remote runs. Sven notes (ts `1773880371.105879`): "Right now, we don't even support cross-agent `entire resume`." Tangential.
+- **Result 12** (Victor, #progress, 2026-01-11): mentions researching how to extend Claude/Gemini/OpenCode/Codex/Amp via plugins/extensions to install hooks. Tangential.
+- **Result 16** (Sven↔Nina DM, 2026-04-06): metadata.json structure showing empty transcript for a session — general debugging, not import.
+- **Result 17** (marvin bot digest, 2026-05-21): mentions Codex fix PR #1244 with data-loss risk. Peripheral.
+- **Result 18** (Stefan, 2026-03-25): Codex agent implementation PR #772. Peripheral.
+- **Result 14** (Stefan, #ai-tips, 2026-07-09): unrelated (cousin's Claude Pro usage).
+- **Results 5, 13, 19** are empty-bot messages or already-quoted context stubs.
+
+## Bottom line on the investigation question
+Yes — this is active, recent work. **Peyton Montei** built the `enable`-integrated onboarding/import ladder (trail 742) and **Stefan Haubold (soph/)** tested it and surfaced the exact gap in issue #1697: imported sessions are "Imported" locally as read-only checkpoints but **do not appear in the web UI / are not linked to a checkpoint** ("entire.io will also not show them without a linked checkpoint"). **Nina** owns the underlying importer (PRs #1540 expanding to all agents, trail 668 the original hidden command, tied to user request issue #1336). Both Peyton and Stefan explicitly flagged that "shows up in the web UI" is currently false and needs fixing, and Nina noted (in #ships) that pushing imported checkpoints up to the UI for search is "coming soon." The primary threads to pull in full:
+- **`C0A095SNK32` / thread_ts `1783439576.563929`** (the #1697 core discussion, Jul 7-8)
+- **`C0A095SNK32` / thread_ts `1782429115.924769`** (import command announcement)
+- **`C0B951VDPRT`** group DM around ts `1781156541.131989` (origin/design, Jun 10)
+- **`C0A095SNK32` / thread_ts `1776171109.426409`** + **`D0AJ84WJKM1` / thread_ts `1776190354.335599`** (plugin/Codex capture + attach-vs-import A/B/C debate, Apr 14)
+
+No message in these results references issue #1697 by number, but the Jul 7-8 thread is unmistakably its subject matter.</result>
+<usage><subagent_tokens>95069</subagent_tokens><tool_uses>5</tool_uses><duration_ms>112441</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a8c8f269b20ccab53</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/91fa7c44-6634-48ab-ae5f-d394502f50d5/tasks/a8c8f269b20ccab53.output</output-file>
+<status>completed</status>
+<summary>Agent "Parse saved Slack search file" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I've read 100% of the file (1319 lines, all 20 results). Here is the extraction.
+
+## Most relevant: the "imported sessions don't show in the UI / session list" thread
+
+This is the thread most directly tied to issue #1697. All in **#entire-cli (channel_id `C0A095SNK32`), thread_ts `1783439576.563929`**, dated 2026-07-07/08. Pull the full thread with that channel_id + thread_ts.
+
+**Peyton Montei** (peyton@entire.io), 2026-07-07 09:33:59 PDT, message_ts `1783442039.899879`
+Permalink: https://entireio.slack.com/archives/C0A095SNK32/p1783442039899879?thread_ts=1783439576.563929&amp;cid=C0A095SNK32
+&gt; "For imported sessions, I guess the benefit is really the read only, so can search/explain in CLI and use in agent sessions, but I do think it would be helpful to see them in the UI too"
+
+**Peyton Montei**, thread parent, 2026-07-07 09:12:56 PDT, message_ts `1783439576.563929` (the trail announcement that started the thread)
+&gt; "feat(onboarding): guided setup ladder — enable walks login/mirror/import, status shows the checklist, re-enable resumes
+&gt; • `enable` prompts users to set up end to end - 1. agent picker (unchanged), 2. login, 3. mirror, import
+&gt; • `status` shows which steps are not complete (if skip Y/N prompt to setup)
+&gt; • run `enable` again to finish setup"
+Trail link: https://entire.io/gh/entireio/cli/trails/742/feat-onboarding-guided-setup-ladder-enable-walks-login
+
+**Stefan Haubold** (stefan@entire.io, `soph/` branches), 2026-07-07 09:28 PDT, message_ts `1783441687.098139` — tested it and hit the empty/inconsistent state:
+&gt; "I just tested this... Did run claude and let it create a script, commit... Did run 'entire enable'... Result:
+&gt; ```
+&gt; Imported 2 turn(s) from 2 session(s) (0 already imported).
+&gt; Setup 2/4 complete
+&gt;   ✓ Agent hooks    Claude Code
+&gt;   ✓ Logged in      Soph
+&gt;   ? Repo mirrored  couldn't check — retry with `entire repo mirror list`
+&gt;   ✗ History        2 claude-code sessions found, not imported
+&gt; → Run `entire enable` to finish setup (1 step left)
+&gt;   run later: entire import claude-code
+&gt; ```
+&gt; It says "Imported" but then at the bottom it says "✗ History""
+
+**Stefan Haubold**, 2026-07-07 09:29:59 PDT, message_ts `1783441799.070769` (this is also Result 10) — the core question behind #1697:
+Permalink: https://entireio.slack.com/archives/C0A095SNK32/p1783441799070769?thread_ts=1783439576.563929&amp;cid=C0A095SNK32
+&gt; "but what I still try to parse is: what do I do now with the imported sessions, since entire.io will also not show them without a linked checkpoint 🤔"
+
+**Stefan Haubold**, message_ts `1783442106.249379` and `1783442112.253059`:
+&gt; "I was reading this 'Imports existing agent history so your work shows up in the web UI.'"
+&gt; "which it does not, right? 🤔"
+
+**Peyton Montei**, message_ts `1783442148.499309`:
+&gt; "Correct it doesn't - wrong assumption on my end, fixing"
+
+**Stefan Haubold**, message_ts `1783441875.029889` / `1783441902.615169`:
+&gt; "in any case: I would love to not merge this before we do the release tomorrow"
+&gt; "or we integrate only mirroring if we want this 🤔"
+
+**Nina** (nina@entire.io), 2026-07-08 08:58:57 PDT, message_ts `1783526337.442239` — importer scoping decision:
+Permalink: https://entireio.slack.com/archives/C0A095SNK32/p1783526337442239?thread_ts=1783439576.563929&amp;cid=C0A095SNK32
+&gt; "I made a decision for the importer to only show the agents that a user selected to enable. So if they didn't select enable for Gemini for example, we wouldn't offer to then import Gemini sessions"
+(Stefan noted in the same thread, ts `1783525929.647679`: "it's still in, only thing I changed (last minute) is that we detect the agent but then only preselect it in the picker but still show the picker"; "good thing: it works with the ref backend" ts `1783441773.616509`.)
+
+## The origin of the import feature (design discussion)
+
+**Group DM `C0B951VDPRT`** (participants: Stefan, Peyton, Sven, Alisha, Paulo, Nina), 2026-06-10, around message_ts `1781156541.131989` (Result 15):
+- Nina, ts `1781156498.430099`: "I wonder if we can detect transcripts on people's pre-entire-enabled repos locally and import them to entire when they enable it. If claude for example pushed on people's behalf, it would have the commit id in the transcript.."
+- Alisha, ts `1781156541.131989`: "I think a user requested this. We should definitely have some sort of import" → links **https://github.com/entireio/cli/issues/1336**
+- Nina, ts `1781156562.442909`: "that would 📈 checkpoint creation straightaway when people onboard their repos"
+- Stefan, ts `1781156639.110239` / `1781156641.892609` / `1781156647.859019`: "but it means rewriting their history" / "in their main branch" / "to add the trailers"
+- Nina, ts `1781157057.036139`: "After chatting with Alisha and Peyton, I realized that search and explain are used a lot more than I initially thought. That and it helps with users not seeing an empty overview page when they enable entire.."
+- Paulo Gomes, ts `1781156949.658109`: "we could do that, but then we have the exponential problem of checkpoints vs refs..." and ts `1781157064.254429` on git `refs/replace/&lt;oid&gt;` redirection.
+
+## The import command announcement (Result 3)
+
+**Nina**, #entire-cli `C0A095SNK32`, 2026-06-25 16:11:55 PDT, message_ts `1782429115.924769`, thread_ts `1782429115.924769`:
+Permalink: https://entireio.slack.com/archives/C0A095SNK32/p1782429115924769?thread_ts=1782429115.924769&amp;cid=C0A095SNK32
+&gt; ":review: Another change I've been working on post summit: a new hidden CLI command to allow for importing existing Claude code sessions (other agents to follow) from prior to when Entire was enabled: [trail 668]... There was a user request for this as well that I found here: https://github.com/entireio/cli/issues/1336 ... Enabling entire for the first time does not offer the user to import their sessions yet. It's a hidden command for now so we can validate it internally first. I tested it on a test repo and I was able to import untracked Claude sessions and run checkpoint explain on them. Rerunning the import command doesn't cause duplicates."
+Sven replies in-thread that cross-agent `entire session resume` requires existing entire checkpoints (ts `1782430782.144869`: "Yeah you have to have entire checkpoints already").
+
+## The #ships public announcement (Result 2)
+
+**Nina**, #ships `C0APUHMSG6P`, 2026-07-07 13:37:50 PDT, message_ts `1783456670.537329`, thread_ts `1783456670.537329`:
+Permalink: https://entireio.slack.com/archives/C0APUHMSG6P/p1783456670537329?thread_ts=1783456670.537329&amp;cid=C0APUHMSG6P
+&gt; "As of CLI version 0.8.1, entire enable on a new project now prompts users to import their previous/existing agent sessions..."
+&gt; (reply ts `1783458415.587249`) "`import` generates read-only checkpoints on a user's machine so they or their agents can run commands on checkpoints generated by their sessions from before entire was enabled: `checkpoint explain`, `investigate` etc. There are new changes coming soon that will allow folks to push up the checkpoints to the UI as well and be able to search against them etc."
+&gt; (reply ts `1783458627.581739`) "A new update to this conversation though: we're discussing in #entire-cli now what the imported checkpoint experience should be. Depending on how that goes, we might hold off on `entire enable` calling import for the launch tomorrow."
+&gt; Links back to the #entire-cli thread: https://entireio.slack.com/archives/C0A095SNK32/p1783439576563929
+
+## Import scope expansion (Result 20 — marvin bot digest)
+
+**marvin [BOT]**, #entire-cli, 2026-06-29 15:01:05 PDT, message_ts `1782770465.268739`:
+&gt; ":inbox_tray: *Import &amp; explain* — Nina • #1540 expands the session importer to cursor, pi, factory, codex, copilot, and gemini. • #1560 enriches `entire explain` JSON output."
+(PRs: https://github.com/entireio/cli/pull/1540 , https://github.com/entireio/cli/pull/1560)
+
+## Desktop/plugin/IDE capture — Codex-within-Claude transcript capture (attach vs capture debate)
+
+A long April thread about **capturing sessions from the plugin surface** (Codex run inside Claude Code via plugin fires its own hooks → separate Entire session, metadata written but no transcript). Directly relevant to "capturing Claude/Codex sessions from desktop/IDE/plugin surfaces."
+
+Thread in **#entire-cli `C0A095SNK32`, thread_ts `1776171109.426409`** (Results 1, 4) and a parallel **DM `D0AJ84WJKM1`, thread_ts `1776190354.335599`** (Results 6, 13, 19):
+
+- **Sven Pfleiderer** (sven@entire.io), 2026-04-14 10:58:48 PDT, msg_ts `1776189528.564589` (Result 1): hypothesis that "When Codex runs inside Claude Code (via the plugin), it fires its own lifecycle hooks... These create a separate Entire session with its own session ID, independent of the Claude Code parent session" — metadata captured, transcript missing.
+- Sven, ts `1776189878.274129`: "What this boils down to for me is two things we should try to address: • Running codex from within claude currently doesn't seem to properly persist the codex logs • Running an agent for research/review purposes (without updating actual files)... results in a similar situation where we capture some metadata but not the full transcripts. I can work on addressing them"
+- **Sven**, #entire-cli 2026-04-15 16:09:31 PDT, msg_ts `1776294571.871759` (Result 4): "here's a PR with a fix: https://github.com/entireio/cli/pull/958 ... codex isn't creating any transcript files for the sessions created by running it via the claude plugin. I opted to not persist any sessions in such cases..."
+- The DM thread (Result 6, D0AJ84WJKM1) is a long Nina↔Sven debate on **options A/B/C**: (A) attach/capture research-only + metadata-only sessions [technically correct], (B) don't attach metadata-only stubs [privacy-preserving], (C) best-effort. Key: Sven ts `1776191536.391979` "Whatever we do needs to fixed on both sides, eventually. Even if we wanted to fix it on the UI level, we can't without the CLI capturing the data." Nina proposed (ts `1776192670.478509`) "if we do a condensation and don't find a transcript for a checkpoint, can we call `attach` and attach it using that metadata session id?" Confirmed (ts `1776193015.802489`) metadata.json IS written for read-only sessions.
+
+## Web-side session display bug (Result 11)
+
+**Pavel Prichodko** (pavel@entire.io), #entire-web `C0A0K3BFDL3`, 2026-04-10 06:29:11 PDT, msg_ts `1775827751.680419`, thread_ts `1775744349.967619`:
+&gt; "it looks like the fix worked and is now showing Codex session correctly cc @Paulo Gomes — however there seem to be another issue when labels in the list do not match sessions in the detail"
+
+## Peripheral / low relevance
+
+- **Result 9** (Pavel, #entire `C095MMM9YHG`, 2026-03-18, ts `1773856482.107229`): product-strategy long-read on the "self-learning flywheel" and remote runs. Sven notes (ts `1773880371.105879`): "Right now, we don't even support cross-agent `entire resume`." Tangential.
+- **Result 12** (Victor, #progress, 2026-01-11): mentions researching how to extend Claude/Gemini/OpenCode/Codex/Amp via plugins/extensions to install hooks. Tangential.
+- **Result 16** (Sven↔Nina DM, 2026-04-06): metadata.json structure showing empty transcript for a session — general debugging, not import.
+- **Result 17** (marvin bot digest, 2026-05-21): mentions Codex fix PR #1244 with data-loss risk. Peripheral.
+- **Result 18** (Stefan, 2026-03-25): Codex agent implementation PR #772. Peripheral.
+- **Result 14** (Stefan, #ai-tips, 2026-07-09): unrelated (cousin's Claude Pro usage).
+- **Results 5, 13, 19** are empty-bot messages or already-quoted context stubs.
+
+## Bottom line on the investigation question
+Yes — this is active, recent work. **Peyton Montei** built the `enable`-integrated onboarding/import ladder (trail 742) and **Stefan Haubold (soph/)** tested it and surfaced the exact gap in issue #1697: imported sessions are "Imported" locally as read-only checkpoints but **do not appear in the web UI / are not linked to a checkpoint** ("entire.io will also not show them without a linked checkpoint"). **Nina** owns the underlying importer (PRs #1540 expanding to all agents, trail 668 the original hidden command, tied to user request issue #1336). Both Peyton and Stefan explicitly flagged that "shows up in the web UI" is currently false and needs fixing, and Nina noted (in #ships) that pushing imported checkpoints up to the UI for search is "coming soon." The primary threads to pull in full:
+- **`C0A095SNK32` / thread_ts `1783439576.563929`** (the #1697 core discussion, Jul 7-8)
+- **`C0A095SNK32` / thread_ts `1782429115.924769`** (import command announcement)
+- **`C0B951VDPRT`** group DM around ts `1781156541.131989` (origin/design, Jun 10)
+- **`C0A095SNK32` / thread_ts `1776171109.426409`** + **`D0AJ84WJKM1` / thread_ts `1776190354.335599`** (plugin/Codex capture + attach-vs-import A/B/C debate, Apr 14)
+
+No message in these results references issue #1697 by number, but the Jul 7-8 thread is unmistakably its subject matter.</result>
+<usage><subagent_tokens>95069</subagent_tokens><tool_uses>5</tool_uses><duration_ms>112441</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a1d005d64da3a5f0a</task-id>
+<tool-use-id>toolu_01QiEzyNzez97xi894wBbba7</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/91fa7c44-6634-48ab-ae5f-d394502f50d5/tasks/a1d005d64da3a5f0a.output</output-file>
+<status>completed</status>
+<summary>Agent "Targeted Slack searches on topic" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Summary
+
+Yes — this work is actively in progress at Entire. It's the direct continuation of the `entire import` feature, and the exact gap called out in cli#1697 (imported sessions not showing as sessions in the UI / `session list`) was being debated internally on 2026-07-07, right before the launch. No one is yet working on the separate idea of capturing Claude Code / Codex sessions from **desktop / IDE / plugin** surfaces — that specific angle did not surface in Slack.
+
+### The core thread (most relevant to #1697)
+"feat(onboarding): guided setup ladder" — #entire-cli, started by **Peyton Montei**, 2026-07-07, 43 replies.
+Permalink: https://entireio.slack.com/archives/C0A095SNK32/p1783439576563929?thread_ts=1783439576.563929&amp;cid=C0A095SNK32
+
+Who said what / status:
+- **Stefan Haubold** (stefan@entire.io) testing `entire enable` + import: *"but what I still try to parse is: what do I do now with the imported sessions, since entire.io will also not show them without a linked checkpoint 🤔"* (2026-07-07 09:29 PDT). https://entireio.slack.com/archives/C0A095SNK32/p1783441799070769
+- **Peyton Montei**: *"For imported sessions, I guess the benefit is really the read only, so can search/explain in CLI and use in agent sessions, but I do think it would be helpful to see them in the UI too"* — then confirmed the enable copy ("Imports existing agent history so your work shows up in the web UI") was a *"wrong assumption on my end, fixing"*. https://entireio.slack.com/archives/C0A095SNK32/p1783442039899879
+- **Stefan**: *"search is also not indexing them… 😞"* and warned *"the risk I see is that people download us tomorrow do this and expect something much different."*
+- **Nina** (nina@entire.io): *"When the user pushes up, I think the checkpoints would appear in the overview page as statistics, just not be tied to any commits…"*; offered to revert the enable→import call-out or fix wording (import stays as a hidden command regardless). Her PR is https://github.com/entireio/cli/pull/1595.
+- **The plan / current status** — Stefan: *"I talked with Peyton already about this: with the ref backend we could change import so it creates the checkpoints under the commit shas … so then we could actually link them from main (which should not be rewritten, so shas should be stable)."* Decision deferred: *"let me play around with it tomorrow."* Next morning Stefan confirmed the import step is still in enable (only tweak: agent picker still shown, preselected). So as of the thread end: **in-progress, unresolved** — imported sessions render in CLI (`explain`, and read-only checkpoints) but do **not** appear in the web UI, are **not** indexed by search, and the fix under consideration is to have import attach checkpoints to commit SHAs via the ref backend.
+
+### Feature origin &amp; the underlying request
+- **cli#1697** itself is **not referenced by number anywhere in Slack** (the "1697" hits are all unrelated entiredb PR #1697 and entire.io PR #1697). The functional discussion happens under the import work instead.
+- The upstream user request is **cli#1336** (an insider wanting to bring past agent sessions into Entire).
+- **Riz̀el Scarlett** scoped the command shape in #entire-cli (2026-06-03), https://entireio.slack.com/archives/C0A095SNK32/p1780511639211019 : *"entire import [agent-name] [--all] [-session-id] should be a new command altogether to get historical transcripts in for each agent. These historical transcripts would just be read-only and won't have the rewind and other capabilities that checkpoints allow but will still allow for context to show up in functionalities like search, dispatch, explain, list."* In that same thread **Sven Pfleiderer** and **Daniel Adams** questioned how useful an import without commits is "since we're structuring a lot of things around commits nowadays. Like, in the UI" — foreshadowing exactly the #1697 gap.
+- **Nina** announced the hidden `entire import` command for review on 2026-06-25 (#entire-cli, https://entireio.slack.com/archives/C0A095SNK32/p1782429115924769 ), noting "other agents to follow," and in #ships: *"There are new changes coming soon that will allow folks to push up the checkpoints to the UI as well and be able to search against them etc."* (https://entireio.slack.com/archives/C0A095SNK32/p... — #ships, 2026-07-07).
+
+### Related Codex-plugin session capture (adjacent, not the same as #1697)
+**Sven Pfleiderer** handled Codex-as-subagent-via-Claude-plugin sessions in #entire-cli (2026-07): Codex running inside Claude Code via the plugin fires its own hooks and creates a separate Entire session, but *"codex isn't creating any transcript files for the sessions created by running it via the claude plugin. I opted to not persist any sessions in such cases."* → PR https://github.com/entireio/cli/pull/958. This is about plugin subagent sessions, not desktop/IDE capture.
+
+### What I did NOT find
+- No Slack discussion of capturing Claude Code / Codex sessions specifically from **Claude Desktop, an IDE, or a plugin surface** as a source for `session list` (only the Codex-subagent-in-plugin transcript issue above, and general Claude Desktop mentions in #competition / #ai-tips unrelated to Entire capture).
+- No message referencing cli#1697 by number, and no Linear ticket for it surfaced in Slack.
+- No indication anyone has *completed* making imported sessions appear in `entire session list` / the web UI — as of 2026-07-07 it was an open, actively-debated gap with a proposed (not yet built) ref-backend/commit-SHA approach owned informally by **Stefan + Peyton**, with **Nina** owning the import command and PR #1595.
+
+Key people confirmed involved: **Peyton Montei** (onboarding ladder, wants UI visibility), **Stefan Haubold** (`soph/`, proposing the ref-backend commit-SHA linking fix), **Nina** (import command, PR #1595), with **Riz̀el Scarlett** (original design) and **Sven Pfleiderer** / **Daniel Adams** (skeptical of commit-less imports) contributing.</result>
+<usage><subagent_tokens>105103</subagent_tokens><tool_uses>13</tool_uses><duration_ms>116070</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a1d005d64da3a5f0a</task-id>
+<tool-use-id>toolu_01QiEzyNzez97xi894wBbba7</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/91fa7c44-6634-48ab-ae5f-d394502f50d5/tasks/a1d005d64da3a5f0a.output</output-file>
+<status>completed</status>
+<summary>Agent "Targeted Slack searches on topic" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Summary
+
+Yes — this work is actively in progress at Entire. It's the direct continuation of the `entire import` feature, and the exact gap called out in cli#1697 (imported sessions not showing as sessions in the UI / `session list`) was being debated internally on 2026-07-07, right before the launch. No one is yet working on the separate idea of capturing Claude Code / Codex sessions from **desktop / IDE / plugin** surfaces — that specific angle did not surface in Slack.
+
+### The core thread (most relevant to #1697)
+"feat(onboarding): guided setup ladder" — #entire-cli, started by **Peyton Montei**, 2026-07-07, 43 replies.
+Permalink: https://entireio.slack.com/archives/C0A095SNK32/p1783439576563929?thread_ts=1783439576.563929&amp;cid=C0A095SNK32
+
+Who said what / status:
+- **Stefan Haubold** (stefan@entire.io) testing `entire enable` + import: *"but what I still try to parse is: what do I do now with the imported sessions, since entire.io will also not show them without a linked checkpoint 🤔"* (2026-07-07 09:29 PDT). https://entireio.slack.com/archives/C0A095SNK32/p1783441799070769
+- **Peyton Montei**: *"For imported sessions, I guess the benefit is really the read only, so can search/explain in CLI and use in agent sessions, but I do think it would be helpful to see them in the UI too"* — then confirmed the enable copy ("Imports existing agent history so your work shows up in the web UI") was a *"wrong assumption on my end, fixing"*. https://entireio.slack.com/archives/C0A095SNK32/p1783442039899879
+- **Stefan**: *"search is also not indexing them… 😞"* and warned *"the risk I see is that people download us tomorrow do this and expect something much different."*
+- **Nina** (nina@entire.io): *"When the user pushes up, I think the checkpoints would appear in the overview page as statistics, just not be tied to any commits…"*; offered to revert the enable→import call-out or fix wording (import stays as a hidden command regardless). Her PR is https://github.com/entireio/cli/pull/1595.
+- **The plan / current status** — Stefan: *"I talked with Peyton already about this: with the ref backend we could change import so it creates the checkpoints under the commit shas … so then we could actually link them from main (which should not be rewritten, so shas should be stable)."* Decision deferred: *"let me play around with it tomorrow."* Next morning Stefan confirmed the import step is still in enable (only tweak: agent picker still shown, preselected). So as of the thread end: **in-progress, unresolved** — imported sessions render in CLI (`explain`, and read-only checkpoints) but do **not** appear in the web UI, are **not** indexed by search, and the fix under consideration is to have import attach checkpoints to commit SHAs via the ref backend.
+
+### Feature origin &amp; the underlying request
+- **cli#1697** itself is **not referenced by number anywhere in Slack** (the "1697" hits are all unrelated entiredb PR #1697 and entire.io PR #1697). The functional discussion happens under the import work instead.
+- The upstream user request is **cli#1336** (an insider wanting to bring past agent sessions into Entire).
+- **Riz̀el Scarlett** scoped the command shape in #entire-cli (2026-06-03), https://entireio.slack.com/archives/C0A095SNK32/p1780511639211019 : *"entire import [agent-name] [--all] [-session-id] should be a new command altogether to get historical transcripts in for each agent. These historical transcripts would just be read-only and won't have the rewind and other capabilities that checkpoints allow but will still allow for context to show up in functionalities like search, dispatch, explain, list."* In that same thread **Sven Pfleiderer** and **Daniel Adams** questioned how useful an import without commits is "since we're structuring a lot of things around commits nowadays. Like, in the UI" — foreshadowing exactly the #1697 gap.
+- **Nina** announced the hidden `entire import` command for review on 2026-06-25 (#entire-cli, https://entireio.slack.com/archives/C0A095SNK32/p1782429115924769 ), noting "other agents to follow," and in #ships: *"There are new changes coming soon that will allow folks to push up the checkpoints to the UI as well and be able to search against them etc."* (https://entireio.slack.com/archives/C0A095SNK32/p... — #ships, 2026-07-07).
+
+### Related Codex-plugin session capture (adjacent, not the same as #1697)
+**Sven Pfleiderer** handled Codex-as-subagent-via-Claude-plugin sessions in #entire-cli (2026-07): Codex running inside Claude Code via the plugin fires its own hooks and creates a separate Entire session, but *"codex isn't creating any transcript files for the sessions created by running it via the claude plugin. I opted to not persist any sessions in such cases."* → PR https://github.com/entireio/cli/pull/958. This is about plugin subagent sessions, not desktop/IDE capture.
+
+### What I did NOT find
+- No Slack discussion of capturing Claude Code / Codex sessions specifically from **Claude Desktop, an IDE, or a plugin surface** as a source for `session list` (only the Codex-subagent-in-plugin transcript issue above, and general Claude Desktop mentions in #competition / #ai-tips unrelated to Entire capture).
+- No message referencing cli#1697 by number, and no Linear ticket for it surfaced in Slack.
+- No indication anyone has *completed* making imported sessions appear in `entire session list` / the web UI — as of 2026-07-07 it was an open, actively-debated gap with a proposed (not yet built) ref-backend/commit-SHA approach owned informally by **Stefan + Peyton**, with **Nina** owning the import command and PR #1595.
+
+Key people confirmed involved: **Peyton Montei** (onboarding ladder, wants UI visibility), **Stefan Haubold** (`soph/`, proposing the ref-backend commit-SHA linking fix), **Nina** (import command, PR #1595), with **Riz̀el Scarlett** (original design) and **Sven Pfleiderer** / **Daniel Adams** (skeptical of commit-less imports) contributing.</result>
+<usage><subagent_tokens>105103</subagent_tokens><tool_uses>13</tool_uses><duration_ms>116070</duration_ms></usage>
+</task-notification>
+
+---
+
+> So the connection to Stefan's git-refs backend work is real: that backend is the enabling infrastructure for the intended fix (link imports to stable commit SHAs), but no branch yet turns imports into listed/linked sessions.
+
+So no one is working on this? What is needed?
+
+---
+
+> So the connection to Stefan's git-refs backend work is real: that backend is the enabling infrastructure for the intended fix (link imports to stable commit SHAs), but no branch yet turns imports into listed/linked sessions.
+
+So no one is working on this? What is needed?
+
+---
+
+If we go with Track A, I want to make sure we're not boxed in and we can still go with the Full Path B in Track B
+
+---
+
+If we go with Track A, I want to make sure we're not boxed in and we can still go with the Full Path B in Track B
+
+---
+
+Let's go with path A but ensure B is not blocked
+
+---
+
+Let's go with path A but ensure B is not blocked
+
+---
+
+<task-notification>
+<task-id>af2036887d02e9373</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/91fa7c44-6634-48ab-ae5f-d394502f50d5/tasks/af2036887d02e9373.output</output-file>
+<status>completed</status>
+<summary>Agent "Map importer structures + insert point" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have all the facts. Here is the complete report.
+
+---
+
+## 1. `agentimport.Run` flow and the per-session/per-turn loop structure
+
+File: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/agentimport/agentimport.go`
+
+The full `Run` function (lines 111-171). The critical structure is the **outer loop over sessions** (`for _, sf := range files`, line 129) containing the **inner loop over turns** (`for _, turn := range turns`, line 145). The point where "all turns for one session are done" is at the **end of the outer loop body, after line 168** (the inner loop closes at 168; the session iteration closes at 169). That is where a per-session `session.State` write would be inserted.
+
+```go
+func Run(ctx context.Context, repo *git.Repository, imp Importer, opts Options) (Result, error) {
+	var res Result
+	files, err := imp.Discover(opts.RepoRoot, opts.OverridePath, opts.Now, opts.SessionFilter)
+	if err != nil {
+		return res, fmt.Errorf("discover %s sessions: %w", imp.Name(), err)
+	}
+
+	stores, err := cp.Open(ctx, repo, cp.OpenOptions{})
+	if err != nil {
+		return res, fmt.Errorf("open checkpoint store: %w", err)
+	}
+	existing := make(map[string]bool)
+	if infos, listErr := stores.Persistent.List(ctx); listErr == nil {
+		for _, in := range infos {
+			existing[in.CheckpointID.String()] = true
+		}
+	}
+
+	for _, sf := range files {
+		res.SessionsScanned++
+		full, readErr := os.ReadFile(sf.Path)
+		if readErr != nil {
+			return res, fmt.Errorf("read %s: %w", sf.Path, readErr)
+		}
+		turns, splitErr := imp.SplitTurns(sf, full)
+		if splitErr != nil {
+			return res, fmt.Errorf("split %s session %s: %w", imp.Name(), sf.SessionID, splitErr)
+		}
+		// Redact the session transcript once and reuse it for every turn's
+		// checkpoint (each turn stores the full session transcript with its own
+		// CheckpointTranscriptStart). Redacting per turn would be O(turns).
+		// Computed lazily so a fully-skipped or dry-run file pays nothing.
+		var red redact.RedactedBytes
+		redacted := false
+		for _, turn := range turns {
+			cid := DeriveCheckpointID(sf.SessionID, turn.UUID)
+			if existing[cid.String()] {
+				res.TurnsSkipped++
+				continue
+			}
+			if opts.DryRun {
+				res.TurnsImported++ // counts what would import
+				continue
+			}
+			if !redacted {
+				r, rerr := redact.JSONLBytes(full)
+				if rerr != nil {
+					return res, fmt.Errorf("redact %s transcript: %w", sf.SessionID, rerr)
+				}
+				red = r
+				redacted = true
+			}
+			if err := writeTurn(ctx, stores, imp, cid, sf, red, turn); err != nil {
+				return res, err
+			}
+			existing[cid.String()] = true
+			res.TurnsImported++
+		}
+	}
+	return res, nil
+}
+```
+
+Note: `writeTurn` (lines 173-191) writes the read-only checkpoint via `stores.Persistent.Write(ctx, cp.Session(cp.WriteOptions{...}))`. There is no session-state write anywhere in this file today.
+
+Important gap for planning: within the session loop there is **no accumulator** of per-session data (e.g. earliest/latest turn time, total tokens). Each turn's data is consumed immediately in the inner loop. A per-session state write would need to aggregate across `turns` (e.g. min/max `turn.CreatedAt`, sum tokens) inside or after the inner loop.
+
+## 2. `SessionFile` and `Turn` structs — all time-related fields
+
+File: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/agentimport/agentimport.go`
+
+`SessionFile` (lines 32-36) — **has SessionID; has NO timestamp fields at all**:
+```go
+// SessionFile is one discovered agent transcript for a repo.
+type SessionFile struct {
+	Path      string // absolute path to the transcript file
+	SessionID string // agent session id (used in checkpoint metadata)
+}
+```
+
+`Turn` (lines 38-47) — the **only** time field is `CreatedAt time.Time`:
+```go
+// Turn is one user-prompt turn extracted from a session transcript. Line
+// offsets are in raw-line space (newline-counted), matching transcript slicing
+// and the agent token-usage helpers.
+type Turn struct {
+	LineStart, LineEnd int
+	UUID               string
+	Prompt, Model      string
+	CreatedAt          time.Time
+	Tokens             *types.TokenUsage
+}
+```
+
+Time-related fields available at import time:
+- Session-level start/end times: **none** (`SessionFile` carries only `Path` + `SessionID`).
+- Turn-level: `Turn.CreatedAt` only. To derive a session `StartedAt`/`EndedAt` for `session.State`, you must aggregate min/max of `turn.CreatedAt` across the session's turns yourself. (File modtime is available via `os.Stat(sf.Path)` but not currently captured.)
+
+Session ID field: `SessionFile.SessionID` (the value threaded into checkpoints as `WriteOptions.SessionID`, line 175).
+
+## 3. Commit SHA / commit id in transcripts — NOT available in any importer
+
+Searched all `agentimport/*.go` (non-test) for `commit|sha|hash|trailer|gitInfo|revision`. **No importer extracts or has access to any git commit SHA / commit id.** The only matches were unrelated (`json.Unmarshal`, the `sha256` used for deterministic checkpoint IDs in `agentimport.go:13,104`, and doc comments).
+
+Per-agent parsing structs and what they capture:
+- **claude.go**: parses `uuid`, `message`, `timestamp` (lines 48-52), plus `parentUuid`/`message.model` (`claudeExtraFields`, lines 68-74). No commit/SHA.
+- **codex.go**: `codexSessionMeta` captures only `id` and `cwd` (lines 32-35); per-line parsing captures `type`, `payload`, `role`, `content[].text`, `timestamp` (lines 131-176). No commit/SHA.
+- Other importers (copilot, cursor, factory, gemini, pi): same — no commit/SHA/trailer fields parsed.
+
+Conclusion for Path B linking: a commit SHA **cannot be captured today** from the parsed transcript data. Codex does record `cwd` (repo path) in `session_meta`, but no commit id. Any commit-SHA capture would require new parsing (the raw transcripts may or may not contain it depending on agent — not currently read).
+
+## 4. The `Importer` interface + Claude/Codex implementations
+
+`Importer` interface (`agentimport.go` lines 49-63):
+```go
+type Importer interface {
+	// Name is the registry key and the provenance source (e.g. "claude-code").
+	Name() string
+	// AgentType is the display name stored in checkpoint metadata (e.g. "Claude Code").
+	AgentType() types.AgentType
+	// Discover returns the agent's transcript files for the repo within the
+	// lookback window. overridePath replaces the default transcript dir;
+	// sessionFilter, when non-empty, keeps only matching session IDs.
+	Discover(repoRoot, overridePath string, now time.Time, sessionFilter []string) ([]SessionFile, error)
+	// SplitTurns splits one session's raw transcript bytes into per-turn units.
+	SplitTurns(sf SessionFile, full []byte) ([]Turn, error)
+}
+```
+(Note: there is no `GetSessionDir`/`ParseSessions` on this interface. `GetSessionDir` lives on the underlying agent implementations, e.g. `(&amp;claudecode.ClaudeCodeAgent{}).GetSessionDir` used in `claudeImporter.Discover`, claude.go:28, and `(&amp;codex.CodexAgent{}).GetSessionDir` in codex.go:40. Data production is `Discover` → `[]SessionFile` and `SplitTurns` → `[]Turn`.)
+
+**claude.go** `SplitTurns` (lines 39-65) — produces `Turn` from each user-prompt line, data on hand: `UUID` (line uuid), `Prompt`, `Model` (`modelInRange`), `CreatedAt` (`parseTimestamp(rec.Timestamp)`), `Tokens`:
+```go
+func (claudeImporter) SplitTurns(sf SessionFile, full []byte) ([]Turn, error) {
+	subagentsDir := filepath.Join(filepath.Dir(sf.Path), sf.SessionID, "subagents")
+	ag := &amp;claudecode.ClaudeCodeAgent{}
+	return splitLineTurns(splitRawLines(full), isUserPromptLine,
+		func(rawLines [][]byte, start, end int, truncated []byte) (*Turn, error) {
+			tokens, err := ag.CalculateTotalTokenUsage(truncated, start, subagentsDir)
+			if err != nil {
+				return nil, fmt.Errorf("token usage: %w", err)
+			}
+			var rec struct {
+				UUID      string          `json:"uuid"`
+				Message   json.RawMessage `json:"message"`
+				Timestamp string          `json:"timestamp"`
+			}
+			if err := json.Unmarshal(rawLines[start], &amp;rec); err != nil {
+				//nolint:nilerr // skip defensively; the line already parsed in isUserPromptLine
+				return nil, nil
+			}
+			return &amp;Turn{
+				UUID:      rec.UUID,
+				Prompt:    transcript.ExtractUserContent(rec.Message),
+				Model:     modelInRange(rawLines, start, end),
+				CreatedAt: parseTimestamp(rec.Timestamp),
+				Tokens:    tokens,
+			}, nil
+		})
+}
+```
+
+**codex.go** `SplitTurns` (lines 109-126) — note the SessionFile arg is ignored (`_`), turn `UUID` is the start-line index (`strconv.Itoa(start)`), `Model` is **not set** (empty), `CreatedAt` from `codexLineTime`:
+```go
+func (codexImporter) SplitTurns(_ SessionFile, full []byte) ([]Turn, error) {
+	ag := &amp;codex.CodexAgent{}
+	return splitLineTurns(splitRawLines(full),
+		func(raw []byte) bool { _, ok := codexPromptText(raw); return ok },
+		func(rawLines [][]byte, start, _ int, truncated []byte) (*Turn, error) {
+			tokens, err := ag.CalculateTokenUsage(truncated, start)
+			if err != nil {
+				return nil, fmt.Errorf("token usage: %w", err)
+			}
+			prompt, _ := codexPromptText(rawLines[start])
+			return &amp;Turn{
+				UUID:      strconv.Itoa(start),
+				Prompt:    prompt,
+				CreatedAt: codexLineTime(rawLines[start]),
+				Tokens:    tokens,
+			}, nil
+		})
+}
+```
+Codex `Discover` also reads `session_meta` (`codexReadSessionMeta`, lines 84-103) giving `id` + `cwd`; `SessionFile.SessionID = meta.ID` (line 64, falling back to filename stem).
+
+## 5. `AgentType` representation per importer
+
+`types.AgentType` is `type AgentType string` (`/Users/ninawork/entire/devenv/cli/cmd/entire/cli/agent/types/agent.go:7`).
+
+Each importer returns a constant from `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/agent/registry.go` (lines 168-178):
+```go
+const (
+	AgentTypeClaudeCode     types.AgentType = "Claude Code"
+	AgentTypeCodex          types.AgentType = "Codex"
+	AgentTypeCopilotCLI     types.AgentType = "Copilot CLI"
+	AgentTypeCursor         types.AgentType = "Cursor"
+	AgentTypeFactoryAIDroid types.AgentType = "Factory AI Droid"
+	AgentTypeGemini         types.AgentType = "Gemini CLI"
+	AgentTypeOpenCode       types.AgentType = "OpenCode"
+	AgentTypePi             types.AgentType = "Pi"
+	AgentTypeUnknown        types.AgentType = "Unknown"
+)
+```
+Accessor: `imp.AgentType()`. Claude: `func (claudeImporter) AgentType() types.AgentType { return agent.AgentTypeClaudeCode }` (claude.go:21). Codex: `func (codexImporter) AgentType() types.AgentType { return agent.AgentTypeCodex }` (codex.go:29). This is exactly what you'd assign to `State.AgentType` (which is also typed `types.AgentType` — see item 6/State).
+
+## 6. Idempotency: `existing` map + deterministic checkpoint ID dedup
+
+Deterministic ID derivation (`agentimport.go` lines 100-106):
+```go
+// DeriveCheckpointID produces a stable 12-hex checkpoint ID for an imported
+// turn. Re-importing the same (sessionID, turnUUID) yields the same ID, which
+// is how import stays idempotent.
+func DeriveCheckpointID(sessionID, turnUUID string) id.CheckpointID {
+	sum := sha256.Sum256([]byte(sessionID + "/" + turnUUID))
+	return id.MustCheckpointID(hex.EncodeToString(sum[:6])) // 6 bytes = 12 lowercase hex chars
+}
+```
+
+The `existing` set is built from the persistent checkpoint store list, then consulted per turn (lines 122-127 and 146-149, updated at 166):
+```go
+existing := make(map[string]bool)
+if infos, listErr := stores.Persistent.List(ctx); listErr == nil {
+	for _, in := range infos {
+		existing[in.CheckpointID.String()] = true
+	}
+}
+```
+```go
+cid := DeriveCheckpointID(sf.SessionID, turn.UUID)
+if existing[cid.String()] {
+	res.TurnsSkipped++
+	continue
+}
+...
+existing[cid.String()] = true
+```
+
+For an idempotent per-session state write, the natural analog is keying on `sf.SessionID` and checking whether a state file already exists. The session-state store already supports this:
+
+File: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/session/state.go`
+- `func NewStateStore(ctx context.Context) (*StateStore, error)` (line 500) — stores files in `&lt;gitCommonDir&gt;/entire-sessions/&lt;session-id&gt;.json` (`SessionStateDirName = "entire-sessions"`, line 27; path built at 506).
+- `func (s *StateStore) Load(ctx, sessionID string) (*State, error)` (line 519) — returns `(nil, nil)` when the file doesn't exist (lines 526-527, 536-537), so an "exists?" idempotency check is a `Load` returning non-nil.
+- `func (s *StateStore) Save(ctx, state *State) error` (line 562) — validates `state.SessionID` (line 566), `MkdirAll` (570), atomic write via `os.Root` rename.
+- `func (s *StateStore) List(ctx) ([]*State, error)` (line 678).
+
+Higher-level wrappers in `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/session_state.go`: `SaveSessionState` (line 103), `LoadSessionState` (line 89), `ListSessionStates` (line 117) — these delegate to `session.NewStateStore`. `entire session list` reads via this same store (`store.List`).
+
+## Relevant `session.State` fields for an imported session
+
+File: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/session/state.go` (struct at line 91). Fields you'll want to populate for an import-originated state:
+- `SessionID string` (line 93) ← `sf.SessionID`
+- `Kind Kind` (line 147) ← there is a `KindImported Kind = "imported"` (line 66) — same discriminator already used for the checkpoints.
+- `AgentType types.AgentType` (line 263) ← `imp.AgentType()`
+- `ModelName string` (line 267) ← e.g. Claude's `turn.Model` (Codex leaves model empty)
+- `StartedAt time.Time` (line 135) / `EndedAt *time.Time` (line 139) ← derive from min/max `turn.CreatedAt`
+- `StepCount int` json `"checkpoint_count"` (line 196) ← number of turns imported
+- `TokenUsage *agent.TokenUsage` (line 270) ← aggregate of `turn.Tokens`
+- `LastPrompt string` json `"first_prompt"` (line 315), `LastInteractionTime *time.Time` (line 192), `AttachedManually bool` (line 251), `CLIVersion` (line 96)
+
+Caveat for planning: `StateStore.Save`/`Load` call `validation.ValidateSessionID(state.SessionID)` (state.go:566, 521). Imported session IDs (Claude file-stem UUIDs, Codex `meta.ID`) must pass `ValidateSessionID`, and `Load` auto-deletes state whose `IsStale()` is true (lines 549-556) — imported sessions with old `EndedAt` timestamps could be considered stale and silently dropped from `session list`; verify `IsStale()`/`StaleSessionThreshold` semantics against imported (historical) timestamps before relying on them appearing in the list.</result>
+<usage><subagent_tokens>50118</subagent_tokens><tool_uses>16</tool_uses><duration_ms>143608</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>af2036887d02e9373</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/91fa7c44-6634-48ab-ae5f-d394502f50d5/tasks/af2036887d02e9373.output</output-file>
+<status>completed</status>
+<summary>Agent "Map importer structures + insert point" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have all the facts. Here is the complete report.
+
+---
+
+## 1. `agentimport.Run` flow and the per-session/per-turn loop structure
+
+File: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/agentimport/agentimport.go`
+
+The full `Run` function (lines 111-171). The critical structure is the **outer loop over sessions** (`for _, sf := range files`, line 129) containing the **inner loop over turns** (`for _, turn := range turns`, line 145). The point where "all turns for one session are done" is at the **end of the outer loop body, after line 168** (the inner loop closes at 168; the session iteration closes at 169). That is where a per-session `session.State` write would be inserted.
+
+```go
+func Run(ctx context.Context, repo *git.Repository, imp Importer, opts Options) (Result, error) {
+	var res Result
+	files, err := imp.Discover(opts.RepoRoot, opts.OverridePath, opts.Now, opts.SessionFilter)
+	if err != nil {
+		return res, fmt.Errorf("discover %s sessions: %w", imp.Name(), err)
+	}
+
+	stores, err := cp.Open(ctx, repo, cp.OpenOptions{})
+	if err != nil {
+		return res, fmt.Errorf("open checkpoint store: %w", err)
+	}
+	existing := make(map[string]bool)
+	if infos, listErr := stores.Persistent.List(ctx); listErr == nil {
+		for _, in := range infos {
+			existing[in.CheckpointID.String()] = true
+		}
+	}
+
+	for _, sf := range files {
+		res.SessionsScanned++
+		full, readErr := os.ReadFile(sf.Path)
+		if readErr != nil {
+			return res, fmt.Errorf("read %s: %w", sf.Path, readErr)
+		}
+		turns, splitErr := imp.SplitTurns(sf, full)
+		if splitErr != nil {
+			return res, fmt.Errorf("split %s session %s: %w", imp.Name(), sf.SessionID, splitErr)
+		}
+		// Redact the session transcript once and reuse it for every turn's
+		// checkpoint (each turn stores the full session transcript with its own
+		// CheckpointTranscriptStart). Redacting per turn would be O(turns).
+		// Computed lazily so a fully-skipped or dry-run file pays nothing.
+		var red redact.RedactedBytes
+		redacted := false
+		for _, turn := range turns {
+			cid := DeriveCheckpointID(sf.SessionID, turn.UUID)
+			if existing[cid.String()] {
+				res.TurnsSkipped++
+				continue
+			}
+			if opts.DryRun {
+				res.TurnsImported++ // counts what would import
+				continue
+			}
+			if !redacted {
+				r, rerr := redact.JSONLBytes(full)
+				if rerr != nil {
+					return res, fmt.Errorf("redact %s transcript: %w", sf.SessionID, rerr)
+				}
+				red = r
+				redacted = true
+			}
+			if err := writeTurn(ctx, stores, imp, cid, sf, red, turn); err != nil {
+				return res, err
+			}
+			existing[cid.String()] = true
+			res.TurnsImported++
+		}
+	}
+	return res, nil
+}
+```
+
+Note: `writeTurn` (lines 173-191) writes the read-only checkpoint via `stores.Persistent.Write(ctx, cp.Session(cp.WriteOptions{...}))`. There is no session-state write anywhere in this file today.
+
+Important gap for planning: within the session loop there is **no accumulator** of per-session data (e.g. earliest/latest turn time, total tokens). Each turn's data is consumed immediately in the inner loop. A per-session state write would need to aggregate across `turns` (e.g. min/max `turn.CreatedAt`, sum tokens) inside or after the inner loop.
+
+## 2. `SessionFile` and `Turn` structs — all time-related fields
+
+File: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/agentimport/agentimport.go`
+
+`SessionFile` (lines 32-36) — **has SessionID; has NO timestamp fields at all**:
+```go
+// SessionFile is one discovered agent transcript for a repo.
+type SessionFile struct {
+	Path      string // absolute path to the transcript file
+	SessionID string // agent session id (used in checkpoint metadata)
+}
+```
+
+`Turn` (lines 38-47) — the **only** time field is `CreatedAt time.Time`:
+```go
+// Turn is one user-prompt turn extracted from a session transcript. Line
+// offsets are in raw-line space (newline-counted), matching transcript slicing
+// and the agent token-usage helpers.
+type Turn struct {
+	LineStart, LineEnd int
+	UUID               string
+	Prompt, Model      string
+	CreatedAt          time.Time
+	Tokens             *types.TokenUsage
+}
+```
+
+Time-related fields available at import time:
+- Session-level start/end times: **none** (`SessionFile` carries only `Path` + `SessionID`).
+- Turn-level: `Turn.CreatedAt` only. To derive a session `StartedAt`/`EndedAt` for `session.State`, you must aggregate min/max of `turn.CreatedAt` across the session's turns yourself. (File modtime is available via `os.Stat(sf.Path)` but not currently captured.)
+
+Session ID field: `SessionFile.SessionID` (the value threaded into checkpoints as `WriteOptions.SessionID`, line 175).
+
+## 3. Commit SHA / commit id in transcripts — NOT available in any importer
+
+Searched all `agentimport/*.go` (non-test) for `commit|sha|hash|trailer|gitInfo|revision`. **No importer extracts or has access to any git commit SHA / commit id.** The only matches were unrelated (`json.Unmarshal`, the `sha256` used for deterministic checkpoint IDs in `agentimport.go:13,104`, and doc comments).
+
+Per-agent parsing structs and what they capture:
+- **claude.go**: parses `uuid`, `message`, `timestamp` (lines 48-52), plus `parentUuid`/`message.model` (`claudeExtraFields`, lines 68-74). No commit/SHA.
+- **codex.go**: `codexSessionMeta` captures only `id` and `cwd` (lines 32-35); per-line parsing captures `type`, `payload`, `role`, `content[].text`, `timestamp` (lines 131-176). No commit/SHA.
+- Other importers (copilot, cursor, factory, gemini, pi): same — no commit/SHA/trailer fields parsed.
+
+Conclusion for Path B linking: a commit SHA **cannot be captured today** from the parsed transcript data. Codex does record `cwd` (repo path) in `session_meta`, but no commit id. Any commit-SHA capture would require new parsing (the raw transcripts may or may not contain it depending on agent — not currently read).
+
+## 4. The `Importer` interface + Claude/Codex implementations
+
+`Importer` interface (`agentimport.go` lines 49-63):
+```go
+type Importer interface {
+	// Name is the registry key and the provenance source (e.g. "claude-code").
+	Name() string
+	// AgentType is the display name stored in checkpoint metadata (e.g. "Claude Code").
+	AgentType() types.AgentType
+	// Discover returns the agent's transcript files for the repo within the
+	// lookback window. overridePath replaces the default transcript dir;
+	// sessionFilter, when non-empty, keeps only matching session IDs.
+	Discover(repoRoot, overridePath string, now time.Time, sessionFilter []string) ([]SessionFile, error)
+	// SplitTurns splits one session's raw transcript bytes into per-turn units.
+	SplitTurns(sf SessionFile, full []byte) ([]Turn, error)
+}
+```
+(Note: there is no `GetSessionDir`/`ParseSessions` on this interface. `GetSessionDir` lives on the underlying agent implementations, e.g. `(&amp;claudecode.ClaudeCodeAgent{}).GetSessionDir` used in `claudeImporter.Discover`, claude.go:28, and `(&amp;codex.CodexAgent{}).GetSessionDir` in codex.go:40. Data production is `Discover` → `[]SessionFile` and `SplitTurns` → `[]Turn`.)
+
+**claude.go** `SplitTurns` (lines 39-65) — produces `Turn` from each user-prompt line, data on hand: `UUID` (line uuid), `Prompt`, `Model` (`modelInRange`), `CreatedAt` (`parseTimestamp(rec.Timestamp)`), `Tokens`:
+```go
+func (claudeImporter) SplitTurns(sf SessionFile, full []byte) ([]Turn, error) {
+	subagentsDir := filepath.Join(filepath.Dir(sf.Path), sf.SessionID, "subagents")
+	ag := &amp;claudecode.ClaudeCodeAgent{}
+	return splitLineTurns(splitRawLines(full), isUserPromptLine,
+		func(rawLines [][]byte, start, end int, truncated []byte) (*Turn, error) {
+			tokens, err := ag.CalculateTotalTokenUsage(truncated, start, subagentsDir)
+			if err != nil {
+				return nil, fmt.Errorf("token usage: %w", err)
+			}
+			var rec struct {
+				UUID      string          `json:"uuid"`
+				Message   json.RawMessage `json:"message"`
+				Timestamp string          `json:"timestamp"`
+			}
+			if err := json.Unmarshal(rawLines[start], &amp;rec); err != nil {
+				//nolint:nilerr // skip defensively; the line already parsed in isUserPromptLine
+				return nil, nil
+			}
+			return &amp;Turn{
+				UUID:      rec.UUID,
+				Prompt:    transcript.ExtractUserContent(rec.Message),
+				Model:     modelInRange(rawLines, start, end),
+				CreatedAt: parseTimestamp(rec.Timestamp),
+				Tokens:    tokens,
+			}, nil
+		})
+}
+```
+
+**codex.go** `SplitTurns` (lines 109-126) — note the SessionFile arg is ignored (`_`), turn `UUID` is the start-line index (`strconv.Itoa(start)`), `Model` is **not set** (empty), `CreatedAt` from `codexLineTime`:
+```go
+func (codexImporter) SplitTurns(_ SessionFile, full []byte) ([]Turn, error) {
+	ag := &amp;codex.CodexAgent{}
+	return splitLineTurns(splitRawLines(full),
+		func(raw []byte) bool { _, ok := codexPromptText(raw); return ok },
+		func(rawLines [][]byte, start, _ int, truncated []byte) (*Turn, error) {
+			tokens, err := ag.CalculateTokenUsage(truncated, start)
+			if err != nil {
+				return nil, fmt.Errorf("token usage: %w", err)
+			}
+			prompt, _ := codexPromptText(rawLines[start])
+			return &amp;Turn{
+				UUID:      strconv.Itoa(start),
+				Prompt:    prompt,
+				CreatedAt: codexLineTime(rawLines[start]),
+				Tokens:    tokens,
+			}, nil
+		})
+}
+```
+Codex `Discover` also reads `session_meta` (`codexReadSessionMeta`, lines 84-103) giving `id` + `cwd`; `SessionFile.SessionID = meta.ID` (line 64, falling back to filename stem).
+
+## 5. `AgentType` representation per importer
+
+`types.AgentType` is `type AgentType string` (`/Users/ninawork/entire/devenv/cli/cmd/entire/cli/agent/types/agent.go:7`).
+
+Each importer returns a constant from `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/agent/registry.go` (lines 168-178):
+```go
+const (
+	AgentTypeClaudeCode     types.AgentType = "Claude Code"
+	AgentTypeCodex          types.AgentType = "Codex"
+	AgentTypeCopilotCLI     types.AgentType = "Copilot CLI"
+	AgentTypeCursor         types.AgentType = "Cursor"
+	AgentTypeFactoryAIDroid types.AgentType = "Factory AI Droid"
+	AgentTypeGemini         types.AgentType = "Gemini CLI"
+	AgentTypeOpenCode       types.AgentType = "OpenCode"
+	AgentTypePi             types.AgentType = "Pi"
+	AgentTypeUnknown        types.AgentType = "Unknown"
+)
+```
+Accessor: `imp.AgentType()`. Claude: `func (claudeImporter) AgentType() types.AgentType { return agent.AgentTypeClaudeCode }` (claude.go:21). Codex: `func (codexImporter) AgentType() types.AgentType { return agent.AgentTypeCodex }` (codex.go:29). This is exactly what you'd assign to `State.AgentType` (which is also typed `types.AgentType` — see item 6/State).
+
+## 6. Idempotency: `existing` map + deterministic checkpoint ID dedup
+
+Deterministic ID derivation (`agentimport.go` lines 100-106):
+```go
+// DeriveCheckpointID produces a stable 12-hex checkpoint ID for an imported
+// turn. Re-importing the same (sessionID, turnUUID) yields the same ID, which
+// is how import stays idempotent.
+func DeriveCheckpointID(sessionID, turnUUID string) id.CheckpointID {
+	sum := sha256.Sum256([]byte(sessionID + "/" + turnUUID))
+	return id.MustCheckpointID(hex.EncodeToString(sum[:6])) // 6 bytes = 12 lowercase hex chars
+}
+```
+
+The `existing` set is built from the persistent checkpoint store list, then consulted per turn (lines 122-127 and 146-149, updated at 166):
+```go
+existing := make(map[string]bool)
+if infos, listErr := stores.Persistent.List(ctx); listErr == nil {
+	for _, in := range infos {
+		existing[in.CheckpointID.String()] = true
+	}
+}
+```
+```go
+cid := DeriveCheckpointID(sf.SessionID, turn.UUID)
+if existing[cid.String()] {
+	res.TurnsSkipped++
+	continue
+}
+...
+existing[cid.String()] = true
+```
+
+For an idempotent per-session state write, the natural analog is keying on `sf.SessionID` and checking whether a state file already exists. The session-state store already supports this:
+
+File: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/session/state.go`
+- `func NewStateStore(ctx context.Context) (*StateStore, error)` (line 500) — stores files in `&lt;gitCommonDir&gt;/entire-sessions/&lt;session-id&gt;.json` (`SessionStateDirName = "entire-sessions"`, line 27; path built at 506).
+- `func (s *StateStore) Load(ctx, sessionID string) (*State, error)` (line 519) — returns `(nil, nil)` when the file doesn't exist (lines 526-527, 536-537), so an "exists?" idempotency check is a `Load` returning non-nil.
+- `func (s *StateStore) Save(ctx, state *State) error` (line 562) — validates `state.SessionID` (line 566), `MkdirAll` (570), atomic write via `os.Root` rename.
+- `func (s *StateStore) List(ctx) ([]*State, error)` (line 678).
+
+Higher-level wrappers in `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/session_state.go`: `SaveSessionState` (line 103), `LoadSessionState` (line 89), `ListSessionStates` (line 117) — these delegate to `session.NewStateStore`. `entire session list` reads via this same store (`store.List`).
+
+## Relevant `session.State` fields for an imported session
+
+File: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/session/state.go` (struct at line 91). Fields you'll want to populate for an import-originated state:
+- `SessionID string` (line 93) ← `sf.SessionID`
+- `Kind Kind` (line 147) ← there is a `KindImported Kind = "imported"` (line 66) — same discriminator already used for the checkpoints.
+- `AgentType types.AgentType` (line 263) ← `imp.AgentType()`
+- `ModelName string` (line 267) ← e.g. Claude's `turn.Model` (Codex leaves model empty)
+- `StartedAt time.Time` (line 135) / `EndedAt *time.Time` (line 139) ← derive from min/max `turn.CreatedAt`
+- `StepCount int` json `"checkpoint_count"` (line 196) ← number of turns imported
+- `TokenUsage *agent.TokenUsage` (line 270) ← aggregate of `turn.Tokens`
+- `LastPrompt string` json `"first_prompt"` (line 315), `LastInteractionTime *time.Time` (line 192), `AttachedManually bool` (line 251), `CLIVersion` (line 96)
+
+Caveat for planning: `StateStore.Save`/`Load` call `validation.ValidateSessionID(state.SessionID)` (state.go:566, 521). Imported session IDs (Claude file-stem UUIDs, Codex `meta.ID`) must pass `ValidateSessionID`, and `Load` auto-deletes state whose `IsStale()` is true (lines 549-556) — imported sessions with old `EndedAt` timestamps could be considered stale and silently dropped from `session list`; verify `IsStale()`/`StaleSessionThreshold` semantics against imported (historical) timestamps before relying on them appearing in the list.</result>
+<usage><subagent_tokens>50118</subagent_tokens><tool_uses>16</tool_uses><duration_ms>143608</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a4e42d198b6db0d53</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/91fa7c44-6634-48ab-ae5f-d394502f50d5/tasks/a4e42d198b6db0d53.output</output-file>
+<status>completed</status>
+<summary>Agent "Map session-state write + lifecycle gating" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I now have all the exact code facts. Here is the exhaustive report.
+
+---
+
+# Code facts for "imported sessions in `entire session list`"
+
+All paths absolute. `strategy.SessionState` is a type alias: `type SessionState = session.State` at `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/manual_commit_types.go:29` — so `session.State` and `strategy.SessionState` are the same struct.
+
+## 1. `session.State` persistence — how to write a State to disk
+
+File: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/session/state.go`
+
+`StateStore.Save` (state.go:561-618):
+```go
+// Save saves the session state atomically.
+func (s *StateStore) Save(ctx context.Context, state *State) error {
+	_ = ctx // Reserved for future use
+	if err := validation.ValidateSessionID(state.SessionID); err != nil {
+		return fmt.Errorf("invalid session ID: %w", err)
+	}
+	if err := os.MkdirAll(s.stateDir, 0o750); err != nil { ... }
+	root, err := os.OpenRoot(s.stateDir) ...
+	data, err := jsonutil.MarshalIndentWithNewline(state, "", "  ") ...
+	fileName := state.SessionID + ".json"          // state.go:588 — filename derivation
+	tmpFile, err := os.CreateTemp(s.stateDir, fileName+".*.tmp") ...
+	// write, close, then atomic rename via os.Root:
+	if err := root.Rename(filepath.Base(tmpFileName), fileName); err != nil { ... }
+	...
+}
+```
+Filename is `&lt;state.SessionID&gt;.json` inside `stateDir`. Save validates the session ID, marshals indented JSON, writes to a unique temp file, then atomically renames.
+
+There is **no separate `Set` or `Update` method on `StateStore`.** The higher-level mutation helper lives in strategy: `SaveSessionState(ctx, state)` at `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/session_state.go:103`, and the safe load→mutate→save wrapper `MutateSessionState(ctx, sessionID, fn)` at `session_state.go:498`. For a brand-new imported record you'd call `Save` (or `SaveSessionState`) directly.
+
+## 2. `NewStateStore` and `stateDir` resolution
+
+state.go:493-508:
+```go
+type StateStore struct {
+	stateDir string // directory where session state files are stored
+}
+
+func NewStateStore(ctx context.Context) (*StateStore, error) {
+	commonDir, err := getGitCommonDir(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get git common dir: %w", err)
+	}
+	return &amp;StateStore{
+		stateDir: filepath.Join(commonDir, SessionStateDirName),
+	}, nil
+}
+```
+`SessionStateDirName = "entire-sessions"` (state.go:27). `getGitCommonDir` (state.go:736) runs `git rev-parse --git-common-dir`, makes it absolute, caches per-cwd → in a worktree this resolves to the **main repo's `.git/`**, so state is shared across worktrees. Test-only constructor: `NewStateStoreWithDir(stateDir string)` (state.go:512).
+
+## 3. `IsStale()` — implementation + every call site
+
+Implementation, state.go:475-483:
+```go
+func (s *State) IsStale() bool {
+	var since time.Duration
+	if s.LastInteractionTime != nil {
+		since = time.Since(*s.LastInteractionTime)
+	} else {
+		since = time.Since(s.StartedAt)
+	}
+	return since &gt; StaleSessionThreshold
+}
+```
+`StaleSessionThreshold = 7 * 24 * time.Hour` (state.go:31).
+
+Call sites (production):
+- **state.go:549** — inside `StateStore.Load`. This is the critical one: after unmarshal+normalize, `if state.IsStale() { s.Clear(...); return nil, nil }`. Since `List` (state.go:678) calls `Load` per file, **an imported session older than 7 days would be silently deleted on the next `list`.** This is the single place to add a `Kind`-based exemption (e.g. `if state.Kind != KindImported &amp;&amp; state.IsStale()`), or exempt inside `IsStale` itself by checking `s.Kind == KindImported`. Note imported checkpoints use historical transcript timestamps, so `StartedAt`/`LastInteractionTime` will almost always be &gt;7 days old → they'd be purged immediately without an exemption.
+
+Call sites (tests, `state_test.go`): lines 185 (`TestState_IsStale`), 195, 205, 212, 219, 226, 235.
+
+No other production caller. Related-but-distinct staleness checks that do NOT call IsStale: `IsStuckActive()` (state.go:439, ACTIVE-phase + StuckActiveThreshold=1h) and `OwnerExited()` (state.go:468). Imported sessions won't be ACTIVE phase, so those don't fire.
+
+## 4. `session.Kind` type + constants — `KindImported` confirmed
+
+state.go:46-67:
+```go
+type Kind string
+
+const (
+	KindAgentReview      Kind = "agent_review"
+	KindAgentInvestigate Kind = "agent_investigate"
+	// KindImported tags a checkpoint created by `entire import` from a
+	// pre-existing agent transcript. Imported checkpoints are read-only and
+	// commit-less; they live on the v1 metadata branch and push like any other
+	// checkpoint.
+	KindImported Kind = "imported"
+)
+```
+**`KindImported` exists, value `"imported"`.** Helpers `Kind.IsReview()` (state.go:73) and `Kind.IsInvestigate()` (state.go:84) — `KindImported` returns false for both.
+
+`State.Kind` declaration, state.go:143-147:
+```go
+	Kind Kind `json:"kind,omitempty"`
+```
+
+Note: `KindImported` is currently used only for **checkpoint** metadata at `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/agentimport/agentimport.go:179` (`Kind: string(session.KindImported)` in `cp.WriteOptions`). `entire import` today writes checkpoints but **no `session.State` file** — that's exactly the gap this feature fills. Existing readers already branch on it: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/trail_resume_cmd.go:958` and `:1001`.
+
+## 5. `entire session list` display code
+
+File: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/sessions.go`
+
+`runSessionList` (sessions.go:346-394): calls `strategy.ListSessionStates(ctx)` → filters nils → sorts by `StartedAt` descending → renders each via `writeSessionCard`. (JSON path: `writeSessionListJSON` → `buildSessionInfoJSON`.) Note `list` shows ALL sessions incl. ended; it does NOT call `filterActiveSessions`.
+
+`sessionPhaseLabel` (sessions.go:313-322):
+```go
+func sessionPhaseLabel(s *strategy.SessionState) string {
+	if s.EndedAt != nil {
+		return string(session.PhaseEnded)
+	}
+	status := string(s.Phase)
+	if status == "" {
+		return string(session.PhaseIdle)
+	}
+	return status
+}
+```
+
+`writeSessionCard` (sessions.go:415-453) — the row renderer, fields consumed:
+```go
+	agentLabel := string(s.AgentType)          // "(unknown)" if empty
+	wt := sessionWorktreeLabel(s)              // WorktreeID → base(WorktreePath) → "(unknown)"
+	// Line 1: Agent · [Model ·] worktree · session &lt;SessionID&gt; [· checkpoint &lt;LastCheckpointID&gt;]
+	//   uses s.AgentType, s.ModelName, s.SessionID, s.LastCheckpointID
+	// Line 2: &gt; "&lt;LastPrompt&gt;"  (truncated 60 runes), only if s.LastPrompt != ""
+	// Line 3 stats:
+	stats = append(stats, sessionPhaseLabel(s))
+	stats = append(stats, "started "+timeAgo(s.StartedAt))
+	if s.LastInteractionTime != nil &amp;&amp; s.LastInteractionTime.Sub(s.StartedAt) &gt; time.Minute {
+		stats = append(stats, activeTimeDisplay(s.LastInteractionTime))
+	}
+	if t := totalTokens(s.TokenUsage); t &gt; 0 {
+		stats = append(stats, "tokens "+formatTokenCount(t))
+	}
+```
+For a sensible imported row, set: `SessionID` (required, validated), `AgentType`, `StartedAt` (drives sort + "started X ago"), optionally `ModelName`, `LastPrompt`, `LastCheckpointID`, `TokenUsage`. `Phase` empty renders as `idle`; set `EndedAt` (or `Phase=PhaseEnded`) if you want it labeled `ended`. Sort key `StartedAt` — imported historical timestamps will sort them to the bottom.
+
+## 6. Lifecycle machinery keyed off `BaseCommit` / shadow branches — empty-BaseCommit risk assessment
+
+`ShadowBranchNameForCommit(baseCommit, worktreeID)` at `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/checkpoint/ephemeral.go:709` does NOT guard empty input: with `baseCommit==""` it returns `entire/-&lt;worktreeHash&gt;` (prefix + empty commit part + "-" + hash). So an empty-BaseCommit state produces a syntactically valid but never-existing shadow branch name → `repo.Reference` lookups miss.
+
+Places that iterate/load ALL session states or assume a shadow branch, with empty-BaseCommit impact:
+
+- **`session/state.go:678` `StateStore.List`** — iterates every `.json`, calls `Load` (→ IsStale purge, see #3). Empty BaseCommit fine here; staleness is the only risk.
+
+- **`strategy/session_state.go:117` `ListSessionStates`** — thin wrapper over `store.List`; used by `runSessionList`, `FindMostRecentSession` (:135), `FindMostRecentSessionInCurrentWorktree` (:153), and `shadowBranchProtectedByCurrentState` (cleanup.go:251). No BaseCommit assumption. Safe.
+
+- **`strategy/manual_commit_session.go:61` `listAllSessionStates`** — **RISK.** For each non-tombstone state it computes `getShadowBranchNameForCommit(state.BaseCommit, state.WorktreeID)` (:97) and looks it up (:99). If the branch is missing AND `!state.Phase.IsActive() &amp;&amp; state.LastCheckpointID.IsEmpty()` → **`store.Clear(...)` deletes the state** (:100-104). An imported state (non-active phase, empty BaseCommit, and if `LastCheckpointID` unset) **would be auto-deleted** whenever any hook calls this. Mitigation: set `LastCheckpointID` on the imported state, OR add a `Kind==KindImported` skip here. This is the second purge path besides IsStale.
+
+- **`strategy/manual_commit_session.go:213` `findSessionsForCommit`** (and exported `FindSessionsForCommit` :231) — filters `state.BaseCommit == baseCommitSHA`. Empty BaseCommit never equals a real SHA → imported states simply never match. Safe (they're inert), but they still pass through `listAllSessionStates` first (see above).
+
+- **`strategy/manual_commit_session.go:143` `findSessionsForWorktree`** — filters by `WorktreePath`; also flows through `listAllSessionStates`. If an imported state has a matching `WorktreePath` it's returned to `PostRewrite` and `postCommitUpdateBaseCommitOnly` (below).
+
+- **`strategy/manual_commit_session.go:246` `CountOtherActiveSessionsWithCheckpoints`** — requires `StepCount&gt;0 &amp;&amp; BaseCommit==currentHead`. Imported (empty BaseCommit, StepCount 0) never counted. Safe.
+
+- **`strategy/manual_commit_session.go:182` `remapSessionForRewrite`** — `remapRewriteSHA(state.BaseCommit, ...)`: empty string won't match any `OldSHA`, returns `("",false)`; combined with attr check → returns `(false,nil)` early (no change). Safe.
+
+- **`strategy/manual_commit_hooks.go:190` `PostRewrite`** — iterates `findSessionsForWorktree` results and calls `remapSessionForRewrite` per session. For imported (empty BaseCommit) it's a no-op (`ErrMutationSkip`). Safe.
+
+- **`strategy/manual_commit_hooks.go:1476` `postCommitUpdateBaseCommitOnly`** — guarded by `if !sess.Phase.IsActive() || sess.BaseCommit == newHead { continue }` (:1490). Imported states are not ACTIVE → skipped, never gets BaseCommit stamped to HEAD (this is desirable — satisfies your "WITHOUT pinning to HEAD" requirement, as long as imported states are never ACTIVE phase). Safe.
+
+- **`strategy/manual_commit_condensation.go:1274` `cleanupShadowBranchIfUnused`** — iterates `listAllSessionStates`, computes `getShadowBranchNameForCommit(state.BaseCommit, ...)` (:1283) and only acts when `otherShadow == shadowBranchName &amp;&amp; state.StepCount &gt; 0`. Empty BaseCommit yields `entire/-&lt;hash&gt;`, StepCount 0 → never matches a real branch. Safe (again, gated by listAllSessionStates purge).
+
+- **`strategy/cleanup.go:292` `ListOrphanedSessionStates`** — **RISK.** For each state (past `sessionGracePeriod = 10*time.Minute`, cleanup.go:27) it computes `checkpoint.ShadowBranchNameForCommit(state.BaseCommit, state.WorktreeID)` (:356) and flags orphaned if `!hasCheckpoints &amp;&amp; !hasShadowBranch` (:360). Imported states: no shadow branch, and `hasCheckpoints` is keyed by `cp.SessionID`/`cp.SessionIDs` from the committed v1 read ref (:320-331). Whether an imported state survives depends on whether the imported checkpoint's `SessionID` matches the state's `SessionID`. In agentimport, checkpoints are written with `SessionID: sf.SessionID` (agentimport.go:175) — **if the imported State reuses that same `sf.SessionID`, `hasCheckpoints` is true and it's NOT flagged orphaned.** If the State's SessionID differs, `entire clean` would offer it as orphaned. Recommendation: use the same `SessionID` as the imported checkpoints, and/or add a `Kind==KindImported` skip here.
+
+- **`strategy/cleanup.go:154` `CleanupPushedShadowBranches`** / **`protectedShadowBranchForSession` (:243)** — operate on the set of existing shadow branches. Imported states have none, so they neither protect nor get cleaned. Safe. (`protectedShadowBranchForSession` returns `getShadowBranchNameForCommit(s.BaseCommit,...)` for non-fully-condensed sessions; an imported empty-BaseCommit state would return `entire/-&lt;hash&gt;` as "protected", but that branch doesn't exist so it's inert.)
+
+### Summary of the two real purge risks to gate on `Kind`
+1. `session/state.go:549` (`Load` → `IsStale` → `Clear`) — imported historical timestamps are always &gt;7 days ⇒ **immediate deletion** without a `KindImported` exemption.
+2. `strategy/manual_commit_session.go:100-104` (`listAllSessionStates` orphan cleanup) — non-active + missing shadow branch + empty `LastCheckpointID` ⇒ **deletion** unless you set `LastCheckpointID` or add a `KindImported` skip.
+
+And one "shows up as orphaned in `entire clean`" risk: `strategy/cleanup.go:360` — mitigated by matching the imported checkpoint `SessionID` or a `KindImported` skip.
+
+Everything else keyed off `BaseCommit`/shadow branches is either gated by `Phase.IsActive()` or by `BaseCommit == &lt;real SHA&gt;` equality, both of which an imported (non-active, empty-BaseCommit) state fails safely.</result>
+<usage><subagent_tokens>76754</subagent_tokens><tool_uses>28</tool_uses><duration_ms>170664</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a4e42d198b6db0d53</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/91fa7c44-6634-48ab-ae5f-d394502f50d5/tasks/a4e42d198b6db0d53.output</output-file>
+<status>completed</status>
+<summary>Agent "Map session-state write + lifecycle gating" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I now have all the exact code facts. Here is the exhaustive report.
+
+---
+
+# Code facts for "imported sessions in `entire session list`"
+
+All paths absolute. `strategy.SessionState` is a type alias: `type SessionState = session.State` at `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/manual_commit_types.go:29` — so `session.State` and `strategy.SessionState` are the same struct.
+
+## 1. `session.State` persistence — how to write a State to disk
+
+File: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/session/state.go`
+
+`StateStore.Save` (state.go:561-618):
+```go
+// Save saves the session state atomically.
+func (s *StateStore) Save(ctx context.Context, state *State) error {
+	_ = ctx // Reserved for future use
+	if err := validation.ValidateSessionID(state.SessionID); err != nil {
+		return fmt.Errorf("invalid session ID: %w", err)
+	}
+	if err := os.MkdirAll(s.stateDir, 0o750); err != nil { ... }
+	root, err := os.OpenRoot(s.stateDir) ...
+	data, err := jsonutil.MarshalIndentWithNewline(state, "", "  ") ...
+	fileName := state.SessionID + ".json"          // state.go:588 — filename derivation
+	tmpFile, err := os.CreateTemp(s.stateDir, fileName+".*.tmp") ...
+	// write, close, then atomic rename via os.Root:
+	if err := root.Rename(filepath.Base(tmpFileName), fileName); err != nil { ... }
+	...
+}
+```
+Filename is `&lt;state.SessionID&gt;.json` inside `stateDir`. Save validates the session ID, marshals indented JSON, writes to a unique temp file, then atomically renames.
+
+There is **no separate `Set` or `Update` method on `StateStore`.** The higher-level mutation helper lives in strategy: `SaveSessionState(ctx, state)` at `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/session_state.go:103`, and the safe load→mutate→save wrapper `MutateSessionState(ctx, sessionID, fn)` at `session_state.go:498`. For a brand-new imported record you'd call `Save` (or `SaveSessionState`) directly.
+
+## 2. `NewStateStore` and `stateDir` resolution
+
+state.go:493-508:
+```go
+type StateStore struct {
+	stateDir string // directory where session state files are stored
+}
+
+func NewStateStore(ctx context.Context) (*StateStore, error) {
+	commonDir, err := getGitCommonDir(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get git common dir: %w", err)
+	}
+	return &amp;StateStore{
+		stateDir: filepath.Join(commonDir, SessionStateDirName),
+	}, nil
+}
+```
+`SessionStateDirName = "entire-sessions"` (state.go:27). `getGitCommonDir` (state.go:736) runs `git rev-parse --git-common-dir`, makes it absolute, caches per-cwd → in a worktree this resolves to the **main repo's `.git/`**, so state is shared across worktrees. Test-only constructor: `NewStateStoreWithDir(stateDir string)` (state.go:512).
+
+## 3. `IsStale()` — implementation + every call site
+
+Implementation, state.go:475-483:
+```go
+func (s *State) IsStale() bool {
+	var since time.Duration
+	if s.LastInteractionTime != nil {
+		since = time.Since(*s.LastInteractionTime)
+	} else {
+		since = time.Since(s.StartedAt)
+	}
+	return since &gt; StaleSessionThreshold
+}
+```
+`StaleSessionThreshold = 7 * 24 * time.Hour` (state.go:31).
+
+Call sites (production):
+- **state.go:549** — inside `StateStore.Load`. This is the critical one: after unmarshal+normalize, `if state.IsStale() { s.Clear(...); return nil, nil }`. Since `List` (state.go:678) calls `Load` per file, **an imported session older than 7 days would be silently deleted on the next `list`.** This is the single place to add a `Kind`-based exemption (e.g. `if state.Kind != KindImported &amp;&amp; state.IsStale()`), or exempt inside `IsStale` itself by checking `s.Kind == KindImported`. Note imported checkpoints use historical transcript timestamps, so `StartedAt`/`LastInteractionTime` will almost always be &gt;7 days old → they'd be purged immediately without an exemption.
+
+Call sites (tests, `state_test.go`): lines 185 (`TestState_IsStale`), 195, 205, 212, 219, 226, 235.
+
+No other production caller. Related-but-distinct staleness checks that do NOT call IsStale: `IsStuckActive()` (state.go:439, ACTIVE-phase + StuckActiveThreshold=1h) and `OwnerExited()` (state.go:468). Imported sessions won't be ACTIVE phase, so those don't fire.
+
+## 4. `session.Kind` type + constants — `KindImported` confirmed
+
+state.go:46-67:
+```go
+type Kind string
+
+const (
+	KindAgentReview      Kind = "agent_review"
+	KindAgentInvestigate Kind = "agent_investigate"
+	// KindImported tags a checkpoint created by `entire import` from a
+	// pre-existing agent transcript. Imported checkpoints are read-only and
+	// commit-less; they live on the v1 metadata branch and push like any other
+	// checkpoint.
+	KindImported Kind = "imported"
+)
+```
+**`KindImported` exists, value `"imported"`.** Helpers `Kind.IsReview()` (state.go:73) and `Kind.IsInvestigate()` (state.go:84) — `KindImported` returns false for both.
+
+`State.Kind` declaration, state.go:143-147:
+```go
+	Kind Kind `json:"kind,omitempty"`
+```
+
+Note: `KindImported` is currently used only for **checkpoint** metadata at `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/agentimport/agentimport.go:179` (`Kind: string(session.KindImported)` in `cp.WriteOptions`). `entire import` today writes checkpoints but **no `session.State` file** — that's exactly the gap this feature fills. Existing readers already branch on it: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/trail_resume_cmd.go:958` and `:1001`.
+
+## 5. `entire session list` display code
+
+File: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/sessions.go`
+
+`runSessionList` (sessions.go:346-394): calls `strategy.ListSessionStates(ctx)` → filters nils → sorts by `StartedAt` descending → renders each via `writeSessionCard`. (JSON path: `writeSessionListJSON` → `buildSessionInfoJSON`.) Note `list` shows ALL sessions incl. ended; it does NOT call `filterActiveSessions`.
+
+`sessionPhaseLabel` (sessions.go:313-322):
+```go
+func sessionPhaseLabel(s *strategy.SessionState) string {
+	if s.EndedAt != nil {
+		return string(session.PhaseEnded)
+	}
+	status := string(s.Phase)
+	if status == "" {
+		return string(session.PhaseIdle)
+	}
+	return status
+}
+```
+
+`writeSessionCard` (sessions.go:415-453) — the row renderer, fields consumed:
+```go
+	agentLabel := string(s.AgentType)          // "(unknown)" if empty
+	wt := sessionWorktreeLabel(s)              // WorktreeID → base(WorktreePath) → "(unknown)"
+	// Line 1: Agent · [Model ·] worktree · session &lt;SessionID&gt; [· checkpoint &lt;LastCheckpointID&gt;]
+	//   uses s.AgentType, s.ModelName, s.SessionID, s.LastCheckpointID
+	// Line 2: &gt; "&lt;LastPrompt&gt;"  (truncated 60 runes), only if s.LastPrompt != ""
+	// Line 3 stats:
+	stats = append(stats, sessionPhaseLabel(s))
+	stats = append(stats, "started "+timeAgo(s.StartedAt))
+	if s.LastInteractionTime != nil &amp;&amp; s.LastInteractionTime.Sub(s.StartedAt) &gt; time.Minute {
+		stats = append(stats, activeTimeDisplay(s.LastInteractionTime))
+	}
+	if t := totalTokens(s.TokenUsage); t &gt; 0 {
+		stats = append(stats, "tokens "+formatTokenCount(t))
+	}
+```
+For a sensible imported row, set: `SessionID` (required, validated), `AgentType`, `StartedAt` (drives sort + "started X ago"), optionally `ModelName`, `LastPrompt`, `LastCheckpointID`, `TokenUsage`. `Phase` empty renders as `idle`; set `EndedAt` (or `Phase=PhaseEnded`) if you want it labeled `ended`. Sort key `StartedAt` — imported historical timestamps will sort them to the bottom.
+
+## 6. Lifecycle machinery keyed off `BaseCommit` / shadow branches — empty-BaseCommit risk assessment
+
+`ShadowBranchNameForCommit(baseCommit, worktreeID)` at `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/checkpoint/ephemeral.go:709` does NOT guard empty input: with `baseCommit==""` it returns `entire/-&lt;worktreeHash&gt;` (prefix + empty commit part + "-" + hash). So an empty-BaseCommit state produces a syntactically valid but never-existing shadow branch name → `repo.Reference` lookups miss.
+
+Places that iterate/load ALL session states or assume a shadow branch, with empty-BaseCommit impact:
+
+- **`session/state.go:678` `StateStore.List`** — iterates every `.json`, calls `Load` (→ IsStale purge, see #3). Empty BaseCommit fine here; staleness is the only risk.
+
+- **`strategy/session_state.go:117` `ListSessionStates`** — thin wrapper over `store.List`; used by `runSessionList`, `FindMostRecentSession` (:135), `FindMostRecentSessionInCurrentWorktree` (:153), and `shadowBranchProtectedByCurrentState` (cleanup.go:251). No BaseCommit assumption. Safe.
+
+- **`strategy/manual_commit_session.go:61` `listAllSessionStates`** — **RISK.** For each non-tombstone state it computes `getShadowBranchNameForCommit(state.BaseCommit, state.WorktreeID)` (:97) and looks it up (:99). If the branch is missing AND `!state.Phase.IsActive() &amp;&amp; state.LastCheckpointID.IsEmpty()` → **`store.Clear(...)` deletes the state** (:100-104). An imported state (non-active phase, empty BaseCommit, and if `LastCheckpointID` unset) **would be auto-deleted** whenever any hook calls this. Mitigation: set `LastCheckpointID` on the imported state, OR add a `Kind==KindImported` skip here. This is the second purge path besides IsStale.
+
+- **`strategy/manual_commit_session.go:213` `findSessionsForCommit`** (and exported `FindSessionsForCommit` :231) — filters `state.BaseCommit == baseCommitSHA`. Empty BaseCommit never equals a real SHA → imported states simply never match. Safe (they're inert), but they still pass through `listAllSessionStates` first (see above).
+
+- **`strategy/manual_commit_session.go:143` `findSessionsForWorktree`** — filters by `WorktreePath`; also flows through `listAllSessionStates`. If an imported state has a matching `WorktreePath` it's returned to `PostRewrite` and `postCommitUpdateBaseCommitOnly` (below).
+
+- **`strategy/manual_commit_session.go:246` `CountOtherActiveSessionsWithCheckpoints`** — requires `StepCount&gt;0 &amp;&amp; BaseCommit==currentHead`. Imported (empty BaseCommit, StepCount 0) never counted. Safe.
+
+- **`strategy/manual_commit_session.go:182` `remapSessionForRewrite`** — `remapRewriteSHA(state.BaseCommit, ...)`: empty string won't match any `OldSHA`, returns `("",false)`; combined with attr check → returns `(false,nil)` early (no change). Safe.
+
+- **`strategy/manual_commit_hooks.go:190` `PostRewrite`** — iterates `findSessionsForWorktree` results and calls `remapSessionForRewrite` per session. For imported (empty BaseCommit) it's a no-op (`ErrMutationSkip`). Safe.
+
+- **`strategy/manual_commit_hooks.go:1476` `postCommitUpdateBaseCommitOnly`** — guarded by `if !sess.Phase.IsActive() || sess.BaseCommit == newHead { continue }` (:1490). Imported states are not ACTIVE → skipped, never gets BaseCommit stamped to HEAD (this is desirable — satisfies your "WITHOUT pinning to HEAD" requirement, as long as imported states are never ACTIVE phase). Safe.
+
+- **`strategy/manual_commit_condensation.go:1274` `cleanupShadowBranchIfUnused`** — iterates `listAllSessionStates`, computes `getShadowBranchNameForCommit(state.BaseCommit, ...)` (:1283) and only acts when `otherShadow == shadowBranchName &amp;&amp; state.StepCount &gt; 0`. Empty BaseCommit yields `entire/-&lt;hash&gt;`, StepCount 0 → never matches a real branch. Safe (again, gated by listAllSessionStates purge).
+
+- **`strategy/cleanup.go:292` `ListOrphanedSessionStates`** — **RISK.** For each state (past `sessionGracePeriod = 10*time.Minute`, cleanup.go:27) it computes `checkpoint.ShadowBranchNameForCommit(state.BaseCommit, state.WorktreeID)` (:356) and flags orphaned if `!hasCheckpoints &amp;&amp; !hasShadowBranch` (:360). Imported states: no shadow branch, and `hasCheckpoints` is keyed by `cp.SessionID`/`cp.SessionIDs` from the committed v1 read ref (:320-331). Whether an imported state survives depends on whether the imported checkpoint's `SessionID` matches the state's `SessionID`. In agentimport, checkpoints are written with `SessionID: sf.SessionID` (agentimport.go:175) — **if the imported State reuses that same `sf.SessionID`, `hasCheckpoints` is true and it's NOT flagged orphaned.** If the State's SessionID differs, `entire clean` would offer it as orphaned. Recommendation: use the same `SessionID` as the imported checkpoints, and/or add a `Kind==KindImported` skip here.
+
+- **`strategy/cleanup.go:154` `CleanupPushedShadowBranches`** / **`protectedShadowBranchForSession` (:243)** — operate on the set of existing shadow branches. Imported states have none, so they neither protect nor get cleaned. Safe. (`protectedShadowBranchForSession` returns `getShadowBranchNameForCommit(s.BaseCommit,...)` for non-fully-condensed sessions; an imported empty-BaseCommit state would return `entire/-&lt;hash&gt;` as "protected", but that branch doesn't exist so it's inert.)
+
+### Summary of the two real purge risks to gate on `Kind`
+1. `session/state.go:549` (`Load` → `IsStale` → `Clear`) — imported historical timestamps are always &gt;7 days ⇒ **immediate deletion** without a `KindImported` exemption.
+2. `strategy/manual_commit_session.go:100-104` (`listAllSessionStates` orphan cleanup) — non-active + missing shadow branch + empty `LastCheckpointID` ⇒ **deletion** unless you set `LastCheckpointID` or add a `KindImported` skip.
+
+And one "shows up as orphaned in `entire clean`" risk: `strategy/cleanup.go:360` — mitigated by matching the imported checkpoint `SessionID` or a `KindImported` skip.
+
+Everything else keyed off `BaseCommit`/shadow branches is either gated by `Phase.IsActive()` or by `BaseCommit == &lt;real SHA&gt;` equality, both of which an imported (non-active, empty-BaseCommit) state fails safely.</result>
+<usage><subagent_tokens>76754</subagent_tokens><tool_uses>28</tool_uses><duration_ms>170664</duration_ms></usage>
+</task-notification>

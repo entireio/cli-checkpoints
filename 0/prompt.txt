@@ -1,0 +1,188 @@
+<task-notification>
+<task-id>ad0a1cf630685dca6</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/a7c8f6a2-7a40-4558-aba8-a31927cc21d3/tasks/ad0a1cf630685dca6.output</output-file>
+<status>completed</status>
+<summary>Agent "Exact backend thread wire shapes" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I now have the complete picture. Here is everything, with exact wire shapes and file:line references.
+
+## Files
+- Routes: `/Users/ninawork/entire/devenv/entire.io/api/src/routes/trails.ts`
+- DB row→response mapping: `/Users/ninawork/entire/devenv/entire.io/api/src/lib/planetscale/trails.ts`
+
+## CRITICAL: the `author` / `created_by` / `resolved_by` shapes
+
+These are the most important answers for your Go structs:
+
+- **`author`** (on a message and on a reply) is a **plain string** — the GitHub login. Not an object.
+  - `messageRecordToMessage` (`.../planetscale/trails.ts:1928-1936`): `author: row.author_login`
+  - reply mapping in `rowsToThreadMessages` (`:1917-1922`): `author: row.author_login`
+- **`last_message_author`** (thread summary) is a **plain string login** (nullable): `threadRecordToSummary` `:1789` → `last_message_author: row.last_message_author`, sourced from the message's `author_login` (`:1691-1697`).
+- **`participants`** is an **array of objects `{ login: string }`** — `parseParticipants` (`:1759-1765`) splits a `GROUP_CONCAT` of `author_login` into `{ login }`. So `[{"login":"alice"},{"login":"bob"}]`.
+- **`created_by`** is `row.created_by_actor_id` (`:1785`) — a **string actor/user UUID, NOT a login**, nullable.
+- **`resolved_by`** is `row.resolved_by_actor_id` (`:1783`) — a **string actor/user UUID, NOT a login**, nullable.
+
+So there are two different identity representations in the same object: `author` / `last_message_author` / `participants[].login` are GitHub logins, while `created_by` / `resolved_by` are actor IDs. None of them are `{id, login, avatar_url}` objects.
+
+Verbatim summary mapper (`.../planetscale/trails.ts:1776-1806`):
+```ts
+const base = {
+  id: row.id,
+  trail_id: row.trail_id,
+  title: row.review_comment_id
+    ? row.title
+    : deriveDiscussionThreadTitle(row.title, row.first_message_body),
+  resolved: row.resolved_at !== null,
+  resolved_by: row.resolved_by_actor_id,
+  resolved_at: dateToStr(row.resolved_at),
+  created_by: row.created_by_actor_id,
+  created_at: row.created_at.toISOString(),
+  updated_at: row.updated_at.toISOString(),
+  last_message_at: stats.lastMessageAt,
+  last_message_author: row.last_message_author,
+  message_count: stats.messageCount,
+  participants: stats.participants,
+}
+if (row.review_comment_id) {
+  ...
+  return { ...base, kind: "code_review", review_comment_id: ..., review_comment: {...} }
+}
+return { ...base, kind: "discussion", review_comment_id: null, review_comment: null }
+```
+
+## Constants (`.../routes/trails.ts:1944-1945`)
+```ts
+const TRAIL_THREAD_MESSAGE_BODY_MAX_LENGTH = 65_536
+const TRAIL_THREAD_TITLE_MAX_LENGTH = 512
+```
+
+## Shared object shapes (zod, `.../routes/trails.ts`)
+
+Thread message (`:1831-1837`) and its reply (`:1824-1829`):
+```ts
+trailThreadMessageReplySchema = { id: string, author: string, created_at: string, body: string }
+trailThreadMessageSchema = { id: string, author: string, created_at: string, body: string,
+                             replies: trailThreadMessageReplySchema[] }
+```
+Note: replies are only nested one level; `messageRecordToMessage` always sets `replies: []` and `rowsToThreadMessages` attaches children to top-level parents only.
+
+Thread summary (`:1883-1900`):
+```ts
+trailThreadSummarySchema = {
+  id: string,
+  trail_id: string,
+  kind: "discussion" | "code_review",
+  title: string,
+  review_comment_id: string | null,
+  resolved: boolean,
+  resolved_by: string | null,       // actor id
+  resolved_at: string | null,
+  created_by: string | null,        // actor id
+  created_at: string,
+  updated_at: string,
+  last_message_at: string | null,
+  last_message_author: string | null,   // login
+  message_count: number,
+  participants: { login: string }[],
+  review_comment: reviewCommentSchema | null,   // non-null only for kind=="code_review"
+}
+```
+`participant` schema (`:1839-1841`): `{ login: string }`.
+
+`reviewCommentSchema` (`:1858-1881`) — present (non-null) only on `code_review` threads; mapped by `threadReviewCommentRowToComment` (`.../planetscale/trails.ts:1862-1900`):
+```
+id, trail_id, repository_id, review_id, code_version_id, actor_id: string
+actor_display_name: string | null (optional)   // this is users.github_login
+body: string | null
+severity: "high"|"medium"|"low" | null
+confidence: number | null
+status: "open"|"resolved"|"dismissed"
+status_reason: string | null
+stale_outcome: "current"|"stale"
+stale_checked_at: string | null
+stale_checked_code_version_id: string | null
+client_id: string | null
+client_id_hash: string | null
+created_at, updated_at: string
+location: {
+  id, review_comment_id, code_version_id: string,
+  granularity: "line"|"range"|"file"|"whole_change",
+  file_path: string | null, start_line/start_column/end_line/end_column: number | null,
+  selected_text: string | null, nearby_text: string | null, language: string | null
+}
+thread_id: string,
+thread_message_count: number
+```
+
+## Endpoint by endpoint
+
+Route prefix is `/:host/:owner/:repo/:number` (i.e. your `.../{number}`).
+
+### 1. GET `/{number}/threads` — list threads
+Handler `.../routes/trails.ts:4736-4775`; returns `c.json(result)` where `result` = `listThreads(...)` (`.../planetscale/trails.ts:1028-1049`).
+
+Response body (200):
+```json
+{ "items": [ &lt;trailThreadSummary&gt; ], "event_cursor": "string" }
+```
+Each item is the full `trailThreadSummary` shape above (`trailThreadListItemSchema = trailThreadSummarySchema`, `:1942`). No request body. No membership required (read).
+
+### 2. GET `/{number}/threads/{threadId}` — thread detail
+Handler `:4948-4964`; returns `c.json(detail)` where `detail` = `getThreadDetail(...)` (`.../planetscale/trails.ts:1051-1093`).
+
+Actual wire response (200):
+```json
+{ "thread": &lt;trailThreadSummary&gt;, "messages": [ &lt;trailThreadMessage&gt; ], "event_cursor": "string" }
+```
+Heads-up: the zod/OpenAPI decl at `:4933-4936` lists only `thread` and `messages`, but the runtime object also includes `event_cursor` (`.../planetscale/trails.ts:1088-1092`). Decode it. 404 `{ "error": "Thread not found" }`.
+
+### 3. POST `/{number}/threads` — create thread
+Handler `:4778-4849`. Request schema `createTrailThreadBodySchema` (`:1955-1962`):
+```ts
+{ type: "object", required: ["body"],
+  properties: { title: {string, maxLength 512}, body: {string, maxLength 65536} } }
+```
+- `body` is **required** (also enforced by `parseThreadMessageBody` `:1576-1587`: must be a non-empty trimmed string, ≤ 65536; else 400 `{"error":"Message body is required"}` / length error).
+- `title` is **optional** (`parseOptionalThreadTitle` `:1589-1601`; if omitted the handler falls back to `"Conversation"` at `:4834`; if present it must be a non-empty string ≤ 512).
+
+**Membership required** (`requireRepoMembership` at `:4816-4817`, before parsing) → 403 `{"error":"repository membership required"}`.
+
+Response (201), `createTrailThreadResponseSchema` (`:1964-1967`), from `createThread` (`.../planetscale/trails.ts:1095-1172`):
+```json
+{ "thread": &lt;trailThreadSummary&gt;, "message": &lt;trailThreadMessage&gt; | null }
+```
+`message` is non-null here because the handler always supplies a message (`:4835`). New threads are always `kind:"discussion"`, `review_comment_id:null`, `review_comment:null`.
+
+### 4. PATCH `/{number}/threads/{threadId}` — update/resolve
+Handler `:4968-5070`. Request schema `updateTrailThreadBodySchema` (`:1947-1953`):
+```ts
+{ type: "object", properties: { title: {string, maxLength 512}, resolved: {boolean} } }
+```
+Both optional; no required fields. `resolved` must be boolean if present (`:5010-5012`). `title` validated by `parseOptionalThreadTitle`.
+
+Behavior split (`:5016-5061`):
+- **code_review thread** (`review_comment_id != null`): sending `title` → 400 `{"error":"Code review thread titles are read-only"}`. Sending `resolved` requires membership, then flips the linked review comment's status via `updateReviewComment` (`status: resolved?"resolved":"open"`, `status_reason: resolved?"Resolved from thread":null`) and re-reads the summary.
+- **discussion thread**: if `title` or `resolved` present, requires membership, then `updateThread(...)`. `resolved:true` sets `resolved_by_actor_id = actorId` and a resolved timestamp; `resolved:false` clears them (see `.../planetscale/trails.ts:1196-1244`, `resolved_by_actor_id` at `:1222`).
+
+Response (200): `{ "thread": &lt;trailThreadSummary&gt; }` (`:5064`). 400 `{"error":"resolved must be a boolean"}` / `{"error":"Invalid request body"}`; 403 membership; 404 not found.
+
+### 5. POST `/{number}/threads/{threadId}/messages` — add message
+Handler `:5074-5138`. Request `addCommentBodySchema` (`:3025-3035`): `{ required:["body"], body: string maxLength 65536 }`. `body` required, non-empty trimmed. **Membership required** (`:5116`). Response (201): `{ "message": &lt;trailThreadMessage&gt; }` (`:5131`). 404 if thread missing.
+
+### 6. PATCH `/{number}/threads/{threadId}/messages/{messageId}` — edit message
+Handler `:5141-5204`. Request `editCommentBodySchema` (`:3037-3047`): `{ required:["body"], body: string maxLength 65536 }`. **Membership required** (`:5182`). Response (200): `{ "message": &lt;trailThreadMessage&gt; }` (`:5197`). 404 `{"error":"Message not found"}`.
+
+### 7. DELETE `/{number}/threads/{threadId}/messages/{messageId}`
+Handler `:5207-5259`. No request body. **Membership required** (`:5238`). Response (200): `{ "success": true }` (`:5252`). 404 `{"error":"Message not found"}`.
+
+## Membership definition
+`requireRepoMembership` (`.../routes/trails.ts:547-553`): returns 403 `{"error":"repository membership required"}` unless `ctx.hasMembership`. All write endpoints (create thread, update thread when changing title/resolved, add/edit/delete message) require it; the two GETs (list, detail) do not.
+
+## Notes for your Go decoder
+- Timestamps are ISO-8601 strings (`.toISOString()`), all `*_at` fields.
+- `event_cursor` is a **string** (stringified max event id), present on list and detail responses even though the detail OpenAPI schema omits it.
+- Distinguish the two identity encodings: login strings (`author`, `last_message_author`, `participants[].login`, `review_comment.actor_display_name`) vs actor-id strings (`created_by`, `resolved_by`, `review_comment.actor_id`). No avatar/id-object anywhere in these payloads.
+- `replies` nesting is single-level; each reply object has no `replies` field of its own.</result>
+<usage><subagent_tokens>52497</subagent_tokens><tool_uses>18</tool_uses><duration_ms>133223</duration_ms></usage>
+</task-notification>

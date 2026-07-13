@@ -1,0 +1,71 @@
+# Fix: `entire auth token --jurisdiction` (-j) ignores the active login context's environment
+
+You are working in the **entire CLI** repo (`/Users/jag/dev/cli`). Fix the bug below and
+open a PR.
+
+## The bug
+
+`entire auth token --jurisdiction <slug>` (short: `-j <slug>`) mints a jurisdictional
+identity token whose issuer/audience is **hardwired to the `entire.io` environment**, even
+when the active login context is a **different environment** (e.g. `partial.to`). It should
+derive the environment from the **active context**, not default to entire.io.
+
+The same defaulting appears in `entire api --to cell` / `entire api --jurisdiction …`:
+cell resolution goes to `*.entire.io` cells regardless of the active context.
+
+## Evidence (reproduced today)
+
+Active context is partial.to (`~/.config/entire/contexts.json`):
+```
+current_context: us.auth.partial.to
+  core_url: https://us.auth.partial.to
+```
+
+- `entire auth token` (control-plane) → token `iss`/`aud` = **`us.auth.partial.to`** ✅ (respects the active context).
+- `entire auth token --jurisdiction us` → token `iss` = **`https://us.auth.entire.io`**, `aud` = **`https://us.entire.io`** ❌ (jumped to the entire.io environment, ignoring the active partial.to context).
+- `entire api --to cell /api/v1/repos…` → resolves to **`aws-us-east-2.api.entire.io`** ❌ (entire.io cell, not a partial.to cell).
+
+Consequence: you cannot obtain a token that a **partial.to** entire-api cell will accept.
+Cells reject the control-plane bearer, and the only jurisdictional token the CLI will mint
+is audienced to entire.io — so hitting `*.api.partial.to` (e.g. a staging cell's Swagger UI)
+returns `401 "authentication required"` no matter what.
+
+## Expected behaviour
+
+The jurisdiction mint (and `--to cell` resolution) must be **environment-aware**, keyed off
+the active context's `core_url` / auth server:
+- With active context `us.auth.partial.to`, `--jurisdiction us` should mint a token
+  audienced to the **partial.to** `us` jurisdiction (i.e. the partial.to environment), and
+  `--to cell` should resolve to the partial.to `us` cell.
+- With active context `us.auth.entire.io`, it should target entire.io (today's behaviour).
+- Don't hardcode `entire.io`. Derive the environment/host suffix from the active context
+  (the same source plain `entire auth token` already uses correctly).
+
+## Where to look
+
+Start from the `entire auth token` command implementation and the `--jurisdiction` mint
+path (the exchange that swaps the login/`ENTIRE_TOKEN` for a jurisdictional audience), plus
+the shared host/jurisdiction resolution used by `entire api --to cell`. Compare against how
+the plain control-plane token path picks up the active context's `core_url` correctly — the
+jurisdiction path likely constructs the audience/issuer from a hardcoded `entire.io` base
+instead of the context's environment. Fix at the shared resolution point so both
+`auth token -j` and `api --to cell`/`--jurisdiction` benefit.
+
+## Verify
+
+- With the partial.to context active, `entire auth token --jurisdiction us` should produce a
+  token whose `aud` is the partial.to environment (decode the JWT payload to confirm), and it
+  should authenticate against a partial.to cell (a request to a `*.api.partial.to` cell
+  endpoint should get past auth — expect non-401).
+- With the entire.io context active, behaviour is unchanged (still entire.io).
+- Add/adjust unit tests around the jurisdiction/cell host derivation so the environment is
+  taken from the active context, not a constant. Cover both partial.to and entire.io.
+- Run the repo's build + tests (check for a task runner, e.g. `mise`/`make`) green.
+
+## Wrap up
+
+Commit with a clear message, push, open a PR describing the bug (jurisdiction mint hardwired
+to entire.io), the fix (environment derived from the active context), and the before/after
+`aud` for the partial.to context. Follow the repo's conventions.
+
+Explore the code yourself; the above is from black-box reproduction, so trust the code.

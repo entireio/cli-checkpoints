@@ -1,0 +1,94 @@
+I know that cobra allows you to group commands so it looks clearer under help command. What groups do you see in our cli ?
+
+---
+
+what groups do you reckon we should have?
+
+---
+
+give me a brief description of what is the intent
+
+---
+
+and a title
+
+---
+
+plan it
+
+---
+
+<task-notification>
+<task-id>af98543a81e20f622</task-id>
+<tool-use-id>toolu_01M16y3xokp3rkr218Wb6UL9</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-cli/5d2c2b72-89da-4e39-b763-c4f08b98aea8/tasks/af98543a81e20f622.output</output-file>
+<status>completed</status>
+<summary>Agent "Explore root cmd help structure" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have everything needed. Here are my findings.
+
+## 1. `cmd/entire/cli/root.go` structure
+
+`NewRootCmd()` (line 34) builds the root `&amp;cobra.Command{...}` inline. Key points:
+
+- **No template/func overrides that would bypass cobra group rendering.** There is no `SetUsageTemplate`/`SetHelpTemplate`/`SetUsageFunc`/`SetHelpFunc` anywhere in `root.go`, the `cli` package, or the entire repo (grep for all of these plus `AddGroup`/`GroupID`/`SetHelpCommandGroupID`/`SetCompletionCommandGroupID` returned nothing outside tests/vendor). So cobra 1.10's built-in grouped help template will render sections out of the box once `AddGroup` + per-command `GroupID` are set.
+- `CompletionOptions{HiddenDefaultCmd: true}` (root.go:44-46) — completion command exists but is hidden from help.
+- `SetVersionTemplate` (line 144), `SetHelpCommand(NewHelpCmd(cmd))` (line 147) — help command is replaced with a custom one (see §6). Neither touches templates/groups.
+- Constants near root: `gettingStarted` (line 17), `accessibilityHelp` (line 27). Helpers: `versionString()` (152), `newVersionCmd()` (157), `newSendAnalyticsCmd()` (171, `__send_analytics`, Hidden).
+
+**AddCommand list (root.go:88-142), grouped by the comments already in the file:**
+
+Noun groups (88-100): `newSessionsCmd`, `newCheckpointGroupCmd`, `newTokensGroupCmd`, `newAgentGroupCmd`, `newAuthCmd`, `newDoctorCmd`, `newLabsCmd`, `newPluginGroupCmd`, `newImportCmd`, `newOrgCmd`, `newProjectCmd`, `newRepoCmd`, `newGrantCmd`.
+
+Lifecycle/standalone (103-119): `cliReview.NewCommand(buildReviewDeps())`, `investigate.NewCommand(buildInvestigateDeps())`, `newCleanCmd`, `newSetupCmd` (=`configure`), `newEnableCmd`, `newDisableCmd`, `newStatusCmd`, `newBlameCmd`, `newWhyCmd`, `newLoginCmd`, `newLogoutCmd`, `newVersionCmd`, `newDispatchCmd`, `newActivityCmd`, `newRecapCmd`, `newAPICmd`, `newAgentHelpCmd(cmd)`.
+
+Hidden shortcuts (122-126): `hideAsAlias(newResumeCmd, "entire session resume")`, `hideAsAlias(newAttachCmd, ...)`, `hideAsAlias(newExplainCmd, ...)`, `hideAsAlias(newTraceCmd, ...)`, `newSearchCmd`.
+
+Hidden labs (129): `newExpertsCmd`. Deprecated (133-134): `newResetCmd`, `newRewindCmd`. Hidden infra (137-142): `newMCPCmd(cmd)`, `newHooksCmd`, `newTrailCmd`, `newRunnerCmd`, `newSendAnalyticsCmd`, `newCurlBashPostInstallCmd`.
+
+## 2. Cobra version
+
+`go.mod:31` — `github.com/spf13/cobra v1.10.2` (well above the 1.6 minimum for Groups).
+
+## 3. Visible vs hidden split (requested list)
+
+**Visible (24)** — no `Hidden`/`Deprecated`:
+`activity` (activity_cmd.go), `agent` (agent_group.go), `agent-help` (root.go:119, explicitly visible), `api` (api_cmd.go), `auth` (auth.go), `checkpoint` (checkpoint_group.go), `clean` (clean.go), `configure` (setup.go:712), `disable` (setup.go:1056), `dispatch` (dispatch.go), `doctor` (doctor.go), `enable` (setup.go:805), `grant` (grant.go), `labs` (labs.go), `login` (login.go), `logout` (logout.go), `org` (org.go), `plugin` (plugin_group.go), `project` (project.go), `recap` (recap.go), `repo` (repo.go), `session` (sessions.go), `status` (status.go), `version` (root.go:157).
+
+**Hidden (8)** — `Hidden: true`:
+`blame` (attribution.go:152), `why` (attribution.go:180), `experts` (experts_cmd.go:187), `review` (review/cmd.go:107), `investigate` (investigate/cmd.go:86), `import` (import_cmd.go:18), `tokens` (tokens_profile.go:55), `runner` (runner_group.go:18).
+
+Note: `tokens` is Hidden despite being in the "noun groups" block. Other hidden root commands not in your list: the four `hideAsAlias` shortcuts + `search` (all Hidden via `aliascmd.go:8-11` which sets both `Hidden` and `Deprecated`), `reset`/`rewind` (Deprecated), and `mcp`/`hooks`/`trail`/`__send_analytics`/`curl-bash-post-install` (Hidden infra).
+
+## 4. `newAgentHelpCmd` (agent_help_cmd.go)
+
+It **does** iterate the root command tree, but reads **no cobra Groups** and setting `GroupID` will **not** affect its output or JSON.
+
+- `newAgentHelpCmd(rootCmd)` (line 43) closes over `rootCmd`; rendering walks `parent.Commands()` in `agentHelpCommands` (209) / `agentHelpFindChild` (118).
+- Inclusion is decided solely by `isAgentHelpAdvertised` (195): filters on `Name()`, `Hidden`, `Deprecated`, and the `agentHelpAnnotation`/`agentHelpRequiresTrailsAnnotation` annotations. No reference to `Group`, `GroupID`, `Groups()`, or `AddGroup`.
+- JSON (`agentHelpJSON` struct, 145-152; `renderAgentHelpJSON`, 155) has no group field. Adding `GroupID` to commands leaves both text and JSON identical. **No change needed here.**
+
+## 5. Existing root-structure tests
+
+`cmd/entire/cli/root_test.go` is the canonical home and matches the pattern a "every visible root command has a GroupID" test should follow:
+
+- `TestRoot_NounGroupShorthandsUseCobraAliases` (root_test.go:179) — builds `NewRootCmd()`, iterates `root.Commands()`, asserts alias vs duplicate. This is the closest existing model: table-driven, `root := NewRootCmd()`, loop over `root.Commands()`.
+- `TestCheckpointSearchIsVisibleButTopLevelSearchIsHidden` (215) and `TestCheckpointPolicyCommandIsHiddenDuringDevelopment` (237) — assert `.Hidden` via `root.Find([...])`.
+- `TestPersistentPostRun_SkipsHiddenParent` (71) / `_ParentHiddenWalk` (100) — hidden/parent-chain patterns.
+- Helper `containsString` (259) is local to this file.
+- Related: `aliascmd_test.go`, `agent_group_test.go`, `plugin_group_test.go` for group-command sub-structure tests.
+
+A new test iterating `root.Commands()` and asserting `!c.Hidden &amp;&amp; c.Deprecated=="" &amp;&amp; c.Name()!="help"` implies `c.GroupID != ""` fits naturally in `root_test.go` using the `getVisibleCommands`-style filter from `help.go:73`.
+
+## 6. Help/completion customization
+
+- **Help command is customized**: `NewHelpCmd(rootCmd)` in `help.go:11`, installed via `SetHelpCommand` (root.go:147). It adds a hidden `-t/--tree` flag but delegates to `targetCmd.Help()` for normal help — it does not override help templates, so grouped rendering of `entire --help`/`entire help` is unaffected. Its tree walker `getVisibleCommands` (help.go:73) skips `Hidden` and `help` (not group-aware, but purely cosmetic for the `-t` tree).
+- Because a **custom help command** is set and the **completion command is hidden** (`HiddenDefaultCmd: true`, root.go:44-46), neither appears in the "Available Commands" list. Cobra normally auto-assigns `help` and `completion` to their own ungrouped section; with groups enabled, if you want them tucked under a group you would call `SetHelpCommandGroupID` / `SetCompletionCommandGroupID`. Since completion is hidden and help is custom (and typically left ungrouped/"Additional Commands"), these are optional — but note the help command is created in `NewHelpCmd` and added via `SetHelpCommand`, so any `GroupID` on it must be set on the returned command or via `rootCmd.SetHelpCommandGroupID(...)` after `SetHelpCommand`.
+
+**Bottom line for implementation:** cobra 1.10.2 supports Groups; no templates/funcs are overridden anywhere, so adding `cmd.AddGroup(...)` plus `GroupID` on the visible constructors will produce sectioned help with zero template work. `agent-help` and the custom help command are unaffected by `GroupID`.</result>
+<usage><subagent_tokens>44383</subagent_tokens><tool_uses>15</tool_uses><duration_ms>123691</duration_ms></usage>
+</task-notification>
+
+---
+
+ship it

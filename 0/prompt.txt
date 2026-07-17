@@ -1,0 +1,23 @@
+The remote helper fails to dry run pushes as per Linear ticket ENT-1199:
+
+Root cause
+
+The bug is in git-remote-entire (the entireio/cli repo), not the server. handlePush in internal/remotehelper/githelper/push.go unconditionally POSTs to /git-receive-pack even when there is nothing to send — which is exactly what happens on every --dry-run push.
+
+The full chain:
+
+1. git push --dry-run origin :cli-test drives the helper with option dry-run true, which the helper forwards as --dry-run to git send-pack --stateless-rpc --helper-status --stdin (options.go:54-56).
+2. In stateless-rpc mode, upstream send-pack guards the entire request emission with !args->dry_run — on a dry run it writes no receive-pack request at all. I reproduced this on git 2.54.0 by feeding send-pack the exact bytes the helper feeds it: its stdout is just an outer flush packet followed immediately by the helper-status line — 0000ok refs/heads/cli-test\n. A real (non-dry-run) deletion, by contrast, emits a proper command pktline first. This holds for any dry-run push, not just deletions — I verified a branch-update dry run produces the same empty request.
+3. gitproto.ReadSendPackRequest consumes that flush and returns an empty body; AppendAgentToReceivePackRequest passes empty input through unchanged; handlePush then POSTs the zero-byte body (push.go:133) and wraps the failure as the observed posting receive-pack: server error (HTTP 400): empty request body.
+4. The server (server/githttp/receive_pack.go:400 in this repo) deliberately rejects zero-byte bodies with 400 — a documented choice so that helper retries after an already-landed push don't page or trip replica failover. It does accept a flush-only body gracefully, but the helper sends literally zero bytes, since the flush belonged to send-pack's outer framing.
+5. Upstream remote-curl.c (which handlePush mirrors) handles this case explicitly: its rpc_service loop reads the first packet from send-pack and breaks without ever calling post_rpc when it's a flush. That's the behavior the helper failed to copy. (GitHub "working" in the repro is over SSH, so it never hits this path at all — but C git over HTTPS also works, thanks to that skip.)
+
+Where the fix belongs
+
+In entireio/cli push.go: when requestBody is empty after ReadSendPackRequest, skip the POST (and close respCh so the feeder goroutine exits). One trap for whoever implements it: in this case the helper must also skip the trailing-flush drain at push.go:153-159 — the single 0000 already consumed is the only flush send-pack emits on a dry run (the trailing packet_flush is guarded by cmds_sent), so the next bytes on stdout are the helper-status lines themselves. Blindly reading 4 more bytes would consume ok r and fail with "expected trailing flush".
+
+Sketch a fix
+
+---
+
+go ahead

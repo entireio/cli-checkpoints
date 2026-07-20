@@ -8,6 +8,7 @@
   "checkpoints_count": 1,
   "files_touched": [],
   "agent": "Claude Code",
+  "model": "",
   "turn_id": "9a06ef2bc570",
   "token_usage": {
     "input_tokens": 94,
@@ -18,5 +19,54 @@
   },
   "session_metrics": {
     "turn_count": 4
+  },
+  "summary": {
+    "intent": "Fix a broken Slack notification in the e2e triage GitHub Action and add an early 'triage started' notification so users know the process has begun.",
+    "outcome": "Shipped fixes across multiple pushes: improved Slack error logging, collapsed the per-agent matrix into a single triage job, fixed a job-level env var bug blocking the start notification, and normalized a malformed thread_ts (missing decimal point) that was causing INT64 overflow errors. Two config-side issues (bot channel invite) were left to the user.",
+    "learnings": {
+      "repo": [
+        "e2e-triage.yml and e2e.yml use two different Slack auth mechanisms: e2e.yml posts via E2E_SLACK_WEBHOOK_URL (incoming webhook, 'CLI E2E Failures' app), while e2e-triage.yml uses SLACK_BOT_TOKEN with chat.postMessage — the bot must be separately invited to the channel (webhook 'integration' add does not add the bot user).",
+        "The triage workflow originally ran one Claude Code session per matrix agent; collapsing failed agents into a single job/session was intentional so cross-agent failures sharing a root cause can be correlated instead of independently rediscovered per agent.",
+        "e2e-fix.yml downloads triage output artifacts; when the matrix was collapsed, artifact naming changed from per-agent (e2e-plan-${agent}) to a single e2e-triage artifact, requiring e2e-fix.yml's download step and prompt to be updated in lockstep.",
+        "Slack thread_ts values must be preserved as strings (e.g. '1774295548.366959'); something upstream (likely GitHub Actions workflow_dispatch input handling or a dispatching Cloudflare Worker) strips the decimal point, turning it into a huge integer that overflows Slack's parser to INT64_MAX."
+      ],
+      "code": [
+        {
+          "path": "scripts/post-slack-message.sh",
+          "finding": "Original script checked Slack response .ok but only logged 'non-ok response' without the JSON error field, making failures like not_in_channel undiagnosable from CI logs; fixed to log the error field and full response body."
+        },
+        {
+          "path": ".github/workflows/e2e-triage.yml",
+          "line": 137,
+          "end_line": 143,
+          "finding": "Per-agent 'Post triage started' step lived inside the triage matrix job; removed in favor of one consolidated notification in matrix-setup/setup job."
+        },
+        {
+          "path": ".github/workflows/e2e-triage.yml",
+          "finding": "SLACK_BOT_TOKEN was set at step-level env, but the step's `if:` condition referencing env.SLACK_BOT_TOKEN is evaluated before step-level env is applied, causing the condition to silently see an empty string; fix moves the token to job-level env."
+        },
+        {
+          "path": ".github/workflows/e2e-triage.yml",
+          "finding": "Added sed-based normalization to insert a missing decimal point into thread_ts (e.g. 1774295548366959 -> 1774295548.366959) before using it in Slack API calls."
+        }
+      ],
+      "workflow": [
+        "GitHub Actions `${{ inputs.foo }}` expressions are template-expanded into shell text before execution and are injectable if not passed via env vars — prefer `env:` + `$VAR` in `run:` blocks over direct `${{ }}` interpolation, even for low-risk workflow_dispatch inputs.",
+        "When debugging a 'successful' CI run that has a hidden failure, check step-level conclusions/logs (not just job-level status) — Slack's API returns HTTP 200 even on failure, so curl -fsS-style status checks won't catch it; must inspect the JSON body's `ok`/`error` fields."
+      ]
+    },
+    "friction": [
+      "Initial CI run showed all jobs as 'success' even though 3 Slack notifications silently failed, requiring step-level log digging to find the real error.",
+      "First fix introduced a new bug (if: condition couldn't see step-scoped env var), so the 'Post triage starting' notification still didn't appear after the first push.",
+      "Second fix surfaced a different failure (not_in_channel) that required distinguishing between two separate Slack auth mechanisms (webhook vs bot token) already in use in different workflows.",
+      "After fixing not_in_channel, a third issue appeared: thread_ts arriving without its decimal point, causing a Slack INT64 overflow error — required a WebSearch into Slack's ts format docs to confirm the string format requirement.",
+      "User had to submit two screenshots of failing GitHub Actions runs to get the assistant enough detail to diagnose issues.",
+      "A planned change (making 'Post triage starting' its own top-level job) was later dropped/superseded once the more pressing thread_ts bug was found."
+    ],
+    "open_items": [
+      "User needs to invite the Slack bot associated with SLACK_BOT_TOKEN into #project-troy (e.g. via /invite @CLI E2E Failures) since adding the webhook integration alone doesn't add the bot user.",
+      "Verify on the next triage run that Slack notifications (start, completion, fix plan) all succeed end-to-end now that thread_ts normalization is in place.",
+      "Confirm whether 'Post triage starting' should still become its own top-level job for Actions UI visibility, or if that idea was permanently shelved in favor of the setup-job placement."
+    ]
   }
 }

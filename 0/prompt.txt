@@ -1,0 +1,135 @@
+I did run entire enable and selected git-refs as checkpoints backend, and it ended up also creating entire checkpoints v1 branch, why ?
+
+---
+
+<task-notification>
+<task-id>a3e48ca7f5b7a8f24</task-id>
+<tool-use-id>toolu_01Uo7PjsPhm97MUVw3A1P5QV</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-cli/b1ecf7a6-fded-4a94-91ea-51ab3d3274ea/tasks/a3e48ca7f5b7a8f24.output</output-file>
+<status>completed</status>
+<summary>Agent "Find git-refs backend v1 branch creation" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I now have a complete, evidence-based picture. Here is my report.
+
+## Summary
+
+Selecting the **git-refs** backend controls only **where new condensed checkpoints are written** (per-checkpoint refs). It does **not** turn off the `entire/checkpoints/v1` branch, because the "committed-metadata ref topology" that names v1 is a **separate, hardcoded concept** from the pluggable backend, and several code paths consult/create v1 regardless of the configured backend.
+
+There are two distinct ways v1 shows up. Which one you hit tells you the root cause.
+
+## 1. Where the backend is selected (`entire enable`)
+
+- Interactive picker and its defaulting: `cmd/entire/cli/checkpoint_backend.go:84-117` (`checkpointBackendChoices`, `promptCheckpointBackend`) — git-refs is pre-selected/recommended.
+- First-run resolution + persist to settings: `cmd/entire/cli/setup.go:1370-1410` (`resolveFirstRunCheckpointBackend`, `firstRunCheckpointBackendDefault`) and `cmd/entire/cli/setup.go:1242-1246`, `1917-1922`.
+- Applied to the `checkpoints.primary` settings block: `cmd/entire/cli/checkpoint_backend.go:50-77` (`applyCheckpointBackend` / `applyCheckpointBackendFlag`).
+
+This path works: a fresh `enable` writes `"primary": {"type": "git-refs"}` into `.entire/settings.json`, verified by `cmd/entire/cli/integration_test/enable_backend_default_test.go:19-54` (which asserts refs get created — but note it does **not** assert v1 is absent).
+
+## 2. What the backend actually governs (writes go to refs, not v1)
+
+- Condensation runs through the config-driven store: `cmd/entire/cli/strategy/manual_commit_condensation.go:325` → `store.Write(...)` at `:401`, where `store` comes from `getPersistentStore` → `checkpoint.Open` (`cmd/entire/cli/strategy/manual_commit.go:43-61`).
+- `checkpoint.Open` builds a fan-out writer whose primary is the git-refs store (no git-branch mirror): `cmd/entire/cli/checkpoint/open.go:63-97`.
+- git-refs `writeSession` writes only a per-checkpoint ref `refs/entire/checkpoints/&lt;shard&gt;/&lt;id&gt;`, never v1: `cmd/entire/cli/checkpoint/refs_store.go:131-161` (`setRef` at `:104-114`).
+- Pre-push under git-refs pushes queued refs, not v1: `cmd/entire/cli/strategy/manual_commit_push.go:84-86` (`PrimaryIsRefs` branch) → `prePushCheckpointRefs` at `:264-290`.
+
+So the normal enable → session → commit → push flow under git-refs does **not** write or push v1.
+
+## 3. Why v1 still appears — the hardcoded topology
+
+The key finding: `checkpoint.ResolveRefs` is **hardcoded to v1** and ignores the backend config.
+
+- `cmd/entire/cli/checkpoint/persistent_refs.go:19-27` (`DefaultV1Refs`) and `:47-49` (`ResolveRefs` returns `DefaultV1Refs()` unconditionally). Primary/Read/Push are all `paths.MetadataBranchName` = `"entire/checkpoints/v1"` (`cmd/entire/cli/paths/paths.go:48`).
+
+This v1 topology is consumed independently of the selected backend by two mechanisms that will **create a local v1 branch**:
+
+**(a) Metadata-fetch/bootstrap (fetches an existing remote v1 into a local branch).**
+- `FetchMetadataBranch` → `fetchMetadataFromOrigin`: `cmd/entire/cli/git_operations.go:366-442`. It calls `checkpoint.ResolveRefs` (`:393`, hardcoded v1), fetches `refs/heads/entire/checkpoints/v1` from origin, then **creates/advances the local `refs/heads/entire/checkpoints/v1`** via `SafelyAdvanceLocalRef` (`:439`).
+- Callers that trigger this on read paths: resume (`cmd/entire/cli/resume.go:529`, `:824`, `:787`), plus explain/attach/doctor fallbacks. None of these check the configured backend.
+
+**(b) Read-routing always builds a git-branch read store even under git-refs primary** (so legacy hex checkpoints stay readable): `cmd/entire/cli/checkpoint/open.go:104-118` (`buildKindReadStores`, the `BackendTypeGitRefs` case still calls `build(..., BackendTypeGitBranch, ...)`). Its tree read consults origin's v1 tracking ref: `cmd/entire/cli/checkpoint/persistent.go:2159-2173` (`getSessionsBranchTree`). This is the "refs-first, branch-fallback" routing the doc describes (`docs/architecture/ref-checkpoint-backend.md:123-138`), which explicitly has "no per-command config knob."
+
+**Creation-from-scratch (orphan) path — the other scenario.** The only code that creates a brand-new orphan v1 ("Initialize sessions branch" commit) is the **git-branch write store**: `cmd/entire/cli/checkpoint/persistent.go:2108-2135` (`ensureSessionsBranch`), called only from git-branch write methods (`persistent.go:77`, `:860`, `:1696`, `:1744`). This runs **only if the git-branch store is actually the primary at write time** — i.e., the git-refs selection did not take effect. That happens when:
+- `ENTIRE_CHECKPOINTS_PRIMARY` env is set (e.g. to `git-branch`), which **overrides the settings file wholesale**: `cmd/entire/cli/settings/checkpoints.go:66-73` (env wins in `LoadCheckpointsConfig`). Doc: `ref-checkpoint-backend.md:157-159`.
+- Config fails to load / is absent at write time → fail-soft default to git-branch: `cmd/entire/cli/checkpoint/open.go:120-127` (`resolvePrimaryType`).
+- The config is resolved relative to cwd/worktree-root, not the repo — if the ctx worktree root isn't set to where `settings.json` lives, the block isn't found and it defaults to git-branch: `cmd/entire/cli/checkpoint/open.go:57-62`, and the acknowledged risk in `ref-checkpoint-backend.md:216`.
+
+## Mechanism in one paragraph
+
+The checkpoint **backend** (`checkpoints.primary`) is a **write-target selector**: git-refs makes condensation and pre-push use per-checkpoint refs instead of the v1 subtree. But the **v1 branch name is hardcoded** in `checkpoint.ResolveRefs`/`DefaultV1Refs` and is used, independent of the backend, by (a) the metadata-fetch/bootstrap helpers (`FetchMetadataBranch` → `SafelyAdvanceLocalRef`) that materialize a **local** `refs/heads/entire/checkpoints/v1` whenever origin already has one, and (b) the always-built git-branch **read** store used for legacy-format read-routing. So choosing git-refs stops v1 from being **written to** by new checkpoints, but does not stop the CLI from **creating a local v1** when the remote has one. If you additionally see a from-scratch orphan v1 ("Initialize sessions branch"), the git-refs selection wasn't actually in force at write time (env override, fail-soft default, or worktree-root/cwd config-resolution mismatch), so the git-branch write store's `ensureSessionsBranch` created it.
+
+## Config/setting that affects v1
+
+- To keep **new** checkpoints off v1: `checkpoints.primary.type = "git-refs"` (what selecting git-refs does). There is **no** config knob to disable the v1 read-routing/fetch — the doc states read routing always does refs-first + branch-fallback with no per-command knob (`ref-checkpoint-backend.md:138`, `:192`).
+- `ENTIRE_CHECKPOINTS_PRIMARY` env (`cmd/entire/cli/settings/checkpoints.go:27`, `:66-73`) **overrides** the settings file. If it is set to `git-branch` (or the settings block isn't seen), condensation itself writes/creates v1 via the git-branch store — this is the most likely cause if you see an orphan v1 created from scratch despite selecting git-refs. Check that env var and that the settings block is being resolved from the repo's worktree root.
+
+No changes were made.</result>
+<usage><subagent_tokens>103504</subagent_tokens><tool_uses>36</tool_uses><duration_ms>367267</duration_ms></usage>
+</task-notification>
+
+---
+
+Cause B, it happens in a folder not git initialized, it's entire enable doing the full repo setup.
+
+---
+
+<task-notification>
+<task-id>a3e48ca7f5b7a8f24</task-id>
+<tool-use-id>toolu_017B8oiFnYLM3hauqahzJPMZ</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-cli/b1ecf7a6-fded-4a94-91ea-51ab3d3274ea/tasks/a3e48ca7f5b7a8f24.output</output-file>
+<status>completed</status>
+<summary>Agent "Find git-refs backend v1 branch creation" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I now have the complete, precise picture. Here is the ordered trace.
+
+## Answer: the v1 branch is created by an explicit, unconditional seed step in `EnsureSetup` — not by ordering, and not by the git-branch store's `ensureSessionsBranch`
+
+### The v1-creating call is `EnsureSetup` → `EnsurePrimaryRef` → `createOrphanMetadataRef`
+
+- `cmd/entire/cli/strategy/common.go:90-117` — `EnsureSetup`. Its comment at `:96` is explicit: *"Ensure the entire/checkpoints/v1 orphan branch exists for permanent session storage."* It calls `EnsurePrimaryRef` at `:105`.
+- `cmd/entire/cli/strategy/common.go:467-569` — `EnsurePrimaryRef`. At `:477` it resolves the ref via the **hardcoded** `checkpoint.ResolveRefs(ctx)` (= `entire/checkpoints/v1`, from `persistent_refs.go:47` / `paths.go:48`). It **never reads `checkpoints.primary`**. On a freshly `git init`-ed folder there is no origin remote and no `checkpoint_remote`, so it falls through to the final branch at `:567-568` → `createOrphanMetadataRef`.
+- `cmd/entire/cli/strategy/common.go:574-628` — `createOrphanMetadataRef`. Builds an empty-tree orphan commit (message **"Initialize metadata ref"**, `:602`) and creates the local branch ref `refs.Primary` = `refs/heads/entire/checkpoints/v1` via `setRefHash` at `:623`. Prints `✓ Created orphan ref entire/checkpoints/v1 for session metadata` (`:627`).
+
+Note this is a **different** function from the one the coordinator hypothesized. The git-branch *store's* `ensureSessionsBranch` (`persistent.go:2108-2135`, commit message "Initialize sessions branch") runs only on git-branch **write** methods and is NOT what fires here. The actual creator during enable is `createOrphanMetadataRef` (commit message "Initialize metadata ref"), reached through the strategy-level setup seed.
+
+### Precise ordered timeline of `entire enable` in an uninitialized folder
+
+Command RunE (`cmd/entire/cli/setup.go`):
+
+1. `setup.go:831-836` — validate `--checkpoint-backend` value (only if the flag was passed).
+2. `setup.go:848-850` — `paths.WorktreeRoot(ctx)` errors (not a git repo) → `runGitHubBootstrapInit` = **phase 1: `git init`** + identity + gather GitHub choices.
+3. `setup.go:867-871` — re-check worktree root; print "Enabling Entire".
+4. `setup.go:876-883` — **defer** phase 2 (`runGitHubBootstrapFinalize` = initial commit + `gh repo create` + push) to run *after* setup.
+5. `setup.go:915-920` — fresh repo (`IsSetUpAny` false) → `runSetupFlow` → `runEnableInteractive`.
+
+Inside `runEnableInteractive` (`cmd/entire/cli/setup.go`):
+
+6. `setup.go:1242` — `resolveFirstRunCheckpointBackend` → interactive picker returns **git-refs**.
+7. `setup.go:1246` — `applyCheckpointBackendFlag(settings, "refs")` → sets `checkpoints.primary.type=git-refs` on the **in-memory** settings.
+8. `setup.go:1271-1273` — **`saveSettings()` writes `.entire/settings.json` with `primary.type=git-refs` to disk.** ← git-refs is persisted HERE.
+9. `setup.go:1277` — `InstallGitHook`.
+10. `setup.go:1313-1315` — `saveSettings()` again (telemetry) — git-refs still on disk.
+11. `setup.go:1321` — **`strategy.EnsureSetup(...)` → `EnsurePrimaryRef` → `createOrphanMetadataRef` CREATES the orphan `entire/checkpoints/v1` branch.** ← v1 created HERE.
+12. `setup.go:1327` — `maybeOfferSessionImport` (first-run; import path also targets v1 but is best-effort and runs after).
+13. (deferred, step 4) `runGitHubBootstrapFinalize` — initial commit + push.
+
+### Direct answers to the coordinator's questions
+
+1. **Order:** `git init` (step 2) → resolve/prompt git-refs (step 6) → persist git-refs to settings.json (step 8) → **create v1** (step 11). So git-refs is chosen and saved *before* v1 is created.
+
+2. **Is v1 created before the setting is persisted / with the fail-soft default?** No. The v1 creation at `setup.go:1321` runs *after* both `saveSettings()` calls (`:1271`, `:1313`). It is **not** a "settings.json not written yet → fail-soft to git-branch" race, and it does **not** go through the git-branch store's `ensureSessionsBranch`. The seed uses the hardcoded `checkpoint.ResolveRefs` (`common.go:477`) and creates v1 directly via `createOrphanMetadataRef`.
+
+3. **Is settings.json written before or after the v1-creating call?** **Before.** Settings write: `setup.go:1271-1273` (and again `:1313-1315`). v1-creating call: `setup.go:1321` → `common.go:105` → `:477` → `:568` → `:623`. Settings-write runs first; v1 creation runs after.
+
+4. **Is there an explicit "initialize checkpoints branch" seed step in the enable flow?** **Yes** — that is exactly `strategy.EnsureSetup` at `setup.go:1321`, whose stated purpose (`common.go:96`) is to ensure the `entire/checkpoints/v1` orphan branch exists. It runs on every first-run enable regardless of backend.
+
+### Root cause
+
+It is **not** a timing/ordering bug. git-refs is correctly persisted to `settings.json` before v1 is created. The bug is that the enable-time seed step, `EnsureSetup` → `EnsurePrimaryRef` → `createOrphanMetadataRef` (`common.go:90-117`, `:467-569`, `:574-628`), is **backend-agnostic**: it resolves the target ref through the hardcoded `checkpoint.ResolveRefs(ctx)` (`common.go:477`, always `entire/checkpoints/v1`) and never consults `checkpoints.primary`. So on a fresh `git init`-ed folder with no origin and no `checkpoint_remote`, it unconditionally creates the empty orphan `entire/checkpoints/v1` branch ("Initialize metadata ref" commit) even though the user selected—and the CLI already saved—the git-refs backend. Under git-refs, nothing ever writes checkpoints into that branch (condensation and pre-push use per-checkpoint refs), so it remains an empty, vestigial v1 branch created purely by this setup seed.
+
+No changes were made.</result>
+<usage><subagent_tokens>123947</subagent_tokens><tool_uses>8</tool_uses><duration_ms>123966</duration_ms></usage>
+</task-notification>
+
+---
+
+draft a fix

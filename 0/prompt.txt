@@ -1,0 +1,402 @@
+this repo is a cli tool that links commits with checkpoints, it has several commands to explore, and manage all the ai data related to a code change. Can you go deeper and find out all the power of this tool.
+
+---
+
+<task-notification>
+<task-id>ab4562744bb4334e0</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-exploring-entire/bbacf00a-cbe7-41b9-a2f1-0dd7125e3626/tasks/ab4562744bb4334e0.output</output-file>
+<status>completed</status>
+<summary>Agent "Map auth/api/control-plane cmds" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I now have a complete picture. Here is the structured summary.
+
+---
+
+# Entire CLI — auth / api / org / project / repo / grant
+
+Architecture: a **control plane** ("core", login servers like `https://us.auth.entire.io` / `us.console.entire.io`) plus per-jurisdiction **data-plane cells** ("entire-api", e.g. `aws-us-east-2.api.entire.io`). Commands are cobra, defined in `cmd/entire/cli/*.go`. Core calls go through `internal/coreapi` (ogen-generated client); cells/session-mgmt through `cmd/entire/cli/api`.
+
+## Cross-cutting power (the interesting bits)
+
+- **`ENTIRE_TOKEN` bypass** (`internal/coreapi/client.go:69-113`, `cmd/entire/cli/auth/env_token.go:16`): if the env var is set (even blank), the CLI is *committed* to it — no contexts.json, no keyring. The token's own `aud` JWT claim becomes the control-plane origin dialed (`CoreURLFromEnvToken`, validated to be an https bare origin). Fail-closed: blank/malformed is fatal, never falls back. Deliberately has **no trust gate** because coreapi sends the token verbatim as the bearer (the token *is* the credential), unlike git-remote-entire which exchanges it (see the long comment at client.go:84-101).
+- **Cross-jurisdiction transport / 421 follow + RFC 8693 exchange** (`internal/coreapi/cross_juris_transport.go`): every core client wraps its RoundTripper so a resource whose home jurisdiction is another region is reachable transparently. Two recovery hops per origin: a **421 Misdirected** carrying `home_core_url` → re-dial the home core; a **401** carrying `{token_exchange_url, audience}` (or a bare 401 right after a 421) → exchange the *original* login JWT at the home core's `/oauth/token` for a token that core accepts. Same-origin guard on `token_exchange_url` (transport.go:80-84); exchanged tokens cached with bounded TTL; chained exchanges rejected (the validator rejects a subject_token already carrying `foreign_iss`).
+- **Contexts model**: multiple saved logins in `contexts.json`, each with its own `CoreURL`. The *active* context drives control-plane commands and `git clone entire://…`. `auth use` retargets. Tokens stored in OS keyring (or file store via `ENTIRE_TOKEN_STORE=file`). Note (auth_context.go:19): data-API commands (activity/search/trail/dispatch) still key off `ENTIRE_API_BASE_URL`, *not* the active context.
+- Hidden `--insecure-http-auth` on every authenticated command relaxes TLS enforcement for local dev (`auth.go:103`).
+
+## `auth` family (`auth.go`, `login.go`, `logout.go`, `auth_context.go`)
+
+- **`login`** (`login.go:73`): default is the **loopback authorization-code (browser) flow with PKCE**; auto-falls-back to the **RFC 8628 device-code flow** when not interactive / SSH session / listener bind fails (`runLoginAuto`, `shouldUseBrowserLogin` at :249). `--device` forces device flow; `--server &lt;origin&gt;` picks a login server (validated to bare origin, userinfo/path/query rejected, login.go:119). Received token is validated (`validateReceivedToken`: parseable JWT claims required, `iss` must match the server dialed, not-already-expired) before persisting via `RecordLoginContext`. Headless keyring-failure hint suggests `ENTIRE_TOKEN_STORE=file`.
+- **`logout`** (`logout.go:28`): default revokes only the *current* session server-side (`POST /api/auth/tokens` current) and removes the active local context, then **promotes the next saved context** so repeated `logout` drains all logins. `--everywhere` revokes every session on that core (list + delete each). `--all-contexts` sweeps every saved login, each against its own core with its own bearer (best-effort, never aborts on one failure).
+- **`status`** (`auth.go:215`): resolves target honoring `ENTIRE_TOKEN` first, else active context (refreshing an expired login JWT from the refresh token). Calls `GET /me` as liveness+profile, prints user/identity/**home jurisdiction slug** (surfaced so it's discoverable for `auth token -j`), token storage backend, and the active-session table. A 401 → "login no longer valid, re-authenticate" (`isKeychainTokenRejected`, auth.go:78 — handles typed 401, `ErrNotLoggedIn`, non-JSON "code 401", and `token exchange: status 4xx`).
+- **`token`** (`auth.go:139`): prints a bearer to stdout for scripting. Default = control-plane bearer (same resolution as the API client: `ENTIRE_TOKEN` verbatim, else refreshed login JWT). **`--jurisdiction &lt;slug&gt;` mints a data-plane cell *identity token*** via `auth.JurisdictionToken` (RFC 8693 exchange, scope `openid`) for that jurisdiction's cells — the control-plane bearer is *rejected* by cells. Only the token goes to stdout; errors/hints to stderr (clean command substitution). Refuses to print a bearer for an insecure core unless opted in.
+- **`contexts`** (`auth_context.go:72`): purely local, lists saved logins with active `*` marker.
+- **`use &lt;context&gt;`** (`auth_context.go:20`): switch active context; has shell completion (`completeContextNames`) annotating handle/core/active.
+
+## `api` — authenticated HTTP passthrough (`api_cmd.go`) — gh-style escape hatch
+
+`entire api &lt;path&gt;` attaches the right bearer + dials the right host. Key design:
+- **`--to core|cell`** (default core): core = control plane; cell = your **home** entire-api cell (`resolveAPIClient`, api_cmd.go:155). `--jurisdiction/-j &lt;slug&gt;` targets a *specific* jurisdiction's cell and **implies `--to cell`**; combining with `--to core` is rejected (`resolveAPITarget`, :135). Cell client is `auth.NewEntireAPICellClient` which mints the jurisdictional identity token.
+- **gh-style fields**: `-f key=val` (always string), `-F key=val` (typed: true/false/null/number inferred, :283), `-H` headers, `--input`/`-`, `-X` method (defaults GET, POST when body/fields present; GET+fields → query string), `-i` include response headers.
+- **Path placeholders filled from the current repo's origin remote** (`expandAPIPlaceholders`, :207): `{owner}`, `{repo}`, and `{repo_id}` — the latter costs a control-plane mirror lookup resolving the repo's Entire ULID (cells key on this). Lazy: only resolves what's referenced.
+- **Security**: `validateAPIPath` (:193) rejects absolute/scheme-relative paths so the bearer can't be redirected to another host. 32 MiB response cap; pretty-prints JSON; non-2xx → silent non-zero exit with body already printed.
+
+## `org` (`org.go`), `project` (`project.go`), `repo` (`repo.go`) — control-plane lifecycle
+
+All share `addControlPlaneFlags` (hidden `--insecure-http-auth`) + per-verb `--json`; deletes get `--force`/`-f`/`--yes`/`-y` with confirmation prompt (`corecmd.go:35,68`). Refs resolve by **name or ULID** (`resolveOrgRef`/`resolveProjectRef`/`resolveRepoRef`); paginated lists via `fetchAllPages`.
+
+- **org**: create (`--region` jurisdiction slug), list, get, delete.
+- **project**: create with `--owner` + `--owner-type org|account` (org by name/ULID, account by `github:handle`/ULID; project.go:34), `--region`; list (`--name` exact server-side filter, `--org` scope), get, delete.
+- **repo**: create (`--project`, `--cluster-host` to pin to a cluster, default = jurisdiction default); list `&lt;project&gt;`; get (adds synthesized **`entire://` REMOTE** clone URL, repo.go:66); delete. Plus subtrees:
+  - **`repo clone &lt;ref&gt; [dir]`** (`repo_clone.go:67`): accepts `/gh/&lt;owner&gt;/&lt;repo&gt;` shorthand or a full `entire://&lt;cluster&gt;/gh/&lt;owner&gt;/&lt;repo&gt;` URL (passed straight to `git clone`, no lookup). Shorthand hits the **pull-gated `/mirrors/placements`** endpoint (`resolvePullablePlacements`, :221 — resolves public repos too, unlike the affiliation-scoped mirror list); multi-cluster → interactive picker or `--cluster`. `--cluster` may name a cluster in *another federation* → dials that cluster's core via well-known (`runCoreForCluster`). `validateClusterHost` (repo_mirror.go:251) blocks the `cluster@evil.com` token-leak vector.
+  - **`repo visibility get|set &lt;public|private&gt;`** (repo.go:259): public = SpiceDB `public_viewer` wildcard = read-only to any *authenticated* user (not anonymous); private = explicit grantees only.
+  - **`repo mirror`** (`repo_mirror.go`): create/list/get/remove/collaborators of GitHub-mirror placements on EntireDB clusters.
+    - **create `[github-url] [cluster-host]`**: no args → interactive multi-repo/multi-region wizard (fans out creating every (repo,region) in parallel). With a URL: registers placement (idempotent on upstream+cluster) and **polls until the initial GitHub→EntireDB clone is ready** (`createAndAwaitMirror`, :405); `--no-wait`, `--wait-timeout` (default 30m). Omitted cluster → picker interactively, else `aws-us-east-2.entire.io`.
+    - **list**: `--cluster/--provider/--owner` server-side filters, `--name` client-side substring, `--sort` (name/clone-url/private, `-` prefix desc). **`--show-available`** lists GitHub repos you *could* onboard (computed live from GitHub via your login; access + status available/mirrored/owner-only). Prints "Listing … on `&lt;CoreOrigin&gt;`" to stderr so a surprising empty result names the actual core dialed (reflects `ENTIRE_TOKEN` aud).
+    - **get `&lt;mirror&gt;`**: ULID → active context's core; `entire://` clone URL → dials the core fronting *that* cluster (cross-federation).
+    - **remove `&lt;github-url&gt; [cluster-host]`**: deletes one placement; other clusters' placements unaffected.
+
+## `grant` (`grant.go`) — access + org membership
+
+Grantees addressed as **`provider:handle`** (e.g. `github:alice`, resolved to the provider account) or an account ULID; targets by name/ULID. Three subtrees, each add/list/remove:
+- **`grant org`**: membership; roles `owner|admin|member` (`--role`, default member). Remove is idempotent (404 → no-op).
+- **`grant project`**: roles `reader|writer|admin` (`--role` required). Remove routes ULID → revoke-by-id, `provider:handle` → revoke-by-provider (`revokeGrantee`, :342).
+- **`grant repo`**: same roles; `--project` scope needed when repo addressed by name. List shows GRANTEE/ROLE/**SOURCE** (direct/inherited/owner)/TYPE/ID.
+
+## Key files
+- `cmd/entire/cli/auth.go`, `login.go`, `logout.go`, `auth_context.go` — auth family
+- `cmd/entire/cli/api_cmd.go` — HTTP passthrough
+- `cmd/entire/cli/org.go`, `project.go`, `grant.go`, `repo.go`, `repo_clone.go`, `repo_mirror.go` — resource commands
+- `internal/coreapi/client.go` — `New`/`NewForCluster`/`NewWithBearer`, ENTIRE_TOKEN bypass, `CoreOrigin`
+- `internal/coreapi/cross_juris_transport.go` — 421 follow + RFC 8693 exchange
+- `cmd/entire/cli/auth/cell_data_api.go` — `JurisdictionToken`, `NewEntireAPICellClient`, jurisdiction→cell resolution
+- `cmd/entire/cli/auth/env_token.go` (`ENTIRE_TOKEN`, aud parsing), `control_plane.go`, `exchange.go`
+- `cmd/entire/cli/corecmd.go` — shared flags + `runCore`/`runCoreForCluster` helpers
+- `cmd/entire/cli/api/client.go`, `base_url.go` — cell/session client (`DefaultAuthBaseURL = https://us.auth.entire.io`)</result>
+<usage><subagent_tokens>116285</subagent_tokens><tool_uses>25</tool_uses><duration_ms>143624</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ac8a9f957fb42cc6d</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-exploring-entire/bbacf00a-cbe7-41b9-a2f1-0dd7125e3626/tasks/ac8a9f957fb42cc6d.output</output-file>
+<status>completed</status>
+<summary>Agent "Map session/checkpoint commands" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I now have a comprehensive picture. Here is my structured summary.
+
+---
+
+# entire CLI — `session` &amp; `checkpoint` command families
+
+All commands live directly in `cmd/entire/cli/` (there is no `commands/` subdir). Parent groups: `newSessionsCmd` (`sessions.go:157`, alias `sessions`) and `newCheckpointGroupCmd` (`checkpoint_group.go:13`, aliases `cp`/`checkpoints`). Both gate on being inside a git worktree via `PersistentPreRunE`.
+
+## Core storage model (docs/architecture/sessions-and-checkpoints.md)
+
+- **Session state**: `.git/entire-sessions/&lt;id&gt;.json`, stored in the git *common dir* so it is shared across worktrees. Records `Branch`, `WorktreeID/Path`, token usage, `LastCheckpointID`, phase, transcript path.
+- **Ephemeral (shadow) checkpoints**: branch `entire/&lt;commit[:7]&gt;-&lt;worktreeHash[:6]&gt;` — full worktree snapshot + `.entire/metadata/&lt;session&gt;/` overlay. Multiple concurrent sessions interleave on one shadow branch. Auto-migrated if the base commit changes (stash→pull→apply), deleted after condensation, reset if orphaned (`sessions-and-checkpoints.md:174-198,532-537`).
+- **Persistent (committed) checkpoints**: pluggable backend — `git-branch` (`entire/checkpoints/v1`, sharded `&lt;id[:2]&gt;/&lt;id[2:]&gt;/`) or `git-refs` (one ref per checkpoint). ID is 12-hex (branch) or 26-char ULID (refs); reads are kind-routed across both (`sessions-and-checkpoints.md:143-152,370-399`).
+- **Checkpoint↔commit link**: `Entire-Checkpoint: &lt;id&gt;` trailer added to user commits by `prepare-commit-msg`; condensation on `post-commit` writes metadata + `full.jsonl` (raw transcript) + `transcript.jsonl` (self-contained compacted session) + `prompt.txt` (`sessions-and-checkpoints.md:199-253,404-467`).
+
+---
+
+## `session` subcommands
+
+**`list`** (`sessions.go:324`) — all sessions across all worktrees (incl. ended), newest-first. `--json` emits an array of the shared `sessionInfoJSON` envelope (`[]` when empty).
+
+**`info &lt;session-id&gt;`** (`sessions.go:470`) — full detail. Three mutually-exclusive output modes (`sessions.go:462-517`): default text, `--json` (metadata only), and the notable **`--transcript`** which streams the *live* raw agent transcript bytes to stdout in native format. Streaming is agent-aware and bounded: JSONL agents (Claude/Cursor/Codex) get line-buffered copy with the trailing partial line dropped; whole-document JSON agents (Gemini) are read fully and `json.Valid`-checked. Read is snapshot-bounded to file size at open via `io.LimitReader`, and Ctrl-C cancellation closes the fd through a goroutine (`sessions.go:52-155`).
+
+**`current`** (`session_current.go`) — resolves the current worktree's active session via `strategy.FindMostRecentSession`, then delegates to `session info`. Same `--json`/`--transcript` modes.
+
+**`tokens [session-id]`** (`session_tokens.go:80`) — token usage + optimization recommendations from captured session state. Defaults to most-recent session; `--current` restricts to current worktree (`FindMostRecentSessionInCurrentWorktree`). Power flag **`--agent-brief`** emits compact next-step guidance intended for an agent to self-optimize. Tracks a subagent-tokens contributor breakdown (`session_tokens.go:186-194`).
+
+**`stop [session-id]`** (`sessions.go:204`) — marks sessions ended by firing `EventSessionStop` through the state machine with a **no-op handler** (no condensation/checkpoint write). No-arg = show/select active sessions (1→confirm, N→TUI multi-select with worktree labels); `--all` stops across all worktrees; `-f/--force` skips confirm. Errors are accumulated so one failure doesn't block the rest (`sessions.go:869-878`).
+
+**`attach &lt;session-id&gt;`** (`attach.go:74`) — creates a checkpoint from an *existing* session's transcript and links it to the last commit (for when hooks didn't fire, or to attach a research session). If the last commit already has a checkpoint it appends; else creates new. Auto-detects agent from transcript if `--agent` doesn't locate one. `-f/--force` amends the last commit with the trailer (best-effort; prints trailer for manual paste on failure). **`--review`** tags the session as an agent review and records the first user prompt; `--skills` declares which review skills ran. Consumes a pending-review marker left by `entire review` when it couldn't launch the agent itself (`attach.go:119-145`).
+
+**`adopt [session-id]`** (`session_adopt.go:33`) — **cross-worktree/cross-repo session migration**. Moves a live session from `--from &lt;path&gt;` into the current worktree. Two paths: *same git session store* → moves the state file (requires `--force`/`--yes`); *external store* → copies state under a two-store lock (`WithSessionStateLocks`), retires the source (marks ended, records `AdoptedIntoWorktree*`), with rollback if the source save fails (`session_adopt.go:125-218`). Adoption preserves the live transcript path but **rebaselines target-local bookkeeping**: rebases attribution to current HEAD, resets checkpoint window/step count/checkpoint IDs, re-baselines subagent token cumulative (avoids over-reporting), seeds current uncommitted changes as `FilesTouched`, clears the owner (`session_adopt.go:415-507`). Source must still belong to the requested worktree and be non-ended/non-condensed; 12h recency window for auto-select (`session_adopt.go:31,390-406`).
+
+**`resume [branch]`** (`resume.go:31`) — two modes:
+- *No arg* → interactive picker (`resume_picker.go`) of stopped sessions across all worktrees; **worktree-aware** — if the chosen branch is checked out in another worktree it points you there instead of failing (`branchCheckedOutElsewhere`, `resume_picker.go:146,450`).
+- *Branch arg* → checks out branch (offers to fetch from origin if remote-only), finds the session from branch-unique commit trailers, and **restores the session log from the checkpoint only if it doesn't exist locally** (`--force` overwrites) (`resume.go:1018-1059`). If newer commits without checkpoints exist, it resets git to the most recent checkpointed commit after confirmation. Restore uses `RestoreLogsOnly` for multi-session checkpoints, falling back to single-session restore for old checkpoints (`resume.go:885-947`). Imported sessions are read-only (not resumable).
+
+---
+
+## `checkpoint` subcommands
+
+**`list`** (`checkpoint_group.go:70`) — condensed checkpoints on the current branch (pager). `--json`, `--session &lt;id&gt;` filter, `--no-pager`. Notable **`--pending`** switches to a *different dataset*: the live shadow-branch rewind points (task checkpoints, logs-only points, condensation IDs). `--pending --json` is the supported replacement for the deprecated `rewind --list` (`checkpoint_group.go:58-123`).
+
+**`explain [id|sha]`** (`explain.go:244`) — human context for checkpoint/commit/session. Auto-detects id vs commit (or force with `--checkpoint`/`--commit`). Verbosity: default / `--short` / `--full` (parsed full transcript) / `--raw-transcript` (raw JSONL). Machine modes: `--json` (metadata only, never transcript bytes), `--transcript` (stream stored checkpoint transcript bytes), `--session-index N` (pick a session in a multi-session checkpoint), `--limit N`. **`--generate`** produces an AI summary (`--force` regenerates, `--summary-timeout-seconds`). `--search-all` removes branch/depth limits when locating commits. Extensive mutual-exclusion enforcement (`explain.go:410-415`).
+
+**`tokens &lt;checkpoint-id&gt;`** (`checkpoint_tokens.go:69`) — token report from committed checkpoint metadata (same resolution path as explain; accepts id prefix, commit ref with trailer, remote fetch). Power feature **`--compare &lt;id&gt;`** diffs against a baseline checkpoint and qualifies observed reduction/increase per metric (input/cache-read/cache-write/output/API-calls) with a `status` and cache-read caveat (`checkpoint_tokens.go:35-67,111-124`). `--agent-brief` for compact agent guidance.
+
+**`search [query]`** (`search_cmd.go:27`, exposed as `checkpoint search`) — **hybrid semantic + keyword search** over checkpoints/commits/sessions via the Entire search *service* (requires `entire login`). Defaults to current repo; `--all-repos` or `repo:*` widens. Inline query filters `author:`, `date:&lt;week|month&gt;`, `branch:`, `repo:`. No-arg opens an interactive results table; `--json` for machine output. **`--code`** switches to code-content search across repos (`--case-sensitive`, repo-scoped via git origin slug); code mode rejects the checkpoint-only filters (`search_cmd.go:64-134`).
+
+**`resume`** (`checkpoint_resume.go:24`, hidden) — resume the session(s) recorded in a committed checkpoint. Target auto-detection order: checkpoint-ID prefix → local branch → remote checkpoint fetch → commit revision → remote branch (offers fetch) (`resumeAutoTarget`, `checkpoint_resume.go:124-157`). Checks out the branch containing the checkpoint at its tip; if that branch is checked out elsewhere, prints the `cd &lt;path&gt; &amp;&amp; entire checkpoint resume &lt;id&gt;` command; if no local branch contains it, restores logs in place. Squash-merge commits with multiple trailers resolve to the newest checkpoint by `CreatedAt`. Never overwrites local logs without `--force`. Interactive picker when no target (limit 20).
+
+**`rewind`** (`rewind.go:44`, **deprecated**) — interactive checkpoint restore. `start.GetRewindPoints` lists up to 20; selection calls `strategy.Rewind` to reset working dir + code, then restores transcript via a 3-tier fallback: **committed checkpoint storage → shadow branch (40-char commit hash) → local file** (`rewind.go:288-316`). Task checkpoints truncate the transcript at the stored `CheckpointUUID` (`rewind.go:258-276`). Three restore flavors for logs-only/committed points: `--logs-only` (restore logs, don't touch working dir), `--reset` (destructive `git reset --hard` to the commit), and full checkout (interactive). `--to &lt;commit&gt;` is non-interactive. Imported checkpoints are refused as read-only (`refuseIfImportedCheckpoint`, `rewind.go:331-357`). `--list` is a hidden deprecated bridge to `checkpoint list --pending --json`. Also registers experimental `checkpoint policy` (`checkpoint_group.go:43`).
+
+---
+
+## Cross-cutting power features worth calling out
+
+- **Live transcript streaming** with snapshot bounding + agent-format awareness (`session info/current --transcript`, `sessions.go:52-155`).
+- **Cross-worktree/cross-repo session adoption** with two-store locking, rollback, and token/attribution rebaselining (`session_adopt.go`).
+- **Worktree-aware resume** that redirects you to the owning worktree instead of failing (`resume_picker.go:450`, `checkpoint_resume.go:225`).
+- **Two distinct checkpoint datasets** behind `checkpoint list`: condensed (committed) vs `--pending` (live shadow-branch rewind points) — deliberately separate (issue #1767, `checkpoint_group.go:58-69`).
+- **Token comparison/qualification** between two checkpoints (`checkpoint tokens --compare`).
+- **Semantic + code search** via a remote service, with inline filter DSL.
+- **3-tier transcript restore** and task-checkpoint UUID truncation in rewind.
+- **`--agent-brief`** on both token commands: purpose-built compact output for an agent to self-optimize its next steps.</result>
+<usage><subagent_tokens>110473</subagent_tokens><tool_uses>24</tool_uses><duration_ms>184532</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a00d1d7367f5bfe90</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-exploring-entire/bbacf00a-cbe7-41b9-a2f1-0dd7125e3626/tasks/a00d1d7367f5bfe90.output</output-file>
+<status>completed</status>
+<summary>Agent "Map lifecycle/agent/labs cmds" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have a comprehensive picture. Here is the structured summary.
+
+---
+
+# Entire CLI — Capability Map
+
+Repo layout note: everything lives in a single `package cli` under `cmd/entire/cli/` (flat `.go` files), with subpackages for heavy features (`review/`, `investigate/`, `dispatch/`, `agent/`, `experimental/`). There is no `commands/` dir. Root wiring is `cmd/entire/cli/root.go:114-171`.
+
+## Command groups &amp; the experimental gate
+`experimental.Register(parent, child)` (`experimental/experimental.go:38`) is the gate for all "labs" commands. `IsVisible()` is a build-time linker var (`Visible != "false"`); when hidden, experimental commands are still runnable but dropped from help. Registration sites: `root.go:116,122,129,130,136,137,152,155,171` + `checkpoint_group.go:43`.
+
+`entire labs` (`labs.go:65`) is pure discovery — it prints a hand-maintained catalog of the experimental commands (`review`, `investigate`, `import claude-code`, `tokens`, `tokens profile`, `session tokens`, `blame`, `why`, `experts`). The commands themselves are registered at **top level**, not under `labs`.
+
+## Non-obvious power: `entire &lt;name&gt;` → `entire-&lt;name&gt;` (kubectl-style plugins)
+`plugin.go:49 MaybeRunPlugin` / `resolvePlugin` (`plugin.go:88`). When arg[0] isn't a built-in Cobra command, it `exec.LookPath("entire-&lt;name&gt;")` and execs it, passing through stdio/exit codes. Key rules (also `docs/architecture/external-commands.md`):
+- Built-ins always win (`rootCmd.Find`, `plugin.go:104`); it primes `help`/`completion` first so those can't be shadowed (`plugin.go:101`).
+- Names prefixed `entire-agent-` are **reserved** for the agent protocol and skipped (`plugin.go:119,155`).
+- Found-but-not-executable is surfaced as a launch error rather than "unknown command" (`plugin.go:114,129 findInaccessiblePlugin`).
+- `upgrade` plugin is special-cased to skip the post-run version check (`plugin.go:36,64`).
+- Child env is **filtered through an allowlist** (`pluginEnv`, `plugin.go:202`) — plugins don't see `AWS_*`/`GITHUB_TOKEN`/`OPENAI_API_KEY` unless allowlisted. Injects `ENTIRE_CLI_VERSION`, `ENTIRE_REPO_ROOT`, `ENTIRE_PLUGIN_DATA_DIR` (per-plugin durable storage, `plugin.go:171-201`).
+- Telemetry only fires for official-allowlist plugins (`maybeTrackPluginInvocation`, `plugin.go:74`).
+- `entire plugin install/list/remove` manage a discovered managed dir (`$XDG_DATA_HOME/entire/plugins/bin`) prepended to PATH.
+
+## Lifecycle commands
+
+- **`enable`** (`setup.go:798`): the big one. If not a git repo, offers a two-phase GitHub bootstrap (git init + optional `gh repo create` + push, phase 2 runs after agent setup so the initial commit captures `.entire/`/`.claude/`/hooks — `setup.go:842-883`). If repo already configured, mutating flags make it behave like `configure` (`setup.go:915 runEnableOnConfiguredRepo`); bare enable is a lightweight re-enable. `--agent &lt;name&gt;` = non-interactive single-agent setup. Rich flag set: `--checkpoint-backend refs|branch`, `--checkpoint-remote provider:owner/repo`, `--skip-push-sessions`, `--search-skill`, `--agent-help-skill`, `--absolute-git-hook-path` (for GUI git clients), `--local`/`--project`, `--yes`, plus bootstrap flags (`--init-repo`, `--repo-owner/name/visibility`, `--no-github`, `--push`). Best-effort `reportRepoEnabled` tells backend + caches trails-enablement (`setup.go:976`).
+- **`disable`** (`setup.go:1051`): default flips enabled flag (hooks exit silently); `--uninstall` fully removes `.entire/`, git hooks, session state, shadow branches, agent hooks.
+- **`configure`** (`setup.go:706`, `Use: "configure"`): non-agent settings only; agent CRUD moved to `entire agent`.
+- **`status`** (`status.go:32`): `--detailed` (per settings-file breakdown), `--json` (`runStatusJSON`, `status.go:601` — reused by MCP `entire_status` tool).
+- **`clean`** (`clean.go:44`): cleans session state files/shadow branches. `--all`, `--session &lt;id&gt;`, `--dry-run`, `--force` (overrides active-session guard).
+- **`doctor`** (`doctor.go:24`): scans/fixes disconnected metadata branches (cherry-picks local checkpoints onto remote tip), Codex hook-trust warnings, and stuck ACTIVE/ENDED sessions (condense/discard/skip). `--force` auto-fixes. Subcommands (`doctor.go:67-70`):
+  - **`doctor trace`** (`trace_cmd.go:12`, also top-level alias `entire trace`, `root.go:151`): hook performance traces; `--last N`, `--hook &lt;type&gt;`.
+  - **`doctor logs`** (`doctor_logs.go:18`): `--tail N` (0=all), `--follow`.
+  - **`doctor bundle`** (`doctor_bundle.go:24`): diagnostic zip for bug reports; **redacts secrets by default** via `redact` pkg (field-aware JSON/JSONL redactor, `doctor_bundle.go:277`); `--raw` disables redaction, `--out`.
+  - **`doctor migrate-checkpoints`** (`doctor_migrate.go:16`): converts branch-store checkpoints → per-checkpoint git refs.
+- **`dispatch`** (`dispatch.go:22`): generates a narrative summary of recent agent work. `--local` (use local agent CLI instead of Entire server), `--since 7d`/`--until`, `--all-branches`, `--repos &lt;slugs&gt;` (cloud), `--voice &lt;preset|desc&gt;`. Interactive wizard fires when run with no flags on a TTY (`dispatch.go:49`); renders markdown in-terminal.
+- **`activity`** (`activity_cmd.go:49`): activity overview + repo breakdown + recent sessions from entire.io; TUI on a terminal, static fallback when piped/accessible. `--commits` shows commits instead of sessions.
+- **`version`** (`root.go:186`): build info. Hidden sibling `__send_analytics` (`root.go:200`).
+
+## `agent` command family
+`agent_group.go:17`. Bare `entire agent` opens an interactive menu (or full setup flow on a fresh repo). Requires a git repo (`PersistentPreRunE`, line 33).
+- **`agent list`** (line 58): shows all registered agents with ✓ for those with hooks installed (`GetAgentsWithHooksInstalled`).
+- **`agent add &lt;name&gt;`** (line 91): `setupAgentHooksNonInteractive`; flags `--force`, `--local-dev`, `--search-skill`, `--agent-help-skill`.
+- **`agent remove &lt;name&gt;`** (line 131).
+
+Registry (`agent/registry.go`): 8 built-ins — `claude-code` (default, `registry.go:181`), `codex`, `copilot-cli`, `cursor`, `factoryai-droid`, `gemini`, `opencode`, `pi`. `Agent` is an interface (`agent/agent.go:22`) with a large optional-interface set: `HookSupport`, `FileWatcher`, `TranscriptAnalyzer`, `PromptExtractor`, `TranscriptCompactor`, `TokenCalculator`, `ModelExtractor`, `TextGenerator`, `SkillDiscoverer`, `Launcher`, `SubagentAwareExtractor`, etc. External agents discovered via `entire-agent-&lt;name&gt;` binaries speaking a JSON-over-stdio subcommand protocol (`docs/architecture/external-agent-protocol.md`). Claude Code hook integration = 6 hooks (SessionStart, UserPromptSubmit, Stop, PreToolUse[Agent], PostToolUse[Agent], PostToolUse[TaskCreate|TaskUpdate]) — see `docs/architecture/claude-hooks-integration.md`; note the `Agent`/`TaskCreate` matcher migration requiring `enable --force`.
+
+## `agent-help` / `mcp` (agent discovery surface)
+- **`agent-help [command...]`** (`agent_help_cmd.go:44`): **visible** in `entire help` so agents on transports without context injection find it. Renders agent-facing usage **live from the Cobra command tree** so it always matches the installed binary (`runAgentHelp`, line 144). `--json` for structured output. Auto-detects repo from origin remote and prints a "never ask the user for the repo name" rule (`agentHelpOverview`, line 36). Advertised surface controlled by annotations: hidden commands opt in via `entire_agent_help` (line 19); some are gated behind `entire_agent_help_requires_trails` (line 26) — trail commands are hidden until the backend says trails are enabled for the repo (with cached enablement + short failure backoff, lines 75-140).
+- **`mcp`** (`mcp.go:39`, hidden): stdio **MCP server** (newline-delimited JSON-RPC 2.0, protocol `2025-06-18`) for MCP-host agents with no hook channel. Read-only. Exposes exactly two tools (`mcpToolDefs`, `mcp.go:177`): `agent_help` (wraps `runAgentHelp`) and `entire_status` (wraps `runStatusJSON`). 1 MiB per-message cap, handles initialize/ping/tools.list/tools.call, rejects batch arrays.
+
+## Experimental / labs commands
+All `Hidden: true`, registered top-level, advertised via `labs`.
+
+- **`review`** (`review/cmd.go:81`): multi-agent branch review. Runs several reviewer agents + an optional consolidating **judge**, driven by **profiles** stored in `.entire/settings.json` (shared) or `.entire/settings.local.json` (per-dev). A profile = `task` + reviewer `agents`(slots, each with skills/model/prompt) + `judge` + `output` (`local`|`trail`). Flags: `--configure` with `--set-agents/--set-judge/--set-output/--set-task/--set-model/--set-slot` for non-interactive profile authoring; `--profile`/positional to select; `--agent`+`--model` to run one reviewer; `--list`/`--agents`/`--models`/`--findings`; `--prompt` (one-off), `--base &lt;ref&gt;` (default `origin/HEAD`→main→master chain), `--timeout` (per-reviewer + judge cap). Can post verdict/findings to a trail (`review_bridge.go:55 postReviewToTrail`). Details: `docs/architecture/review-command.md`.
+- **`investigate [seed-doc]`** (`investigate/cmd.go:78`): multi-agent investigation — agents take turns appending to a shared findings doc until **quorum**. Inputs (mutually exclusive): positional seed file or `--issue-link &lt;gh url&gt;` (resolved via gh). Flags: `--agents csv`, `--max-turns N` (default 2), `--quorum N` (0=all), `--continue &lt;run-id&gt;`, `--edit`, `--findings`, `--allow-untrusted-seed` (security gate: issue-link content is attacker-influenced and agents run with sandbox bypass, line 108). Subcommands: `fix [run-id]` (launch a coding agent with findings as grounded context), `show [run-id]`, `clean [run-id|--all]`.
+- **`blame &lt;file&gt;[:line[-line]]`** (`attribution.go:142`): git-blame-style line attribution enriched with Entire checkpoint metadata. `--line`, `--json`, `--long` (agent/model/author/session columns).
+- **`why &lt;file&gt;[:line]`** (`attribution.go:171`): explains the commit, checkpoint, prompt, and session behind a line. `--line`, `--json`.
+- **`experts [scope-or-query]`** (`experts_cmd.go:182`): ranks **agent/skill/tool provenance** for code scopes (who/what has touched given files). Hits the `entire-api` cell (repo-ULID keyed). `--repo`, `--branch`, `--limit` (1-20 clamped), `--staged` (use staged paths as scopes), `--tui`, `--json`. Note cross-region routing is incomplete: returns a clear 404 message when repo homed in another region (`experts_cmd.go:399`).
+- **`search [query]`** (`search_cmd.go:27`, also top-level; = checkpoint search): hybrid **semantic + keyword** search over checkpoints/commits/sessions via Entire search service (v4 query-serve path, `search_v4.go`). Interactive table when no args; `--json`. Inline query filters `author:`, `date:week|month`, `branch:`, `repo:owner/name`, `repo:*`. Flags: `--code` (code-content search, with `--case-sensitive`), `--all-repos`, `--repo`, `--author/--date/--branch`, `--limit`, `--page`.
+- **`tokens`** (`tokens_profile.go:51`) group → **`tokens profile`** (line 73): aggregates token usage from **committed checkpoint metadata only** (deterministic, no transcript/source reads, no added token cost). `--limit` (default 50), `--all`, `--json`. Related: `checkpoint tokens &lt;id&gt;` (`checkpoint_tokens.go:75`) and `session tokens [id]` (`session_tokens.go:86`) give per-checkpoint / per-session usage + optimization recommendations.
+- **`import claude-code`** (`import_cmd.go:14`): imports last month of pre-existing agent transcripts as **read-only** checkpoints. `--path` (override transcript dir), `--dry-run`, `--session &lt;id&gt;` (repeatable).
+- **`runner`** (`runner_group.go:12`, hidden): manages per-repo **trail runner** configs in `.entire/runners/` — evaluators (risk, confidence, drift, security, review) that score/review a branch. `runner setup` creates the default set and tailors prompts. Persistent hidden `--insecure-http-auth`.
+- **`checkpoint policy`** (`checkpoint_policy.go:24`, under `checkpoint` group): inspect/update `checkpoint_version` (write guard — clients that can't write the configured version fail on checkpoint-creating commands, warn elsewhere) and `checkpoint_min_version` (upgrade nudge + write guard). `--force` required to allow version downgrades (including downgrades caused by unsetting a field, line 42).
+
+## Cross-cutting notes
+- `--insecure-http-auth` is a recurring hidden flag (local dev, plain-HTTP auth).
+- Many top-level commands are hidden aliases to canonical paths (`root.go:148-151`): `resume`→`session resume`, `attach`→`session attach`, `explain`→`checkpoint explain`, `trace`→`doctor trace`.
+- Backend split: control-plane = `entire-core` (auth/login-session, org/project/repo/grant); data/activity/search/experts = per-jurisdiction `entire-api` cells with repo-ULID keying and cell fan-out (`cell_fanout.go`, `entireapi_client.go`).</result>
+<usage><subagent_tokens>86561</subagent_tokens><tool_uses>44</tool_uses><duration_ms>267905</duration_ms></usage>
+</task-notification>
+
+---
+
+what are the commands we can use, and what give us each command?
+
+---
+
+you, as and code agent, working in a git repo by adding features, creating commits, PR's , etc all code related. Which of those commands you find useful to be used while you as a agent are doing your job?
+
+---
+
+Now, you have so much context about what Entire CLI does and how you would use it in a normal development work flow but, if you are in a fresh session in a different repo with no Entire CLi context at all ( yes, entire is installed and enabled ) how would you insert all this context to that agent so it can make right decision and right entire cli usage ?
+
+---
+
+is it better to be part of AGENTS.md or expernal skill? We can inject that context as session start hook, text generated by our command so it is always in sync with the entire version installed?
+
+---
+
+yes, do it and also review all the command descriptions and see if with entry context + generated pointer + command description would be enough for the agent to know how to do the things.
+
+---
+
+<task-notification>
+<task-id>a8aaf0257f72e74a1</task-id>
+<tool-use-id>toolu_01Pty1Xy47Non626ki5HGBXF</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-exploring-entire/bbacf00a-cbe7-41b9-a2f1-0dd7125e3626/tasks/a8aaf0257f72e74a1.output</output-file>
+<status>completed</status>
+<summary>Agent "Find SessionStart injection content" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have everything needed. Here is the complete picture.
+
+## Summary
+
+### (a) What is injected verbatim
+
+There are **three distinct surfaces**, and none of them carry behavioral rules — they are all pointers.
+
+**1. First-turn model-context injection** (the main event). Built by `entireTrailContextInjection` at `/Users/gtrrz-victor/wks/cli/exploring-entire/cmd/entire/cli/lifecycle.go:426-446`. Emitted once per session by `emitContextInjection` (lifecycle.go:452), gated on `ContextInjectionDecided` being false AND trails being enabled for the repo. The exact string (lifecycle.go:432 + one of two repo tails):
+
+&gt; `Entire is enabled for this repo. Run `entire agent-help` to see what entire does and which subcommand to use, then `entire agent-help &lt;command&gt;` for that command's exact, current flags. `
+
+then, if the repo resolved cleanly (line 439-441):
+
+&gt; `This repo is auto-detected from the git origin remote as &lt;repo&gt;; you are already inside it, so never ask the user for the repo name.`
+
+or, as fallback (line 443):
+
+&gt; `Entire auto-detects the repo from the git origin remote, so never ask the user for the repo name.`
+
+This is wrapped in the Claude-Code hook envelope `{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":&lt;text&gt;}}` by `RenderAdditionalContextHookOutput` (`cmd/entire/cli/agent/inject.go:63-79`), fired at `InjectionEvent() == TurnStart` = the UserPromptSubmit hook (`cmd/entire/cli/agent/claudecode/lifecycle.go:44-54`). Note: despite the "SessionStart" framing in the task, Claude Code injects on the **first UserPromptSubmit (TurnStart)**, not SessionStart.
+
+**2. The `agent-help` overview** (what the agent sees *after* it follows the pointer). `agentHelpOverview` at `cmd/entire/cli/agent_help_cmd.go:36-39`:
+
+&gt; `Entire's CLI is the source of truth for its own usage. Do not guess flags or subcommands — read them from this command. You are already inside the repo: entire auto-detects it from the git origin remote, so never ask the user for the repo name. Pass --repo only to target a DIFFERENT repo.`
+
+Rendered by `renderAgentHelpTop` (agent_help_cmd.go:331-349), which appends the auto-detected repo block, a live `When to use entire:` list of each advertised subcommand's `Short` string (generated from the cobra tree, not hand-written), and a trailing:
+
+&gt; `Drill in for exact, currently-installed flags:  entire agent-help &lt;command&gt;  (e.g. entire agent-help checkpoint)`
+&gt; `Add --json for structured output.`
+
+**3. The agent-help SKILL body** (installed as a file for Claude/Codex/Gemini when `--agent-help-skill` is set). `agentHelpSkillBody` at `cmd/entire/cli/setup_agent_help_skill.go:103-110` — same pointer-only content, byte-identical across the three agents.
+
+### (b) Pointer-only, or behavioral invariant?
+
+**Pointer-only.** This is explicit and load-bearing in the design. The injection deliberately enumerates NO flags/subcommands and NO behavioral rules. Per the doc comment at lifecycle.go:418-425: *"It deliberately enumerates NO flags or subcommands — that surface is fetched on demand via `entire agent-help` ... so the injection never goes stale ... Kept terse: it costs context-window tokens on the first turn of every session."*
+
+The ONLY non-pointer content is the standing **repo-inference rule** ("you are already inside the repo, auto-detected from git origin, never ask for the repo name"). That is a factual/scoping instruction, not a behavioral invariant. There is **nothing** about "commits auto-capture checkpoints," "use why/search before edits," or "don't run destructive commands." Those concepts do not appear in any injected/overview string. The behavioral surface is entirely deferred to on-demand `entire agent-help &lt;command&gt;` output (rendered live from cobra `Short`/`Long`/flags).
+
+### (c) Per-channel differences
+
+Every agent gets the pointer through exactly one channel, chosen to avoid duplication (see `agentHelpBannerSuffix` doc, lifecycle.go:281-293):
+
+- **Claude Code, Codex, Gemini CLI, OpenCode, Pi** — get it via **model-context injection** at TurnStart (`RenderContextInjection`). Claude Code/Codex use the `additionalContext` hook shape; Gemini uses BeforeAgent; Pi/OpenCode emit an `{"inject_context":"..."}` envelope. Claude/Codex/Gemini *additionally* can get the SKILL file if `--agent-help-skill` is enabled.
+- **Factory AI Droid** — banner-only. No model injection, no skill file. Its sole in-session channel is the **SessionStart banner suffix** appended by `agentHelpBannerSuffix` (lifecycle.go:288-291): `"\n  Run `entire agent-help` to see entire's commands and flags."` This is appended *after* any ResponseMessage override (`finalizeSessionStartBanner`, line 300-305) precisely so it survives.
+- **Cursor, Copilot CLI, MCP hosts** — "no-channel" passive discovery only. They see the pointer via the **`entire status` footer** (`writeAgentHelpHint`, status.go:121-123): `"Agents: run `entire agent-help` for machine-readable usage."` and via `entire status --json`'s `agent_help` field = `"entire agent-help"` (`agentHelpCommand`, status.go:116; set at status.go:641).
+- **MCP hosts** additionally get two tools (`cmd/entire/cli/mcp.go:181-197`): `agent_help` (returns the live agent-help JSON via `runAgentHelp(..., asJSON=true)`) and `entire_status`. The `agent_help` tool description: *"Machine-readable usage for the entire CLI, generated live from the installed binary. Omit command for a top-level map of when to use entire and which subcommand; pass a command path to drill into that command's exact, current flags."*
+
+Key gating detail: the first-turn injection only fires when trails are enabled for the repo (API-backed, cached per scope), whereas the status footer / MCP pointer / skill file are always present once entire is set up. The banner suffix and status footer are pointer-only with no repo-inference rule; only the model injection and the agent-help overview/skill carry the "never ask for the repo name" line.</result>
+<usage><subagent_tokens>50328</subagent_tokens><tool_uses>15</tool_uses><duration_ms>95013</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a27076433d9129a81</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-exploring-entire/bbacf00a-cbe7-41b9-a2f1-0dd7125e3626/tasks/a27076433d9129a81.output</output-file>
+<status>completed</status>
+<summary>Agent "Audit command descriptions quality" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have everything I need. Let me compile the audit.
+
+## Audit: Are `entire` Cobra descriptions enough for an agent to self-serve?
+
+### 1. What `agent-help` actually surfaces (from `agent_help_cmd.go`)
+
+`renderAgentHelpCommand` (text) and `renderAgentHelpJSON` both render, per command:
+- Command path + `Short`
+- `Long` (trimmed; skipped only if identical to Short)
+- Auto-detected repo line
+- **Flags block** — `LocalFlags().FlagUsages()` + `InheritedFlags()` (hidden flags dropped). This means every `--json`/`--line`/`--compare` flag and its usage string IS shown even when the prose never mentions it.
+- Advertised subcommands + a "drill in" pointer
+
+**`cmd.Example` is NOT rendered — neither in text nor JSON.** Commands that want an example visible to agents must bake it into `Long`. Several do exactly that (`checkpoint` group, `explain`, `session info` embed an `Examples:` section inside `Long`); those render. The commands that use the real `Example:` field (`api`, `auth`, `grant`, `project`, `repo`, `session adopt`) get NO example in agent-help.
+
+### 2. Advertisement gate — a build-dependent surface (important)
+
+`isAgentHelpAdvertised` hides: `help`/`agent-help`, deprecated commands, and hidden commands that don't set `Annotations["entire_agent_help"]`. **Only `trail_cmd.go` sets that annotation** (nothing else in the tree).
+
+`experimental.Register` sets `child.Hidden = true` in **release builds** (GoReleaser stamps `Visible=false`) and `false` in dev builds. Consequence:
+
+- **`why`, `blame`, `experts` are registered via `experimental.Register`** (root.go 136-137, 155). In a shipped/release binary they are `Hidden` with no annotation → **not advertised in agent-help at all** (nor drillable). In dev builds they are advertised. So three of the commands the task asks about are invisible to an agent using a released CLI.
+- Same fate for top-level `search`, the top-level `tokens` group, `import`, `review`, `investigate`, `runner`, `checkpoint policy`.
+- Still advertised (added via plain `AddCommand`, not experimental): `checkpoint` + `list`/`explain`/`tokens`/`search` (search is force-unhidden in `newCheckpointSearchCmd`), `session` + `list`/`info`/`tokens`/`resume`/`stop`/`current`, `status`.
+
+### 3. Per-command verdict
+
+| command | when-to-use? | arg format? | runnable example (in Long, since Example field isn't rendered)? | gap |
+|---|---|---|---|---|
+| `why` | partial (Short only) | yes (`&lt;file&gt;:12`, `--line`) | no | No example; not advertised in release builds; when-to-use ("AI vs human review") only implied |
+| `blame` | partial | yes (`&lt;file&gt;:12`, `&lt;file&gt;:12-20`, `--line`) | no | No example; not advertised in release builds |
+| `experts` | weak (terse Short, **no `Long` at all**) | ambiguous — `[scope-or-query]` only; nothing says it can be a file path, dir, or NL query | no | **Thinnest of all.** No Long, no example, arg semantics undocumented; not advertised in release builds |
+| `checkpoint search` | implied | yes — inline filters (`author:`,`date:`,`branch:`,`repo:`,`repo:*`) fully documented in Long | no literal command, but filter syntax is concrete | Missing one concrete `entire checkpoint search "..."` example (parent `checkpoint` Long does have one) |
+| `checkpoint explain` | **strong** (self-review / teammate work) | yes (`[checkpoint-id \| commit-sha]`) | **yes** (multiple embedded) | None material |
+| `checkpoint tokens` | yes | yes (`&lt;checkpoint-id&gt;`, abbrev allowed, `--compare`) | no | No runnable example; `--agent-brief` behavior not in prose (flag usage covers it) |
+| `session tokens` | **strong** (no-arg behavior + `--agent-brief` scenario) | yes (`[session-id]` optional) | prose scenario, no literal command | No literal runnable example |
+| `session resume` | **strong** (picker vs branch, step-by-step) | yes (`[branch]`) | no literal command but behavior explicit | Minor — no literal example |
+| `session info` | yes | yes (`&lt;session-id&gt;`) | **yes** (embedded Examples incl. `--transcript &gt; file`) | Minor: examples say `sessions info` (plural alias) |
+| `checkpoint list` | yes | n/a (no args) | parent group shows `entire checkpoint list` | None material |
+| `status` | weak | n/a | no | Terse Long ("enabled or disabled"); doesn't tell agents `--json` yields structured status / `--detailed` exists (flag block does carry them) |
+| `agent-help` (top) | yes (curated overview + repo rule) | n/a | n/a; ends with drill-in + "Add --json" | Relies entirely on each command's one-line `Short`; no flags/examples at top level — agent must drill in per command |
+
+### 4. Commands flagged as too thin for correct first-try use
+
+- **`experts`** — no `Long`, and `[scope-or-query]` gives no hint that the argument may be a file path, a directory, `--staged`, or a natural-language query. An agent cannot know the input contract without trial-and-error. Worst offender.
+- **`status`** — `Long` is a single clause; an agent won't learn from prose that `--json` exists for machine parsing (only the rendered flag block saves it).
+- **`why` / `blame`** — descriptions themselves are adequate on arg format, but they carry no runnable example and, more importantly, are **not advertised in release builds**, so an agent relying on `agent-help` won't discover them at all.
+- **`checkpoint tokens` / `session tokens`** — usable, but no concrete runnable example; an agent must infer invocation from `Use` + flag list.
+
+### 5. Annotation / example opt-in status
+
+- `entire_agent_help` annotation: set by **`trail` only**. Every other advertised command relies on being non-hidden. Hidden experimental commands (`why`, `blame`, `experts`, `search`, `tokens`, `import`, `review`, `investigate`, `runner`) do **not** opt in, so they vanish from agent-help in release builds.
+- Real `Example:` fields exist on `api`, `auth`, `grant`, `project`, `repo`, `session adopt` — **but agent-help never renders `Example`**, so those examples are invisible to agents. The commands that surface examples to agents do so by embedding an `Examples:` block inside `Long` (`checkpoint` group, `explain`, `session info`).
+
+### Overall judgment
+
+For the **core advertised commands** — `checkpoint explain`, `checkpoint list`, `checkpoint search`, `session info`, `session resume`, `session tokens` — "entry context + generated pointer + descriptions" is **good enough to self-serve**: `Long` carries when-to-use, arg format, output modes, and (for explain/info) embedded examples, and the rendered flag block always exposes `--json`. An agent could act on these without trial-and-error.
+
+But there are **specific, structural gaps**:
+
+1. **`cmd.Example` is dead weight for agents** — it is never rendered. Any command whose only example lives in the `Example` field (`api`, `auth`, `grant`, `repo`, `project`, `session adopt`) gives the agent no example. The reliable pattern is embedding examples in `Long`, and it's applied inconsistently.
+2. **Release builds silently drop `why`, `blame`, `experts` (and `search`/`tokens`/etc.) from agent-help**, because they're `experimental.Register`-hidden and don't set the `entire_agent_help` annotation. An agent on a shipped binary can't discover the very attribution/provenance commands most useful during dev work. This is the largest gap and is invisible in dev testing (where they show up).
+3. **`experts` is under-described even when visible** — no `Long`, undocumented argument contract → guaranteed trial-and-error.
+4. Minor: `checkpoint tokens`, `session tokens`, `checkpoint search`, `why`, `blame` lack a literal runnable example in `Long`; `status` prose omits its output modes.
+
+Net: the framework is sound and the flag-block rendering compensates for missing `--json` prose, but the combination of (a) `Example` not being rendered and (b) experimental commands not opting into the annotation means an agent on a real release build would be forced into trial-and-error precisely for `why`/`blame`/`experts`, and would get no worked example for the token/search commands.</result>
+<usage><subagent_tokens>113792</subagent_tokens><tool_uses>21</tool_uses><duration_ms>183151</duration_ms></usage>
+</task-notification>
+
+---
+
+should we also give examples so agents have better context ?
+
+---
+
+yes but, skip 2.

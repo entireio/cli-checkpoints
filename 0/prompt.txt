@@ -1,0 +1,86 @@
+great, can you check everywhere we call ensure sessions branch to find out what other command usage would be ending up creating the branch even though the checkpoint backend selected is git-refs? if you find something, we would need to create another branch from main and its own PR
+
+---
+
+<task-notification>
+<task-id>a3e48ca7f5b7a8f24</task-id>
+<tool-use-id>toolu_0112rrjP18iy5Wu5399BJ44g</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-cli/b1ecf7a6-fded-4a94-91ea-51ab3d3274ea/tasks/a3e48ca7f5b7a8f24.output</output-file>
+<status>completed</status>
+<summary>Agent "Find git-refs backend v1 branch creation" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>The audit is complete. Here is my report.
+
+## Audit: `ensureSessionsBranch` → `entire/checkpoints/v1` creation under a git-refs primary
+
+### 1. All callers of `ensureSessionsBranch`
+
+Definition: `cmd/entire/cli/checkpoint/persistent.go:2109` (`func (s *GitStore) ensureSessionsBranch`).
+
+Production callers (all methods on the git-branch `GitStore`):
+
+| # | file:line | enclosing method | kind |
+|---|-----------|------------------|------|
+| 1 | `persistent.go:77` | `GitStore.writeSession` (`:61`) | write |
+| 2 | `persistent.go:860` | `GitStore.backfillAttribution` (`:855`) | write |
+| 3 | `persistent.go:1696` | `GitStore.backfillSummary` (`:1690`) | write |
+| 4 | `persistent.go:1744` | `GitStore.backfillTranscript` (`:1738`) | write |
+
+Test-only callers (out of scope): `checkpoint_test.go:572,925,1807,1830`, `persistent_write_test.go:92`.
+
+Every production caller is a **write** method. There is no read method that calls it (verified: `GitStore.Read`/`ReadSession*`/`List` at `persistent.go:1329,1377,1402,1433,1457,1482,1525` do not call it). So v1 is created/populated only by a **write** to the git-branch store.
+
+### 2. Is the git-branch store ever a write target under a git-refs primary?
+
+All four write methods are reached only through the dispatcher `GitStore.Write` (`cmd/entire/cli/checkpoint/persistent_write.go:12-25`). That dispatcher is invoked only by the fanout writer:
+
+- `fanoutStore.Write` (`cmd/entire/cli/checkpoint/fanout.go:68-79`): calls `s.primary.Write` (`:69`) then each `mirror.Write` (`:73`).
+- `newFanoutStore` (`fanout.go:27-36`): with **no mirrors it returns the primary unchanged** (`:28-29`).
+- `kindRoutingStore.Write` (`cmd/entire/cli/checkpoint/routing_store.go:187-189`): routes **all writes to `s.writer`** (the fanout), never to the `branch`/`refs` read stores. Its comment (`:23-25`, `:186`) confirms "Writes are NOT kind-routed."
+
+Under a git-refs **primary** with **no** git-branch mirror, `checkpoint.Open` (`cmd/entire/cli/checkpoint/open.go:63-97`) builds `writer = newFanoutStore(refsStore, nil)` = the git-refs store alone (`:72-81`). The git-branch store built at `open.go:111` (`buildKindReadStores`, the `BackendTypeGitRefs` case) is passed only as the routing store's **read** `branch` (`open.go:87,93`). Its read methods (`GitStore.Read`, `List`, `ReadSession*`) never touch `ensureSessionsBranch`.
+
+**Verdict: SAFE.** With git-refs as the sole primary, `GitStore.Write` is never called, so `ensureSessionsBranch` never fires and v1 is never created/populated through this route.
+
+### 3. Direct git-branch store construction that bypasses backend selection
+
+Non-test `NewGitStore` call sites (`grep --include=*.go`):
+
+| file:line | usage | verdict |
+|-----------|-------|---------|
+| `registry.go:145` (`build` factory) | the backend-selection path; only produces a *writer* when git-branch is the configured primary/mirror | SAFE |
+| `migrate.go:51` (`MigrateBranchToRefs`) | `NewGitStore(repo, DefaultV1Refs())` used **read-only** — only `branch.getSessionsBranchTree()` at `migrate.go:52`; all writes go to `refsStore` (`newGitRefsStore`, `:61`, `:136-142`). Never calls a `GitStore` write method | SAFE |
+| `benchutil/benchutil.go:180` | benchmark harness, not production | N/A |
+
+`doctor migrate` (`cmd/entire/cli/doctor_migrate.go:56`) is the only production caller of `MigrateBranchToRefs`; it reads v1 and writes refs, so it does not create/populate v1.
+
+### 4. Per-flow verdicts (does each honor `checkpoints.primary`?)
+
+- **Condensation** — `manual_commit_condensation.go:325,401` → `getPersistentStore` → `checkpoint.Open` (`manual_commit.go:43-61`). Backend-driven. **SAFE** (git-refs writes refs).
+- **Backfill transcript/summary/attribution** — same store facade, dispatched via fanout to the configured primary. **SAFE.**
+- **Import** (`entire import`, and first-run offer) — `agentimport/agentimport.go:128` uses `cp.Open(ctx, repo, cp.OpenOptions{})` and writes via `stores.Persistent.Write` (`:265`). Backend-driven. **SAFE.** Note: the comment at `import_sync_notice.go:57` ("writes read-only checkpoints to the local entire/checkpoints/v1 store") is **stale/misleading** — the code honors the backend and writes refs under git-refs; only the wording implies v1.
+- **Resume** — `resume.go:215,300,428,997` all use `checkpoint.Open`; `resume.go:1042` `ag.WriteSession` is the *agent's* session-file restore, not the checkpoint store. **SAFE.**
+- **Adopt / rewind / explain / tokens / attach / review** — all go through `checkpoint.Open` (see the earlier caller list). Backend-driven. **SAFE.**
+- **Migration** — read-only on v1 (item 3). **SAFE.**
+- **Metadata reconcile** (`metadata_reconcile.go:32-33,78-82,108`) and **OPF rewrite** (`manual_commit_opf_rewrite.go:754`) write/advance `refs.Primary` (v1) **directly**, bypassing the store — but these do **not** call `ensureSessionsBranch` and only advance/rewrite an **already-existing** v1; they do not create it. Under git-refs primary, pre-push takes the refs branch (`manual_commit_push.go:84-86`), so the OPF/v1 push path is not reached. Out of scope for this audit; flagged for completeness only.
+
+### 4(a)/(b) Legitimate vs bug
+
+- **(a) Legitimate:** a **git-branch mirror** configured alongside a git-refs primary. Then `buildMirrors` (`open.go:156-177`) adds the git-branch store as a fanout mirror, and `fanoutStore.Write` (`fanout.go:73`) calls `GitStore.Write` → `ensureSessionsBranch` → v1 populated. This is the intended mirror-write behavior (v1 is a deliberate downgrade-safety target).
+- **(b) Bug:** **none found.** There is no production flow where the git-branch store is written when git-refs is the sole primary and no git-branch mirror is configured. Write dispatch (`kindRoutingStore.Write` → fanout → primary+mirrors) strictly honors `checkpoints.primary` and `checkpoints.mirrors`, and the only direct git-branch instantiation outside the factory (`migrate.go:51`) is read-only.
+
+### Conclusion
+
+After the enable-time `createOrphanMetadataRef` fix, the remaining `ensureSessionsBranch` path is not independently reachable under a git-refs sole-primary configuration. It fires only when the git-branch store is an explicitly configured primary or mirror — both intended. The only residual concerns are cosmetic/out-of-scope: the stale v1 comment at `import_sync_notice.go:57`, and the reconcile/OPF paths that advance an existing v1 via the hardcoded `checkpoint.ResolveRefs` (not a creation path).
+
+No code was changed.</result>
+<usage><subagent_tokens>156594</subagent_tokens><tool_uses>17</tool_uses><duration_ms>166639</duration_ms></usage>
+</task-notification>
+
+---
+
+are our e2e test running with git-refs as backend?
+
+---
+
+Please add into the matrix somehow a claude agent running the e2e test using git refs as primary. And after each test I want to make sure we don't have any checkpoint v1 branch created

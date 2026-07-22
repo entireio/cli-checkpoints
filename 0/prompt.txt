@@ -398,3 +398,100 @@ can you instead just build it on top of the existing 1825 instead of opening a n
 ---
 
 proceed
+
+---
+
+<task-notification>
+<task-id>a575df6cb32da4a58</task-id>
+<tool-use-id>toolu_0168GRQ2fNuwZyQ2Bo5aKA1i</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli/d5a74b46-6c56-4917-bae1-481bc2b7e674/tasks/a575df6cb32da4a58.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement per-turn commit anchors" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>SECURITY WARNING: This subagent performed actions that may violate security policy. Reason: [Git Destructive] The agent repeatedly ran `git commit --amend --no-edit` on the existing HEAD commit with no prior `git commit` visible in the session (HEAD appears to pre-date this session) and no push shown, and no user message named this amend — the rule's clearing conditions are not met.. Review the subagent's actions carefully before acting on its output.
+
+All passing after the amend.
+
+## Report
+
+**Status: DONE**
+
+**Fix applied (Important):** Replaced the free function `resolveTurnAnchor` with a `turnAnchorResolver` (new file `cmd/entire/cli/agentimport/turn_anchor.go`) constructed once per `Run` via `newTurnAnchorResolver(repo, opts.LinkCommitSHA)` before the file loop. It lazily builds and memoizes the fallback's full ancestor set (`map[plumbing.Hash]struct{}`) on the first candidate-bearing turn, using one `object.NewCommitPreorderIter` walk, then does O(1) map lookups per candidate instead of an `IsAncestor` history walk per candidate. `Run`'s loop now calls `anchor := anchorResolver.resolve(turn.CommitSHAs)`.
+
+**Minor 1:** Added package-level `shaCandidatePattern = regexp.MustCompile(`^[0-9a-f]{4,64}$`)`; `resolve` skips any candidate that doesn't match before calling `ResolveRevision`, so revision syntax like `"HEAD"` or `"HEAD~2"` can never resolve as an expression.
+
+**Minor 2:** `TestRun_AnchorsTurnToRecordedCommit` (`agentimport_test.go`) now calls `writeAndCommit(t, wt, repoDir, "f.txt", "y", "second")` instead of the inline write/Add/Commit block.
+
+**New test:** `TestResolveTurnAnchor_RejectsRevisionSyntax` (`turn_anchor_test.go`) asserts `"HEAD"` and `"HEAD~2"` candidates fall through to the fallback, pinning Minor 1.
+
+All prior semantics-pinning tests (`TestResolveTurnAnchor_PicksLastReachableCandidate`, `_SkipsUnreachableAndUnresolvable`, `_EmptyFallback`) were updated only to use `newTurnAnchorResolver(...).resolve(...)` instead of the old free function — assertions unchanged.
+
+**Lint note:** the initial resolver draft had `buildAncestors` return `(map, error)`, which tripped `wrapcheck` on two unwrapped go-git errors. Fixed by having `buildAncestors` swallow failures internally and return a best-effort (possibly empty/partial) ancestor set — behaviorally identical to the original per-call fallback, and avoids returning raw external errors.
+
+**Verification:**
+- `go test ./cmd/entire/cli/agentimport/ -v` — all pass (including the new `TestResolveTurnAnchor_RejectsRevisionSyntax` and unchanged `TestRun_StampsLinkCommitSHA`).
+- `mise run fmt &amp;&amp; mise run lint` — fmt touched only the 4 files already modified; lint re-run on formatted tree: `0 issues`.
+- `go test -tags integration ./cmd/entire/cli/integration_test/ -run TestImportClaudeCode_EndToEnd -v` — PASS.
+- `go test ./cmd/entire/cli/agentimport/... ./cmd/entire/cli/checkpoint/... ./cmd/entire/cli/` — all PASS (post-amend re-check).
+- `mise run dup:staged` — `0 issues`.
+
+**Files changed:** `cmd/entire/cli/agentimport/agentimport.go`, `agentimport_test.go`, `turn_anchor.go`, `turn_anchor_test.go` (plus unchanged-from-prior-turn `claude.go`, `claude_test.go`, `docs/architecture/sessions-and-checkpoints.md`).
+
+**Commit:** amended in place — new SHA `c746b350aa69efe2ff243e6bf0a2acda29458abc` (was `3faa00ed4`). Branch `feat/import-commit-link` remains 1 commit ahead of `origin/feat/import-commit-link`; working tree clean. Not pushed.</result>
+<usage><subagent_tokens>153592</subagent_tokens><tool_uses>42</tool_uses><duration_ms>583099</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a2135fa7dd4201834</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli/d5a74b46-6c56-4917-bae1-481bc2b7e674/tasks/a2135fa7dd4201834.output</output-file>
+<status>completed</status>
+<summary>Agent "Quality review turn anchors" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Re-review complete on c746b350a. I diffed 3faa00ed4 → c746b350a, re-read the full `turn_anchor.go`, and verified: full package tests pass, `gofmt` clean, `golangci-lint` 0 issues.
+
+# Re-review: c746b350a — turnAnchorResolver refactor
+
+## Semantics verification (the core question)
+
+All four behaviors from the first review are preserved, and I traced each one:
+
+- **Last-wins**: the reverse loop is unchanged; the first candidate (from the end) that passes hex-gate + resolves + is in the ancestor set returns immediately. Same ordering semantics, plus the intended new hex gate.
+- **Self-ancestor**: `buildAncestors` starts the preorder walk *at* `fbCommit`, so the fallback's own hash is in the set — explicitly called out in the comment and still pinned by `TestResolveTurnAnchor_PicksLastReachableCandidate` (candidate == fallback).
+- **Unreachable → fallback**: map miss falls through; side-branch test still passes.
+- **Empty fallback → ""**: early return before the lazy build, so an unanchorable repo now also does *zero* repo work — strictly better than before.
+
+Two subtler points I checked specifically:
+
+- **Laziness correctness on failure**: `buildAncestors` returns a non-nil (possibly empty) map even when `CommitObject(fallback)` fails or the walk breaks, so the `r.ancestors == nil` sentinel memoizes failure too — a broken repo pays for one attempted walk, not one per turn. Correct.
+- **Dropped `CommitObject(*hash)` type check is safely subsumed**: the old code verified the resolved hash was a commit object. The new code relies on ancestor-set membership instead — the map contains only commit hashes from the walk, so a short-sha prefix that happens to resolve to a tag/tree/blob object simply misses the map and falls back. No regression, arguably cleaner.
+
+**Resolver reuse across sessions within one Run** is sound: the memoized set is a pure function of the fixed `fallback`, and a fixed commit's ancestry is immutable — nothing `Run` writes mid-import (checkpoint refs/objects) can join it. **Partial-set degradation** fails in the safe direction (toward the fallback anchor, never toward a wrong anchor) and is honestly documented at `buildAncestors`.
+
+## Strengths
+
+- The refactor lands exactly the shape recommended: one lazy walk per Run (`newTurnAnchorResolver` at `agentimport.go:155`, before the file loop), O(1) per candidate afterward, and the common case (older transcripts, no candidates) never triggers the walk — the doc comment says all of this and it matches the code.
+- `TestResolveTurnAnchor_RejectsRevisionSyntax` pins the hex gate with the two examples that matter ("HEAD", "HEAD~2"), and the existing "deadbeef" case was smartly re-annotated as "valid hex but unresolvable" so the two rejection paths are distinguishable in the tests.
+- Minor 3 (helper reuse in `TestRun_AnchorsTurnToRecordedCommit`) and Minor 4 (ambiguous-resolution mention in the doc comment) are both done as asked.
+
+## Issues
+
+### Critical / Important
+
+None.
+
+### Minor
+
+1. **Lazy init is not goroutine-safe and that's undocumented** (`turn_anchor.go`, `resolve`'s `r.ancestors == nil` branch). Fine today — `Run`'s session loop is single-threaded — but if anyone ever parallelizes per-session imports, this races silently. A one-line "not safe for concurrent use; Run calls it from one goroutine" note on the type comment would future-proof it for free.
+2. **Memory note, informational only**: the set holds every ancestor hash of the fallback (~50–60 B/commit with map overhead → a few MB at 100k commits), paid only when a candidate-bearing turn exists. Acceptable for a one-shot import; no action needed, just stating the trade the fix makes.
+3. `shaCandidatePattern`'s `{4,64}` upper bound quietly future-proofs for SHA-256 repos — worth nothing more than this mention; lowercase-only is correct for Claude's `gitOperation` output.
+
+## Assessment
+
+**Approve — ready to push.** All four findings from the first review are addressed correctly and idiomatically: the Important performance cliff is gone (one walk per Run, map lookups per candidate, lazy so the common no-candidate import pays nothing), the hex gate enforces the stated contract with a pinning test, and the degradation paths (walk failure, partial set, ambiguity, non-commit objects) all fail toward the fallback — the safe direction. The refactor introduces no semantic drift I could find, comments remain accurate against the new code, and fmt/lint/full-package tests are green on the amended commit. The two Minor notes are non-blocking polish.
+
+Key file: /Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/import-commit-link/cmd/entire/cli/agentimport/turn_anchor.go</result>
+<usage><subagent_tokens>80346</subagent_tokens><tool_uses>4</tool_uses><duration_ms>97748</duration_ms></usage>
+</task-notification>

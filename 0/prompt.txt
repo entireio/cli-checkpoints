@@ -1,0 +1,95 @@
+After testing entire trail commands I found the following issues:
+creating trail as draft -> entire trail list -> did not display it until it becomes ready
+entire trail update -> does not display the original body content, so it behaves as replace full content ( title does load the current value )
+entire trail comment edit|delete  needs a message id, how can I find it? I could get it from entire trail comment show neither entire trail comment list
+
+Lets first check that those are real issues right now and then, make a plan to fix each one on different branches/PRs
+
+---
+
+<task-notification>
+<task-id>a0f68c8719f7b689d</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-exploring-entire/fc405056-72ab-4318-bb6e-499c9c17e858/tasks/a0f68c8719f7b689d.output</output-file>
+<status>completed</status>
+<summary>Agent "Verify trail list draft filter" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have everything needed. Findings below.
+
+## Findings
+
+The user's report is confirmed. `entire trail list` defaults to showing only `open` trails and hides drafts. The filter is applied server-side via a query param.
+
+### 1. Trail status values
+Defined in `/Users/gtrrz-victor/wks/cli/exploring-entire/cmd/entire/cli/trail/trail.go:34-39`:
+
+```go
+StatusDraft  Status = "draft"
+StatusOpen   Status = "open"
+StatusMerged Status = "merged"
+StatusClosed Status = "closed"
+```
+
+Note the comment at trail.go:31-33: "The status set mirrors the server's repo_trails check constraint... The former in_progress and in_review statuses were folded into open." So the "ready" the user perceives corresponds to the `open` status.
+
+### 2. Does list filter by status? Yes — default excludes drafts
+The default status filter is `open`, set at `/Users/gtrrz-victor/wks/cli/exploring-entire/cmd/entire/cli/trail_cmd.go:32`:
+
+```go
+defaultTrailListStatus = string(trail.StatusOpen)
+```
+
+Wired into the `--status` flag default at `trail_cmd.go:414-415`:
+
+```go
+cmd.Flags().StringVar(&amp;opts.Status, "status", defaultTrailListStatus,
+    "Filter by comma-separated status(es): "+formatValidStatuses()+"; use '"+trailListStatusAny+"' for all statuses")
+```
+
+**The filtering is server-side (a query param), not client-side.** Confirmed by:
+- The comment at `trail_cmd.go:456-458`: "Filtering, sorting (updated_at desc), and truncation all happen server-side..."
+- `trailListQueryWithOffset` at `trail_cmd.go:524-544` builds the `status` query param:
+
+```go
+if len(statusFilters) &gt; 0 {
+    parts := make([]string, len(statusFilters))
+    for i, status := range statusFilters {
+        parts[i] = string(status)
+    }
+    q.Set("status", strings.Join(parts, ","))
+}
+```
+
+So a bare `entire trail list` sends `?status=open&amp;limit=10`, and the server returns only open trails — drafts never come back to the client.
+
+### 3. Flag to include drafts
+Yes. Two ways via the single `--status` flag (there is no `--all` or `--draft` flag):
+- `--status any` — disables the status filter entirely (returns all statuses). Constant at `trail_cmd.go:34` (`trailListStatusAny = "any"`); handled in `parseTrailStatusFilter` at `trail_cmd.go:572-575`:
+
+```go
+if filter == "" || filter == trailListStatusAny {
+    return nil, nil
+}
+```
+(returning empty filters, which omits the `status` param — see the `len(statusFilters) &gt; 0` guard above).
+- `--status draft` (or a comma list like `--status draft,open`) — explicitly requests drafts.
+
+### 4. Exact code that sets the default excluding drafts
+- Default constant: `trail_cmd.go:32` — `defaultTrailListStatus = string(trail.StatusOpen)`
+- Flag default binding: `trail_cmd.go:414` — `cmd.Flags().StringVar(&amp;opts.Status, "status", defaultTrailListStatus, ...)`
+- Query param construction (server-side filter): `trail_cmd.go:526-532`
+
+### Extra context worth flagging
+- **Draft trails are not the default on creation.** `resolveTrailCreateFields` at `trail_cmd.go:958-961` defaults a new trail's status to `open`, so a trail is only a draft when explicitly created with `--status draft`.
+- **The empty-state message already hints at this** (`printTrailListEmpty`, `trail_cmd.go:560-563`): when a status filter is active and nothing matches, it prints "Use --status any to see trails in other statuses." So a repo containing only draft trails will show "No open trails found" plus that hint, rather than listing the drafts.
+- Drafts are intentionally left uncolored in the list display — `trailStatusColor` at `trail_cmd.go:799-800` returns `false` for `StatusDraft`.</result>
+<usage><subagent_tokens>41760</subagent_tokens><tool_uses>6</tool_uses><duration_ms>39723</duration_ms></usage>
+</task-notification>
+
+---
+
+y
+
+---
+
+sorry, I kill the terminal, keep going

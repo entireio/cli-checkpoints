@@ -1,0 +1,53 @@
+Generate me the ouput of ALL the interactive steps from the CLI entire enable.
+
+---
+
+Dude, just read the fucking code and create a huge markdown document with one code block listing all those fucking potential steps!!!
+
+---
+
+I asked for the flow. Not a 2k lines of slop. Just one time the whole flow.
+
+---
+
+Entire Trail review comment
+ID: 019f89be-809c-7fce-877c-3a1f0dfdddb7
+URL: https://entire.io/gh/entireio/cli/trails/920/explicit-target-review-attach-bind-checkpoints-to-a-commit-s
+Severity: medium
+Context: cmd/entire/cli/attach.go:345
+Selected context:
+```
+checkpointID, isExistingCheckpoint = opts.CheckpointID, false
+```
+In explicit-target mode, `runAttach` still calls `saveAttachSessionState`, which unconditionally sets `state.LastCheckpointID = checkpointID` (the server-minted, commit-SHA-bound review checkpoint) and, if `BaseCommit` was empty, sets it to the current HEAD. `LastCheckpointID`/`BaseCommit` are also read by `handleAmendCommitMsg` (prepare-commit-msg hook) to auto-restore an `Entire-Checkpoint` trailer on a later `git commit --amend` of the same base commit, and by the resume picker. Since the explicit-target checkpoint is deliberately *not* meant to be trailer-linked (it's bound via `commit_sha` metadata, not a trailer), this can cause a later unrelated amend to silently inject the review-provenance checkpoint ID as the code checkpoint trailer, or make `session resume`/`sessions` misreport the session's checkpoint linkage.
+
+---
+
+Entire Trail review comment
+ID: 019f89c9-8acd-7a68-8a29-9eda2676bf8b
+URL: https://entire.io/gh/entireio/cli/trails/920/explicit-target-review-attach-bind-checkpoints-to-a-commit-s
+Severity: high
+Context: cmd/entire/cli/attach.go:694-699
+Selected context:
+```
+if fetchErr != nil {
+		logging.Warn(logCtx, "failed to refresh explicit checkpoint before attach; treating as new",
+			slog.String("checkpoint_id", checkpointID.String()),
+			slog.String("error", fetchErr.Error()))
+		return repo, false, nil
+	}
+```
+When `refreshCheckpoint` fails inside `ensureExplicitCheckpointFreshness` (network blip, auth failure, remote misconfig), this treats the checkpoint as "not present" and lets the caller proceed to write a brand-new checkpoint under the caller-supplied ID. `FetchCheckpointRef`'s own doc says a fetch failure is indistinguishable from "ref doesn't exist" ("the caller treats a fetch failure as 'checkpoint not found'"), so a transient fetch error on a retry — exactly the scenario this function exists to guard against per its own docstring — silently takes the risky path and can rebuild the ID as an orphan that clobbers the original checkpoint on push. Compare with the sibling `ensureCheckpointAvailable`, which on the same fetch failure falls through to `missingCheckpointError` and refuses rather than assuming safety. This branch should likewise propagate the fetch error instead of returning `(repo, false, nil)`.
+
+---
+
+Entire Trail review comment
+ID: 019f8a4d-141c-70ee-a867-65d8ed08cb1c
+URL: https://entire.io/gh/entireio/cli/trails/920/explicit-target-review-attach-bind-checkpoints-to-a-commit-s
+Severity: high
+Context: cmd/entire/cli/attach.go:676
+Selected context:
+```
+if fetchErr != nil {
+```
+`ensureExplicitCheckpointFreshness` treats any `refreshCheckpoint`/`FetchCheckpointRef` error as fatal (`"failed to refresh explicit checkpoint %s before attach"`), but under the git-refs primary backend a brand-new, never-pushed checkpoint ID (the normal case for explicit-target attach per the doc comment above) causes `git fetch` to fail with a "couldn't find remote ref" error since the refspec source doesn't exist yet. That failure is indistinguishable from a real transport/auth error per this function's own docstring, yet it's unconditionally fail-closed here — unlike the analogous `ensureCheckpointAvailable` path (line ~562-563) which logs and proceeds on fetch failure. This means `entire attach --review --checkpoint-id <new-id>` will always fail for brand-new IDs when git-refs is the primary checkpoint backend, breaking the feature's primary use case under that (documented, supported) backend configuration.

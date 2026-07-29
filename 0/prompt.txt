@@ -1,0 +1,1845 @@
+`entire trail list` and other trail-related commands don't work when you're not inside a repository. is there a way we can see which repos someone has enabled locally and just list all the trails for those repos?
+I'm not sure how the mechanism for listing a trail works today but we could also list all the trails the user has access to for their account? someone raised a good point today that it's a bit odd that we require someone to have a repo checked out just to be able to list the trails or create a new one.
+
+---
+
+<task-notification>
+<task-id>abcd748563dc6a4b3</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/6886e45b-b31d-4653-910b-399b6cbfd9cb/tasks/abcd748563dc6a4b3.output</output-file>
+<status>completed</status>
+<summary>Agent "Trails read path &amp; data model" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I now have a complete picture. Here is the report.
+
+# Trails read/list path in entire-api
+
+All paths below are absolute under `/Users/ninawork/entire/devenv/entire-api`.
+
+## Important discrepancy up front
+The task states the CLI passes `status`, `author`, `limit`, `offset`. The server's list route does **not** support those. The real query params are `pageSize` (default 50, clamped 1..100) and `pageToken` (opaque keyset cursor). There is **no** status/author filtering and **no** offset pagination on this endpoint — filtering is not implemented server-side at all; the list returns all of a repo's trails, `updated_at DESC` paginated by cursor.
+
+---
+
+## 1. Router registration
+`internal/httpapi/trails.go:476` `registerTrails(api, deps)` wires the whole trails surface.
+
+- Host-path list route registered at `internal/httpapi/trails.go:488-492`:
+  ```go
+  huma.Register(api, trailsOp("trailsList", http.MethodGet,
+      "/trails/{host}/{owner}/{repo}", "List a repo's trails"),
+      func(ctx, in *TrailsListInput) (*TrailsListOutput, error) {
+          return trailsListCore(ctx, deps, in.PageSize, in.PageToken)
+      })
+  ```
+- The gate (`trailsOp`, line 478-480) attaches `[]opMiddleware{requireAuth(...), requireTrailsAccess(...)}` (defined line 477).
+- Paths get the `/api/v1` prefix elsewhere (`APIBase`/`apiPrefix`); huma registers the bare `/trails/...`.
+- Handler function: the inline closure delegating to `trailsListCore` (`trails.go:279`).
+- There is a second, ULID-addressed twin route `GET /repos/{repo_id}/trails` → `trailsListByRepoID` (`trails.go:494-498`), same core, gated by `requireTrailsAccessByID`.
+
+The forge slug is the `{host}` path param (`gh` or `et`); the CLI's "forge" = this `{host}`.
+
+## 2. List handler
+`trailsListCore` — `internal/httpapi/trails.go:279-311`. Steps:
+1. `trailsRepoFromContext(ctx)` (line 280) — pulls the `resolvedTrailsRepo{repoID}` the gate stashed. `forge/owner/repo` are **not** parsed in the handler; the middleware already resolved them to a `repoID` (see §3).
+2. `decodeTrailsPageToken(pageToken)` (line 284) — decodes the opaque base64 cursor into `*store.TrailCursor{UpdatedAt, ID}`; a present-but-unparseable token → `400` (`trails.go:235-258`). No status/author params exist.
+3. `clampLimit(pageSizeIn, 50, 100)` (line 288) — bounds page size (consts `trailsListDefaultPageSize=50`, `trailsListMaxPageSize=100`, lines 176-179).
+4. `deps.Store.ListTrailsByRepo(ctx, rep.repoID, pageSize, after)` (line 289) — the DB read (§4).
+5. Fetches `pageSize+1`; if an extra row came back, trims it and builds `nextPageToken` from the last returned row's `(UpdatedAt, ID)` via `encodeTrailsPageToken` (lines 296-302).
+6. `resolveAuthorLogins` (line 303) — best-effort maps author account ULIDs → GitHub logins (`trails.go:265-273`); failures degrade to null login, never an error.
+7. Maps each row via `toTrailListItem` and returns `TrailsListResponse{Items, NextPageToken}` (lines 304-310).
+
+## 3. Repo identity resolution
+Done in the gate middleware `requireTrailsAccessWithPermission` — `internal/httpapi/trails.go:93-126`:
+- Validates `{host}` against `validTrailsHosts = {gh, et}` (line 39, 96); unknown → `400`.
+- Builds `fullName = owner + "/" + repo` (line 100).
+- Only `resolvableTrailsHosts = {gh}` (line 48) actually resolves; `et` falls through and fails closed to `404`.
+- `deps.Store.RepoIDByFullName(ctx, fullName)` (line 107) → `internal/store/repo_aggregates.go:559-576`:
+  ```sql
+  SELECT repo_id FROM github_repo_meta WHERE full_name = $1
+  UNION ALL
+  SELECT id FROM repos WHERE full_name = $1
+  LIMIT 1
+  ```
+  Prefers the GitHub mirror mapping (`github_repo_meta`) over native `repos`. Not found → `ok=false`.
+- Per-cell placement: resolution is **cell-local** — a repo not hosted in this cell simply won't be found here (→ collapsed `404`). There is no cross-cell lookup in this path. The ULID twin (`requireTrailsAccessByID`, line 134-149) skips resolution and takes `repo_id` straight from the path.
+- On success the resolved `repoID` is stashed in context (`trailsRepoKey{}`) and read back by the handler.
+
+## 4. Data source &amp; query
+Table: **`repo_trails`** (Postgres, pgx pool). Store method `ListTrailsByRepo` — `internal/store/trails.go:67-122`:
+```sql
+SELECT id, number, title, status,
+    COALESCE(branch, ''), COALESCE(original_branch, ''),
+    base, type, COALESCE(priority, ''),
+    author_account_id,
+    assignees, reviewers, requested_reviewers,
+    has_code_changes, comment_count, unresolved_count,
+    created_at, updated_at, merged_at
+FROM repo_trails
+WHERE repo_id = $1 [AND (updated_at, id) &lt; ($n, $m)]
+ORDER BY updated_at DESC, id DESC
+LIMIT $k
+```
+- Sort: `updated_at DESC, id DESC` (id tiebreak for determinism).
+- Filter: `repo_id` only, plus the optional keyset cursor predicate `(updated_at, id) &lt; (after.UpdatedAt, after.ID)`. No status/author filter.
+- `id`/`author_account_id` are `ulid` bytea columns, bound as raw 16 bytes (`ulidBytes`) and surfaced as base32 text (`ulidText`).
+- Fetches `limit+1` rows unmodified (httpapi layer trims + encodes the cursor).
+- Related reads: `CountTrailsByStatus` (`trails.go:135`, stats endpoint, `GROUP BY status`) and `TrailsEnabled` (`trails.go:298`, product toggle, see §5).
+
+## 5. Access control (the key part)
+Two independent checks, both in the gate before the handler runs. Shared decision helper `trailsAccessAllowed` — `internal/httpapi/trails.go:67-77`:
+```go
+allowed, err := repoPermissionAllowed(ctx, deps, repoID, permission) // SpiceDB
+if err != nil || !allowed { return allowed, err }
+enabled, err := deps.Store.TrailsEnabled(ctx, repoID)               // product toggle
+...
+return enabled, nil
+```
+
+a) **Authorization (SpiceDB)** — `repoPermissionAllowed` (`internal/httpapi/authz.go:188-198`):
+- Builds a per-request `AccessChecker` from the caller's verified Identity (`perRequestAccessChecker`, `perreq.go:18-24`).
+- `ac.HasPermission(ctx, "repo", repoID, "pull")` — reads use `permRepoRead = "pull"` (`authz.go:32`); writes use `permRepoWrite = "push"`.
+- `HasPermission` (`internal/auth/access.go:102-116`) calls `reader.Can(ctx, AccountSubject(identity.AccountID), action, Resource{repo, repoID})` against the **regional read-only SpiceDB** (`authz.Reader`, process-singleton gRPC client). The subject is **always** derived from the verified Identity, never from request input (confused-deputy guard, `access.go:88-92`). "pull" maps to `authz.Pull`. So **"the user has access to this repo's trails" = the caller's account holds the SpiceDB `pull` permission on `repo:&lt;repoID&gt;`** (direct grant, project membership, org cascade, or the `public_viewer` wildcard on public repos).
+- Fail-closed: SpiceDB error → `503`; unknown type/permission → rejected.
+- Note: this gate does **not** do `requireRepoAccess`'s repo-existence recheck (`authz.go:178-198` docstring) — existence is collapsed into the toggle result below.
+
+b) **Product toggle** — `deps.Store.TrailsEnabled(ctx, repoID)` (`internal/store/trails.go:298-310`):
+```sql
+SELECT &lt;bool_or FILTER(...) COALESCE false for SettingTrails&gt;
+FROM repo_setting_kv WHERE repo_id = $1
+```
+Trails must be enabled in repo settings KV.
+
+c) **Collapsed 404 (existence-hiding)** — `trails.go:113-124`: unknown repo, denied (`pull` false), and trails-disabled **all** return the same `404 "repository not found"`. A caller can never distinguish them (spike parity, `trails.go:9-15`). Infra errors are mapped by `writeAccessErr` (`authz.go:217-224`) to their real status (500/503).
+
+**For an account-scoped endpoint**, the relevant "across all repos" primitives already exist on `AccessChecker`:
+- `AccessibleRepoSet()` (`access.go:126-157`) = SpiceDB `repo/pull` enumeration (the whole readable set, includes public_viewer wildcard), TTL-cached ~15s.
+- `MemberRepoSet()` (`access.go:180-198`) = SpiceDB `repo/list` enumeration ("your repos": direct grants + project membership, **excludes** the public_viewer wildcard and platform cascade).
+- The existing `/me/*` family (`internal/httpapi/me.go`, `experimental_me.go`) uses exactly this: `loadAccessibleSet` filters activity rows by `memberRepoSet` (membership), `loadReadable` filters by `accessibleRepoSet` (pull) — see `experimental_me.go:264-324` and `perreq.go:26-79`. The docstrings there spell out the membership-vs-pull choice (`experimental_me.go:284-297`).
+
+## 6. Response shape
+Envelope `TrailsListResponse` — `internal/httpapi/trails_types.go:51-54`:
+```go
+type TrailsListResponse struct {
+    Items         []TrailListItem `json:"items"`
+    NextPageToken *string         `json:"nextPageToken"` // null when no further page
+}
+```
+No total count (the separate `/stats` endpoint returns `store.TrailStatusCounts{draft,open,merged,closed,total}`, `store/trails.go:127-133`).
+
+Per-trail `TrailListItem` — `trails_types.go:25-46` (JSON tags shown, no field ever omitted; nullables serialize as explicit null):
+`id, number, title, status, branch (*), originalBranch (*), base, type, priority, author ({id, login *}), assignees ([]string), reviewers ([]{login,status}), requestedReviewers ([]string), hasCodeChanges, commentCount, unresolvedCount, createdAt, updatedAt, mergedAt (*), phase (*)`.
+Mapping `toTrailListItem` — `trails_types.go:144-180`: timestamps rendered `isoMillis` (JS `toISOString`); empty `priority` → `"none"`; `phase` derived by `deriveTrailPhase` (`trails_types.go:124-139`); author login filled from the best-effort login map. Detail endpoint extends this with `TrailDetailResponse` (`trails_types.go:64-72`).
+
+## 7. Caller identity
+- Middleware `requireAuth` — `internal/httpapi/router.go:471-492`: calls `deps.Authenticator.Authenticate(...)`; on success stashes the Identity via `auth.WithIdentity(ctx, id)` and the raw bearer via `auth.WithBearer`. Missing/invalid token → `401`. Also runs the waitlist/approval gate.
+- `Authenticator.Authenticate` / `verifyBearer` — `internal/auth/auth.go:63-108`: validates a **bearer JWT** against Core JWKS. Contract (ADR 20260612): signature (EdDSA/RS256/ES256), required `exp`, audience pinned to this cell's jurisdiction host, `scope=openid`, optional exact `iss` match.
+- Claims → Identity (`auth.go:29-35`, `101-107`):
+  - `AccountID` = JWT `sub` (required; empty → error). This is the SpiceDB subject.
+  - `Handle`, `Provider`, `ProviderUserID`, and **`HomeJurisdiction`** — the last comes from the `home_jurisdiction` claim carried on the identity token (entire-core #2094), read locally without calling Core.
+- Extraction inside handlers/gates: `auth.FromContext(ctx)` (`auth.go:119-122`) returns `*Identity` or nil; helper `id(ctx)` (`experimental_me.go:257-262`) returns `AccountID`.
+- **home_jurisdiction relevance**: identity tokens are per-jurisdiction and the audience is pinned to the cell's jurisdiction host, so a token is only accepted by its home cell. `/me/*` account-scoped reads run against the caller's home cell (where `my_activity` is consolidated); trails, by contrast, live in the one cell hosting the repo. An account-scoped `/me/trails` would be served by whichever cell the request lands on and would only see `repo_trails` rows for repos placed in that cell (no server-side cross-cell aggregation).
+
+---
+
+### Key files
+- `internal/httpapi/trails.go` — routes, gates, list/stats/detail core handlers
+- `internal/httpapi/trails_types.go` — wire response structs + mapping
+- `internal/httpapi/authz.go` — repo permission gates, `repoPermissionAllowed`, perm constants
+- `internal/auth/access.go` — `AccessChecker.HasPermission`, `AccessibleRepoSet`, `MemberRepoSet`
+- `internal/auth/auth.go` — JWT auth, `Identity`, `FromContext`
+- `internal/httpapi/router.go` — `requireAuth`
+- `internal/httpapi/perreq.go` — `perRequestAccessChecker`, `accessibleRepoSet`/`memberRepoSet`
+- `internal/store/trails.go` — `ListTrailsByRepo`, `TrailsEnabled`, `CountTrailsByStatus`, `TrailListRow`
+- `internal/store/repo_aggregates.go:559` — `RepoIDByFullName`
+- `internal/httpapi/me.go` + `experimental_me.go` — existing `/me/*` account-scoped access-filter pattern (`loadAccessibleSet`/`loadReadable`)</result>
+<usage><subagent_tokens>103064</subagent_tokens><tool_uses>23</tool_uses><duration_ms>151414</duration_ms></usage>
+</task-notification>
+
+---
+
+fresh is fine but it should also allow for refinement by repos as well (do we already support that as part of listing trails for a repo someone's viewing locally on their machine anyway?)
+
+---
+
+for b: membership.
+c: flag-and-defer: don't write any code comments about it, but make a little note locally for me to review. don't commit it, just when you're done, tell me where the file lives. like a little handoff message or a template for a trail or linear issue.
+
+---
+
+/i-have-adhd:i-have-adhd
+
+---
+
+summarize the spec
+
+---
+
+I want to confirm: if someone says `entire trail list` in their own repo, it should work the same as it already does today.
+also, we should be able to support other commands beyond just `list` as part of this.
+
+---
+
+ship it
+
+---
+
+<task-notification>
+<task-id>aa5bc3972ac30a8f8</task-id>
+<tool-use-id>toolu_0138AGDRdMAMreXxtuy6JDK8</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/6886e45b-b31d-4653-910b-399b6cbfd9cb/tasks/aa5bc3972ac30a8f8.output</output-file>
+<status>completed</status>
+<summary>Agent "Extract CLI trail code snippets" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>All extracted. Everything below is verbatim with `file:line`.
+
+---
+
+## 1. `newTrailListCmd`, `runTrailListAll`, `runTrailListAllWithClient`
+
+`cmd/entire/cli/trail_cmd.go:399-420`:
+```go
+func newTrailListCmd() *cobra.Command {
+	var opts trailListOptions
+
+	cmd := &amp;cobra.Command{
+		Use:   "list",
+		Short: "List recent trails",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			opts.InsecureHTTP = trailInsecureHTTP(cmd)
+			opts.Repo = trailRepoFlag(cmd)
+			return runTrailListAll(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), opts)
+		},
+	}
+
+	cmd.Flags().StringVar(&amp;opts.Author, "author", "",
+		"Filter by author login (case-insensitive); use '"+trailListAuthorMe+"' for yourself (requires gh CLI); omit for any author")
+	cmd.Flags().StringVar(&amp;opts.Status, "status", defaultTrailListStatus,
+		"Filter by comma-separated status(es): "+formatValidStatuses()+"; use '"+trailListStatusAny+"' for all statuses")
+	cmd.Flags().BoolVar(&amp;opts.JSON, "json", false, "Output as JSON (respects --author, --status, and --limit)")
+	cmd.Flags().IntVarP(&amp;opts.Limit, "limit", "n", defaultTrailListLimit, "Maximum number of trails to show")
+
+	return cmd
+}
+```
+
+`cmd/entire/cli/trail_cmd.go:422-437` (`runTrailListAll` + `validateTrailListOptions`):
+```go
+func runTrailListAll(ctx context.Context, w, errW io.Writer, opts trailListOptions) error {
+	statusFilters, err := validateTrailListOptions(opts)
+	if err != nil {
+		return err
+	}
+	return runAuthenticatedTrailAPI(ctx, errW, opts.InsecureHTTP, opts.Repo, func(ctx context.Context, client *api.Client) error {
+		return runTrailListAllWithClient(ctx, w, client, opts, statusFilters)
+	})
+}
+
+func validateTrailListOptions(opts trailListOptions) ([]trail.Status, error) {
+	if opts.Limit &lt;= 0 {
+		return nil, errors.New("limit must be greater than 0")
+	}
+	return parseTrailStatusFilter(opts.Status)
+}
+```
+
+`cmd/entire/cli/trail_cmd.go:439-515` (`runTrailListAllWithClient`):
+```go
+func runTrailListAllWithClient(ctx context.Context, w io.Writer, client *api.Client, opts trailListOptions, statusFilters []trail.Status) error {
+	authorFilter := opts.Author
+	currentUserLogin := ""
+	if authorFilter == trailListAuthorMe {
+		login, err := fetchCurrentUserLogin(ctx, execRunner{})
+		if err != nil {
+			return err
+		}
+		currentUserLogin = login
+		authorFilter = login
+	}
+
+	forge, owner, repo, err := resolveTrailRepoOrRemote(ctx, opts.Repo)
+	if err != nil {
+		return err
+	}
+
+	// Filtering, sorting (updated_at desc), and truncation all happen
+	// server-side; the response carries the total match count so a capped
+	// page never reads as the total number of matches.
+	resp, err := client.Get(ctx, trailsBasePath(forge, owner, repo)+trailListQuery(statusFilters, authorFilter, opts.Limit))
+	if err != nil {
+		return fmt.Errorf("failed to list trails: %w", err)
+	}
+	defer resp.Body.Close()
+	if err := checkTrailResponse(resp); err != nil {
+		return err
+	}
+
+	var listResp api.TrailListResponse
+	if err := api.DecodeJSON(resp, &amp;listResp); err != nil {
+		return fmt.Errorf("failed to decode trail list: %w", err)
+	}
+
+	// Convert to metadata for display, attaching the browser URL (server-provided
+	// when present, locally constructed as a fallback for older servers).
+	trails := make([]*trail.Metadata, 0, len(listResp.Trails))
+	for i := range listResp.Trails {
+		m := listResp.Trails[i].ToMetadata()
+		m.URL = trailDisplayURL(listResp.Trails[i], forge, owner, repo)
+		trails = append(trails, m)
+	}
+
+	totalMatched := listResp.Total
+	if totalMatched &lt; len(trails) {
+		// Older servers don't report a total; fall back to the page size.
+		totalMatched = len(trails)
+	}
+
+	if opts.JSON {
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(trails); err != nil {
+			return fmt.Errorf("failed to encode JSON: %w", err)
+		}
+		return nil
+	}
+
+	if len(trails) == 0 {
+		printTrailListEmpty(w, authorFilter, statusFilters)
+		return nil
+	}
+
+	printTrailList(w, trails, trailListDisplayOptions{
+		RequestedAuthor: authorFilter,
+		CurrentUser:     currentUserLogin,
+		StatusFilters:   statusFilters,
+		TotalMatched:    totalMatched,
+	})
+
+	if opts.Limit &gt; trailListServerMaxLimit &amp;&amp; totalMatched &gt; len(trails) {
+		fmt.Fprintln(w)
+		fmt.Fprintf(w, "Note: --limit %d exceeds the server maximum of %d trails per request.\n", opts.Limit, trailListServerMaxLimit)
+	}
+
+	return nil
+}
+```
+
+---
+
+## 2. `trailListOptions` struct
+
+`cmd/entire/cli/trail_cmd.go:137-148`:
+```go
+// trailListOptions are the inputs to runTrailListAll. Keeping them on a
+// struct avoids a long positional argument list at the two call sites.
+type trailListOptions struct {
+	Author       string
+	Status       string
+	JSON         bool
+	Limit        int
+	InsecureHTTP bool
+	// Repo is an optional --repo override (forge/owner/repo or a clone URL);
+	// empty means derive the repo from the origin remote.
+	Repo string
+}
+```
+
+---
+
+## 3. `TrailListResponse` + `TrailResource` (the per-trail item)
+
+`cmd/entire/cli/api/trail_types.go:9-53`:
+```go
+// TrailListResponse is the response from GET /api/v1/trails/:org/:repo.
+// The endpoint paginates: Trails holds one page (server max 200 rows) and
+// Total is the full match count for the requested filters.
+type TrailListResponse struct {
+	Trails        []TrailResource `json:"trails"`
+	Total         int             `json:"total"`
+	Limit         int             `json:"limit"`
+	Offset        int             `json:"offset"`
+	RepoFullName  string          `json:"repo_full_name"`
+	DefaultBranch string          `json:"default_branch"`
+	UpdatedAt     time.Time       `json:"updated_at"`
+}
+
+// TrailResource represents a single trail from the API.
+type TrailResource struct {
+	ID        string           `json:"id,omitempty"`
+	Number    int              `json:"number,omitempty"`
+	URL       string           `json:"url,omitempty"`
+	Branch    string           `json:"branch"`
+	Base      string           `json:"base"`
+	Title     string           `json:"title"`
+	Body      string           `json:"body"`
+	Status    string           `json:"status"`
+	Phase     string           `json:"phase,omitempty"`
+	Author    *trail.Author    `json:"author"`
+	Assignees []string         `json:"assignees"`
+	Labels    []string         `json:"labels"`
+	Priority  string           `json:"priority,omitempty"`
+	Type      string           `json:"type,omitempty"`
+	Reviewers []trail.Reviewer `json:"reviewers,omitempty"`
+	// RequestedReviewers holds the logins requested for review (distinct from
+	// Reviewers, which carries per-login review status). The replace-set
+	// --add-reviewer/--remove-reviewer merge computes the new set from this.
+	RequestedReviewers []string   `json:"requested_reviewers,omitempty"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
+	MergedAt           *time.Time `json:"merged_at,omitempty"`
+	CommentCount       int        `json:"comment_count,omitempty"`
+	UnresolvedCount    int        `json:"unresolved_count,omitempty"`
+	CheckpointCount    int        `json:"checkpoint_count,omitempty"`
+	CommitsAhead       int        `json:"commits_ahead,omitempty"`
+	// BodyDocument carries the trail's description (collaborative editor doc).
+	// The list endpoint omits it; the detail endpoint populates it.
+	BodyDocument *TrailBodyDocument `json:"body_document,omitempty"`
+}
+```
+
+`ToMetadata` at `cmd/entire/cli/api/trail_types.go:61-90`:
+```go
+// ToMetadata converts a TrailResource to a trail.Metadata for display.
+func (r *TrailResource) ToMetadata() *trail.Metadata {
+	m := &amp;trail.Metadata{
+		Number:    r.Number,
+		TrailID:   trail.ID(r.ID),
+		URL:       r.URL,
+		Branch:    r.Branch,
+		Base:      r.Base,
+		Title:     r.Title,
+		Body:      r.Body,
+		Status:    trail.Status(r.Status),
+		Phase:     r.Phase,
+		Author:    r.Author,
+		Assignees: r.Assignees,
+		Labels:    r.Labels,
+		Type:      trail.Type(r.Type),
+		Priority:  trail.Priority(r.Priority),
+		Reviewers: r.Reviewers,
+		CreatedAt: r.CreatedAt,
+		UpdatedAt: r.UpdatedAt,
+		MergedAt:  r.MergedAt,
+	}
+	if m.Assignees == nil {
+		m.Assignees = []string{}
+	}
+	if m.Labels == nil {
+		m.Labels = []string{}
+	}
+	return m
+}
+```
+
+Note: `TrailListResponse` already has `RepoFullName` and `DefaultBranch` json fields (`repo_full_name`, `default_branch`). There is no `isPrivate` field anywhere in this file, and `TrailResource` has no repo-identifying field — you will need to add both an account-wide response type and a repo/visibility field to the per-trail item.
+
+---
+
+## 4. `trailListDisplayOptions` + `printTrailList` (+ header + rows)
+
+`cmd/entire/cli/trail_cmd.go:612-620` (`trailListDisplayOptions`):
+```go
+type trailListDisplayOptions struct {
+	RequestedAuthor string
+	CurrentUser     string
+	StatusFilters   []trail.Status
+	// TotalMatched is the number of trails matching the filters server-side,
+	// before --limit truncation. Counts render as "shown/total" when they
+	// differ so a capped page doesn't read as the total number of matches.
+	TotalMatched int
+}
+```
+
+`cmd/entire/cli/trail_cmd.go:622-661` (`printTrailList` + `printTrailListHeader`):
+```go
+func printTrailList(w io.Writer, trails []*trail.Metadata, opts trailListDisplayOptions) {
+	showAuthor := opts.RequestedAuthor == ""
+	// Show the status column unless exactly one status is filtered — that
+	// status is already named in the header.
+	showStatus := len(opts.StatusFilters) != 1
+	printTrailListHeader(w, opts, len(trails))
+	fmt.Fprintln(w)
+	printTrailRows(w, trails, showAuthor, showStatus)
+}
+
+func printTrailListHeader(w io.Writer, opts trailListDisplayOptions, count int) {
+	countStr := trailCountDisplay(count, opts.TotalMatched)
+	// The noun refers to the full match set, so pluralize by the total when
+	// the page is truncated ("1/2 trails", not "1/2 trail").
+	nounCount := count
+	if opts.TotalMatched &gt; count {
+		nounCount = opts.TotalMatched
+	}
+	if opts.RequestedAuthor == "" {
+		if len(opts.StatusFilters) == 0 {
+			fmt.Fprintf(w, "  Recent %s · %s\n", pluralize("trail", nounCount), countStr)
+			return
+		}
+		fmt.Fprintf(w, "  %s · %s %s\n", trailStatusListTitle(opts.StatusFilters), countStr, pluralize("trail", nounCount))
+		return
+	}
+
+	label := opts.RequestedAuthor
+	// When --author me resolves to the same login the server already returned
+	// for the trail, render "Your trails (login)" so identity drift between
+	// gh and Entire is visible at a glance.
+	if opts.CurrentUser != "" &amp;&amp; strings.EqualFold(opts.RequestedAuthor, opts.CurrentUser) {
+		label = fmt.Sprintf("Your trails (%s)", opts.CurrentUser)
+	}
+	if len(opts.StatusFilters) == 0 {
+		fmt.Fprintf(w, "  %s · %s\n", label, countStr)
+		return
+	}
+	fmt.Fprintf(w, "  %s · %s %s\n", label, countStr, trailStatusListDisplay(opts.StatusFilters))
+}
+```
+
+`cmd/entire/cli/trail_cmd.go:663-739` (`printTrailRows` — the column/row formatting you'd extend with a repo column):
+```go
+func printTrailRows(w io.Writer, trails []*trail.Metadata, showAuthor, showStatus bool) {
+	styles := newStatusStyles(w)
+	showPhase := trailListHasPhase(trails)
+	showURL := trailListHasURL(trails)
+
+	// The leading two-space indent is folded into the first column so the shared
+	// table renderer (columnWidths/writeTableRow) reproduces the list's layout.
+	headers := []string{"  NUM", "BRANCH", "TITLE"}
+	if showStatus {
+		headers = append(headers, "STATUS")
+	}
+	if showPhase {
+		headers = append(headers, "PHASE")
+	}
+	if showAuthor {
+		headers = append(headers, "AUTHOR")
+	}
+	headers = append(headers, "UPDATED")
+	if showURL {
+		headers = append(headers, "URL")
+	}
+
+	rows := make([][]string, len(trails))
+	for i, t := range trails {
+		number := "-"
+		if t.Number &gt; 0 {
+			number = strconv.Itoa(t.Number)
+		}
+		title := truncateOneLine(t.Title, 60)
+		if title == "" {
+			title = "(untitled)"
+		}
+		fields := []string{"  " + number, t.Branch, title}
+		// Cells are pre-colored here; columnWidths/writeTableRow measure width
+		// with lipgloss.Width (ANSI-agnostic), so color never shifts columns.
+		if showStatus {
+			status := trailStatusDisplay(t.Status)
+			if style, ok := trailStatusColor(styles, t.Status); ok {
+				status = styles.render(style, status)
+			}
+			fields = append(fields, status)
+		}
+		if showPhase {
+			phase := trailPhaseDisplay(t.Phase)
+			if styles.colorEnabled &amp;&amp; phase != "-" {
+				phase = styles.render(styles.yellow, phase)
+			}
+			fields = append(fields, phase)
+		}
+		if showAuthor {
+			author := t.AuthorLogin()
+			if styles.colorEnabled &amp;&amp; author != "" {
+				author = styles.render(styles.cyan, author)
+			}
+			fields = append(fields, author)
+		}
+		fields = append(fields, timeAgo(t.UpdatedAt))
+		if showURL {
+			fields = append(fields, t.URL)
+		}
+		rows[i] = fields
+	}
+
+	widths := columnWidths(headers, rows)
+	var b strings.Builder
+	// Header row is yellow; data cells are already pre-colored, so they pass
+	// through a disabled style. tblSt only supplies the color-enabled gate for
+	// the header style.
+	tblSt := newTableStyles(w)
+	headerStyle := func(int) lipgloss.Style { return styles.yellow }
+	plain := func(int) lipgloss.Style { return lipgloss.Style{} }
+	writeTableRow(&amp;b, headers, widths, headerStyle, tblSt)
+	for _, r := range rows {
+		writeTableRow(&amp;b, r, widths, plain, tableStyles{})
+	}
+	fmt.Fprint(w, b.String())
+}
+```
+
+---
+
+## 5. `runAuthenticatedActivityAPI` (confirmed) + a `/me/*` GET call site
+
+Confirmed verbatim at `cmd/entire/cli/entireapi_client.go:34-41`:
+```go
+func runAuthenticatedActivityAPI(ctx context.Context, errW io.Writer, insecureHTTP bool, fn func(context.Context, *api.Client) error) error {
+	client, err := auth.NewEntireAPICellClient(ctx, insecureHTTP, nil)
+	if err != nil {
+		logCellClientFallback(ctx, err)
+		return runAuthenticatedDataAPI(ctx, errW, insecureHTTP, fn)
+	}
+	return fn(ctx, client)
+}
+```
+
+Example `/me/*` GET + decode, `cmd/entire/cli/activity_cmd.go:136-157`:
+```go
+	q := url.Values{}
+	q.Set("timezone", detectTimezone())
+	q.Set("timeframe", activityTimeframe)
+	q.Set("limit", strconv.Itoa(activityLimit))
+	path := "/api/v1/me/activity?" + q.Encode()
+
+	resp, err := client.Get(ctx, path)
+	if err != nil {
+		return nil, fmt.Errorf("GET activity: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if err := api.CheckResponse(resp); err != nil {
+		return nil, fmt.Errorf("activity response: %w", err)
+	}
+
+	var result userActivityResponse
+	if err := api.DecodeJSON(resp, &amp;result); err != nil {
+		return nil, fmt.Errorf("decode activity: %w", err)
+	}
+	return &amp;result, nil
+}
+```
+Note the call chain: `activity` invokes these via `runAuthenticatedActivityAPI` (`activity_cmd.go:66`), which routes through the home-cell client (`auth.NewEntireAPICellClient(ctx, insecureHTTP, nil)`) — the exact routing you want for account-wide trail listing.
+
+---
+
+## 6. `runAuthenticatedTrailAPI` (confirmed)
+
+`cmd/entire/cli/trail_context_cache.go:475-488`:
+```go
+// runAuthenticatedTrailAPI runs fn against the data API as the current user.
+// repoOverride is the raw --repo flag: when non-empty the trails-enablement
+// cache is skipped, because that cache is keyed to the local clone's origin and
+// a cross-repo query says nothing about the local clone (recording it would
+// mis-attribute enablement to the wrong repo).
+func runAuthenticatedTrailAPI(ctx context.Context, errW io.Writer, insecureHTTP bool, repoOverride string, fn func(context.Context, *api.Client) error) error {
+	return runAuthenticatedDataAPI(ctx, errW, insecureHTTP, func(ctx context.Context, client *api.Client) error {
+		err := fn(ctx, client)
+		if repoOverride == "" {
+			noteTrailCommandEnablement(ctx, client, err)
+		}
+		return err
+	})
+}
+```
+Important: this routes through `runAuthenticatedDataAPI` (the data API), NOT the home-cell client. `runAuthenticatedActivityAPI` (#5) is the cell-routed variant. An account-wide `/me/trails` path will want the cell client, not this data-API path.
+
+---
+
+## 7. `newTrailShowCmd`, `runTrailShow`, and the selector resolver
+
+`cmd/entire/cli/trail_cmd.go:150-176` (`newTrailShowCmd`):
+```go
+func newTrailShowCmd() *cobra.Command {
+	var branch string
+	cmd := &amp;cobra.Command{
+		Use:   "show [&lt;trail&gt;]",
+		Short: "Show a trail",
+		Long: `Show a trail.
+
+If &lt;trail&gt; is omitted, shows the trail for the current branch (or --branch).
+Otherwise, &lt;trail&gt; may be a trail number, id, or branch in the target repo.`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			selector := ""
+			if len(args) == 1 {
+				selector = args[0]
+			}
+			if selector != "" &amp;&amp; trailBranchFlag(cmd) != "" {
+				return errors.New("pass a trail selector or --branch, not both")
+			}
+			if err := ensureTrailRepoHasTarget(cmd, selector != "" || trailBranchFlag(cmd) != "", "pass a trail selector or --branch"); err != nil {
+				return err
+			}
+			return runTrailShow(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), trailInsecureHTTP(cmd), selector, trailRepoFlag(cmd), trailBranchFlag(cmd))
+		},
+	}
+	cmd.Flags().StringVar(&amp;branch, "branch", "", "Show the trail for this branch instead of the current branch; cannot be combined with a trail selector")
+	return cmd
+}
+```
+
+`cmd/entire/cli/trail_cmd.go:178-223` (`runTrailShow`):
+```go
+// runTrailShow shows one trail, defaulting to the current branch's trail.
+func runTrailShow(ctx context.Context, w, errW io.Writer, insecureHTTP bool, selector, repoOverride, branchOverride string) error {
+	return runAuthenticatedTrailAPI(ctx, errW, insecureHTTP, repoOverride, func(ctx context.Context, client *api.Client) error {
+		forge, owner, repo, err := resolveTrailRepoOrRemote(ctx, repoOverride)
+		if err != nil {
+			return err
+		}
+
+		found, err := resolveTrailBySelector(ctx, client, forge, owner, repo, selector, branchOverride)
+		if err != nil {
+			return err
+		}
+
+		// Enrich the list result with the detail endpoint, which carries the
+		// rendered description (trail.body_document.text_snapshot) the list
+		// omits, and surface a browser URL. The detail fetch is best-effort:
+		// the core metadata already came from the list, so a detail failure
+		// falls back to the list body with a warning rather than failing.
+		m := found.ToMetadata()
+		webURL := trailDisplayURL(*found, forge, owner, repo)
+		// Seed the description from the list body so a failed (or skipped)
+		// detail fetch still shows something; a successful detail fetch
+		// supersedes it with the richer body_document text below.
+		bodyText := found.Body
+		descriptionLoaded := strings.TrimSpace(found.Body) != ""
+		if found.Number &gt; 0 {
+			if bt, derr := fetchTrailDescription(ctx, client, forge, owner, repo, found.Number); derr == nil {
+				// A successful fetch means we authoritatively consulted the
+				// description, but it only supersedes the seeded list body when
+				// it actually carries text: an older/partial server that omits
+				// body_document returns "" here and must not blank out a list
+				// body that is present.
+				descriptionLoaded = true
+				if strings.TrimSpace(bt) != "" {
+					bodyText = bt
+				}
+			} else {
+				// Best-effort: warn but still render metadata + URL (and the
+				// list body) rather than failing the whole command.
+				fmt.Fprintf(errW, "Warning: could not load trail description: %v\n", derr)
+			}
+		}
+		printTrailDetails(w, m, webURL, trailDescriptionForDisplay(bodyText, descriptionLoaded))
+		return nil
+	})
+}
+```
+
+`cmd/entire/cli/trail_cmd.go:225-253` (`resolveTrailBySelector` — the selector/branch resolver with its error strings):
+```go
+// resolveTrailBySelector resolves a trail by an optional selector (trail
+// number, id, or branch). An empty selector falls back to the current branch's
+// trail. It returns an actionable error (never a nil trail with a nil error)
+// when nothing matches, so callers can rely on a non-nil result.
+func resolveTrailBySelector(ctx context.Context, client *api.Client, forge, owner, repo, selector, branchOverride string) (*api.TrailResource, error) {
+	selector = strings.TrimSpace(selector)
+	if selector == "" {
+		branch, err := resolveTrailBranch(ctx, branchOverride)
+		if err != nil {
+			return nil, fmt.Errorf("no trail selector given and current branch is unknown: %w\nhint: run 'entire trail list --status any' or pass a trail number, id, or branch", err)
+		}
+		found, err := findTrailByBranch(ctx, client, forge, owner, repo, branch)
+		if err != nil {
+			return nil, err
+		}
+		if found == nil {
+			return nil, fmt.Errorf("no trail found for current branch %q\nhint: run 'entire trail create' or 'entire trail list --status any'", branch)
+		}
+		return found, nil
+	}
+	found, err := findTrailBySelector(ctx, client, forge, owner, repo, selector)
+	if err != nil {
+		return nil, err
+	}
+	if found == nil {
+		return nil, fmt.Errorf("no trail %q found in %s/%s/%s (run 'entire trail list --status any')", selector, forge, owner, repo)
+	}
+	return found, nil
+}
+```
+
+The selector implementation helpers it calls — `cmd/entire/cli/trail_cmd.go:1875-1911` (`findTrailBySelector`, `parseTrailNumberSelector`, `findTrailByBranch`, `findTrailByNumber`):
+```go
+func findTrailBySelector(ctx context.Context, client *api.Client, forge, owner, repo, selector string) (*api.TrailResource, error) {
+	selector = strings.TrimSpace(selector)
+	if selector == "" {
+		return nil, nil //nolint:nilnil // empty selector means not found for this helper
+	}
+	if n, ok := parseTrailNumberSelector(selector); ok {
+		found, err := findTrailByNumber(ctx, client, forge, owner, repo, n)
+		if err != nil || found != nil {
+			return found, err
+		}
+	}
+	return findTrail(ctx, client, forge, owner, repo, func(t api.TrailResource) bool {
+		return t.ID == selector || t.Branch == selector
+	})
+}
+
+func parseTrailNumberSelector(selector string) (int, bool) {
+	n, err := strconv.Atoi(strings.TrimSpace(selector))
+	if err != nil || n &lt;= 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+func findTrailByBranch(ctx context.Context, client *api.Client, forge, owner, repo, branch string) (*api.TrailResource, error) {
+	return findTrail(ctx, client, forge, owner, repo, func(t api.TrailResource) bool {
+		return t.Branch == branch
+	})
+}
+
+// findTrailByNumber looks up a trail by numeric identifier via the list API.
+func findTrailByNumber(ctx context.Context, client *api.Client, forge, owner, repo string, number int) (*api.TrailResource, error) {
+	return findTrail(ctx, client, forge, owner, repo, func(t api.TrailResource) bool {
+		return t.Number == number
+	})
+}
+```
+
+And the underlying paginating `findTrail`, `cmd/entire/cli/trail_cmd.go:1912-1961`:
+```go
+func findTrail(ctx context.Context, client *api.Client, forge, owner, repo string, match func(api.TrailResource) bool) (*api.TrailResource, error) {
+	// The list endpoint paginates; walk bounded pages so branch/number/id lookups do
+	// not silently miss older trails beyond the first server-max page.
+	offset := 0
+	previousPageSignature := ""
+	for range trailFindMaxPages {
+		resp, err := client.Get(ctx, trailsBasePath(forge, owner, repo)+trailListQueryWithOffset(nil, "", trailListServerMaxLimit, offset))
+		if err != nil {
+			return nil, fmt.Errorf("list trails: %w", err)
+		}
+
+		var listResp api.TrailListResponse
+		decodeErr := func() error {
+			defer resp.Body.Close()
+			if err := checkTrailResponse(resp); err != nil {
+				return err
+			}
+			if err := api.DecodeJSON(resp, &amp;listResp); err != nil {
+				return fmt.Errorf("decode trail list: %w", err)
+			}
+			return nil
+		}()
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+
+		for i := range listResp.Trails {
+			if match(listResp.Trails[i]) {
+				return &amp;listResp.Trails[i], nil
+			}
+		}
+
+		pageLen := len(listResp.Trails)
+		if pageLen == 0 || pageLen &lt; trailListServerMaxLimit {
+			break
+		}
+		if listResp.Total == 0 {
+			pageSignature := trailListPageSignature(listResp.Trails)
+			if pageSignature != "" &amp;&amp; pageSignature == previousPageSignature {
+				break
+			}
+			previousPageSignature = pageSignature
+		}
+		offset += pageLen
+		if listResp.Total &gt; 0 &amp;&amp; offset &gt;= listResp.Total {
+			break
+		}
+	}
+	return nil, nil //nolint:nilnil // nil, nil means "not found" — callers check both
+}
+```
+
+---
+
+## 8. `--repo` flag registration + repo-routing helpers
+
+`--repo` persistent flag registration, `cmd/entire/cli/trail_cmd.go:73-78`:
+```go
+	// Target an explicit repository instead of the origin remote, so the trail
+	// commands can drive a repo the caller is not checked out in (e.g. a GUI
+	// backend). Commands that mutate the local clone (create, checkout, finding
+	// apply) reject it via ensureNoTrailRepoOverride.
+	cmd.PersistentFlags().StringVar(&amp;repoOverride, "repo", "",
+		"Target repository as forge/owner/repo (e.g. gh/acme/app) or a clone URL; defaults to the origin remote")
+```
+
+`trailRepoFlag`, `cmd/entire/cli/trail_cmd.go:103-109`:
+```go
+// trailRepoFlag reads the persistent --repo flag from the trail command tree.
+// It is always registered on the trail root, so a missing flag (empty string)
+// just means "derive from origin".
+func trailRepoFlag(cmd *cobra.Command) string {
+	v, _ := cmd.Flags().GetString("repo") //nolint:errcheck // flag is always registered on the trail root
+	return strings.TrimSpace(v)
+}
+```
+
+`resolveTrailRemote`, `resolveTrailRepoOrRemote`, `resolveTrailBranch`, `parseTrailRepoArg`, `cmd/entire/cli/trail_cmd.go:1985-2052`:
+```go
+// resolveTrailRemote resolves the origin remote and ensures the forge is
+// known to the trails API. Without this guard, an unmapped host (e.g.
+// gitlab.com, or a misconfigured entire:// URL with no forge prefix)
+// produces a malformed `/api/v1/trails//owner/repo` path that the server
+// rejects with an opaque error instead of a clear "unsupported forge" one.
+func resolveTrailRemote(ctx context.Context) (forge, owner, repo string, err error) {
+	forge, owner, repo, err = gitremote.ResolveRemoteRepo(ctx, "origin")
+	if err != nil {
+		return "", "", "", fmt.Errorf("failed to resolve repository: %w", err)
+	}
+	if forge == "" {
+		return "", "", "", errors.New("origin remote is not on a forge supported by Entire trails (supported: github.com)")
+	}
+	return forge, owner, repo, nil
+}
+
+// resolveTrailRepoOrRemote resolves the forge/owner/repo triple used to build
+// trail API paths. An explicit --repo override (repoOverride) wins; otherwise
+// it derives the triple from the origin remote of the current clone.
+func resolveTrailRepoOrRemote(ctx context.Context, repoOverride string) (forge, owner, repo string, err error) {
+	if repoOverride != "" {
+		return parseTrailRepoArg(repoOverride)
+	}
+	return resolveTrailRemote(ctx)
+}
+
+// resolveTrailBranch returns the branch a trail lookup should use: an explicit
+// --branch override (branchOverride) when given, otherwise the current branch.
+func resolveTrailBranch(ctx context.Context, branchOverride string) (string, error) {
+	if branchOverride != "" {
+		return branchOverride, nil
+	}
+	return GetCurrentBranch(ctx)
+}
+
+// parseTrailRepoArg parses an explicit --repo value into the forge/owner/repo
+// triple. It accepts the canonical "forge/owner/repo" form (e.g. gh/acme/app)
+// as well as a full clone URL (https://, git@, or entire://) that gitremote
+// can parse. A trailing ".git" on the repo is stripped.
+func parseTrailRepoArg(raw string) (forge, owner, repo string, err error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", "", errors.New("empty --repo value")
+	}
+	// Bare path form: forge/owner/repo. URLs (with a scheme or an SCP "@")
+	// fall through to the URL parser, which understands hosts and schemes.
+	if !strings.Contains(raw, "://") &amp;&amp; !strings.Contains(raw, "@") {
+		parts := strings.Split(strings.Trim(raw, "/"), "/")
+		if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+			return "", "", "", fmt.Errorf("invalid --repo %q: expected forge/owner/repo (e.g. gh/acme/app) or a clone URL", raw)
+		}
+		// parts[0] must be a short forge id ("gh"), not a hostname. A host-like
+		// value (github.com/acme/app) would otherwise be forwarded verbatim and
+		// the server would reject the malformed path with an opaque error.
+		if !gitremote.IsSupportedForge(parts[0]) {
+			return "", "", "", fmt.Errorf("invalid --repo %q: %q is not a supported forge id (use a forge id like \"gh\", or pass a clone URL such as https://github.com/%s/%s)", raw, parts[0], parts[1], parts[2])
+		}
+		return parts[0], parts[1], strings.TrimSuffix(parts[2], ".git"), nil
+	}
+	info, perr := gitremote.ParseURL(raw)
+	if perr != nil {
+		return "", "", "", fmt.Errorf("invalid --repo %q: %w", raw, perr)
+	}
+	if info.Forge == "" {
+		return "", "", "", fmt.Errorf("invalid --repo %q: unsupported forge host (supported: github.com)", raw)
+	}
+	return info.Forge, info.Owner, info.Repo, nil
+}
+```
+
+---
+
+## 9. `trailsBasePath`, `client.Get`/`do`, `checkTrailResponse`
+
+`trailsBasePath`, `cmd/entire/cli/trail_cmd.go:1972-1976`:
+```go
+// trailsBasePath returns the API path prefix for trails endpoints
+// (e.g., "/api/v1/trails/gh/org/repo").
+func trailsBasePath(forge, owner, repo string) string {
+	return fmt.Sprintf("/api/v1/trails/%s/%s/%s", forge, owner, repo)
+}
+```
+
+`client.Get` → `do`, `cmd/entire/cli/api/client.go:135-137` and `191-209`:
+```go
+func (c *Client) Get(ctx context.Context, path string) (*http.Response, error) {
+	return c.do(ctx, http.MethodGet, path, nil, nil)
+}
+```
+```go
+func (c *Client) do(ctx context.Context, method, path string, body io.Reader, headers http.Header) (*http.Response, error) {
+	endpoint, err := ResolveURLFromBase(c.baseURL, path)
+	if err != nil {
+		return nil, fmt.Errorf("resolve URL %s: %w", path, err)
+	}
+	// The bearer is only ever sent to the API's own host. A path that resolves
+	// to another host (absolute or scheme-relative URL) would otherwise redirect
+	// the Authorization header off-origin.
+	if err := requireSameHost(c.baseURL, endpoint); err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, body)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+
+	for k, vs := range headers {
+		for _, v := range vs {
+```
+
+`checkTrailResponse`, `cmd/entire/cli/trail_cmd.go:2054-2064`:
+```go
+// checkTrailResponse checks the API response and returns user-friendly errors.
+// For auth failures, it appends a hint to re-authenticate while preserving the server's error message.
+func checkTrailResponse(resp *http.Response) error {
+	if err := api.CheckResponse(resp); err != nil {
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			return fmt.Errorf("%w — run 'entire login' to re-authenticate", err)
+		}
+		return fmt.Errorf("trail API: %w", err)
+	}
+	return nil
+}
+```
+
+---
+
+## 10. Representative `trail list` test (httptest server + client stub + assert)
+
+`cmd/entire/cli/trail_cmd_test.go:980-1021` (`TestFindTrailPaginatesPastServerMax` — the fullest "stub server + `api.NewClientWithBaseURL` + assert" harness):
+```go
+func TestFindTrailPaginatesPastServerMax(t *testing.T) {
+	t.Parallel()
+	var offsets []int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		offsetStr := r.URL.Query().Get("offset")
+		offset := 0
+		if offsetStr != "" {
+			var err error
+			offset, err = strconv.Atoi(offsetStr)
+			if err != nil {
+				t.Fatalf("parse offset %q: %v", offsetStr, err)
+			}
+		}
+		offsets = append(offsets, offset)
+		trails := []api.TrailResource{}
+		switch offset {
+		case 0:
+			trails = make([]api.TrailResource, trailListServerMaxLimit)
+			for i := range trails {
+				trails[i] = api.TrailResource{ID: "trl_first_" + strconv.Itoa(i), Number: i + 1, Branch: "old/" + strconv.Itoa(i)}
+			}
+		case trailListServerMaxLimit:
+			trails = []api.TrailResource{{ID: "trl_target", Number: 201, Branch: "target"}}
+		}
+		if err := json.NewEncoder(w).Encode(api.TrailListResponse{Trails: trails, Total: trailListServerMaxLimit + 1}); err != nil {
+			t.Fatalf("encode response: %v", err)
+		}
+	}))
+	defer srv.Close()
+
+	client := api.NewClientWithBaseURL("tok", srv.URL)
+	found, err := findTrailByBranch(context.Background(), client, "gh", "acme", "repo", "target")
+	if err != nil {
+		t.Fatalf("findTrailByBranch: %v", err)
+	}
+	if found == nil || found.ID != "trl_target" {
+		t.Fatalf("found = %#v, want trl_target", found)
+	}
+	if len(offsets) != 2 || offsets[0] != 0 || offsets[1] != trailListServerMaxLimit {
+		t.Fatalf("offsets = %v, want [0 %d]", offsets, trailListServerMaxLimit)
+	}
+}
+```
+
+Two complementary harness patterns also worth mirroring, both `cmd/entire/cli/trail_cmd_test.go`:
+- `TestRunTrailListAll_PrintsLoginHintWhenNotLoggedIn` (lines 371-403) — drives `runTrailListAll(ctx, &amp;out, &amp;errOut, trailListOptions{...})` end-to-end, stubbing auth via `auth.SetResolveContextForAPIForTest` + `tokenstore.UseFileBackendForTesting`, capturing `bytes.Buffer` stdout/stderr, and asserting on output strings and error chains (`errors.Is`/`errors.As`). Not `t.Parallel` because it mutates package-level auth state.
+- The `printTrailList*` tests (e.g. `TestPrintTrailListDefaultRepoShapeShowsAuthor`, line 1146) — pure formatting tests that build `[]*trail.Metadata` + `trailListDisplayOptions` and assert rendered columns. These are the ones to extend for a new repo column.
+
+---
+
+## Key facts for your plan (no placeholders)
+
+- The account-wide path should route through the home-cell client via `auth.NewEntireAPICellClient(ctx, insecureHTTP, nil)` — exactly what `runAuthenticatedActivityAPI` (`entireapi_client.go:34`) does for `/me/*`. The existing `runAuthenticatedTrailAPI` (`trail_context_cache.go:480`) does NOT do this; it uses `runAuthenticatedDataAPI` (the data API). So `trail list --all` needs a new/alternate routing helper, not the existing trail helper.
+- `trailListOptions` (`trail_cmd.go:139`) has no `All` field; add one. `newTrailListCmd` (`trail_cmd.go:399`) does not register `--all`.
+- `TrailListResponse` (`api/trail_types.go:12`) already carries `RepoFullName` (`repo_full_name`) and `DefaultBranch` at the response level, but `TrailResource` (line 23) carries no repo identity and no `isPrivate`. An account-wide response type + per-item repo/visibility fields are net-new.
+- `trailsBasePath` (`trail_cmd.go:1974`) hard-codes `/api/v1/trails/%s/%s/%s`; the account-wide endpoint `/api/v1/me/trails` is a separate path with no forge/owner/repo, so `runTrailListAllWithClient`'s call to `resolveTrailRepoOrRemote` + `trailsBasePath` (lines 451, 459) must be bypassed on the `--all`/repo-less branch.
+- `trailListQuery`/`trailListQueryWithOffset` (`trail_cmd.go:520`, `524`) build the `?status=&amp;author=&amp;limit=&amp;offset=` query; reusable for `/me/trails` as-is.
+- `printTrailRows` (`trail_cmd.go:663`) is where a REPO column gets added; note the leading-indent-folding convention on the first column (`"  " + number`) and that cells are pre-colored and measured with `lipgloss.Width`.
+- `resolveTrailBySelector` (`trail_cmd.go:229`) and `findTrail`/`findTrailBySelector` (`trail_cmd.go:1912`/`1875`) all take `forge, owner, repo` and call `trailsBasePath`; a repo-less `trail show` resolve-from-account-index path needs a parallel resolver that queries `/me/trails` and matches on number/id/branch (and likely repo) without the forge/owner/repo triple.
+- Test harness: `api.NewClientWithBaseURL("tok", srv.URL)` + `httptest.NewServer` is the standard stub; full command-level tests stub auth with `auth.SetResolveContextForAPIForTest` + `tokenstore.UseFileBackendForTesting` and capture `bytes.Buffer`s (those tests are non-parallel due to package-global mutation).</result>
+<usage><subagent_tokens>88351</subagent_tokens><tool_uses>16</tool_uses><duration_ms>202583</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aa067c125ab171f1d</task-id>
+<tool-use-id>toolu_012aYHcWpcaenfmDEtDkx2c7</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/6886e45b-b31d-4653-910b-399b6cbfd9cb/tasks/aa067c125ab171f1d.output</output-file>
+<status>completed</status>
+<summary>Agent "Extract entire-api code snippets" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have everything needed. Here is the exhaustive verbatim extraction for the `GET /api/v1/me/trails` plan.
+
+---
+
+## 1. `ListTrailsByRepo` + `TrailListRow` + `TrailCursor`
+
+`internal/store/trails.go:17-122`:
+
+```go
+// TrailListRow is one repo_trails row as the list read returns it. ULID
+// columns surface as base32 text ("" when NULL); nullable TEXT columns
+// surface as "" (callers apply wire semantics); JSONB columns surface raw.
+type TrailListRow struct {
+	ID                 string
+	Number             int
+	Title              string
+	Status             string
+	Branch             string
+	OriginalBranch     string
+	Base               string
+	Type               string
+	Priority           string
+	AuthorAccountID    string
+	Assignees          []byte
+	Reviewers          []byte
+	RequestedReviewers []byte
+	HasCodeChanges     bool
+	CommentCount       int
+	UnresolvedCount    int
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
+	MergedAt           *time.Time
+}
+
+// TrailCursor is the keyset position for cursor pagination over
+// ListTrailsByRepo's (updated_at DESC, id DESC) order — the last row of the
+// previous page.
+type TrailCursor struct {
+	UpdatedAt time.Time
+	ID        string
+}
+
+// ListTrailsByRepo pages a repo's trails, updated_at DESC (id DESC tiebreak
+// for determinism). after nil selects the first page; a non-nil after adds
+// the keyset predicate `(updated_at, id) &lt; (after.UpdatedAt, after.ID)`,
+// matching the ORDER BY so the page picks up exactly where the previous one
+// left off. The id side of the tuple compares on the raw 16-byte ULID
+// (decoded via ulidBytes, same as every other ULID bind in this package) —
+// not the base32 text — because the column itself is `ulid` (a bytea
+// domain, see migrations/repo/001_init.sql): comparing bytea to bytea matches
+// what the column actually stores and how the query planner evaluates it.
+// This is safe: ULID's base32 (Crockford) text encoding is order-preserving
+// over the raw bytes, so a bytea comparison and a text comparison agree on
+// the same order.
+//
+// Returns up to limit+1 rows, unmodified — the caller detects and trims the
+// extra row to decide whether a next page exists (mirrors ListRepoSessions'
+// hasMore convention, but returns the raw slice since encoding the
+// next-page cursor is the httpapi layer's job here).
+func (s *RepoStore) ListTrailsByRepo(ctx context.Context, repoID string, limit int, after *TrailCursor) ([]TrailListRow, error) {
+	if limit &lt;= 0 || limit &gt; 1000 {
+		limit = 100
+	}
+	rid, err := ulidBytes(repoID)
+	if err != nil {
+		return nil, fmt.Errorf("store: list trails %s: %w", repoID, err)
+	}
+	conds := []string{"repo_id = $1"}
+	args := []any{rid}
+	if after != nil {
+		aid, err := ulidBytes(after.ID)
+		if err != nil {
+			return nil, fmt.Errorf("store: list trails %s: cursor id: %w", repoID, err)
+		}
+		args = append(args, after.UpdatedAt, aid)
+		conds = append(conds, fmt.Sprintf("(updated_at, id) &lt; ($%d, $%d)", len(args)-1, len(args)))
+	}
+	args = append(args, limit+1)
+	q := `
+		SELECT id, number, title, status,
+			COALESCE(branch, ''), COALESCE(original_branch, ''),
+			base, type, COALESCE(priority, ''),
+			author_account_id,
+			assignees, reviewers, requested_reviewers,
+			has_code_changes, comment_count, unresolved_count,
+			created_at, updated_at, merged_at
+		FROM repo_trails
+		WHERE ` + strings.Join(conds, " AND ") + `
+		ORDER BY updated_at DESC, id DESC
+		LIMIT $` + strconv.Itoa(len(args))
+	rows, err := s.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: list trails %s: select: %w", repoID, err)
+	}
+	out, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (TrailListRow, error) {
+		var (
+			tr         TrailListRow
+			id, author []byte
+		)
+		if err := r.Scan(&amp;id, &amp;tr.Number, &amp;tr.Title, &amp;tr.Status,
+			&amp;tr.Branch, &amp;tr.OriginalBranch, &amp;tr.Base, &amp;tr.Type, &amp;tr.Priority,
+			&amp;author, &amp;tr.Assignees, &amp;tr.Reviewers, &amp;tr.RequestedReviewers,
+			&amp;tr.HasCodeChanges, &amp;tr.CommentCount, &amp;tr.UnresolvedCount,
+			&amp;tr.CreatedAt, &amp;tr.UpdatedAt, &amp;tr.MergedAt); err != nil {
+			return tr, fmt.Errorf("scan trail: %w", err)
+		}
+		tr.ID = ulidText(id)
+		tr.AuthorAccountID = ulidText(author)
+		return tr, nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("store: list trails %s: scan: %w", repoID, err)
+	}
+	return out, nil
+}
+```
+
+Note: `repo_id = $1` is a single-repo predicate. For `TrailsForRepos` you mirror the `= ANY($1)` bytea[] pattern from `OpenPullRequestsForRepos` (item 3) — decode the repo-id set via `ulidBytesList` and bind `WHERE repo_id = ANY($n)`.
+
+## 2. `TrailListRow` + ulid helpers
+
+`TrailListRow` is above. The ulid helpers live in `internal/store/codec.go:23-48` and `:78-89`:
+
+```go
+// ulidBytes decodes a 26-char Crockford base32 ULID to its 16 raw bytes for a
+// bytea bind. The empty string maps to a nil bind — a NULL ulid column (e.g. an
+// unresolved owning_project_id / pusher_account_id).
+func ulidBytes(s string) ([]byte, error) {
+	if s == "" {
+		return nil, nil
+	}
+	u, err := ulid.Parse(s)
+	if err != nil {
+		return nil, fmt.Errorf("store: invalid ULID %q: %w", s, err)
+	}
+	b := make([]byte, len(u))
+	copy(b, u[:])
+	return b, nil
+}
+
+// ulidText encodes 16 raw ULID bytes to the canonical 26-char base32. nil/empty
+// (a NULL column) maps to "".
+func ulidText(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	var u ulid.ULID
+	copy(u[:], b)
+	return u.String()
+}
+```
+
+```go
+// ulidBytesList decodes a slice of ULID strings for an `= ANY($n)` bytea[] bind.
+func ulidBytesList(ss []string) ([][]byte, error) {
+	out := make([][]byte, len(ss))
+	for i, s := range ss {
+		b, err := ulidBytes(s)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = b
+	}
+	return out, nil
+}
+```
+
+## 3. `cache_prs.go` (full) + `OpenPullRequestsForRepos` + I/O structs
+
+`internal/httpapi/cache_prs.go` (entire file):
+
+```go
+package httpapi
+
+import (
+	"context"
+	"net/http"
+	"time"
+
+	"github.com/danielgtaylor/huma/v2"
+
+	"github.com/entirehq/entire-api/internal/store"
+)
+
+// registerCachePRs wires the entire.io /cache/* drop-ins the web BFF consumes.
+// Today that's GET /cache/prs — the caller's open PRs across their repos. Like
+// listRepos it's an enumeration (no {repo_id} to gate on), so it carries only
+// requireAuth and does its own fail-closed access enumeration. It reuses the
+// same discovery scope as /repos — the SpiceDB membership set (repo/list), NOT
+// the pull set — then keeps the PRs this region stores; scoping to pull would
+// flood it with PRs from every public repo (public_viewer) and, for staff, the
+// whole cell.
+func registerCachePRs(api huma.API, deps *RepoActivityDeps) {
+	listGate := []opMiddleware{requireAuth(api, &amp;deps.baseDeps)}
+
+	huma.Register(api, teamOp("cacheOpenPRs", http.MethodGet, "/cache/prs",
+		"Your open pull requests across your repositories", "pull-requests", listGate),
+		func(ctx context.Context, _ *ReposListInput) (*PRsListOutput, error) {
+			set, err := memberRepoSet(ctx, deps.Reader)
+			if err != nil {
+				return nil, err
+			}
+			ids := make([]string, 0, len(set))
+			for id := range set {
+				ids = append(ids, id)
+			}
+			rows, err := deps.Store.OpenPullRequestsForRepos(ctx, ids)
+			if err != nil {
+				return nil, huma.Error500InternalServerError("store: open prs", err)
+			}
+			out := &amp;PRsListOutput{}
+			out.Body.PRs = prListItems(rows)
+			// updated_at mirrors entire.io: the most-recently-updated PR's local
+			// write stamp (rows come back ordered by PR updated_at), or now() when
+			// the caller has no open PRs.
+			updatedAt := time.Now().UTC()
+			if len(rows) &gt; 0 {
+				updatedAt = rows[0].SyncedAt
+			}
+			out.Body.UpdatedAt, out.Body.FromDB = isoTime(updatedAt), true
+			return out, nil
+		})
+}
+
+// prListItems maps the store rows to the GET /cache/prs item list (always
+// non-nil so the array renders []). Timestamps are formatted ISO to match
+// entire.io's GitHubPR.
+func prListItems(rows []store.PullRequestListRow) []PRListItem {
+	out := make([]PRListItem, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, PRListItem{
+			ID:           r.GitHubPRID,
+			Number:       r.Number,
+			Title:        r.Title,
+			HTMLURL:      r.HTMLURL,
+			State:        r.State,
+			RepoFullName: r.RepoFullName,
+			CreatedAt:    isoTime(r.CreatedAt),
+			UpdatedAt:    isoTime(r.UpdatedAt),
+			Draft:        r.Draft,
+		})
+	}
+	return out
+}
+```
+
+`OpenPullRequestsForRepos` — signature, chunking dispatch, and the `= ANY($1)` bind (`internal/store/store.go:1675-1706` + the chunk query `:1713-1725`):
+
+```go
+func (s *RepoStore) OpenPullRequestsForRepos(ctx context.Context, ids []string) ([]PullRequestListRow, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	idB, err := ulidBytesList(ids)
+	if err != nil {
+		return nil, fmt.Errorf("store: open prs: %w", err)
+	}
+	// A set that fits one bind runs as a single query, keeping its SQL ordering
+	// (updated_at desc, number desc) verbatim. A thousands-repo caller would
+	// otherwise bind one giant array against github_pull_request_meta, so its set
+	// is split across chunked binds and the union re-sorted on the same keys to
+	// keep the outward ordering unchanged.
+	if len(idB) &lt;= idBindChunk {
+		return s.openPullRequestsChunk(ctx, idB)
+	}
+	var out []PullRequestListRow
+	for chunk := range slices.Chunk(idB, idBindChunk) {
+		chunkRows, err := s.openPullRequestsChunk(ctx, chunk)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, chunkRows...)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].UpdatedAt.Equal(out[j].UpdatedAt) {
+			return out[i].UpdatedAt.After(out[j].UpdatedAt)
+		}
+		return out[i].Number &gt; out[j].Number
+	})
+	return out, nil
+}
+```
+
+```go
+func (s *RepoStore) openPullRequestsChunk(ctx context.Context, idB [][]byte) ([]PullRequestListRow, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT coalesce(pr.github_pr_id, 0), pr.number, coalesce(pr.title,''),
+			coalesce(pr.html_url,''), coalesce(pr.state,''),
+			coalesce(r.full_name, g.full_name, ''), pr.draft,
+			coalesce(pr.created_at, pr.observed_at), coalesce(pr.updated_at, pr.observed_at),
+			pr.synced_at
+		FROM github_pull_request_meta pr
+		JOIN repos r ON r.id = pr.repo_id
+		LEFT JOIN github_repo_meta g ON g.repo_id = pr.repo_id
+		WHERE pr.repo_id = ANY($1) AND pr.state = 'open'
+			AND NOT coalesce(g.archived, false)
+		ORDER BY coalesce(pr.updated_at, pr.observed_at) DESC, pr.number DESC`, idB)
+	...
+```
+
+The `idBindChunk` package var (`codec.go:76`): `var idBindChunk = 1000`.
+
+I/O structs — `ReposListInput`, `PRListItem`, `PRsListOutput` (`internal/httpapi/types.go:260-262`, `:301-311`, `:320-326`):
+
+```go
+type ReposListInput struct {
+	Include []string `query:"include,explode" enum:"activity" doc:"Extra computed fields to include; supported: activity"`
+}
+```
+```go
+type PRListItem struct {
+	ID           int64  `json:"id"`
+	Number       int    `json:"number"`
+	Title        string `json:"title"`
+	HTMLURL      string `json:"html_url"`
+	State        string `json:"state"`
+	RepoFullName string `json:"repo_full_name"`
+	CreatedAt    string `json:"created_at"`
+	UpdatedAt    string `json:"updated_at"`
+	Draft        bool   `json:"draft"`
+}
+```
+```go
+type PRsListOutput struct {
+	Body struct {
+		PRs       []PRListItem `json:"prs"`
+		UpdatedAt string       `json:"updated_at"`
+		FromDB    bool         `json:"from_db"`
+	}
+}
+```
+
+## 4. `me_sessions.go` registration + handler skeleton
+
+`internal/httpapi/me_sessions.go:76-97` (registration shape + how params/caller are read). Note it registers with a raw `huma.Operation` literal (NOT `teamOp`), because `/me/sessions` gates on `userDeps` and carries no `{repo_id}`:
+
+```go
+func registerMeSessions(api huma.API, repoDeps *RepoActivityDeps, userDeps *UserActivityDeps) {
+	mw := []func(huma.Context, func(huma.Context)){requireAuth(api, &amp;userDeps.baseDeps)}
+	huma.Register(api, huma.Operation{
+		OperationID: "listMySessions", Method: http.MethodGet, Path: apiPrefix + "/me/sessions",
+		Summary:     "Your sessions across all repositories",
+		Description: opDescriptions["listMySessions"],
+		Tags:        []string{"me"}, Security: secSchemes, Errors: stdErrors, Middlewares: mw,
+	},
+		func(ctx context.Context, in *TimeframeInput) (*MeSessionsOutput, error) {
+			tf := parseTimeframe(in)
+			acc := id(ctx)
+
+			// Spine: the caller's own checkpoints in-window tell us which repos +
+			// sessions are theirs. Read-gated, not membership-gated (see above).
+			rows, err := loadReadable(ctx, userDeps, store.ActivityQuery{
+				AccountID: acc, Type: "checkpoint", Since: tf.since, Until: tf.until,
+				States: countedStates, Limit: meSessionsSpineCap,
+			})
+			if err != nil {
+				return nil, err
+			}
+			// ... (metadata resolution, origin grouping, batched reads, output build) ...
+```
+
+Output envelope struct (`me_sessions.go:30-36`):
+
+```go
+type MeSessionsOutput struct {
+	Body struct {
+		Sessions  []meUserSession `json:"sessions"`
+		Timeframe string          `json:"timeframe"`
+		UpdatedAt string          `json:"updated_at"`
+	}
+}
+```
+
+`id(ctx)` and `parseTimeframe` (`internal/httpapi/experimental_me.go:257-262`, `:466-475`, `TimeframeInput` at `types.go:42-47`):
+
+```go
+// id pulls the caller accountID from context (middleware guarantees presence).
+func id(ctx context.Context) string {
+	if i := auth.FromContext(ctx); i != nil {
+		return i.AccountID
+	}
+	return ""
+}
+```
+```go
+type timeframe struct {
+	name         string
+	since, until time.Time
+	limit        int
+}
+
+// parseTimeframe ports entire.io parseTimeframeParams: relative window
+// (last-month / -3-months / -6-months), with explicit since/until
+// overrides; limit clamped to [1,1000], default 500.
+func parseTimeframe(in *TimeframeInput) timeframe {
+```
+```go
+type TimeframeInput struct {
+	Timeframe string `query:"timeframe" enum:"last-month,last-3-months,last-6-months" default:"last-6-months" doc:"Relative window"`
+	Since     string `query:"since" doc:"RFC 3339; overrides timeframe start"`
+	Until     string `query:"until" doc:"RFC 3339; overrides timeframe end"`
+	Limit     int    `query:"limit" minimum:"1" maximum:"1000" default:"500"`
+}
+```
+
+## 5. `memberRepoSet` — return type is `map[string]struct{}`
+
+`internal/httpapi/perreq.go:47-63`. The "repo id set" is concretely a `map[string]struct{}` of repo-id ULID strings (NOT `[][]byte`):
+
+```go
+// memberRepoSet returns the caller's fail-closed set of member repo ids (the
+// SpiceDB repo/list enumeration — direct grants + project membership, excluding
+// the public_viewer wildcard and platform cascade), with the same error
+// contract as accessibleRepoSet. The /me read-time row filter and the /cache/prs
+// discovery list scope to this; /repos uses memberRepoAccess (same set, with
+// per-repo tiers).
+func memberRepoSet(ctx context.Context, reader *authz.Reader) (map[string]struct{}, error) {
+	ac, err := perRequestAccessChecker(ctx, reader)
+	if err != nil {
+		return nil, huma.Error500InternalServerError("auth: access checker", err)
+	}
+	set, err := ac.MemberRepoSet(ctx)
+	if err != nil {
+		return nil, huma.Error503ServiceUnavailable("core: list member repos", err)
+	}
+	return set, nil
+}
+```
+
+The cache_prs handler (item 3) shows the canonical conversion: iterate `for id := range set` to build a `[]string` for the store call.
+
+## 6. `repoDisplay` + `repoMetaMap` signatures + call site
+
+`internal/httpapi/me.go:457` and `:551`:
+
+```go
+func repoMetaMap(ctx context.Context, repoDeps *RepoActivityDeps, rows []store.MyActivityRow) (repoMetas, error)
+```
+```go
+func repoDisplay(m repoMetas, originKey, repoID string) (fullName string, isPrivate bool)
+```
+
+`repoMetas` is an unexported struct (`me.go:~538-542`): fields `byRepoID`, `byGroup map[string]store.RepoListRow`, `foreign map[string]ForeignRepoName`.
+
+Live call site in `me_sessions.go:101` and `:122` (labels a row with full_name + is_private):
+
+```go
+metas, err := repoMetaMap(ctx, repoDeps, rows)
+if err != nil {
+	return nil, err
+}
+// ...
+name, priv := repoDisplay(metas, r.OriginKey, r.RepoID)
+```
+
+Caveat: `repoMetaMap` takes `[]store.MyActivityRow` and reads each row's `.OriginKey` / `.RepoID`. Trail rows carry only `AuthorAccountID` + a repo id, not an `OriginKey`. To reuse `repoDisplay` for `/me/trails` you must build the `repoMetas` yourself — either via `repoMetasFor(ctx, repoDeps, []originRepo{...})` (the lower-level entry `repoMetaMap` wraps, `me.go:480`, taking `originRepo{origin, repoID}`) or by calling `repoMetaMap` with synthesized `MyActivityRow`s. For a per-repo label where origin == repo_id (native), `repoDisplay(metas, repoID, repoID)` resolves via `byRepoID`.
+
+## 7. `RepoIDByFullName`
+
+`internal/store/repo_aggregates.go:559-576`:
+
+```go
+func (s *RepoStore) RepoIDByFullName(ctx context.Context, fullName string) (string, bool, error) {
+	if fullName == "" {
+		return "", false, nil
+	}
+	var id []byte
+	err := s.pool.QueryRow(ctx, `
+		SELECT repo_id FROM github_repo_meta WHERE full_name = $1
+		UNION ALL
+		SELECT id FROM repos WHERE full_name = $1
+		LIMIT 1`, fullName).Scan(&amp;id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("store: repo id by full name %q: %w", fullName, err)
+	}
+	return ulidText(id), true, nil
+}
+```
+
+## 8. `teamOp` + an example `huma.Register(..., teamOp(...), handler)`
+
+`internal/httpapi/repos.go:26-30`:
+
+```go
+func teamOp(id, method, path, summary, tag string, mw []opMiddleware) huma.Operation {
+	return huma.Operation{OperationID: id, Method: method, Path: apiPrefix + path, Summary: summary,
+		Description: opDescriptions[id],
+		Tags:        []string{tag}, Security: secSchemes, Errors: stdErrors, Middlewares: mw}
+}
+```
+
+Example `huma.Register(api, teamOp(...), handler)` — the cache_prs registration (`cache_prs.go:22-25`):
+
+```go
+	listGate := []opMiddleware{requireAuth(api, &amp;deps.baseDeps)}
+
+	huma.Register(api, teamOp("cacheOpenPRs", http.MethodGet, "/cache/prs",
+		"Your open pull requests across your repositories", "pull-requests", listGate),
+		func(ctx context.Context, _ *ReposListInput) (*PRsListOutput, error) {
+```
+
+This is the exact template for your account-scoped enumeration: an auth-only `listGate` (no `requireRepoAccess`), and the handler enumerates via `memberRepoSet` itself.
+
+## 9. Router registration site + deps types
+
+`internal/httpapi/router.go:402-427` (registrations, verbatim):
+
+```go
+func NewActivityAPIRouter(repoDeps *RepoActivityDeps, userDeps *UserActivityDeps) *Router {
+	base := repoDeps.baseDeps
+	base.ReadyChecks = append(append([]ReadyCheck{}, repoDeps.ReadyChecks...), userDeps.ReadyChecks...)
+	r := newRouter(base, ...)
+	...
+	registerExperimentalMe(r.API, userDeps)
+	registerMe(r.API, repoDeps, userDeps)
+	registerMeSessions(r.API, repoDeps, userDeps)
+	registerPreferences(r.API, userDeps)
+	registerRepoPreferences(r.API, repoDeps, userDeps)
+	registerRepos(r.API, repoDeps)
+	registerRefEvents(r.API, repoDeps)
+	registerSharedSessionRead(r.API, repoDeps)
+	registerExperts(r.API, repoDeps)
+	registerCachePRs(r.API, repoDeps)
+	registerProjects(r.API, repoDeps)
+	registerTrails(r.API, repoDeps)
+	registerEditorSync(r.API, repoDeps)
+	return r
+}
+```
+
+Add your `registerMeTrails(r.API, repoDeps)` here. Deps variable types in scope: `repoDeps *RepoActivityDeps`, `userDeps *UserActivityDeps`.
+
+`RepoActivityDeps` embeds `baseDeps` and holds `Store *store.RepoStore` (`router.go:118-120`). `baseDeps` carries `Reader` (the `*authz.Reader` that `memberRepoSet`/`repoDeps.Reader` reads). `UserActivityDeps` embeds `baseDeps` and holds `Store userReader` (`router.go:99-101`). Since `/me/trails` reads trails from the RepoStore and enumerates member repos (both on `repoDeps`), register it with `repoDeps` only — same as `registerCachePRs` / `registerTrails`.
+
+## 10. Test harnesses
+
+There is **no** `cache_prs_test.go`. Coverage splits three ways:
+- Store method: `internal/store/github_pr_test.go` (`TestIntegrationOpenPullRequestsForRepos`) and `internal/store/trails_test.go` (`TestIntegrationListTrailsByRepo`).
+- Full HTTP endpoint through the router: `internal/httpapi/me_sessions_integration_test.go` — the closest mirror for a `/me/*` endpoint (builds deps, fakes reader, mints token, seeds repos/sessions, asserts JSON).
+- The `/cache/prs` discovery scope alone is unit-tested via `TestMemberRepoSet` in `internal/httpapi/repos_list_test.go` (fakes the SpiceDB member set with `fakeReader`/`fakeAuthz`).
+
+**Store test (mirror this for a `TrailsForRepos` store test)** — `internal/store/trails_test.go:12-106`:
+
+```go
+func insertTrail(t *testing.T, s *RepoStore, tr TrailListRow, repoID string) {
+	t.Helper()
+	rid, err := ulidBytes(repoID)
+	if err != nil {
+		t.Fatalf("repo ulid: %v", err)
+	}
+	id, err := ulidBytes(tr.ID)
+	...
+	_, err = s.pool.Exec(context.Background(), `
+		INSERT INTO repo_trails (id, repo_id, number, title, status, branch, original_branch,
+			base, type, priority, author_account_id, assignees, reviewers, requested_reviewers,
+			has_code_changes, comment_count, unresolved_count, created_at, updated_at, merged_at)
+		VALUES ($1,$2,$3,$4,$5,NULLIF($6,''),NULLIF($7,''),$8,$9,NULLIF($10,''),$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
+		id, rid, tr.Number, tr.Title, tr.Status, tr.Branch, tr.OriginalBranch,
+		tr.Base, tr.Type, tr.Priority, author,
+		string(tr.Assignees), string(tr.Reviewers), string(tr.RequestedReviewers),
+		tr.HasCodeChanges, tr.CommentCount, tr.UnresolvedCount,
+		tr.CreatedAt, tr.UpdatedAt, tr.MergedAt)
+	if err != nil {
+		t.Fatalf("insert trail: %v", err)
+	}
+}
+
+func TestIntegrationListTrailsByRepo(t *testing.T) {
+	repo, _ := openTest(t)
+	ctx := context.Background()
+	repoID := uid("trails-repo")
+	otherRepo := uid("other-repo")
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	older := now.Add(-time.Hour)
+	merged := now.Add(-30 * time.Minute)
+
+	insertTrail(t, repo, TrailListRow{
+		ID: uid("trail-1"), Number: 1, Title: "First", Status: "open",
+		Branch: "feat/a", Base: "main", Type: "standard", Priority: "",
+		AuthorAccountID: uid("author-1"),
+		Assignees:       []byte(`["alice"]`), Reviewers: []byte(`[{"login":"bob","status":"approved"}]`),
+		RequestedReviewers: []byte(`["carol"]`),
+		HasCodeChanges:     true, CommentCount: 3, UnresolvedCount: 1,
+		CreatedAt: older, UpdatedAt: older,
+	}, repoID)
+	insertTrail(t, repo, TrailListRow{
+		ID: uid("trail-2"), Number: 2, Title: "Second", Status: "merged",
+		OriginalBranch: "feat/b", Base: "main", Type: "standard",
+		Assignees: []byte(`[]`), Reviewers: []byte(`[]`), RequestedReviewers: []byte(`[]`),
+		CreatedAt: older, UpdatedAt: now, MergedAt: &amp;merged,
+	}, repoID)
+	insertTrail(t, repo, TrailListRow{
+		ID: uid("trail-3"), Number: 1, Title: "Elsewhere", Status: "open",
+		Base: "main", Type: "standard",
+		Assignees: []byte(`[]`), Reviewers: []byte(`[]`), RequestedReviewers: []byte(`[]`),
+		CreatedAt: older, UpdatedAt: older,
+	}, otherRepo)
+
+	rows, err := repo.ListTrailsByRepo(ctx, repoID, 50, nil)
+	if err != nil {
+		t.Fatalf("ListTrailsByRepo: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows, want 2 (repo-scoped)", len(rows))
+	}
+	// updated_at DESC: trail-2 (now) before trail-1 (older).
+	if rows[0].ID != uid("trail-2") || rows[1].ID != uid("trail-1") {
+		t.Errorf("order = [%s, %s], want [trail-2, trail-1]", rows[0].ID, rows[1].ID)
+	}
+	...
+}
+```
+
+Store tests use `repo, _ := openTest(t)` (skips without the DB env) and `uid("label")` to make deterministic ULIDs. The PR store test (`github_pr_test.go:154`) is the direct model for a multi-repo `= ANY` store method: it seeds repos via `repo.UpsertRepo`, passes an id set including one not-passed and one archived, asserts ordering, then re-runs under `withIDBindChunk(t, 1)` to exercise the chunk-merge path, then asserts `OpenPullRequestsForRepos(ctx, nil)` yields `nil, nil`.
+
+**HTTP endpoint test (mirror this for a `/me/trails` router test)** — the harness helper `pipelineRouter` (`internal/httpapi/pipeline_integration_test.go:219-229`) is where deps are built, the reader/member set is faked, and the token minted:
+
+```go
+func pipelineRouter(t *testing.T, repoStore *store.RepoStore, userStore *store.UserStore, pullable []string, configure ...func(*RepoActivityDeps)) (*Router, func(account string) string) {
+	t.Helper()
+	authn, mint := jwksAuth(t)
+	base := baseDeps{Authenticator: authn, Reader: fakeReader(pullable, nil, false)}
+	userDeps := &amp;UserActivityDeps{baseDeps: base, Store: userStore}
+	repoDeps := &amp;RepoActivityDeps{baseDeps: base, Store: repoStore}
+	for _, c := range configure {
+		c(repoDeps)
+	}
+	return NewActivityAPIRouter(repoDeps, userDeps), mint
+}
+```
+
+`fakeReader(pullable, projects, fail)` (`repos_authz_test.go:170-174`) populates BOTH the pull set and the membership (`repo/list`) set from `pullable` — so passing your seeded repo ids as `pullable` makes the caller a **member** of them, which is exactly what `memberRepoSet` enumerates for a `/cache/prs`-style handler:
+
+```go
+func fakeReader(accessible, projects []string, fail bool) *authz.Reader {
+	return authz.NewReaderFromClient(&amp;fakeAuthz{
+		repos: toSet(accessible), listRepos: toSet(accessible), projs: toSet(projects), fail: fail,
+	})
+}
+```
+
+Use `fakeReaderMember(pullable, member, fail)` (`repos_authz_test.go:188-192`) when you need to prove the scope is the **member** set, not the pull set (e.g. a public repo the caller can pull but doesn't belong to must not appear). The `TestMemberRepoSet` test (`repos_list_test.go:414-435`) is the direct precedent asserting the public-viewer repo is excluded from the discovery set.
+
+An endpoint test wires it end-to-end (`me_sessions_integration_test.go:104-141`): `openPipelineStores(t)` (skips without `ACTIVITY_TEST_DATABASE_URL`) → seed via `repoStore.UpsertRepo(...)` etc. → `r, mint := pipelineRouter(t, repoStore, userStore, []string{code})` → issue an authenticated request with `mint(acc)` as the bearer through `r.HTTPHandler().ServeHTTP(w, req)` and decode the envelope (see `getMeSessions`, `me_sessions_integration_test.go:27-42`).
+
+---
+
+### Notable gotchas for the plan (evidence-based, not design)
+- `memberRepoSet` returns `map[string]struct{}` (repo-id ULID strings), not bytes — the ULID→bytea decode happens inside the store via `ulidBytesList`, exactly as `OpenPullRequestsForRepos` does. Your `TrailsForRepos` should take `[]string` and decode internally.
+- `ListTrailsByRepo` binds `repo_id = $1` (single repo). For the account-scoped read you need a new store method with `repo_id = ANY($n)` — model it on `openPullRequestsChunk` (`= ANY($1)` over `[][]byte`), including the `idBindChunk` split if you expect large member sets.
+- `repoDisplay`/`repoMetaMap` are keyed off `store.MyActivityRow{OriginKey, RepoID}`; trail rows have no `OriginKey`. Reuse `repoMetasFor(ctx, repoDeps, []originRepo{{origin, repoID}})` (the unexported entry `repoMetaMap` wraps) to build `repoMetas` for arbitrary repo ids, then call `repoDisplay(metas, repoID, repoID)` for native repos.
+- Register with `repoDeps` only (like `registerCachePRs`/`registerTrails`), auth-only gate via `teamOp(..., []opMiddleware{requireAuth(api, &amp;deps.baseDeps)})`, and enumerate access in-handler with `memberRepoSet(ctx, deps.Reader)`.
+- The `{items,total}` envelope you described is not an existing shape here — `/cache/prs` uses `{prs, updated_at, from_db}` and `/me/sessions` uses `{sessions, timeframe, updated_at}`. There is no existing `total` count on these list endpoints; `CountTrailsByStatus` (`trails.go:135`) exists per-repo if you need counts, but no cross-repo total helper exists today.</result>
+<usage><subagent_tokens>102066</subagent_tokens><tool_uses>31</tool_uses><duration_ms>248592</duration_ms></usage>
+</task-notification>
+
+---
+
+inline please :)
+
+---
+
+<task-notification>
+<task-id>a1be26a1b249cc774</task-id>
+<tool-use-id>toolu_01LNWUWc1hExo7Ec7bCFW44J</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/6886e45b-b31d-4653-910b-399b6cbfd9cb/tasks/a1be26a1b249cc774.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplify entire-api diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Done. Build and vet pass.
+
+## Simplifications applied
+
+**`internal/httpapi/me_trails.go:121` — `fullNameFromRepoSpec`** (before→after)
+- Before: a `switch len(parts)` with a `case 3` and `case 2` branch, each independently building `x + "/" + y` and re-computing `x != "" &amp;&amp; y != ""`.
+- After: strip a leading forge segment when 3 parts, then a single `len(parts) != 2 || parts[0] == "" || parts[1] == ""` guard and one return.
+- Why: removes the duplicated concat + non-empty check across two branches; one validation path. Behavior is identical at the only call site (`scopeAccountRepoIDs`), which uses the returned string only when `ok` is true — 3-part, 2-part, and all other-length inputs resolve exactly as before.
+
+That is the only change. Verification:
+
+```
+BUILD+VET OK
+```
+(`go build ./internal/store/ ./internal/httpapi/ &amp;&amp; go vet ./internal/store/ ./internal/httpapi/`)
+
+## Considered and deliberately left unchanged
+
+- **`splitCSV` (me_trails.go:134)** — not duplicating a reusable helper. The package's other CSV parsers (`parseReviewCommentCSVFilter`, `parseCompareInclude`, `parseReviewFilePaths`, `parseTrailEventTypeFilter` in `reviews_read.go`/`compare.go`) all validate against a fixed allowed-set and return `400` on unknown values. Reusing any of them would reject unknown statuses instead of passing them through — a behavior change. No pure non-validating splitter exists to reuse. Keep.
+- **`set → []string` loop in `scopeAccountRepoIDs` (me_trails.go:96)** — identical to the inline loop in `cache_prs.go:30`. Extracting a shared `repoSetIDs` helper would mean editing `cache_prs.go`, which is outside this branch's diff. Keeping it inline matches the sibling endpoint's own convention.
+- **Store `SELECT`/scan in `TrailsForRepos` (trails.go)** — the scan closure mirrors `ListTrailsByRepo` (embeds `TrailListRow` + 2 columns); the shapes can't be merged without splitting `Scan`. The `COUNT(*)` + `SELECT` two-query pattern and the `t.repo_id = ANY($1)` bind are correct as written; I did not rewrite the SQL (e.g. to a `count(*) OVER()` single query) because the semantics constraint forbids it and the integration tests are DB-gated (I can't execute them to confirm equivalence).
+
+## Observations only (not changed — would alter behavior or exceed a simplification pass)
+
+- **`AccountTrailRow` over-selects.** By embedding `TrailListRow`, `TrailsForRepos` selects and scans `assignees`, `reviewers`, `requested_reviewers`, `has_code_changes`, `original_branch`, `type`, `priority`, `merged_at` — none of which `meTrailItems` maps to the wire. Trimming the SELECT would be an efficiency win but would drop the `TrailListRow` reuse and the scan symmetry with `ListTrailsByRepo`; negligible at the 1000-row cap. Left as-is.
+- **`full_name` coalesce order differs from the sibling.** `TrailsForRepos` uses `COALESCE(g.full_name, r.full_name, '')` (github meta first — matches `me.go`'s `repoMetaName`), whereas `OpenPullRequestsForRepos`/`cache_prs` use `coalesce(r.full_name, g.full_name, '')` (repos table first). Two live conventions exist; flipping either changes which name wins when they differ, so not a safe simplification.
+- **No chunked bind.** The sibling `OpenPullRequestsForRepos` splits large id sets across `idBindChunk`-sized binds; `TrailsForRepos` binds all ids in one `ANY($1)`. That's a scalability hardening gap, not a simplification — adding it would be new complexity, so out of scope here.
+
+All file paths are absolute above.</result>
+<usage><subagent_tokens>85864</subagent_tokens><tool_uses>12</tool_uses><duration_ms>204661</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>af904b56b3b7da0fb</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/6886e45b-b31d-4653-910b-399b6cbfd9cb/tasks/af904b56b3b7da0fb.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplify CLI diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Done. Here is the complete report.
+
+## Summary
+
+I scoped strictly to this branch's diff. After reviewing all the new code, there was **very little worth changing** for pure simplification — the new code largely follows existing conventions (the inline `json.NewEncoder`/`SetIndent` idiom matches ~18 sibling call sites, `trailListHasRepo` correctly mirrors `trailListHasURL`, the repo cell in `printTrailRows` mirrors the author cell, and `meTrailsQuery` parallels the file's existing `trailListQuery`/`trailListQueryWithOffset` builder pair). I deliberately did **not** merge the two list functions (the task flagged them as intentionally separate) or touch `decideTrailListRoute`'s semantics.
+
+However, `mise run lint` was **already failing on the branch HEAD** (confirmed by stashing my edit and re-linting) due to the branch's own new test code. Making verification pass required fixing those.
+
+### Changes
+
+**Simplification (production code):**
+- `cmd/entire/cli/trail_cmd.go:516` — `runTrailListAll`: replaced the 4-line `originResolvable := false; if ...; rerr == nil { originResolvable = true }` with `_, _, _, rerr := resolveTrailRemote(ctx); originResolvable := rerr == nil`. Removes a needless bool-init/if in favor of the direct Go idiom. Behavior-identical.
+
+**Lint fixes on the branch's new tests (pre-existing failures, all branch-introduced):**
+- `cmd/entire/cli/trail_cmd_test.go:1784` — `func(w, r *http.Request)` → `func(w, _ *http.Request)`: `r` was unused (revive `unused-parameter`).
+- `cmd/entire/cli/trail_cmd_test.go:1818` and `:1835` — `_ = json.NewEncoder(w).Encode(...)` → checked `if err := ...; err != nil { t.Fatalf("encode: %v", err) }`, matching the neighboring handlers. The repo's `errcheck` config sets `check-blank: true`, so the `_ =` form does not satisfy it.
+- `cmd/entire/cli/trail_cmd_test.go:1782,1806,1829` — added `const accountIndexTestOwner = "acme"` and used it in the two new assertions (`owner != "acme"` → `owner != accountIndexTestOwner`). goconst's default `ignore-calls: true` counts only non-call literals: origin/main had 2 (in the unrelated, out-of-scope `setup_github_test.go`), and the branch's two new comparisons pushed the exact string `"acme"` to 4 (threshold 3), tripping goconst. I used a const rather than string-concatenation because concatenation would have shifted the flag onto `"acme/lib"` (which has its own non-call composite-literal occurrences). No out-of-scope file was touched.
+
+No tests were weakened or deleted; assertions are unchanged in meaning.
+
+### Verification output
+
+`mise run fmt &amp;&amp; mise run lint`:
+```
+[fmt] $ gofmt -s -w .
+[lint:go] 0 issues.
+[lint:go] Finished in 17.31s
+[lint] Finished in 13.9ms
+```
+
+`go test ./cmd/entire/cli/ ./cmd/entire/cli/api/ ./cmd/entire/cli/trail/`:
+```
+ok  	github.com/entireio/cli/cmd/entire/cli	60.207s
+ok  	github.com/entireio/cli/cmd/entire/cli/api	(cached)
+ok  	github.com/entireio/cli/cmd/entire/cli/trail	(cached)
+```
+
+All pass. No commit made.
+
+Note: the `mise run lint` failures were committed on the branch, independent of my work — `mise run lint` locally runs full (not new-issues-only), and these are new relative to `origin/main`. Worth confirming CI (which uses the golangci-lint-action's new-issues-only mode) agrees, but the fixes above make full-mode lint clean regardless.</result>
+<usage><subagent_tokens>136798</subagent_tokens><tool_uses>34</tool_uses><duration_ms>675353</duration_ms></usage>
+</task-notification>
+
+---
+
+now take the handoff in trail-list-contract-drift-HANDOFF.md and implement it in a new branch

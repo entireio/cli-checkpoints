@@ -1,0 +1,497 @@
+I did just run:
+
+entire trail resume 955 --repo entireio/cli --branch feat/repo-mirror-use
+Warning: could not load trail checkpoint sessions: read checkpoint 01KYSGR4W1ZATZRW47J510EZGJ: checkpoint not found
+  Trail #955  Add entire repo mirror use to repoint a clone at a mirror
+  Status: open · Phase: building · Branch: feat/repo-mirror-use
+  Base: main
+  URL: https://entire.io/gh/entireio/cli/trails/955
+
+  Checkpoint sessions:
+    unavailable before restore: read checkpoint 01KYSGR4W1ZATZRW47J510EZGJ: checkpoint not found
+
+  Findings: open 1  high 0  medium 1  low 0  resolved 0  dismissed 0  stale 0
+    ID            SEV     LOCATION                               SUMMARY
+    019fb343-106  Medium  cmd/entire/cli/repo_mirror_use.go:167  When the target remote is repointed but `--upstream` (default `"upstream"`) alre…
+
+  Commands:
+    entire trail finding 955 --json
+    entire trail resume 955 --repo entireio/cli --branch feat/repo-mirror-use
+
+Fetching branch 'feat/repo-mirror-use' from origin...
+✓ Switched to branch feat/repo-mirror-use
+2026/07/31 10:46:10 WARN checkpoint metadata read failed, checking remote component=resume REDACTED error="read checkpoint: read persistent checkpoint: fetch checkpoint ref refs/entire/checkpoints/GJ/01KYSGR4W1ZATZRW47J510EZGJ: fetch checkpoint ref refs/entire/checkpoints/GJ/01KYSGR4W1ZATZRW47J510EZGJ from https://github.com/entireio/cli-checkpoints.git: git fetch: exit status 128"
+Checkpoint '01KYSGR4W1ZATZRW47J510EZGJ' found in commit but its metadata could not be fetched from the checkpoint remote.
+Ensure you have access to the checkpoint remote configured in .entire/settings.json.
+
+
+And the checkpoint could not be found. why? Mixing backends? branch vs git-refs? Investigate it please
+
+---
+
+if we have configured a remote, git-refs would be pushed to this repo or remote ?
+
+---
+
+can we fetch cli-checkpoints again?
+
+---
+
+it was missing from remote, please fetch again
+
+---
+
+what is the command to validate if that checkpoint is on remote?
+
+---
+
+okey, we are investigating why that checkpoint is missing. We need an active way to find missing checkpoints. I want to have a workflow that runs every 24 hours and check all the commits created on the last 24 hours get its entire checkpoint trailer and tries to find it on the remote checkpoint repo, if the checkpoint is not found, job should fail and create at the end a report with a table with all the checkpoints found that does not have a remote checkpoint. For those missing checkpoints, we should attach as much context as we have like, whose commit ? branch? trail? commit description?
+
+---
+
+<task-notification>
+<task-id>a9b817f6fc3cbb34b</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-bug-investigation/95408240-a03d-480f-a60c-d524265059aa/tasks/a9b817f6fc3cbb34b.output</output-file>
+<status>completed</status>
+<summary>Agent "Explore checkpoint ref + trailer code" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have everything needed. Here is the complete findings report.
+
+---
+
+# Checkpoint-audit tool: existing Go utilities to reuse
+
+## 1. Checkpoint ref naming (ID → git ref)
+
+**File:** `cmd/entire/cli/checkpoint/refs_naming.go`
+
+```go
+const CheckpointRefPrefix = "refs/entire/checkpoints/"                              // :19
+
+func RefName(cid id.CheckpointID) (plumbing.ReferenceName, error)                   // :26
+func ParseRef(name plumbing.ReferenceName) (id.CheckpointID, bool)                  // :43
+```
+
+- `RefName` builds `refs/entire/checkpoints/&lt;shard&gt;/&lt;id&gt;` where `&lt;shard&gt;` = `cid.ShardFor()` and the leaf is `cid.String()`. Errors (does not return a malformed ref) when `cid.Kind() == id.KindUnknown`.
+- `ParseRef` is the inverse — strips the prefix, requires exactly `&lt;shard&gt;/&lt;id&gt;` (rejects extra path segments), and re-validates that `cid.ShardFor() == shard`, so mismatched-shard or peeled (`^{}`) refs are rejected. Round-trips with `RefName`.
+
+**Shard logic** — `cmd/entire/cli/checkpoint/id/id.go:134`:
+
+```go
+func (id CheckpointID) ShardFor() string {
+    s := string(id)
+    if len(s) &lt; 2 { return s }
+    return s[len(s)-2:]   // LAST two chars, for BOTH legacy-hex and ULID
+}
+```
+
+Note: this is the **git-refs** ref namespace only. The legacy `entire/checkpoints/v1` branch tree uses a *different* layout — `(id CheckpointID) Path()` at `id.go:249` shards on the **first** two chars (`"a3/b2c4d5e6f7"`). Don't confuse the two.
+
+## 2. Commit trailer extraction
+
+**File:** `cmd/entire/cli/trailers/trailers.go` — the package that defines and parses every Entire commit trailer.
+
+The checkpoint trailer key and its parsers:
+
+```go
+const CheckpointTrailerKey = "Entire-Checkpoint"                                    // :42
+
+func ParseCheckpoint(commitMessage string) (id.CheckpointID, bool)                  // :108  first trailer, validated
+func ParseAllCheckpoints(commitMessage string) []id.CheckpointID                    // :124  all trailers, deduped, order-preserving (squash merges)
+func ParseSession(commitMessage string) (string, bool)                              // :98
+func ParseMetadata(commitMessage string) (string, bool)                             // :77
+func ParseTaskMetadata(commitMessage string) (string, bool)                         // :87
+func HasOPFApplied(commitMessage string) bool                                       // :249
+func IsTrailerLine(line string) bool                                                // :190
+func AppendCheckpointTrailer(message, checkpointID string) string                   // :237
+func FormatCheckpoint(message string, cpID id.CheckpointID) string                  // :182
+```
+
+For your audit, `ParseAllCheckpoints` is the one to use when walking `git log` — it handles squash-merge commits carrying multiple `Entire-Checkpoint` trailers. The matching regex is `checkpointTrailerRegex` (`trailers.go:72`), which uses `id.CheckpointPattern` (accepts legacy 12-hex OR ULID) and then re-validates each captured token through `id.NewCheckpointID`.
+
+**Every trailer key the CLI writes to commits** (all constants in `trailers.go:14-65`):
+
+| Constant | Key string | Meaning |
+|---|---|---|
+| `CheckpointTrailerKey` | `Entire-Checkpoint` | checkpoint ID (12-hex or ULID) |
+| `SessionTrailerKey` | `Entire-Session` | session identifier |
+| `MetadataTrailerKey` | `Entire-Metadata` | metadata dir in commit tree |
+| `MetadataTaskTrailerKey` | `Entire-Metadata-Task` | subagent/task metadata dir |
+| `StrategyTrailerKey` | `Entire-Strategy` | strategy that created the commit |
+| `AgentTrailerKey` | `Entire-Agent` | agent name (e.g. "Claude Code") |
+| `SourceRefTrailerKey` | `Entire-Source-Ref` | `&lt;branch&gt;@&lt;hash&gt;` link to metadata branch |
+| `BaseCommitTrailerKey` | `Base-Commit` | shadow→base code commit link |
+| `CondensationTrailerKey` | `Entire-Condensation` | condensation ID (legacy) |
+| `EphemeralBranchTrailerKey` | `Ephemeral-branch` | originating shadow branch |
+| `OPFAppliedTrailerKey` | `Entire-OPF-Applied` | literal `true` when OPF redaction ran |
+
+There is **no** dedicated "trail id" or "tokens" trailer. "Trail" concepts live elsewhere (`trail_cmd.go`), and token counts are read from checkpoint metadata (`checkpoint_tokens.go`), not from a commit trailer. Where persistent checkpoint commits are assembled: `cmd/entire/cli/checkpoint/persistent.go:1290-1299` (writes Session/Strategy/Agent/EphemeralBranch/MetadataTask trailers).
+
+## 3. Remote checkpoint existence / enumeration
+
+**URL resolution** — `cmd/entire/cli/checkpoint/remote/util.go`:
+
+```go
+func FetchURL(ctx, opts ...FetchURLOptions) (string, error)                         // :42   effective checkpoint fetch URL
+func PushURL(ctx, pushRemoteName string) (string, bool, error)                      // :143  (url, enabled, err)
+func GetRemoteURL(ctx, remoteName string) (string, error)                           // :268  wraps gitremote.GetRemoteURL
+func GetRemoteURLInDir(ctx, dir, remoteName string) (string, error)                 // :277
+func Configured(ctx) bool                                                           // :256  is checkpoint_remote configured
+func RedactURL(rawURL string) string                                               // :465  strip creds before logging
+```
+
+Underlying: `cmd/entire/cli/gitremote/gitremote.go:93` `GetRemoteURL`, `:98` `GetRemoteURLInDir`.
+
+**Low-level git ops** — `cmd/entire/cli/checkpoint/remote/git.go`:
+
+```go
+func LsRemoteInDir(ctx, dir, remote string, patterns ...string) ([]byte, error)     // :452
+func Fetch(ctx, opts FetchOptions) ([]byte, error)                                  // :239
+```
+
+**High-level helpers you'll want to reuse directly** — `cmd/entire/cli/git_operations.go`:
+
+```go
+func FetchCheckpointRef(ctx, ref plumbing.ReferenceName) error                      // :481
+func ListCheckpointRefsOnRemote(ctx) ([]plumbing.ReferenceName, error)              // :522
+func parseCheckpointRefNames(output []byte) []plumbing.ReferenceName                // :554 (unexported)
+```
+
+- **`ListCheckpointRefsOnRemote`** is exactly the "enumerate remote checkpoint refs" primitive: single `git ls-remote refs/entire/checkpoints/*` (names only, no object transfer), pinned to the worktree root, 5s timeout (`checkpointRefListTimeout`, :504). Returns `(nil, nil)` when no `checkpoint_remote` is configured. This is the cleanest way to build a "which checkpoints exist on the remote" set for an audit.
+- **`FetchCheckpointRef`** tests/hydrates a *single* ref: a fetch failure is treated by callers as "checkpoint not found" — so it doubles as an existence probe for one checkpoint (2min timeout, best-effort).
+
+**Function type + wiring** (dependency-injection seam): `cmd/entire/cli/checkpoint/fetching_tree.go:39`
+```go
+type RemoteRefListFunc func(ctx context.Context) ([]plumbing.ReferenceName, error)
+```
+Wired in `explain.go:2396` (`RemoteRefLister: ListCheckpointRefsOnRemote`) → `registry.go:168` → `refs_store.go:74 SetRemoteRefLister`. The store's `List` then merges remote-discovered stubs via `appendRemoteDiscovered` (`refs_store.go:466`).
+
+`ReadBootstrappableFromOrigin` is a different concept — `cmd/entire/cli/checkpoint/persistent_refs.go:36`, `func (r PersistentRefs) ReadBootstrappableFromOrigin() bool` — reports whether reads can bootstrap from origin; not a ref-existence check.
+
+## 4. CheckpointID type / parsing
+
+**File:** `cmd/entire/cli/checkpoint/id/id.go`
+
+```go
+type CheckpointID string                                                            // :21
+const EmptyCheckpointID CheckpointID = ""                                           // :24
+
+func NewCheckpointID(s string) (CheckpointID, error)                                // :144  parse + validate
+func MustCheckpointID(s string) CheckpointID                                        // :153  panics on invalid
+func Validate(s string) error                                                       // :193
+func KindOf(s string) Kind                                                          // :103  KindUnknown|KindLegacy|KindULID
+func (id CheckpointID) Kind() Kind                                                  // :115
+func (id CheckpointID) ShardFor() string                                            // :134  last 2 chars (git-refs)
+func (id CheckpointID) Path() string                                               // :249  first-2/rest (v1 branch)
+func (id CheckpointID) Time() (time.Time, bool)                                     // :235  ULID-embedded timestamp
+func (id CheckpointID) DisplayShort() string                                        // :212
+func (id CheckpointID) IsEmpty() bool                                               // :224
+func CouldBePrefix(s string) bool                                                   // :59   cheap prefix gate
+func Generate() (CheckpointID, error)                                               // :166  12-hex
+func GenerateULID() (CheckpointID, error)                                           // :182  26-char ULID
+```
+
+Constants for pattern-matching in free text: `Pattern` (`[0-9a-f]{12}`, :31), `CheckpointPattern` (legacy-or-ULID, :46), `MaxIDLength` (:72), `ShortIDLength` (12, :65). To validate your example ULID `01KYSGR4W1ZATZRW47J510EZGJ`, call `id.NewCheckpointID(s)` — validation decodes via `oklog/ulid.ParseStrict` and requires canonical uppercase encoding (`isULID`, :84).
+
+## 5. Existing audit / doctor / verify commands
+
+**No existing command already does what you're building** (walk `git log`, list commits with `Entire-Checkpoint` trailers, and verify checkpoint availability against the remote). But these overlap and are worth reusing/not-duplicating:
+
+- **`entire doctor`** — `cmd/entire/cli/doctor.go` (`newDoctorCmd`, :25, "Diagnose and fix session issues"). Focuses on stuck **sessions**, disconnected metadata, and hook drift — NOT checkpoint-trailer/availability auditing. Subcommands in `doctor_bundle.go`, `doctor_logs.go`, `doctor_migrate.go`. No checkpoint-availability logic.
+
+- **`entire explain`** — `cmd/entire/cli/explain.go` — the closest existing code that walks commits for checkpoint trailers:
+  - `getAssociatedCommits(ctx, repo, checkpointID, searchAll)` (:1681) — walks `repo.Log` (full DAG when `searchAll`) collecting commits whose message carries a matching `Entire-Checkpoint` trailer. This is the reference implementation for a git-log trailer walk.
+  - `printNoTrailerMessage` (:116) — friendly "no Entire-Checkpoint trailer" rendering.
+  - It already wires `RemoteRefLister: ListCheckpointRefsOnRemote` (:2396) for remote discovery.
+
+- **`resume`** — `cmd/entire/cli/resume.go`: `findBranchCheckpoints` (:582) / `findBranchCheckpointsFromCommit` find the most recent branch-unique commit with an `Entire-Checkpoint` trailer. Another trailer-walk reference.
+
+- **`explain_export.go`** (`--commit &lt;ref&gt;` path, :167-202) resolves a commit → `Entire-Checkpoint` trailer → checkpoint, and at :255 fetches that single ref directly. Good model for "resolve commit to checkpoint, then verify it exists."
+
+**Recommendation for reuse:** build the audit on `ParseAllCheckpoints` (trailer extraction per commit, handles squash merges) + `getAssociatedCommits`-style `repo.Log` walk + `ListCheckpointRefsOnRemote` (remote ref set) + `RefName`/`ParseRef` to correlate the two. For a per-checkpoint availability probe fall back to `FetchCheckpointRef`. Nothing existing duplicates that composition, so you're adding a genuinely new command rather than reimplementing one.</result>
+<usage><subagent_tokens>51312</subagent_tokens><tool_uses>18</tool_uses><duration_ms>118326</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ae48f30438898ed34</task-id>
+<tool-use-id>toolu_01TZHeQR19em9knic7aXXgXW</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-bug-investigation/95408240-a03d-480f-a60c-d524265059aa/tasks/ae48f30438898ed34.output</output-file>
+<status>completed</status>
+<summary>Agent "Explore CI workflows &amp; auth" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have everything needed. Here is my report.
+
+---
+
+# CI/CD Patterns in entireio/cli — for a 24h Checkpoint-Audit Job
+
+## 1. Workflows in `.github/workflows/`
+
+All paths absolute under `/Users/gtrrz-victor/wks/cli/bug-investigation/.github/workflows/`.
+
+| File | Trigger(s) | Purpose |
+|------|-----------|---------|
+| `ci.yml` | `workflow_dispatch`, `pull_request`, `push:main` | Core tests (`mise run test:ci:core`), integration shards, E2E canary against `checkpoint_store: [git-branch, git-refs]` matrix |
+| `lint.yml` | dispatch, PR, push:main | `mise run lint` + golangci-lint-action |
+| `license-check.yml` | dispatch, PR, push:main | License compliance |
+| `codeql-actions.yml` | dispatch, PR (paths `.github/**`) | CodeQL scan of actions |
+| `pr-binary-size.yml` | `pull_request` | Fails PR if a committed binary exceeds 1 MiB (`scripts/check-pr-binaries.sh`) |
+| `e2e.yml` | dispatch, push:main | Full real-agent E2E matrix + Slack notify |
+| `e2e-checkpoint-store.yml` | `workflow_dispatch` (inputs) | E2E per checkpoint backend; uploads artifacts |
+| `e2e-checkpoints-v2.yml` | `workflow_dispatch` | E2E checkpoints v2 mode |
+| `e2e-isolated.yml` | `workflow_dispatch` | Single-agent single-test debug |
+| `e2e-windows.yml` | `workflow_call`, dispatch | Windows E2E (reusable) |
+| `publish-git-remote-entire.yml` | push:main, dispatch | Publishes git-remote helper (uses AWS OIDC `id-token: write`) |
+| `release.yml` | `workflow_dispatch` (version), `push: tags v*` | GoReleaser release + Slack notify |
+| **`nightly.yml`** | **`schedule: cron "0 6 * * *"`, dispatch** | **The only scheduled workflow.** Creates nightly tag |
+
+### The one existing cron workflow — copyable template
+
+`nightly.yml` is your best template. Full YAML shape:
+
+```yaml
+name: Nightly Release
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # 06:00 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nightly-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  create-nightly-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.HOMEBREW_TAP_APP_ID }}
+          private-key: ${{ secrets.HOMEBREW_TAP_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: cli
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Create nightly tag
+        run: |
+          # ... script ...
+```
+
+For a **24h** cadence, keep `cron: "0 6 * * *"` (daily at a fixed UTC hour is the convention here; GitHub does not honor sub-daily precision reliably anyway). Note the repo convention: **all actions are SHA-pinned with a version comment**, and `workflow_dispatch` is always included alongside `schedule` for manual runs.
+
+## 2. Git-remote / checkpoint auth
+
+**Key finding: no CI workflow currently authenticates against `github.com/entireio/cli-checkpoints.git`.** The E2E jobs exercise checkpoint storage only against *local* backends selected via the `E2E_CHECKPOINT_STORE` env (`git-branch`, `git-refs` — see `ci.yml:54`), never the real remote. `grep` for `ENTIRE_CHECKPOINT_TOKEN` across `.github/` returns nothing.
+
+The remote `entireio/cli-checkpoints` appears only in:
+- `/Users/gtrrz-victor/wks/cli/bug-investigation/.entire/settings.json:7` → `"repo": "entireio/cli-checkpoints"` (this repo's own checkpoint config)
+- `cmd/entire/cli/checkpoint/remote/util_test.go` (tests)
+
+**How the CLI authenticates to the checkpoint remote (the mechanism your audit job must use):**
+
+Defined in `/Users/gtrrz-victor/wks/cli/bug-investigation/cmd/entire/cli/checkpoint/remote/git.go:28-34`:
+
+```go
+// CheckpointTokenEnvVar is the environment variable for providing an access token
+// used to authenticate git push/fetch operations for checkpoint branches.
+// The token is injected as an HTTP Basic Authorization header per RFC 7617:
+// the credentials string "x-access-token:&lt;token&gt;" is base64-encoded and sent as
+// "Authorization: Basic &lt;base64&gt;". This matches GitHub's token auth for Git HTTPS.
+const CheckpointTokenEnvVar = "ENTIRE_CHECKPOINT_TOKEN"
+```
+
+- Set env `ENTIRE_CHECKPOINT_TOKEN=&lt;token&gt;`. When set, the CLI **forces HTTPS** on the provider host and sends `Authorization: Basic base64("x-access-token:"+token)` — GitHub's standard token auth. Logic lives in `cmd/entire/cli/checkpoint/remote/util.go` (lines ~56, 192, 368, 482, 499).
+- The token could be a GitHub App installation token (matching the existing `create-github-app-token` pattern with `repositories: cli-checkpoints`) or a PAT — as long as it can read/fetch the checkpoints repo.
+
+**Existing token-wiring patterns to copy (secret names):**
+- **GitHub App token** (preferred, used by `nightly.yml` and `release.yml`): `secrets.HOMEBREW_TAP_APP_ID` + `secrets.HOMEBREW_TAP_APP_PRIVATE_KEY` via `actions/create-github-app-token`, scoped with `owner:` + `repositories:`. For a checkpoints audit you'd want a token scoped to `cli-checkpoints` (either extend that App's install or add a new App secret pair).
+- **Default `GITHUB_TOKEN`** (`github.token`): used in `e2e-checkpoint-store.yml` and `e2e.yml`; note it's scoped to the *current* repo only, so it will NOT read `cli-checkpoints` — you need an App/PAT.
+- **AWS OIDC**: `publish-git-remote-entire.yml` uses `permissions: id-token: write` for `assume-role` (relevant only if you audit the `entire://aws-...entire.io` mirror seen in `util_test.go:432`).
+
+So for your audit job: mint an App token scoped to `cli-checkpoints`, then pass it as `ENTIRE_CHECKPOINT_TOKEN` to the `entire` binary (or run raw `git ls-remote REDACTED`).
+
+## 3. Report / notification / artifact patterns
+
+- **Fail-the-job-on-condition**: `scripts/check-pr-binaries.sh` invoked by `pr-binary-size.yml:22`; script exit code fails the check. Also `scripts/create-nightly-tag.sh` uses a tri-state exit code (0 ok / 2 skip / else error) consumed inline in `nightly.yml:34-41` and `release.yml:180-187` — a good pattern for "audit found nothing / audit found drift / audit errored".
+- **Artifact upload**: `actions/upload-artifact@...v7` with `if: always()`, `retention-days: 7` — see `e2e-checkpoint-store.yml:159-165`.
+- **Slack notification (richest, most copyable)**: `e2e.yml:146-220` job `notify-slack`.
+  - Guarded by `if: ${{ always() &amp;&amp; (needs.&lt;job&gt;.result == 'failure') &amp;&amp; github.event_name == 'push' }}`.
+  - A "Classify failures" step (`e2e.yml:156-208`) uses `gh api .../actions/runs/${{ github.run_id }}/jobs` to build a message, writes `color`/`header`/`body` to `$GITHUB_OUTPUT`.
+  - Posts via `slackapi/slack-github-action@dcb1066...v4.0.0` with `webhook: ${{ secrets.E2E_SLACK_WEBHOOK_URL }}`, `webhook-type: incoming-webhook`, and a Slack Block Kit `payload:`. This is the mechanism to reuse to "post a table" of checkpoint audit results.
+  - `release.yml:192-209` has a simpler single-block version of the same.
+- **Discord**: `secrets.DISCORD_WEBHOOK_ID` / `secrets.DISCORD_WEBHOOK_TOKEN` passed to GoReleaser in `release.yml:116-117` (release announcements only).
+- No existing "post a table to a PR/issue comment" pattern (`github-script`/`gh pr comment`) exists — Slack is the notification channel of record. `GITHUB_STEP_SUMMARY` is not currently used either.
+
+## 4. mise task convention (this is how CI runs everything)
+
+CI does **not** use a Makefile. Every workflow sets up mise via `jdx/mise-action@f10502fc09dadecfefb962fff68ce77213930204 # v4` then calls `mise run &lt;task&gt;`. Examples: `ci.yml:24` `mise run test:ci:core`; `lint.yml:29` `mise run lint`; `e2e-checkpoint-store.yml:156` `mise run test:e2e --agent ...`.
+
+Tasks are defined in **two places**:
+
+1. **`/Users/gtrrz-victor/wks/cli/bug-investigation/mise.toml`** — inline `[tasks.*]` for simple ones (`fmt`, `test`, `test:ci`, `check`, `build:windows`, …). Shape:
+   ```toml
+   [tasks."test:ci"]
+   description = "Run all tests (unit + integration + E2E canary) with race detection"
+   run = """
+   go test -tags=integration -race ./...
+   mise run test:e2e:canary
+   """
+   ```
+   `depends = [...]` chains tasks (see `[tasks.check]`).
+
+2. **`/Users/gtrrz-victor/wks/cli/bug-investigation/mise-tasks/`** — file-based tasks for anything scripted. Nested dirs become colon-separated names: `mise-tasks/test/e2e/canary` → `test:e2e:canary`; `mise-tasks/lint/go` → `lint:go`. Each file is a `#!/bin/sh` script with magic-comment headers:
+   ```sh
+   #!/bin/sh
+   #MISE description="..."
+   #MISE quiet=true
+   #USAGE flag "--agent &lt;agent&gt;" help="..." default="" env="E2E_AGENT"
+   #USAGE arg "[filter]" help="..." default=""
+   ```
+   Existing dirs: `build`, `release`, `completions`, `bench/{cpu,mem,compare}`, `lint/{go,gofmt,gomod,licenses,shellcheck,mise}`, `dup/{staged}`, `dev/publish`, `test/{ci/core, ci/integration/shard, e2e/canary, e2e/roger-roger, e2e/_default}`.
+
+**To add a checkpoint-audit task**: create an executable file e.g. `mise-tasks/checkpoint/audit` (invokable as `mise run checkpoint:audit`) with the `#MISE description=` header and a `#!/bin/sh` body (build the `entire` binary via `mise run build` if needed, then run the audit passing `ENTIRE_CHECKPOINT_TOKEN`). Then have the new scheduled workflow do: `jdx/mise-action@...v4` → `mise run checkpoint:audit`. Alternatively add a `[tasks."checkpoint:audit"]` block in `mise.toml` if it's a one-liner.
+
+### Recommended assembly for your job
+`nightly.yml` (cron + App-token skeleton) + `e2e-checkpoint-store.yml` (mise-action setup, artifact upload) + `e2e.yml` notify-slack (reporting) + a new `mise-tasks/checkpoint/audit` script that runs the `entire` audit with `ENTIRE_CHECKPOINT_TOKEN` set from an App token scoped to `cli-checkpoints`.</result>
+<usage><subagent_tokens>42751</subagent_tokens><tool_uses>18</tool_uses><duration_ms>144790</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>acec29507f49f5f0c</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-bug-investigation/95408240-a03d-480f-a60c-d524265059aa/tasks/acec29507f49f5f0c.output</output-file>
+<status>completed</status>
+<summary>Agent "Explore trail linkage &amp; context" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have everything I need. Here is my report.
+
+---
+
+# Context available for a commit with a MISSING checkpoint
+
+## Summary of the data model
+
+- Commit trailers are defined in `cmd/entire/cli/trailers/trailers.go`. The ONLY Entire-* trailers that exist are: `Entire-Metadata`, `Entire-Metadata-Task`, `Entire-Strategy`, `Base-Commit`, `Entire-Session`, `Entire-Condensation`, `Entire-Source-Ref`, `Entire-Checkpoint`, `Ephemeral-branch`, `Entire-Agent`, `Entire-OPF-Applied`. **There is no `Entire-Trail` trailer** — trail linkage is NOT stored on the commit or in checkpoint metadata.
+- Trails are explicitly documented as **branch-centric, served by the core API** (`cmd/entire/cli/trail/trail.go:1-5`): "Trails ... answer why/what ... while checkpoints answer how/when."
+
+---
+
+## 1. Trail linkage (commit/checkpoint → trail number/URL)
+
+**There is no local mapping.** A trail is resolved from a **branch name** via the control-plane API. So the chain is: commit → branch → trail (network call required).
+
+Getting the branch for your commit (all local, git-native):
+- `session.State.Branch` — the branch HEAD pointed at when the session last took a turn (`cmd/entire/cli/session/state.go:136-142`). This is the intended "map a stopped session back to its branch" field.
+- Or compute which branch(es) contain the commit from git directly (see section 3).
+
+Resolving branch → trail (`cmd/entire/cli/trail_cmd.go`):
+- `resolveTrailBySelector(...)` at `trail_cmd.go:229` — when no selector is given, calls `resolveTrailBranch` then `findTrailByBranch`.
+- `findTrailByBranch(ctx, client, forge, owner, repo, branch)` at `trail_cmd.go:1899` — matches `t.Branch == branch`.
+- `findTrailBySelector` at `trail_cmd.go:1875` — accepts a trail number, id, or branch string.
+- `findTrailByNumber` at `trail_cmd.go:1906`.
+- All go through `findTrail(...)` at `trail_cmd.go:1912`, which **paginates `GET /api/v1/trails/{forge}/{owner}/{repo}`** and matches client-side. There is no direct "trail by commit/checkpoint id" endpoint.
+
+The resulting `api.TrailResource` (`cmd/entire/cli/api/trail_types.go:22-53`) gives you the trail Number, URL, Title, Status, Base, etc.
+
+Trail number → URL:
+- Prefer `TrailResource.URL` (server-supplied).
+- Fallback constructor `trailWebURL(base, forge, owner, repo, number)` at `trail_cmd.go:369` → `&lt;origin&gt;/&lt;forge&gt;/&lt;owner&gt;/&lt;repo&gt;/trails/&lt;number&gt;`.
+- `trailDisplayURL` at `trail_cmd.go:353` encapsulates the prefer-URL-else-build logic.
+
+Repo/forge resolution: `resolveTrailRemote(ctx)` at `trail_cmd.go:1990` → `gitremote.ResolveRemoteRepo(ctx, "origin")` returns `(forge, owner, repo)`.
+
+Trail metadata display struct: `trail.Metadata` at `cmd/entire/cli/trail/trail.go:134-153` (Number, TrailID, URL, Branch, Base, Title, Body, Status, Phase, Author, Assignees, Labels, Type, Priority, Reviewers, CreatedAt, UpdatedAt, MergedAt). Convert via `TrailResource.ToMetadata()` at `trail_types.go:62`.
+
+---
+
+## 2. Checkpoint metadata fields (available only when the checkpoint IS present)
+
+Primary struct — `strategy.CheckpointInfo` at `cmd/entire/cli/strategy/manual_commit_types.go:33-45`:
+```go
+type CheckpointInfo struct {
+    CheckpointID     id.CheckpointID `json:"checkpoint_id"`
+    SessionID        string          `json:"session_id"`
+    CreatedAt        time.Time       `json:"created_at"`
+    CheckpointsCount int             `json:"checkpoints_count"`
+    FilesTouched     []string        `json:"files_touched"`
+    Agent            types.AgentType `json:"agent,omitempty"`      // e.g. "Claude Code"
+    IsTask           bool            `json:"is_task,omitempty"`
+    ToolUseID        string          `json:"tool_use_id,omitempty"`
+    SessionCount     int             `json:"session_count,omitempty"`
+    SessionIDs       []string        `json:"session_ids,omitempty"`
+    Imported         bool            `json:"imported,omitempty"`
+}
+```
+
+Author of a checkpoint (from git log on the checkpoints ref): `checkpoint.Author{Name, Email}` at `cmd/entire/cli/checkpoint/persistent.go:2618`, retrieved via `GetCheckpointAuthor(ctx, checkpointID)` / the `AuthorReader` interface (persistent.go ~2626-2636). NOTE: this reads the checkpoint commit, so it is unavailable when the checkpoint is missing.
+
+Richer session-level metadata that carries the "context" fields — `session.State` at `cmd/entire/cli/session/state.go:101`:
+- `SessionID` (:103), `CLIVersion` (:106), `BaseCommit`/`AttributionBaseCommit` (:111,:117), `Branch` (:142), `StartedAt`/`EndedAt` (:145,:149), `Phase`/`Kind` (:153,:157)
+- `ReviewSkills`, `ReviewPrompt`, `InvestigateRunID`, `InvestigateTopic` (:163-180)
+- `TurnCheckpointIDs` (:197), `LastCheckpointID` (:233)
+- Token usage: `TokenUsage`, `CheckpointTokenUsage`, `SubagentTokensBaseline` — all `*agent.TokenUsage` (:295,:299,:310)
+- `LastPrompt` (:351), `PromptAttributions []PromptAttribution` (:355), `PendingPromptAttribution` (:359)
+- `PromptAttribution` struct at `state.go:374` (per-checkpoint user vs agent lines added/removed, per-file maps)
+
+Ephemeral/other checkpoint carriers (also unavailable if the snapshot is gone): `checkpoint.Info` (`checkpoint/checkpoint.go:150`), `checkpoint.EphemeralCheckpointInfo` (checkpoint.go:229).
+
+`explain` builds its checkpoint report from `checkpoint.CheckpointSummary` + `checkpoint.SessionContent` + `checkpoint.Author` + associated commits — see `formatCheckpointOutput` at `cmd/entire/cli/explain.go:1963`. These are the pieces to reuse for a report, but they all require the checkpoint to be readable.
+
+---
+
+## 3. Commit-derived (git-native) context — ALWAYS available even when checkpoint is missing
+
+`entire trail resume` / `explain` already have helpers you can reuse:
+
+Associated commits + author/date/subject: `getAssociatedCommits(ctx, repo, checkpointID, searchAll)` at `cmd/entire/cli/explain.go:1683`. It walks `repo.Log` (full DAG or first-parent) matching `trailers.ParseCheckpoint(c.Message)`, and produces `associatedCommit` (`explain.go:214`):
+```go
+type associatedCommit struct {
+    SHA, ShortSHA, Message, Author, Email string
+    Date time.Time
+}
+```
+Populated from `c.Author.Name`, `c.Author.Email`, `c.Author.When`, and the first line of `c.Message` (explain.go:1692-1706). This is the model for pulling author/subject/date straight from the commit object.
+
+Git author config: `GetGitAuthor(ctx) (*GitAuthor{Name,Email}, error)` at `cmd/entire/cli/git_operations.go:63` (go-git local→global with `git config` fallback). Backing helper `strategy.GetGitAuthorFromRepo(repo)`.
+
+Default-branch / branch detection: `IsOnDefaultBranch` at `git_operations.go:108`; `isOnDefaultBranchRepo` at `:121`; `getDefaultBranchFromRemote`.
+
+"Which branches contain a commit": there is **no existing `git for-each-ref --contains` / `branch --contains` wrapper**. The closest existing logic is `computeReachableFromMain(ctx, repo)` and `walkFirstParentCommits(...)` used inside `getAssociatedCommits` (explain.go:1733-1748) to decide reachability. `for-each-ref` usage in the repo is limited to `cmd/entire/cli/gitrepo/reftable.go` (reftable listing, not `--contains`). To find containing branches you would run git yourself (the repo shells out to git via `exec.CommandContext` as in `getGitConfigValue`, git_operations.go:94) or use go-git `repo.Log`. Trailer parsing helpers to pull checkpoint/session/agent IDs out of the commit message: `trailers.ParseCheckpoint`, `ParseAllCheckpoints`, `ParseSession`, `ParseMetadata` (`cmd/entire/cli/trailers/trailers.go:98-144`).
+
+---
+
+## 4. Control-plane API client (trail / findings context)
+
+Client: `api.Client` in `cmd/entire/cli/api/client.go` (methods `Get/Post/Patch/Delete` at :135-177; `DecodeJSON`). Base URL via `api.BaseURL()`.
+
+Trail endpoints (all require network + auth):
+- List/lookup: `GET /api/v1/trails/{forge}/{owner}/{repo}` via `trailsBasePath` (`trail_cmd.go:1974`) — used by `findTrail`.
+- Detail (description/body): `GET /api/v1/trails/{forge}/{owner}/{repo}/{number}` via `trailNumberPath` (`trail_cmd.go:1981`); `fetchTrailDescription` at `trail_cmd.go:378`. **Server keys detail by integer Number, not the UUID ID.**
+- Enablement probe: `Client.TrailsEnabled(ctx, forge, owner, repo)` at `cmd/entire/cli/api/trails.go:13`.
+
+Findings/review context tied to a trail (useful for a report): `loadTrailResumeFindingsContext(ctx, client, trailID)` at `cmd/entire/cli/trail_resume_cmd.go:622` → `fetchAllTrailReviewComments` / `fetchTrailReviewComments` (severity/status/freshness filters, `trailResumeTopFindingOptions` at :642). Review types in `cmd/entire/cli/api/trail_review_types.go` (`GET /api/v1/trails/{trail_id}/reviews/...`). Note these use the trail **id**, obtained from the list/detail result.
+
+There is a second, generated OpenAPI client at `internal/coreapi/` (ogen-generated, `oas_client_gen.go` etc.), but the trail flows above use the hand-written `cmd/entire/cli/api.Client`.
+
+**Bottom line for your tool:** trail context is NOT derivable offline — you must (a) determine the commit's branch (from `session.State.Branch` or `git branch --contains`), then (b) call the trails list API and match on `Branch` to get Number/URL/Title/Status. Everything in sections 2's `session.State` and all of section 3 is available locally without the checkpoint snapshot; the checkpoint-commit-derived fields (CheckpointInfo, checkpoint.Author, transcript/token metadata stored in the snapshot) are exactly what's lost when the checkpoint is missing from the remote.</result>
+<usage><subagent_tokens>65298</subagent_tokens><tool_uses>33</tool_uses><duration_ms>179674</duration_ms></usage>
+</task-notification>
+
+---
+
+Continue planning the 24h checkpoint-audit workflow after Explore agents return

@@ -1,0 +1,764 @@
+we need to just do 1886 only for now since you say this is blocker for everyone working on CLI - so do we need to run /review and /pr-review-toolkit:review-pr for this one the get it reviewqed
+
+---
+
+just run them at the same time
+
+---
+
+<task-notification>
+<task-id>a418d209416e4c035</task-id>
+<tool-use-id>toolu_01WuGgJRxJPpH7RL4B22oCMz</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-trail-resume/c1854786-9653-4758-84d5-417c987b2328/tasks/a418d209416e4c035.output</output-file>
+<status>completed</status>
+<summary>Agent "General PR review of 1886" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Both sanity checks pass on the PR branch: the touched package's `TestFetchCheckpointRef*` suite is green, and `TestRunExplainAuto_GeneratePersistsHexOnBranchUnderRefsPrimary` — the test that is red on main — passes with this fix. Review follows.
+
+---
+
+# Review: PR #1886 — remote: classify a remoteless repo as checkpoint-ref absence, not outage
+
+**Scope:** 2 files, +103/-0. `cmd/entire/cli/checkpoint/remote/checkpoint_ref.go` (guard + helper) and its test file. Base `main`, head `fix/local-repo-checkpoint-probe` (verified this worktree is on that branch).
+
+## Overview
+
+Main is red from a semantic conflict between #1824 (fetch-probe: transport failure is never absence) and #1811 (backfill writes routed through the refs store). In a repo with no remotes, `FetchCheckpointRef`'s origin-name fallback runs `git ls-remote origin`, gets exit 128, and the contract turns "no remotes exist" into a hard error, breaking backfill routing and `explain --generate`. The fix inserts a pre-probe guard: when the fetch target is the non-authoritative `"origin"` name fallback, settings load successfully, no `checkpoint_remote` key exists at all, and origin has no URL, return `plumbing.ErrReferenceNotFound` (absence) without probing. Three regression tests cover the matrix.
+
+## Correctness analysis
+
+**Does the guard preserve the false-absence protections? Largely yes.** I traced every path into the `("origin", false)` fallback of `checkpointFetchTarget` (util.go:41-47, reached only when `fetchURLAuthoritative` errors or yields an empty URL — which always implies origin's URL was unresolvable):
+
+- Unreadable settings → `loadErr != nil` → guard skipped → hard failure (test 2 verifies).
+- Key present but malformed (`GetCheckpointRemote` collapses to nil, settings.go:1421-1432) → `checkpointRemoteKeyPresent` true → guard skipped → hard failure (test 3 verifies). This correctly distinguishes "no intent" from "botched intent", which `GetCheckpointRemote` alone cannot.
+- Valid `checkpoint_remote` + no origin → key present → guard skipped → hard failure. Correct.
+- The fallback-emptiness refusal (checkpoint_ref.go:97-104) and the unreachable-remote path are untouched.
+- The guard cannot fire on a resolved-URL target: `fetchTarget == originRemote` only matches the literal name fallback (a real remote URL never equals `"origin"`).
+
+**Important — canceled/expired context is misclassified as absence** (checkpoint_ref.go:84). `GetRemoteURL` → `gitremote.GetRemoteURLInDir` (gitremote.go:98-108) runs `git remote get-url` via `exec.CommandContext` and collapses **every** failure — including context cancellation — into `"remote %q not found"`. Walkthrough: parent ctx already canceled → `fetchURLAuthoritative`'s own `getRemoteURL` fails → `originURL == ""` → (settings load ignores ctx, succeeds; no key) → falls back to `("origin", false)` → guard: load OK, key absent, `GetRemoteURL` fails again → returns `ErrReferenceNotFound` — **false absence in a repo that has an origin remote**. The refs store then acts on it (refs_store.go:396-402) and write routing falls through to another backend — exactly the misdirection #1824's contract exists to prevent. Note the surrounding code is deliberately careful about this same class: refs_store.go:404-407 refuses to memoize ctx-cancellation failures. How realistic: `HookCheckpointRefFetcher`/`BoundedCheckpointRefFetcher` mint fresh 15s child timeouts, so it needs the *parent* hook ctx to be dead (overall hook deadline exhausted mid-loop, SIGINT) — an edge, but a one-line fix closes it:
+
+```go
+if _, urlErr := GetRemoteURL(ctx, originRemote); urlErr != nil &amp;&amp; ctx.Err() == nil {
+```
+
+(Other exec-failure modes — git binary missing, unreadable repo — also collapse into `urlErr != nil`, but in those worlds the subsequent ls-remote fails everywhere anyway; ctx is the only one where the guard flips an otherwise-correct outcome.)
+
+**TOCTOU between the guard's re-resolution and `checkpointFetchTarget` — analyzed, safe.** The guard re-runs `settings.Load` and `git remote get-url` that `fetchURLAuthoritative` just ran. I checked all four drift orderings: remote added between calls → guard doesn't fire, proceeds to a now-valid probe (safe); key added → guard skipped, hard failure (safe); key removed → absence matches final state; remote removed → can't matter (fallback already implied it was gone). No dangerous ordering, so this is a cleanliness concern, not correctness (see suggestions).
+
+**Transient `GetRemoteURL` failure while origin exists:** to even reach the guard, the *first* `getRemoteURL` inside `fetchURLAuthoritative` must already have failed, so a single transient blip doesn't get you there — it takes two consecutive failures with the same ctx. Outside the ctx-cancellation case above (where both fail deterministically), there is no plausible transient double-failure on a local `git remote get-url`; acceptable.
+
+## Project conventions
+
+**Important — settings access convention** (checkpoint_ref.go:131-137). `checkpointRemoteKeyPresent` reaches into `s.StrategyOptions["checkpoint_remote"]` from the `remote` package, duplicating the storage-key literal that lives in settings.go:1417. CLAUDE.md is explicit: "Do NOT ... create new settings helpers without adding them to the `settings` package." This helper is a settings helper by function; it belongs next to `GetCheckpointRemote` as e.g. `(s *EntireSettings) CheckpointRemoteKeyPresent() bool`, keeping key-name knowledge in one file. As written, a future key rename would silently break this guard.
+
+Otherwise clean: tests use `testutil.InitRepo` per convention; no `t.Parallel()` is correct here since every test calls `t.Chdir` (documented exception); error wrapping uses the sentinel properly; comments explain the *why* at appropriate length.
+
+## Performance (git hooks, 15s budget)
+
+Net positive. The guard's cost is one string compare on the happy path (resolved URL → skipped entirely). On the fallback path it adds one `settings.Load` (local file reads) + one `git remote get-url` subprocess, and in the remoteless case it *removes* the doomed `git ls-remote origin` subprocess. Both added operations are local and fast (~10ms). The per-store failure memo in the refs store is unaffected — absence is per-ref and unmemoized, which is correct since remoteless-repo "absence" is cheap to recompute. Suggestion: the duplicate `settings.Load`/`get-url` could be eliminated by having `fetchURLAuthoritative` surface a "no remotes at all" signal (sentinel error or reason enum) instead of the guard re-deriving it — also removes the drift surface.
+
+## Test coverage
+
+Good on the stated matrix; three targeted tests with clear rationale comments:
+
+- remoteless repo → absence (the regression)
+- corrupt settings → never absence
+- malformed `checkpoint_remote` → never absence
+
+Plus verified: the four pre-existing contract tests still pass, and the red-on-main explain test passes with this fix.
+
+Gaps (suggestion):
+- **No test for the ctx-cancellation path** — a test passing an already-canceled context in a repo *with* an origin would fail today per the Important issue above, and would pin the fix.
+- No test for *valid* `checkpoint_remote` + no origin; the key-present branch covers it identically to the malformed case, so this is minor.
+- `"checkpoint_remote": null` — key present with nil value → treated as configured → hard failure. That's the conservative direction (safe), but worth a line in the helper's comment.
+
+## Risk assessment
+
+Low. The change is additive, fires only on the origin-name fallback (which always implies origin was unresolvable), and every guard-skip path degrades to today's behavior (hard failure). The one genuine contract hole is the ctx-cancellation edge; it is narrow and one line to close.
+
+## Issue summary
+
+| Severity | Location | Issue |
+|---|---|---|
+| Important | checkpoint_ref.go:84 | Canceled/expired ctx makes `GetRemoteURL` fail → false absence in a repo that has an origin; add `&amp;&amp; ctx.Err() == nil` |
+| Important | checkpoint_ref.go:131-137 | Settings-key helper lives outside the settings package, duplicating the `"checkpoint_remote"` literal (settings.go:1417); move onto `EntireSettings` per CLAUDE.md |
+| Suggestion | checkpoint_ref.go:82-88 | Guard re-derives what `fetchURLAuthoritative` already computed; surface a "no remotes" signal from resolution instead |
+| Suggestion | checkpoint_ref_test.go | Add a canceled-context regression test (would catch the Important issue); optionally valid-remote+no-origin |
+
+Verdict: approve with the ctx-cancellation guard fixed (one line) — the helper relocation can land in this PR or immediately after, given main is red and this unblocks it.
+
+result: Reviewed PR #1886 (remoteless-repo checkpoint absence fix) — sound and verified green including main's red explain test; flagged 2 important issues (canceled-context can still be misread as absence at checkpoint_ref.go:84; settings-key helper belongs in the settings package) plus 2 suggestions.</result>
+<usage><subagent_tokens>73126</subagent_tokens><tool_uses>16</tool_uses><duration_ms>249855</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a7031da47e75e4183</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-trail-resume/c1854786-9653-4758-84d5-417c987b2328/tasks/a7031da47e75e4183.output</output-file>
+<status>completed</status>
+<summary>Agent "Code review agent on 1886" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Reviewed
+
+`gh pr diff 1886` (3 commits, branch `fix/local-repo-checkpoint-probe`) — `cmd/entire/cli/checkpoint/remote/checkpoint_ref.go` and `checkpoint_ref_test.go`. Read `util.go` (`fetchURLAuthoritative`, `GetRemoteURL`), `gitremote/gitremote.go`, `settings/settings.go`, and `checkpoint/refs_store.go` for context. Package tests, `golangci-lint`, and `gofmt` are all clean on the head commit.
+
+The core idea is right and the two review-driven tightenings (readable-config requirement, key-presence over `GetCheckpointRemote`) are both correct. Three findings.
+
+## Critical
+
+### 1. A cancelled or expired context is classified as ref absence (confidence 93)
+
+`/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/fix-local-probe/cmd/entire/cli/checkpoint/remote/checkpoint_ref.go:84`
+
+`GetRemoteURL` → `gitremote.GetRemoteURLInDir` collapses *every* failure of `git remote get-url origin` into `remote %q not found` (`cmd/entire/cli/gitremote/gitremote.go:98-107`) — including `exec` failing because the context is done. `settings.Load` does not fail on a done context (it only reads files; the `git rev-parse` failure is swallowed to a Debug log), so both guard conditions pass and the function returns `plumbing.ErrReferenceNotFound` for a repo that has a perfectly good origin hosting the ref.
+
+Demonstrated against the PR head with a scratch test using the existing `checkpointRefFixture(t, true)` (origin *has* the ref) and an already-cancelled context:
+
+```
+err = checkpoint ref refs/entire/checkpoints/Z9/01KV...: repository has no remote to fetch from: reference not found
+```
+
+Pre-PR this same input reached `LsRemoteInDir` and surfaced a transport error, so this is a regression introduced by the guard, against the contract stated 20 lines above it ("Any transport-level failure ... never mapped to absence"). Impact is the one the contract exists to prevent: `refs_store.go:396-402` treats an `ErrReferenceNotFound`-wrapped fetch error as genuine absence, explicitly *not* memoized as a failure, so backfill routing falls through to another backend — a summary written to the branch store for a checkpoint that lives on the refs store. Reachable via Ctrl-C during `explain --generate`, and via `HookCheckpointRefFetcher`/`BoundedCheckpointRefFetcher` when the parent context is already done as the loop walks N checkpoints (every remaining probe silently converts to absence).
+
+Minimal fix at the guard:
+
+```go
+if _, urlErr := GetRemoteURL(ctx, originRemote); urlErr != nil &amp;&amp; ctx.Err() == nil {
+```
+
+Better: give the caller a signal that actually means "no origin remote is configured" rather than inferring it from a lossy error (see finding 2 — the information is already available upstream without a second subprocess). Please add a regression test for the done-context case alongside the three new ones; none of them cover it.
+
+## Important
+
+### 2. The guard re-derives a decision `fetchURLAuthoritative` already made, and its origin probe is provably redundant (confidence 82)
+
+`checkpoint_ref.go:82-88` vs `cmd/entire/cli/checkpoint/remote/util.go:54-144`
+
+`checkpointFetchTarget` returns the literal `"origin"` **only** when `fetchURLAuthoritative` saw `originURL == ""` — every return path with a non-empty URL yields that URL as the target. So `fetchTarget == originRemote` already implies `GetRemoteURL(ctx, "origin")` failed inside this same call; the guard's re-probe adds no information, only a second subprocess and the window that finding 1 exploits. Likewise `settings.Load` is now called twice per probe.
+
+More importantly this makes checkpoint-target precedence a two-source-of-truth affair, which is exactly the shape CLAUDE.md warns about for control-plane core resolution ("this precedence lives only inside `coreapi`; nothing else re-derives it"). `util.go:93-99` is the single place that knows both facts — settings loaded cleanly *and* no origin URL:
+
+```go
+config := s.GetCheckpointRemote()
+if config == nil {
+    if originURL == "" {
+        return "", false, fmt.Errorf("no fetch URL found: %w", originErr)
+    }
+```
+
+Returning a sentinel (`errNoRemoteConfigured`, gated on the key-presence check so a malformed entry still doesn't qualify) and having `FetchCheckpointRef` do `errors.Is` on it would make the guard a two-line check with no re-probe, no double load, and no divergence risk between the two derivations.
+
+### 3. New settings predicate lives outside the `settings` package (confidence 85)
+
+`checkpoint_ref.go:131-137`
+
+CLAUDE.md's Settings section lists under **Do NOT**: "Create new settings helpers without adding them to the `settings` package," and "Duplicate settings parsing logic in other packages." `checkpointRemoteKeyPresent` reaches into `s.StrategyOptions` and hardcodes the `"checkpoint_remote"` key from the `remote` package. That literal now appears in three packages (`settings/settings.go:1417`, `setup.go:101`, and here), so a future rename of the option silently leaves this guard reading a key that no longer exists — and its failure mode is the false absence this PR is fixing.
+
+Move it to `settings` as a method next to `GetCheckpointRemote`, e.g. `func (s *EntireSettings) HasCheckpointRemoteKey() bool`, with a doc comment noting it deliberately differs from `GetCheckpointRemote` by counting malformed entries.
+
+## Checked and clean
+
+- Absence/failure matrix holds for the intended cases: configured-and-unresolvable remote still hits the fallback-emptiness refusal (`checkpoint_ref.go:97-104`); unreadable settings and present-but-malformed entries both stay hard failures; the guard cannot fire when origin resolves, since the target is then a URL, not `"origin"`.
+- Tests correctly omit `t.Parallel()` (they use `t.Chdir`), use `testutil.InitRepo` per the git-in-tests rule, and stay inside `t.TempDir()`.
+- No user content logged; error strings carry only the ref name; no new `fmt.Print*`.
+- The three new tests repeat the same five-line local-repo setup — a `localOnlyRepoFixture(t)` sibling to the existing `checkpointRefFixture` would be tidier, but `dupl` does not fire and this is below the reporting bar.</result>
+<usage><subagent_tokens>74784</subagent_tokens><tool_uses>20</tool_uses><duration_ms>252014</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a39cb1ad7251bed1e</task-id>
+<tool-use-id>toolu_01SvQhpiVUc3e5WjshRMtUoW</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-trail-resume/c1854786-9653-4758-84d5-417c987b2328/tasks/a39cb1ad7251bed1e.output</output-file>
+<status>completed</status>
+<summary>Agent "Comment accuracy review of 1886" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>**Summary**: Analyzed PR #1886's comments in `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/fix-local-probe` — the guard block comment, `checkpointRemoteKeyPresent` doc, three new test doc comments, and the pre-existing `FetchCheckpointRef` contract. I verified claims against `settings.Load`, `GetCheckpointRemote`, `fetchURLAuthoritative`, and `GetRemoteURL`, and empirically ran the three new tests (all pass) plus an instrumented variant to determine which error path actually fires in the configured-but-malformed + no-origin case. Most claims are accurate; two claims in the guard comment are not.
+
+**Critical Issues**
+
+1. **"the fallback-emptiness refusal below still applies" is wrong for the scenario this PR is about** — `cmd/entire/cli/checkpoint/remote/checkpoint_ref.go:79-81`.
+   The comment claims: "When a checkpoint_remote IS configured (even unresolvable), the fallback-emptiness refusal below still applies." The fallback-emptiness refusal (line 96-104) only fires when `LsRemoteInDir` **succeeds with empty output** — which requires an origin remote that exists. In the remoteless case (exactly what `TestFetchCheckpointRef_MalformedCheckpointRemoteNeverClassifiesAbsence` covers), I confirmed empirically that the error comes from the ls-remote **probe error path** at line 91-95 (`probe checkpoint ref ... exit status 128`), not the emptiness refusal. The contract is still preserved (not classified as absence), but a future maintainer tracing "why does the malformed case stay a failure?" will be sent to the wrong branch. Suggestion: "...the guard is skipped and the ordinary probe paths apply: a missing origin surfaces as a probe transport error, and an origin that merely lacks the ref hits the fallback-emptiness refusal below — neither classifies as absence."
+
+2. **"GetCheckpointRemote collapses both to nil" has a wrong antecedent** — `cmd/entire/cli/checkpoint/remote/checkpoint_ref.go:76-79`.
+   The sentence structure makes "both" refer to the two preceding items: "an unreadable configuration" and "a present-but-malformed entry." But `GetCheckpointRemote` is never even called when settings are unreadable (`settings.Load` fails first, at `settings.go:449`; `GetCheckpointRemote` is at `settings.go:1413`). What actually collapses to nil under `GetCheckpointRemote` is **key-absent** and **present-but-malformed** — which is the real reason `checkpointRemoteKeyPresent` exists instead of `s.GetCheckpointRemote() == nil`. Suggestion: "(GetCheckpointRemote returns nil for both an absent and a malformed entry, so it cannot distinguish them — hence checkpointRemoteKeyPresent)".
+
+**Improvement Opportunities**
+
+3. **Contract comment on `FetchCheckpointRef` is now incomplete** — `cmd/entire/cli/checkpoint/remote/checkpoint_ref.go:54-62`.
+   The contract header ("absence is distinguishable from failure") remains accurate: the new early return wraps `plumbing.ErrReferenceNotFound`, i.e. a deliberate absence classification, not a failure mapped to absence. But the first bullet says absence means "the remote genuinely lacking the ref... probed via ls-remote before fetching" — there is now a second absence source that involves no remote and no ls-remote (the remoteless guard). Suggestion: add a third bullet or extend the first: "A repository with no checkpoint remote configured and no origin also returns ErrReferenceNotFound without probing — there is no remote that could host the ref."
+
+4. **Guard comment says "no origin remote"; the code tests "GetRemoteURL failed"** — `cmd/entire/cli/checkpoint/remote/checkpoint_ref.go:69-70` vs. line 84. `GetRemoteURL` (util.go:283) errors on any `git remote get-url` failure, not solely a missing remote. In practice ls-remote would fail too if git itself is broken, so the simplification is defensible — minor nuance, no change strictly required.
+
+5. **Test 2's doc comment shares issue #1's misdirection** — `cmd/entire/cli/checkpoint/remote/checkpoint_ref_test.go:120-125`. "the same case the fallback emptiness path refuses to classify" — conceptually right (the emptiness refusal's own comment covers the "undeterminable" case), but in this test the emptiness path is never reached: origin doesn't exist, so the probe error path fires. Fine as an analogy; if #1 is reworded, consider aligning this too.
+
+**Stale comment out of this PR's diff — this PR should fix it**
+
+6. `cmd/entire/cli/checkpoint/routing_store.go:202-204` — "Note the stores' backfill absence probes are local-only (the refs store's refBase does not on-demand fetch like its read path does); a checkpoint whose ref exists only remotely backfills to the fallback store." All three claims are stale: backfills no longer use `refBase` — they use `refBaseForBackfill` (refs_store.go:160-174), which **does** on-demand fetch when a fetcher is configured (wired in `explain.go:723` and `manual_commit_hooks.go:1071,2916`), and a remotely-existing ref is fetched and backfilled into the refs store, not the fallback. Git history shows the last commits touching routing_store.go are #1811-era (`3848cac26f`, `6b961f761b`); #1824 landed without reconciling it despite its PR description saying whichever landed second would. #1886 is the natural vehicle: it is the third PR in exactly this interaction (its guard exists because these probes now go remote), it's a one-comment change, and leaving it means the file actively contradicts the fetch machinery this PR documents. Suggested replacement: "Note the refs store's backfill absence probe fetches the ref on demand when a fetcher is configured (refBaseForBackfill); only a ref absent locally AND remotely falls through to the fallback store."
+
+**Positive Findings**
+
+- `checkpointRemoteKeyPresent` doc (checkpoint_ref.go:126-130) is fully accurate: `GetCheckpointRemote` (settings.go:1413) does reject wrong-type/missing-field entries, and the doc correctly states why key-presence, not parse-success, is the signal.
+- Test 3's comment (checkpoint_ref_test.go:142-147): "missing the required repo field" is verified — `GetCheckpointRemote` requires non-empty `provider` and `repo` with a slash; the fixture `{"provider": "github"}` is malformed exactly as described.
+- Test 1's regression note (checkpoint_ref_test.go:98-104) accurately matches the confirmed behavior (exit 128 from `git ls-remote origin` in a remoteless repo) and the #1811/#1824 semantic-conflict root cause in the PR description.
+- The guard comment's core claims are code-accurate: successful-load requirement (`loadErr == nil`), key-presence-at-all check, and the exit-128 failure mode all match; note `settings.Load` returning defaults for a *missing* settings file (settings.go:444-449) correctly lets the guard fire in a never-configured repo, while corrupt JSON errors and blocks it — verified by the passing tests.</result>
+<usage><subagent_tokens>69668</subagent_tokens><tool_uses>19</tool_uses><duration_ms>278290</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>afd19c5960908a208</task-id>
+<tool-use-id>toolu_01A1sqYJiLB8AY81dExqAca5</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-trail-resume/c1854786-9653-4758-84d5-417c987b2328/tasks/afd19c5960908a208.output</output-file>
+<status>completed</status>
+<summary>Agent "Silent-failure hunt on 1886" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Audit complete. I examined the guard in context, traced both swallowed errors to their implementations, and verified the consumer's classification contract. The settings-side of the guard is genuinely careful (key-presence check stricter than `GetCheckpointRemote`, with tests for unreadable and malformed config) — but the `GetRemoteURL` side of the guard has real holes. Findings, worst first.
+
+---
+
+## Issue 1: Any `GetRemoteURL` failure — including context cancellation — is converted into a false "absent" verdict
+
+- **Location**: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/fix-local-probe/cmd/entire/cli/checkpoint/remote/checkpoint_ref.go:84-86`, rooted in `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/fix-local-probe/cmd/entire/cli/gitremote/gitremote.go:98-108`
+- **Severity**: CRITICAL
+
+The guard treats `urlErr != nil` as proof that no origin remote exists. But `gitremote.GetRemoteURLInDir` collapses **every** failure mode of `git remote get-url origin` into `remote "origin" not found` — and does not even `%w`-wrap the underlying error, so no caller can ever distinguish:
+
+```go
+output, err := cmd.Output()
+if err != nil {
+    return "", fmt.Errorf("remote %q not found", remoteName)
+}
+```
+
+I verified git itself distinguishes these: missing remote exits **2**; environmental failure (not a repo, bad dir) exits **128**. Hidden errors this catch conflates into "no remote":
+
+- `context.Canceled` / `context.DeadlineExceeded` — `exec.CommandContext` kills the child and `Output()` errors
+- git binary missing from `PATH` (`exec.ErrNotFound`) — plausible in hook environments with stripped PATH
+- not-a-repository / `.git` permission or lock failures (exit 128)
+- fork/exec resource failures
+
+**Concrete regression path** — this is not the remoteless-repo case; it hits ordinary repos **with** an origin remote and no `checkpoint_remote` configured: caller's ctx is cancelled (Ctrl-C mid-loop) or the deadline expires (`WriteProbeFetchBudget` = 15s at `checkpoint_ref.go:21` on the hook write path, `readFetchTimeout` on reads). Then `fetchURLAuthoritative` fails to resolve the origin URL (ctx dead) → falls back to `("origin", false)` → the guard fires: `settings.Load` is pure file IO and succeeds, no `checkpoint_remote` key, `GetRemoteURL(ctx, "origin")` fails **because the context is dead** → the function returns `plumbing.ErrReferenceNotFound`.
+
+**User impact**: the consumer at `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/fix-local-probe/cmd/entire/cli/checkpoint/refs_store.go:396-402` sees `errors.Is(fetchErr, plumbing.ErrReferenceNotFound)` and returns absence — the verdict write routing acts on. The irony: the very next lines of that consumer (`refs_store.go:404-413`) refuse to even *memoize* a caller-ctx cancellation because "a cancellation ... says nothing about the remote and must not poison later fetches." The new guard now upgrades that same cancellation past "poison" straight into a positive "checkpoint does not exist" — a direct violation of the function's own contract at `checkpoint_ref.go:60-62` ("Any transport-level failure ... never mapped to absence"), with the data-fork consequence the contract exists to prevent. Before this PR, a dead ctx surfaced as a probe/fetch error and the backfill retried.
+
+**Recommendation**: never classify absence off an undifferentiated error. Either:
+
+1. Enumerate remotes locally via go-git repo config (no subprocess → no ctx sensitivity, no PATH dependence) — `repo.Config().Remotes`; or
+2. Keep the exec but make the classification narrow: check `ctx.Err() == nil` first, and require exit code 2 / stderr containing `No such remote` before concluding the remote is absent. Any other failure must fall through to the probe (which will error properly).
+
+```go
+if fetchTarget == originRemote &amp;&amp; !authoritative &amp;&amp; ctx.Err() == nil {
+    if s, loadErr := settings.Load(ctx); loadErr == nil &amp;&amp; !checkpointRemoteKeyPresent(s) {
+        if absent, checkErr := originRemoteDefinitelyAbsent(ctx); checkErr == nil &amp;&amp; absent {
+            return fmt.Errorf("checkpoint ref %s: repository has no remote to fetch from: %w", ref, plumbing.ErrReferenceNotFound)
+        }
+    }
+}
+```
+
+where `originRemoteDefinitelyAbsent` returns `(false, err)` for anything that isn't a confirmed exit-2 "No such remote". The tests should include: cancelled context in a repo **with** an origin must NOT return `ErrReferenceNotFound`.
+
+---
+
+## Issue 2: "No origin" is not "no remote" — repos with only non-origin remotes get a false absent verdict
+
+- **Location**: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/fix-local-probe/cmd/entire/cli/checkpoint/remote/checkpoint_ref.go:69-88` (comment and guard), plus the test name `TestFetchCheckpointRef_NoRemoteAtAllIsAbsence`
+- **Severity**: HIGH
+
+The comment claims the guard identifies a repository that "has no remote that could host checkpoint refs," but the code only proves *origin* is missing. A repo whose sole remote is `upstream` (or `fork`, or an `entire://` mirror — `git remote rename origin upstream` is a common workflow) satisfies the guard and gets classified as absence. This matters because checkpoint refs are written by the pre-push hook to **whatever remote the user pushes** — `PushURL` at `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/fix-local-probe/cmd/entire/cli/checkpoint/remote/util.go:158` derives from `pushRemoteName`, not origin. So checkpoints can genuinely live on a non-origin remote in a repo with no origin.
+
+**Hidden error**: "the fetch path can't see the remote your checkpoints live on" — previously surfaced as a probe error (exit 128 on `ls-remote origin`, retryable, visible); now silently converted to "checkpoint does not exist."
+
+**User impact**: exactly the stated stake — backfill misroutes onto a stale store, forking checkpoint data, in a configuration the user can't tell is degraded because nothing errors. The test name (`NoRemoteAtAll`) documents an invariant the code doesn't enforce.
+
+**Recommendation**: enumerate all remotes and require **zero** before classifying absence (`git remote` / `repo.Config().Remotes` emptiness). This also composes cleanly with the Issue 1 fix — a config-based enumeration answers both questions in one non-exec read. Add a test: repo with only an `upstream` remote must NOT classify as absence.
+
+---
+
+## Issue 3: The swallowed `loadErr` leaves no diagnostic trail; users get a misleading exit-128 message
+
+- **Location**: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/fix-local-probe/cmd/entire/cli/checkpoint/remote/checkpoint_ref.go:83`
+- **Severity**: MEDIUM
+
+The `settings.Load` error handling is *directionally* correct — an unreadable config falls through to the probe rather than classifying absence (and the test locks that in). But `loadErr` is discarded with zero logging. A user with a remoteless repo **and** corrupt settings gets `probe checkpoint ref ... on origin: exit status 128` — a transport-flavored message whose actual root cause (unreadable `.entire/settings.json` disabled the local-repo shortcut) is nowhere in any log. Six months from now that is a dead-end bug report. Note the same package already sets the precedent: `Configured()` at `util.go:273-278` logs a `Warn` when settings can't be read.
+
+**Recommendation**: `logging.Warn(ctx, "settings unreadable; cannot rule out a configured checkpoint remote, keeping remote probe", slog.String("error", loadErr.Error()))` in the `loadErr != nil` arm. Similarly, log a `Debug` when the guard *fires* — right now the absence short-circuit executes silently, and if Issues 1/2 ever misfire in the field there is no trace distinguishing "guard classified absence" from "remote genuinely lacked the ref."
+
+---
+
+## Issue 4: Duplicate resolution creates a consistency window and redundant execs
+
+- **Location**: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/fix-local-probe/cmd/entire/cli/checkpoint/remote/checkpoint_ref.go:67-88` vs `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/fix-local-probe/cmd/entire/cli/checkpoint/remote/util.go:70-99`
+- **Severity**: LOW
+
+`checkpointFetchTarget` already ran `settings.Load` and `GetRemoteURL(origin)` inside `fetchURLAuthoritative`; the guard re-runs both and can observe a *different* answer (settings file written between the calls, CWD-relative resolution). The guard's classification is then based on evidence that may contradict what produced the `("origin", false)` fallback it's guarding. Also adds one settings parse + one `git` exec per `FetchCheckpointRef` call in every non-authoritative-fallback repo — the write path calls this in per-checkpoint loops.
+
+**Recommendation**: have `checkpointFetchTarget`/`fetchURLAuthoritative` return *why* the fallback happened (settings-load-failed / no-config-no-origin / config-present-unresolvable) instead of re-deriving it. That eliminates the TOCTOU, the double exec, and makes the "narrow guard" conditions structurally impossible to drift from the resolver's actual state.
+
+---
+
+## What is done well
+
+Worth stating because it's rare: `checkpointRemoteKeyPresent` (`checkpoint_ref.go:131-137`) checking raw key presence rather than `GetCheckpointRemote()` — which collapses malformed config to `nil` — is exactly the right paranoia, and both refusal cases (unreadable settings, present-but-malformed config) have regression tests asserting `NotErrorIs(..., ErrReferenceNotFound)`. The absence error also wraps `plumbing.ErrReferenceNotFound` while carrying a human-readable cause. The failure modes that slipped through are all on the `GetRemoteURL` side of the guard, where a single opaque "not found" error is doing classification work it was never built for.
+
+**Bottom line**: Issues 1 and 2 are both real false-absence paths with the data-fork consequence the PR's own contract forbids, and both stem from the same root — the guard trusts an error that means "something, anything, went wrong" as proof of "the remote does not exist." A config-based zero-remotes check (plus a `ctx.Err()` gate) fixes both.</result>
+<usage><subagent_tokens>73555</subagent_tokens><tool_uses>14</tool_uses><duration_ms>301562</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a5e8f8553e2ff5011</task-id>
+<tool-use-id>toolu_01F9BXsiJWknFPmKXpoMpo2Y</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-trail-resume/c1854786-9653-4758-84d5-417c987b2328/tasks/a5e8f8553e2ff5011.output</output-file>
+<status>completed</status>
+<summary>Agent "Test coverage review of 1886" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>The worktree is restored to clean. I have everything needed for the analysis.
+
+---
+
+# Test Coverage Analysis — PR #1886 (remoteless-repo probe guard)
+
+Analyzed at `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/fix-local-probe` (branch `fix/local-repo-checkpoint-probe`, matching the PR head). Files: `cmd/entire/cli/checkpoint/remote/checkpoint_ref.go` and `checkpoint_ref_test.go`. All 7 tests pass. I additionally ran three hand-mutations of the guard to verify which tests pin which condition (worktree restored afterwards).
+
+## Summary
+
+Coverage is strong. The three new tests are behavioral, pinned at the right seam (the public `FetchCheckpointRef` error-classification contract via `ErrorIs`/`NotErrorIs plumbing.ErrReferenceNotFound` — exactly what store probes consume), and two of the guard's three conditions are mutation-verified as pinned. The third condition (`GetRemoteURL(origin)` re-check) is not pinned, but analysis shows it is an equivalent mutant — unreachable-false through the public API. One genuine untested edge exists: a repo whose only remote is non-origin silently changed classification from failure to absence.
+
+## Guard conditions — pinned or not (mutation-verified)
+
+1. **`loadErr == nil` (unreadable settings never classify absence)** — PINNED. Mutation (guard fires on load error) → `UnreadableSettingsNeverClassifiesAbsence` fails.
+2. **`!checkpointRemoteKeyPresent(s)` (present-but-malformed key blocks the shortcut)** — PINNED. Mutation (key lookup broken) → `MalformedCheckpointRemoteNeverClassifiesAbsence` fails. Note this test is load-bearing beyond the obvious: `GetCheckpointRemote()` collapses malformed→nil, so only the raw-key check distinguishes this case, and only this test guards that distinction.
+3. **`GetRemoteURL(ctx, originRemote)` failing** — NOT pinned (mutation replacing it with `if true` survives the full suite). However, it's provably redundant today: `fetchURLAuthoritative` (`util.go:54-144`) only ever falls back to the literal name `"origin"` when `originURL == ""`, i.e. when `GetRemoteURL(origin)` just failed. Every reachable path into the guard already has no origin. The check is defense-in-depth against future drift in `fetchURLAuthoritative`, and is untestable through the public API without injection. **Severity 2 — acceptable as-is**; the code comment covers the intent. (Same is true of `!authoritative`: the literal-`"origin"` target is never returned as authoritative.)
+
+The guard-must-not-fire-when-origin-exists direction is pinned by the pre-existing `PresentRefFetches` (an over-eager guard would return absence instead of fetching) and `RemoteMissingRefIsAbsence`.
+
+## Missing edge cases
+
+- **Severity 6 — repo whose only remote is non-origin (e.g. `git clone -o upstream`), no checkpoint_remote.** Untested, and it's the one input class where this PR genuinely changed behavior beyond the remoteless case: before, `ls-remote origin` failed with exit 128 (failure, backfill retries); now the guard classifies ABSENCE (`GetRemoteURL(origin)` fails, key absent). This is not obviously wrong — the fetch universe is only origin/checkpoint_remote — but the push side is not so restricted: `flushCheckpointRefsQueue` (`cmd/entire/cli/strategy/manual_commit_push.go:326`) pushes checkpoint refs toward whatever remote the pre-push hook fires for, so refs can exist on a non-origin remote the probe will now call "absent", and absence is a signal write routing acts on. Also, the error message "repository has no remote to fetch from" is inaccurate for this repo. A test should pin whichever semantics is intended (`git remote add upstream &lt;bare&gt;` and assert the chosen classification); right now the decision is implicit and undocumented.
+- **Severity 3 — well-formed `checkpoint_remote` + no origin.** Follows the identical guard branch as the Malformed test (`checkpointRemoteKeyPresent` is value-blind), so today it adds little. Its value would be pinning the outcome if `fetchURLAuthoritative` ever learns to resolve provider-canonical URLs without an origin (currently `util.go:120` bails before `resolveProviderCheckpointURL` when origin is missing). Optional.
+- **Severity 2 — hermeticity nit:** the tests inherit `ENTIRE_CHECKPOINT_TOKEN` from the environment; a set token routes `fetchURLAuthoritative` through the token path. Tracing shows all three tests still land on the same fallback, so it can't flip results today, but a `t.Setenv("ENTIRE_CHECKPOINT_TOKEN", "")` would make that a non-question. Pre-existing tests share this nit.
+- **Covered, no gap:** "origin exists, checkpoint_remote key absent — normal path must still probe" — the pre-existing fixture writes no settings file, so `RemoteMissingRefIsAbsence`/`PresentRefFetches` are exactly this case (they resolve origin's URL as authoritative and probe it). "Configured checkpoint_remote with origin present" stays on the fallback-emptiness refusal, pinned by `FallbackTargetNeverClassifiesAbsence`.
+
+## Test quality
+
+- **Behavioral, not implementation-coupled.** Assertions target only the absence-vs-failure contract via sentinel error wrapping; no string matching, no internal-call assertions. The tests survive any refactor of the guard that preserves classification. Comments are DAMP and each names the concrete production failure it prevents (backfill misrouting, `explain --generate` breakage).
+- **Minor (severity 2):** the three new tests repeat the same 5-line temp-repo setup instead of extracting a `localRepoFixture(t, settingsJSON string)` helper next to `checkpointRefFixture`. Below the dupl lint threshold and readable as-is; optional cleanup.
+
+## Repo-rule compliance
+
+- `testutil.InitRepo` temp-repo isolation: yes, all three new tests (init + commit before any handler runs, per CLAUDE.md).
+- `t.Parallel` vs `t.Chdir`: correct — none of the 7 tests call `t.Parallel()`, which is the mandated exception since `t.Chdir` panics under parallel.
+- Settings isolation: `.entire/settings.json` written inside the temp repo; `settings.Load` resolves from the chdir'd worktree root; no `~/.config/entire` or keyring contact on this path.
+
+## Verdict
+
+No blocking gaps. The one addition I'd actually request before merge is the **severity-6 non-origin-remote test**, since the PR silently converts that case from failure to absence and absence drives write routing. Everything else is optional polish.</result>
+<usage><subagent_tokens>69386</subagent_tokens><tool_uses>19</tool_uses><duration_ms>329166</duration_ms></usage>
+</task-notification>
+
+---
+
+finish with edits, but can you ttake a look at recently created pr's and see if this test failure is impacting anyone else, because i thought that it would but is it just because newwer ones are just not touching where we made edits?
+
+---
+
+okay so literally stop writing like novels and tell me should we reivew this one then?
+
+---
+
+okay so do you want to close 1886
+
+---
+
+okay so is 1886 ready then?
+
+---
+
+okay what do i send as SHORT,SLACK MESSAGE - VERY SIMPLE - like fixes test failure -SUPER SIMPLE NO NOVEL
+
+---
+
+well this gives absolutly nothign main is red (test-core, #1811×#1824 interaction) - CI green whatever is also useless
+
+---
+
+well this gives absolutly nothign main is red (test-core, #1811×#1824 interaction) - CI green whatever is also useless - say what the pr deos "fixes _what_ test failure
+
+---
+
+shorter test not the function bame
+
+---
+
+keep this in memory how i like the messages
+
+---
+
+1886 has been merged, we can go back to 1885 and 1884
+
+---
+
+1884 is pretty large now. do you need to take another look at scope, re-evalute? and do a review again
+
+---
+
+<task-notification>
+<task-id>aab9c7d18ffab0db2</task-id>
+<tool-use-id>toolu_01Xg6jYSLhBmx8LDUm6g5EgK</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-trail-resume/c1854786-9653-4758-84d5-417c987b2328/tasks/aab9c7d18ffab0db2.output</output-file>
+<status>completed</status>
+<summary>Agent "Test coverage review of 1884" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Analysis complete. I read the full PR diff (7 commits), the current tree's test callers, and the existing integration harness.
+
+# Test Coverage Analysis — PR #1884 (trail resume: finish the non-interactive contract)
+
+## Summary
+
+The pure-helper layer is pinned thoroughly and well: every typed error survives `SilentError`/`fmt.Errorf` wrapping, every JSON error-object mapping (all 5 enum types + untyped→nil) is tested, and the no-checkpoint exit contract is pinned at all three levels (unit, integration, e2e). The structural weakness is concentrated in one place: **`runTrailResumeJSON` — the orchestration function that is the PR's headline feature — has zero execution coverage.** Only its extracted pure helpers are tested, and four of the review-fix commits (patches 5 and 6) changed behavior *inside* that function with no regression test for any of them.
+
+## Critical Gaps (8)
+
+**1. `runTrailResumeJSON` is never executed by any test — the typed-failure report emission is entirely unpinned. Criticality: 8.**
+`grep` confirms zero test callers for `runTrailResumeJSON`, `restoreTrailSessionsForReport`, `resumeTrailLatest`, `resumeTrailCheckpoint`, and `trailResumeCheckpointBehindHead`. What the helper tests cannot catch:
+
+- The `fail()` closure contract (`cmd/entire/cli/trail_resume_json.go:171-186`): emits the report on **stdout** with the side effects that already happened (`actions`, `restored`), nils the continuation, then returns `NewSilentError(err)`. This is the exact behavior commit 5 advertises ("a typed failure never hides real state changes"), and nothing tests it. Regressions it would silently allow: reordering `restored = sessions` after `ensurePreferredRestoredSession` (side effects vanish from the `session_not_found` report), dropping `report.Continuation = nil` (failure report points at a session the caller shouldn't launch), or returning `err` instead of `NewSilentError(err)` (error text printed after the JSON, corrupting the stdout-is-only-JSON contract that agents parse).
+- The success path's stdout purity — nothing anywhere verifies that a real `--json` run produces stdout that `json.Unmarshal` accepts end-to-end.
+
+This is fillable: `runTrailResumeJSON` takes `found api.TrailResource` directly (no control-plane call inside it), so a unit test with a temp repo + cobra command can drive it — the pattern in `resume_errors_test.go` (`setupResumeTestRepo` + `t.Chdir`) already does the hard part. And `cmd/entire/cli/integration_test/trail_resume_test.go` proves the fake-control-plane harness exists for a full-command `--json` integration test; it currently has no `--json` case at all.
+
+## Important Improvements (5–7)
+
+**2. Detached-HEAD `switched_branch` fix (commit 5) has no regression test. Criticality: 6.**
+Commit 5 explicitly fixed "`switched_branch` no longer lies on detached HEAD" by changing `currentBranch = branch` to `currentBranch = ""` on read failure (`trail_resume_json.go:195-198`). A deliberately fixed bug with no test is the most likely thing to be reintroduced — a future "simplification" restoring the old fallback would pass every current test.
+
+**3. Zero-sessions wiring on the human act path and the `--force` case are untested. Criticality: 6.**
+`TestEnsureTrailSessionsRestored` covers only `(nil, false)` under go-test non-interactivity. Untested: (a) `ensureTrailSessionsRestored(nil, true)` — with `--force`, `trailResumeCanPromptRestoredSessions` returns false, so zero sessions must error; this is the agent-facing case (agents pass `--force`) and it's one boolean inversion away from silently exiting 0 again; (b) the wiring calls inserted into `resumeTrailLatest` and `resumeTrailCheckpoint` (`trail_resume_cmd.go:352-354, 383-385`) — no test drives either function, so deleting one call site would not fail anything; (c) the JSON path's own zero-sessions → `fail(&amp;ResumeNoSessionsRestoredError{})` branch (`trail_resume_json.go:229-234`), which is separate code from the helper.
+
+**4. `checkpoint_behind_head` gating (commit 6 fix) untested. Criticality: 5.**
+The fix scoping the count to the default latest-checkpoint path (`opts.CheckpointID == "" &amp;&amp; opts.SessionID == ""`, `trail_resume_json.go:221-225`) has no test; a regression reintroduces the documented misleading count for `--checkpoint`/`--session` runs. Would be covered for free by gap 1's tests.
+
+**5. Human-path `ResumeSessionNotFoundError` branch untested. Criticality: 5.**
+`continueRestoredSessions` in `resume_continue.go:53-56` now returns the typed error for a bogus preferred session, but the four existing `continueRestoredSessions` tests (`trail_resume_cmd_test.go:977-1104`) all exercise success paths. Only the JSON-side twin (`ensurePreferredRestoredSession`) tests the not-found branch. If the JSON path ever routes through `continueRestoredSessions` again (it did before patch 4), the `errors.As` contract there matters and is unpinned.
+
+**6. Worktree-clash guidance to stderr in `--json` mode (commit 5 fix) untested. Criticality: 5.**
+`ensureTrailResumeBranchAvailable(ctx, errW, branch)` — the change from `io.Discard` to `errW` — has no test asserting the guidance reaches stderr while stdout stays pure JSON.
+
+## Nice-to-Have (3–4)
+
+- **Full-command final-line assertion (4):** the slim-output contract is pinned at display level (`TestDisplayTrailResumeContinuation_*` assert the literal last line) and wiring level (`TestContinueTrailRestoredSessionsNonInteractiveEndsWithContinuation`), but the integration test only uses `strings.Contains` — nothing pins that the *full* act path (identity line first, bare command last) keeps the command as the final stdout line once real command output surrounds it.
+- **Act path no longer fetches findings (3):** the removal of the findings API call from the act path has no guard; reintroduction would only show up as cost/latency, not a test failure. Probably not worth a test.
+- **`checkRemoteMetadata` fresh-repo-open-failure path (3):** the middle of the three metadata-unavailable returns (`resume.go`, repo open error) is untested — hard to trigger, same error type as the tested paths.
+
+## Test Quality Issues
+
+- **`TestCheckpointResumeAuto_ChecksCheckpointBeforeBranch` (`checkpoint_resume_test.go:71-84`)** now uses `ResumeMetadataUnavailableError` as a proxy for "the checkpoint path was taken" — it depends on the fixture's metadata being unreadable via the ULID read path. If a future fixture change makes the metadata readable, the test fails for a reason unrelated to its stated point (delegation order). The comment documents this honestly, but a fixture-independent assertion (the existing `"not on any local branch"` output check is the real signal) would be more robust; the typed-error assertion is the brittle half.
+- **Exact-string pinning** (`TestPrintTrailResumeIdentityLine`, `"(1 commit newer than the checkpoint)"`, `"✓ Restored checkpoint..."`) is deliberate contract-pinning for machine-lifted output — appropriate here, not a defect, but expect these to fail on any copy tweak.
+- Repo-rule compliance is correct throughout: `t.Parallel()` everywhere except the `t.Chdir`/`t.Setenv` tests (which correctly omit it), and all git-touching tests use `setupResumeTestRepo`/`testutil`-style temp-repo isolation.
+
+## Positive Observations
+
+- **`TestRestoreFromCurrentBranch_JSONModeSuppressesPromptEvenOnTTY`** is the standout: it forces interactivity ON via `ENTIRE_TEST_TTY=1` and proves `allowPrompts=false` still suppresses the huh dialog — the only way to genuinely test that guard rather than ride the default non-interactive environment. The companion test covers the default-environment half, so the prompt guard is pinned from both directions.
+- The no-checkpoint contract has exemplary depth: typed-error unit tests → `runResume` level → integration non-zero-exit with message → e2e `require.Error`. That's the model the JSON path should be brought up to.
+- `TestResumeErrorsSurviveSilentErrorWrapping` pins exactly the `errors.As`-through-`SilentError` property the whole JSON contract depends on, with distinct field values per subtest (patch 3 even strengthened them to avoid cross-contamination false passes).
+- `TestResume_RerunIsIdempotent` pins the retry semantics agents actually rely on, including the "Keeping existing" log guarantee.
+- Main-merge test flips (patch 7) preserve each test's original point (delegation order, checkout, remote fallback) while updating only the exit expectation — the right way to reconcile.
+
+**Bottom line:** helper-level coverage is excellent; the single action item worth blocking on is a test (unit with temp repo, or `--json` integration case in `cmd/entire/cli/integration_test/trail_resume_test.go`) that actually executes `runTrailResumeJSON` through one success and one typed failure, asserting stdout parses as JSON, the failure report carries `switched_branch`/`restored_sessions`, and the process exit is non-zero. That one test collapses gaps 1, 2, 4, and 6.
+
+Key files: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/trail-resume/cmd/entire/cli/trail_resume_json.go` (untested orchestration), `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/trail-resume/cmd/entire/cli/trail_resume_json_test.go`, `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/trail-resume/cmd/entire/cli/resume_errors_test.go`, `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/trail-resume/cmd/entire/cli/integration_test/trail_resume_test.go` (harness for a `--json` integration case).</result>
+<usage><subagent_tokens>103971</subagent_tokens><tool_uses>12</tool_uses><duration_ms>225159</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ab2070385c97d272c</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-trail-resume/c1854786-9653-4758-84d5-417c987b2328/tasks/ab2070385c97d272c.output</output-file>
+<status>completed</status>
+<summary>Agent "General PR review of 1884" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>All checks pass (build, vet, and the PR's new/updated unit tests in `cmd/entire/cli` are green). Review complete — here it is.
+
+---
+
+# Review: PR #1884 — trail resume: finish the non-interactive contract
+
+**Verdict: approve with one behavioral gap worth confirming.** No critical issues. The fail/emit flow, prompt threading, and post-merge `checkRemoteMetadata` all check out; the one real finding is that `entire session resume` does not fully inherit the "non-zero when nothing was resumed" contract.
+
+## Overview
+
+The PR delivers the five advertised changes cleanly: prompt guard decoupled from `--force`, typed sentinel errors on every nothing-resumed path, a slim act-path output ending in a liftable resume command, `--json` action reports with a typed failure contract, and shared-engine inheritance for `session resume` / `checkpoint resume`. I verified the load-bearing mechanics against the checkout:
+
+- **`runTrailResumeJSON` fail/emit flow** (`trail_resume_json.go:170-246`): `actions` and `restored` are captured by the `fail` closure by reference, so a typed failure after the branch switch or restore correctly reports those side effects. `Continuation` is nil'd on failure so the report never points at a wrong session. Untyped errors bypass `emit` (empty stdout, stderr text) per contract. The `NewSilentError(err)` re-wrap of an already-silent error is harmless — `errors.As` still recovers the inner type.
+- **`allowPrompts` threading** (`resume.go:284`): the guard is `!allowPrompts || !interactive.CanPromptInteractively()`; JSON passes `false` plus `io.Discard` for stdout so JSON purity holds even under `ENTIRE_TEST_TTY=1` (pinned by test). Human trail and session paths pass `true`. `switchToBranchForResume` in JSON mode gets `skipPrompts=true`, which matches the non-interactive human path (`trailResumeSkipBranchPrompts`).
+- **`ensureTrailSessionsRestored` matrix** (`trail_resume_cmd.go:368-375`): zero sessions errors when `force` or non-interactive; interactive non-force zero is treated as a decline (exit 0). Consistent with the stated design.
+- **Post-merge `checkRemoteMetadata`** (`resume.go:778-886`): merge resolved correctly — both fetch fallbacks (checkpoint remote, origin) still short-circuit into `restoreResumeSessions` on success, and all three exhaustion paths now return `NewSilentError(&amp;ResumeMetadataUnavailableError{...})` after printing guidance. No path lost its typed error in the merge.
+- **Picker regression check**: the picker now receives raw `resolveTrailResumeSessionContexts` output instead of the `knownTrailResumeSessionsForContext`-processed slice — that helper only maps errors to a string and does not filter sessions (`trail_resume_cmd.go:333-338`), so picker contents are unchanged.
+
+## Issues
+
+**Important — `session resume` can still exit 0 with nothing restored** (`resume.go:237-240`, also `resume.go:196-202`)
+`restoreResumeSessions` can return `(nil, nil)`: when `RestoreLogsOnly` yields nothing and `restoreSingleSession` hits `unavailableSessionLogResult` with no local log, it prints "session log not available" and returns `ok=false, nil` (`resume.go:1099`). The trail path guards this with `ensureTrailSessionsRestored`, but `resumeFromCurrentBranch` and `resumeByCheckpointID` still do `if err != nil || len(sessions) == 0 { return err }` — exit 0. The PR body says session resume "picks up the exit-code fixes"; it inherits no-checkpoint and metadata-unavailable but not the no-sessions-restored case. If deliberate scoping, fine — but worth a comment or a follow-up, since it's the same "agents can't detect failure" class this PR exists to fix.
+
+**Suggestion — interactive zero-sessions conflates decline with genuine failure** (`trail_resume_cmd.go:368-375`)
+`ensureTrailSessionsRestored` infers "user declined" from interactivity, but the same `(nil, nil)` above is reachable on a TTY without any prompt firing — a genuine nothing-restored then exits 0 interactively. A human sees the message so it's low-impact, but an explicit decline sentinel from `restoreFromCurrentBranch` (instead of inferring from `CanPromptInteractively`) would make the matrix exact.
+
+**Suggestion — orphaned doc comment** (`resume.go:739`)
+`// promptResumeFromOlderCheckpoint asks the user...` now sits on top of `olderCheckpointNotice`'s doc block; `promptResumeFromOlderCheckpoint` at `resume.go:755` lost its doc. Move the line down.
+
+**Suggestion — untyped errors on the JSON path for common pre-restore failures** (`resume.go:127`, `resume.go:157`)
+"uncommitted changes" and "branch not found locally or on origin" are plain errors, so `--json` callers get empty stdout for two of the most likely real-world failures. Consistent with the stated "pre-action failures keep empty stdout" contract, but these are prime candidates for the typed enum in a follow-up. Relatedly, the `resume stopped before switching branches` guard (`trail_resume_json.go:214`) is unreachable with `skipPrompts=true` — fine as defense, just noting it's dead in practice.
+
+**Suggestion — no direct test of `runTrailResumeJSON` wiring** (`trail_resume_json.go`)
+The components are well-pinned (report builder, error mapper, ensure helpers, prompt suppression), but the orchestration itself — emit-on-typed-failure including already-accrued side effects, the `actions` capture ordering around the switch — has no test. A unit test driving `runTrailResumeJSON` against a fixture repo (like `TestEnsureTrailResumeBranchAvailableReturnsTypedClashError` does for its helper) would pin the one flow the whole JSON contract hangs on.
+
+**Nit — `olderCheckpointNotice` labels a branch tip as "HEAD"** (`resume.go:742-753`)
+The notice always says `HEAD abc1234 has no checkpoint...` even when resume just switched to a named branch; naming the branch would read better. Also `describeTrailResumeRef` yields bare `"trail"` when both Number and ID are empty — cosmetic edge.
+
+## Conventions, performance, tests
+
+- **Conventions**: `SilentError` usage matches the documented pattern (silent only where guidance was already printed; `ResumeNoCheckpointError` correctly stays loud). Errors are typed with pointer receivers used consistently. Prompts go through `NewAccessibleForm`. `t.Parallel()` used except where `t.Chdir`/`t.Setenv` forbid it — correct.
+- **Performance**: net win — the act path drops the findings fetch and pre-restore session-context reads except where consumed. `trailResumeCheckpointBehindHead` adds one extra repo open per JSON run; negligible.
+- **Test coverage**: strong at the unit layer (typed-error round-trips through `SilentError`, prompt guard both TTY-forced and default, JSON payload shape, slim-output final-line contract, worktree clash) plus the new idempotency integration test. The gaps are the `runTrailResumeJSON` orchestration (above) and no integration-level `trail resume --json` run.
+- **Risk**: exit-code semantics change for scripts that relied on exit-0-with-nothing-resumed — intended, flagged in the PR body, and tests were migrated rather than deleted. The lowercase message change ("no Entire checkpoint found") is pinned in both integration and e2e tests.
+
+---
+
+Sanity check performed: `go build ./cmd/...` and `go vet` clean on the PR branch; all 14 new/updated unit test functions in `cmd/entire/cli` pass (`go test -count=1`, 1.6s).
+
+result: Reviewed PR #1884 (trail resume non-interactive contract): approve — fail/emit flow, prompt threading, and merged checkRemoteMetadata all verified correct; one important gap (entire session resume still exits 0 when restore yields zero sessions, resume.go:237) plus five suggestions/nits.</result>
+<usage><subagent_tokens>112371</subagent_tokens><tool_uses>18</tool_uses><duration_ms>319893</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a77b45472aa44d323</task-id>
+<tool-use-id>toolu_01AgbznznT1z3j9H2B6TG9ao</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-trail-resume/c1854786-9653-4758-84d5-417c987b2328/tasks/a77b45472aa44d323.output</output-file>
+<status>completed</status>
+<summary>Agent "Silent-failure hunt on 1884" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Audit complete. I read the full PR diff (`gh pr diff 1884`) and the current head-branch state of `trail_resume_json.go`, `trail_resume_cmd.go`, `resume.go`, `resume_continue.go`, `resume_errors.go`, and `checkpoint_resume.go`. Findings below, ordered by severity. The PR's stated contract: "Non-interactive and --json runs exit non-zero whenever nothing was resumed; declining an interactive prompt exits zero."
+
+## HIGH
+
+### H1. `--session --force` fallback can overwrite the wrong checkpoint's session logs after a swallowed read error
+`/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/trail-resume/cmd/entire/cli/trail_resume_cmd.go:275-281` and `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/trail-resume/cmd/entire/cli/trail_resume_json.go:286-298`
+
+When `resolveTrailResumeSessionContexts` fails (checkpoint store read error, corrupt metadata ref, blob-fetch failure), the error is downgraded to a stderr warning and the code falls back to `resumeTrailLatest` / `restoreFromCurrentBranch`. The restore executes **before** the `--session` membership check (`ensurePreferredRestoredSession` / `continueRestoredSessions`). Consequences:
+
+- With `--force`, the latest checkpoint's restore **overwrites the local session logs of every session in that checkpoint** — sessions the user never asked to touch — and only then fails with `ResumeSessionNotFoundError` if the requested session lived in an older checkpoint (e.g. a squash-merge commit carrying multiple checkpoint trailers, which is exactly the case the code comment at trail_resume_cmd.go:273-274 says this lookup exists for). A swallowed read error turns into a destructive side effect plus a misleading "session not found in the restored checkpoint" message for a session that does exist.
+- Hidden errors behind this catch: `openRepository` failure, `findBranchCheckpointsForBranchRef` failure, `checkpoint.Open` failure, `ReadCheckpoint` failure per checkpoint ID — all collapsed into one warning whose text never says "falling back to the latest checkpoint" so the user can't connect the warning to the wrong outcome.
+
+Recommendation: when `--session` was explicitly given and the context read fails, fail typed (or at minimum perform the membership check against the restored checkpoint **before** any `--force` overwrite). If the fallback stays, the warning must state the consequence: "falling back to the latest checkpoint; --session may not be found there."
+
+### H2. JSON success report silently drops the continuation command on agent-resolution failure — text path errors, JSON path exits 0
+`/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/trail-resume/cmd/entire/cli/trail_resume_json.go:161-164`
+
+```go
+if sessionAgent, err := strategy.ResolveAgentForRewind(choice.Agent); err == nil {
+    continuation.Command = sessionAgent.FormatResumeCommand(choice.SessionID)
+}
+```
+
+The error is discarded with no log, no stderr warning, and no report field. Compare the non-interactive text path, `displayTrailResumeContinuation` (trail_resume_cmd.go:460-463), which returns an error and exits non-zero for the exact same failure. So an unknown/unregistered agent (external agent binary missing on this machine, checkpoint written by an agent not installed here) yields exit 1 in text mode and exit 0 with `"command": ""` (omitted, `omitempty`) in `--json` mode. An orchestrator that lifts `continuation.command` gets an empty string with zero explanation — precisely the obscure, hard-to-debug outcome this PR exists to eliminate. Hidden errors: `ResolveAgentForRewind` failures (unknown agent type, external discovery gaps).
+
+Recommendation: at minimum `logging.Debug`/stderr-warn and add a `command_unavailable`/reason field; better, treat it the same as the text path since a continuation nobody can execute is arguably "nothing resumed" from the orchestrator's viewpoint.
+
+### H3. `entire session resume` / picker / `entire checkpoint resume` still exit 0 with zero sessions restored (transcript-unavailable path)
+`/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/trail-resume/cmd/entire/cli/resume.go:196-202` (`resumeByCheckpointID`), `resume.go:237-243` (`resumeFromCurrentBranch`), fed by `resume.go:955-963` (`restoreResumeSessions` fallback) and `resume.go:1087-1103` (`unavailableSessionLogResult` returning `ok=false, err=nil`).
+
+Both wrappers use `if err != nil || len(sessions) == 0 { return err }` — zero sessions with nil error is exit 0. The PR's own `resume_errors.go` comment says the shared restore engine means `entire session resume` surfaces the typed no-checkpoint and metadata-unavailable errors too — but the *third* nothing-was-resumed case, "checkpoint metadata readable but transcript blob unavailable and no local log exists" (`unavailableSessionLogResult`), still returns `(restored, false, nil)` → `(nil, nil)` → **exit 0, non-interactively**. The trail paths guard this with `ensureTrailSessionsRestored`; the session/checkpoint paths have no equivalent, so `ResumeNoSessionsRestoredError` can never fire there. A scripted `entire session resume &lt;branch&gt;` that restored nothing succeeds. This is a direct survival of the exit-0-on-nothing-resumed contract violation the PR targets, on a command the PR explicitly pulled into the typed-error contract.
+
+Recommendation: apply the same non-interactive zero-sessions check (`ResumeNoSessionsRestoredError`) in `resumeFromCurrentBranch` and `resumeByCheckpointID`, carving out only the genuine interactive-decline `(nil, nil)` case.
+
+## MEDIUM
+
+### M1. `ensureTrailSessionsRestored`'s interactive carve-out fires on non-decline failures
+`/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/trail-resume/cmd/entire/cli/trail_resume_cmd.go:361-369`
+
+The comment claims "an interactive zero means the user declined." False: `restoreResumeSessions` (resume.go:955-963) returns `(nil, nil)` when `RestoreLogsOnly` fails/produces nothing **and** the single-session fallback finds the transcript unavailable — no prompt was ever shown, nothing was declined, yet an interactive `entire trail resume` exits 0. To the good: I verified the carve-out is **not** reachable non-interactively — `trailResumeCanPromptRestoredSessions` requires `interactive.CanPromptInteractively()`, which is forced false under `testing.Testing()`, CI, agent sentinels, and no-TTY; and the `--json` path never consults it (trail_resume_json.go:235-240 always fails typed on zero sessions). So the blast radius is an interactive human who at least saw the "session log not available" message — but the exit code still lies, and any tooling wrapping an interactive TTY (tmux-driven agents) inherits the lie. Recommendation: distinguish "user declined" (a sentinel or boolean out of the restore path) from "restore produced nothing" instead of inferring decline from interactivity.
+
+### M2. `trailResumeCheckpointBehindHead` returns 0 on any error; combined with `io.Discard`, the older-checkpoint fact can vanish entirely from `--json`
+`/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/trail-resume/cmd/entire/cli/trail_resume_json.go:265-276` (helper), `:224-228` (call), `:283-300` (`io.Discard` restores)
+
+Three problems compound:
+1. `openRepository` and `findBranchCheckpoints` errors are swallowed with **no logging whatsoever** and mapped to 0. With `omitempty` on `checkpoint_behind_head`, "could not determine" is indistinguishable from "checkpoint is at HEAD."
+2. On the JSON path, `restoreFromCurrentBranch` receives `w = io.Discard`, so the `olderCheckpointNotice` (resume.go:290) that replaces the prompt is discarded by design — the JSON field is the *only* carrier of this fact. When the helper errors, the fact is silently gone: an orchestrator resumes from a checkpoint N commits behind HEAD believing it's current.
+3. The `opts.SessionID != ""` guard skips the count even on the `--session` **fallback-to-latest** path (H1), where the count would accurately describe the checkpoint actually being restored — so that path emits neither notice nor count under any circumstances.
+
+Mitigating: persistent repo/HEAD failures would also fail the restore itself (same primitives), so the fully-silent window is mostly transient/racy. Still: add `logging.Debug` on both error branches, and consider `*int`/a companion field so "unknown" is representable.
+
+### M3. `entire checkpoint resume`: worktree-clash still exits 0 — the exact condition the PR gave a typed error
+`/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/trail-resume/cmd/entire/cli/checkpoint_resume.go:225-229`
+
+```go
+if otherPath, ok := branchCheckedOutElsewhere(ctx, branch); ok {
+    fmt.Fprintf(w, "Branch %q is already checked out at %s...\n", ...)
+    return nil
+}
+```
+
+Not in this diff, but the PR created `ResumeWorktreeClashError` (with `WorktreePath` specifically "so an orchestrating caller can re-run resume from the right directory") and converted the trail path (`ensureTrailResumeBranchAvailable`, trail_resume_cmd.go:1244-1251). The identical condition on `entire checkpoint resume` still prints guidance and exits 0 non-interactively with nothing resumed. Scripted callers cannot detect it. One-line fix: `return NewSilentError(&amp;ResumeWorktreeClashError{Branch: branch, WorktreePath: otherPath})`.
+
+## LOW
+
+### L1. Best-effort report facts swallow errors without even a debug log
+`/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/trail-resume/cmd/entire/cli/trail_resume_json.go:205-223`
+
+- `GetCurrentBranch` error → `currentBranch = ""` → `switched_branch: true`. If the failure is transient (not detached HEAD) while already *on* the target branch, the report claims a switch that didn't happen. Harmless action-wise (the redundant checkout is a no-op) but the fact is wrong and the error leaves no trace. The detached-HEAD justification in the comment is fine; the missing `logging.Debug` is not.
+- `BranchExistsLocally` error → `existedLocally = true` → `fetched_branch: false`. I traced this one: the same call inside `switchToBranchForResume` (resume.go:114-117) would fail the whole command immediately after, so a misreported `fetched_branch` is effectively unreachable in an emitted report. Defensible, but log the error — six months from now nobody will reconstruct why `switched_branch` was true.
+
+### L2. `fail` closure discards the typed error when JSON encoding fails
+`/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/trail-resume/cmd/entire/cli/trail_resume_json.go:195-197` — `return encodeErr` drops the original typed resume error. Wrap it (`fmt.Errorf("%w (also failed to encode report: %v)", err, encodeErr)`) so the root cause survives.
+
+## Verified clean (worth noting)
+
+- `checkRemoteMetadata` (resume.go:786-885): all three former `return nil, nil` sinks now return `NewSilentError(&amp;ResumeMetadataUnavailableError{...})` after printing actionable guidance — this correctly kills the worst pre-existing silent path.
+- `ResumeNoCheckpointError` replacing the informational-print-plus-nil at resume.go:272-274, with integration/e2e tests flipped to assert non-zero exit.
+- The JSON `fail` path emits the report with already-performed side effects (branch switch, restored sessions) rather than hiding partial state — good design.
+- `resume_errors_test.go` pins `errors.As` recoverability through `SilentError` + `fmt.Errorf` wrapping, protecting the JSON error mapping from future wrapping regressions.
+- The non-interactive older-checkpoint prompt replacement (resume.go:288-305) is correctly gated on `!allowPrompts || !CanPromptInteractively()` and prints a notice instead of blocking; the decline exit-0 there is only reachable behind a real prompt.
+
+Summary: the PR genuinely closes the main silent paths it targets, but three HIGH items survive — the `--session --force` wrong-checkpoint overwrite after a swallowed context-read error, the JSON/text asymmetry on continuation-command resolution (exit 0 vs exit 1 for the same failure), and the transcript-unavailable zero-sessions exit 0 still live on `entire session resume` / `entire checkpoint resume`, which the PR's own error-type documentation claims are covered by the shared contract.</result>
+<usage><subagent_tokens>118984</subagent_tokens><tool_uses>11</tool_uses><duration_ms>310409</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a43182106f692afce</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-trail-resume/c1854786-9653-4758-84d5-417c987b2328/tasks/a43182106f692afce.output</output-file>
+<status>completed</status>
+<summary>Agent "Comment accuracy review of 1884" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>All verifications are complete. Here is the comment-accuracy analysis for PR #1884.
+
+**Summary**
+
+I checked every scoped comment against the implementation: the typed-error docs in `resume_errors.go`, the prompt-guard comments and `allowPrompts` doc in `resume.go`, the JSON contract comments in `trail_resume_json.go`, the carve-out and decline-rationale comments in `trail_resume_cmd.go`, and every behavioral promise in the `trail resume` Long help. Most comments are accurate and verifiably load-bearing. I found one clear-cut comment bug (a stranded doc comment), one typed-error doc that overstates its own preconditions, and three smaller precision issues.
+
+**Critical Issues**
+
+- Location: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/trail-resume/cmd/entire/cli/resume.go:739-741`
+- Issue: Stranded doc comment. The pre-existing line `// promptResumeFromOlderCheckpoint asks the user if they want to resume from an older checkpoint.` now sits directly above `olderCheckpointNotice` (the new comment was inserted below it instead of above it). Godoc for `olderCheckpointNotice` therefore opens with a sentence describing a different function, and `promptResumeFromOlderCheckpoint` (line 755) has lost its doc comment entirely.
+- Suggestion: Move the `promptResumeFromOlderCheckpoint` line down to line 754, immediately above its function.
+
+**Improvement Opportunities**
+
+- Location: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/trail-resume/cmd/entire/cli/resume_errors.go:55-57`
+- Current state: `ResumeMetadataUnavailableError` doc claims "a checkpoint referenced by a commit trailer exists but its metadata could not be read locally or fetched from any remote." Two overstatements: (1) the same error is returned from `restoreByCheckpointID` (resume.go:225-231 → `checkRemoteMetadata`) for a user-supplied `--checkpoint &lt;id&gt;` — the id need not come from a commit trailer, and its existence is never verified (a typo'd id produces this exact error); (2) `checkRemoteMetadata` only consults origin (`ReadBootstrappableFromOrigin`, resume.go:786), not "any remote."
+- Suggestion: Rephrase to something like "reports that a checkpoint id (from a commit trailer or an explicit `--checkpoint` flag) has no readable metadata locally and none could be fetched from origin."
+
+- Location: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/trail-resume/cmd/entire/cli/trail_resume_cmd.go:145-146` (Long help)
+- Current state: "with a picker when the checkpoint has multiple sessions." The picker's inputs come from `resolveTrailResumeSessionContexts` (line 524), which aggregates sessions across *all* checkpoint ids on the trailer commit (a squash merge can carry several — see resume.go:321-322) and falls back to local session state when checkpoint reads produce nothing. The picker triggers when the *trail branch* has multiple resumable sessions, potentially spanning several checkpoints — not strictly one checkpoint.
+- Suggestion: "with a picker when the trail branch has multiple sessions."
+
+- Location: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/trail-resume/cmd/entire/cli/trail_resume_cmd.go:361-363`
+- Current state: `ensureTrailSessionsRestored`'s doc asserts "an interactive zero means the user declined, which exits 0." Not always true: an interactive (non-force) run whose restore genuinely produced zero sessions (session log content unavailable) also passes this guard and exits 0 — no decline occurred. The guard cannot distinguish the two; the comment presents the decline as the only interactive-zero cause.
+- Suggestion: Soften to "an interactive zero is treated as a decline (the guard cannot distinguish a genuine empty restore, which then also exits 0)."
+
+- Location: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/trail-resume/cmd/entire/cli/trail_resume_json.go:66-68`
+- Current state: "untyped/pre-action failures keep stdout empty with text on stderr" is ambiguous. The worktree clash is a pre-action failure (before any branch switch) that is typed and *does* emit the JSON report (line 201-203). The claim is only correct if "pre-action" means "before `runTrailResumeJSON` is entered" (trail resolution/`--repo`/`--branch` validation in `runTrailResume`).
+- Suggestion: Disambiguate, e.g. "untyped errors, and failures before the resume phase starts (trail lookup, flag validation), keep stdout empty with text on stderr."
+
+**Recommended Removals**
+
+None. Every new comment carries information not obvious from the code.
+
+**Positive Findings** (claims I verified as accurate against the code)
+
+- `resume_errors.go:9-12` naming rationale is correct: `entire session resume` (`runResume` → `resumeFromCurrentBranch`/`restoreByCheckpointID`) does surface `ResumeNoCheckpointError` (resume.go:273) and `ResumeMetadataUnavailableError` (resume.go:789, 799, 885); the clash/no-sessions errors stay trail-only, exactly as the comment scopes it.
+- `resume.go:254-257` `allowPrompts` doc matches: only the JSON path passes `false` (trail_resume_json.go:296, 299), and the "stdout must carry only JSON" rationale is sound — huh/bubbletea renders prompts to stdout, which would corrupt the JSON stream.
+- `resume.go:283-287` guard comment matches the code path exactly (notice for `!allowPrompts || non-interactive`, prompt otherwise).
+- `trail_resume_json.go:184-186` fail-emits-side-effects claim holds: `actions`/`restored` are closure-captured, branch-switch facts are set before restore, and no restore helper returns partial sessions alongside an error, so the report never hides a state change for typed failures.
+- `trail_resume_json.go:224-225` checkpoint_behind_head comment matches the gate at 226-228.
+- `trail_resume_cmd.go:236-240` carve-out is truthful: the act paths (human and JSON) never call `loadTrailResumeFindingsContext`, and `resolveTrailResumeSessionContexts` runs only for the interactive-picker gate (line 285), human `--session` mapping (line 275), and JSON `--session` mapping (trail_resume_json.go:287). `entire trail finding` exists (trail_cmd.go:87).
+- The Long help's exit-code sentence checks out on every path I traced: non-interactive runs pass `skipPrompts=true` into `switchToBranchForResume`, so its only `false, nil` return (declined fetch prompt, resume.go:131-138) is unreachable non-interactively; zero restores are gated by `ensureTrailSessionsRestored`; all three interactive declines (fetch, older-checkpoint, start-agent) return nil/exit 0; the JSON path converts `!proceed` to an error. The "resume command as final line" promise holds via `continueRestoredSessions` → `displayTrailResumeContinuation` (nothing prints after `display`).</result>
+<usage><subagent_tokens>115052</subagent_tokens><tool_uses>19</tool_uses><duration_ms>344390</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a0457823596e237b0</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-trail-resume/c1854786-9653-4758-84d5-417c987b2328/tasks/a0457823596e237b0.output</output-file>
+<status>completed</status>
+<summary>Agent "Code review agent on 1884" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Scope reviewed
+
+`gh pr diff 1884` — 14 files on `trail-resume` (head = `e4ccaa30c3`, main merged in), read against surrounding code in `cmd/entire/cli/`. Verification run locally in this worktree:
+
+- `go vet ./cmd/entire/cli/` clean
+- `go test ./cmd/entire/cli/ -run 'Resume|Trail' -count=1` — ok
+- `go test -tags=integration -run 'TestResume_' ./cmd/entire/cli/integration_test/...` — ok
+- `mise run lint` — 0 issues
+
+The core design holds up. I traced the stdout-purity claim for `--json` end to end (`switchToBranchForResume`, `FetchAndCheckoutRemoteBranch`, `CheckoutBranch` all capture git output; `restoreResumeSessions` receives `io.Discard`; `checkRemoteMetadata` guidance goes to `errW`) and found no leak. `SilenceUsage: true` on root (`cmd/entire/cli/root.go:60`) means the new typed errors won't dump usage. `buildTrailResumeRestoredSessionChoices` is 1:1 with its input, so `choices[0]` in the new code can't panic. The e2e and integration harnesses both use `CombinedOutput`, so moving the no-checkpoint text from stdout to the `Error:` line doesn't invalidate the updated assertions.
+
+No Critical findings. Four Important ones.
+
+## Important (80-89)
+
+**1. Orphaned doc comment misattributed to the new function — `cmd/entire/cli/resume.go:739` (confidence 92)**
+
+```go
+// promptResumeFromOlderCheckpoint asks the user if they want to resume from an older checkpoint.
+// olderCheckpointNotice describes proceeding from a checkpoint older than
+// HEAD, for non-interactive runs where the confirmation prompt cannot fire.
+func olderCheckpointNotice(...)
+```
+
+The new function was inserted between `promptResumeFromOlderCheckpoint`'s doc comment and its declaration. Godoc now attributes the prompt sentence to `olderCheckpointNotice`, and `promptResumeFromOlderCheckpoint` (line 755) is left undocumented. Fix: delete line 739, or move it back above line 755.
+
+**2. `detachedHEADDisplay` reused as a generic "HEAD" label — `cmd/entire/cli/resume.go:743-745` (confidence 85)**
+
+`detachedHEADDisplay` is defined at `cmd/entire/cli/status.go:273` as the label for a *detached* HEAD in status output. `olderCheckpointNotice` fires just as often on an attached branch HEAD, and it now depends on that constant staying literally `"HEAD"` — if status's detached label ever becomes `"(detached HEAD)"` or similar, the resume notice silently turns into nonsense ("(detached HEAD) 1a2b3c4 has no checkpoint…"). Use a local literal or a notice-specific constant instead of borrowing status's.
+
+**3. Worktree-clash guidance still goes to stdout on the human path, stderr on the JSON path (confidence 82)**
+
+`ensureTrailResumeBranchAvailable` is called with `cmd.OutOrStdout()` at `cmd/entire/cli/trail_resume_cmd.go:344`, `:375`, and `:1204`, but with `errW` at `cmd/entire/cli/trail_resume_json.go:201`. That asymmetry was fine when the clash exited 0 and stdout was already a prose report; it isn't now. This PR makes the clash a non-zero exit *and* commits the act path to "stdout = identity line, actions, resume command as the final line, machine-liftable." A clash leaves multi-line guidance prose on stdout with no resume command, which is exactly the shape a scripted caller lifting the last stdout line will misread. Recommend passing `errW` on the three human call sites too (the new test passes an explicit buffer, so it stays green).
+
+**4. `session resume` / `checkpoint resume` still exit 0 when a resolved checkpoint restores zero sessions — `cmd/entire/cli/resume.go:238-241` (confidence 80)**
+
+```go
+sessions, err := restoreFromCurrentBranch(ctx, w, errW, branchName, force, true)
+if err != nil || len(sessions) == 0 {
+    return err   // nil when zero sessions restored
+}
+```
+
+Trail resume now closes this hole via `ensureTrailSessionsRestored` (`trail_resume_cmd.go:355`, `:383`, `:364`) and the JSON path (`trail_resume_json.go:235`), both raising `ResumeNoSessionsRestoredError`. The shared-engine commands don't: `restoreResumeSessions` → `restoreSingleSession` returning `ok == false, err == nil` still yields exit 0 with nothing restored, reachable non-interactively (it isn't only the interactive-decline case, which is the one that legitimately should exit 0). Since the PR body states `entire session resume` "picks up the prompt guard and exit-code fixes," an agent calling `entire session resume` still gets the exit-0-nothing-resumed behavior this PR set out to eliminate. Either extend the guard to `resumeFromCurrentBranch` (gating on `interactive.CanPromptInteractively()` the way `trailResumeCanPromptRestoredSessions` does) or state the carve-out explicitly in the PR body so the contract isn't over-claimed.
+
+## Below the reporting threshold (noted, no action required)
+
+- `cmd/entire/cli/trail_resume_json.go:219-221`: `!proceed` is unreachable — `switchToBranchForResume` is called with `force=true`, and its only `(false, nil)` return is the declined fetch prompt. If it ever became reachable it returns an untyped error, so stdout would be empty in `--json` mode.
+- `cmd/entire/cli/trail_resume_json.go:140`: `if report.Actions.CheckpointID == ""` is always true (no caller populates it), so on a `--checkpoint &lt;id&gt;` failure the report omits the checkpoint id that was requested even though `opts.CheckpointID` is known.
+- `checkpoint_behind_head` is `omitempty` *and* conditionally computed (`trail_resume_json.go:226`), so a consumer can't distinguish "checkpoint is at HEAD", "not computed because `--session`/`--checkpoint`", and "couldn't determine".</result>
+<usage><subagent_tokens>147409</subagent_tokens><tool_uses>40</tool_uses><duration_ms>486611</duration_ms></usage>
+</task-notification>
+
+---
+
+just for size it's just over what was estimated, so i wanted to compare against spec - but from review standpoint the fixes found from reviewers shoudl be fixed without incresing the weight too much - as in making the pr too large while still mainintaing desired behavior and also making sure we're not breaking anything like from what the reviewers found, but i do think in the review loop is where a lot of times the increase in bulk happens
+
+---
+
+sure, but before trim pass, did you already apply review fixes?
+
+---
+
+okay go ahead with trim pass

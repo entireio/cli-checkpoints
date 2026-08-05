@@ -1,0 +1,106 @@
+we got a user report that using lazygit broke the interactive "Link this commit to session context" question when using entire for the first time on a new repo. Can we detect lazygit in the same way we detect already other none interactive sessions?
+
+---
+
+we got a user report that using lazygit broke the interactive "Link this commit to session context" question when using entire for the first time on a new repo. Can we detect lazygit in the same way we detect already other none interactive sessions?
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>a969e4543e138579c</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/435ae99e-6528-4dcd-a7d5-4f0604c68c2f/tasks/a969e4543e138579c.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review of rawmode change" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Solid real-PTY test, confirms the signal is generic and tested against actual raw-mode semantics, not a lazygit string match. That completes my investigation. Here are my findings.
+
+## Altitude Review Findings
+
+**Overall verdict: the fix is at the right altitude.** It's a generic terminal-ownership signal added to the one shared predicate, not a lazygit-specific bandaid. One real concern surfaced (checkpoint-policy stderr warnings), documented below, but it's a minor scope-creep issue, not a wrong-layer fix.
+
+1. **Right layer — confirmed.** `interactive.CanPromptInteractively()` (`cmd/entire/cli/interactive/interactive.go:36`) is the correct home. Every one of the ~45 call sites I enumerated (grep across `cmd/entire/cli/**/*.go`, excluding tests) already treats "can I prompt" as one policy decision — adding a narrower `CanPromptFromGitHook()` would fork that policy and require every non-hook site to separately learn about raw-mode TUIs (any of them can also be invoked as a lazygit/gitui custom command, e.g. `entire session resume`, `entire attach`, `entire trail resume`). Classification of the cited sites:
+   - **(a) blocking prompt / picker gate**: `cmd/entire/cli/strategy/manual_commit_hooks.go:504` (the actual bug site), `manual_commit_opf_prompt.go:65`, `hooks_git_cmd.go:91/114` (policy-upgrade message — arguably (b), see below), `resume_picker.go:69`, `attach.go:861`, `checkpoint_resume.go:251`, `repo_clone.go:305`, `repo_mirror_use.go:519`, `setup.go:470/1702/2281`, `investigate/cmd.go` (several), `trail_resume_cmd.go:267/355/359`, `review/cmd.go:286`, `login.go:101`.
+   - **(b) stderr warning, non-blocking**: `strategy/checkpoint_policy.go:59/69/79/103` and `hooks_git_cmd.go:91/114` — these gate a `fmt.Fprint(...)` to plain `os.Stderr`/`stderrWriter`, not a blocking `/dev/tty` read+write.
+   - **(c) other**: `versioncheck/autoupdate.go:73` (choose interactive-update vs. print-instructions), `setup_github.go` (several sequential form pre-checks).
+
+   **Category (b) verdict: this is where the generic signal overreaches.** `strategy/manual_commit_hooks.go:820` defines `stderrWriter = os.Stderr` and documents (line ~2019) that plain stderr writes are safe because "stderr from the hook is TTY-bound to the invoking process" — and indeed `warnIfAttributionDiverged` (line 2032) prints unconditionally, with **no** `CanPromptInteractively()` gate at all. That is inconsistent with `checkpoint_policy.go`'s four sites, which gate functionally-identical one-line warnings on the same predicate that now also encodes raw-mode detection. Concretely: under lazygit, a checkpoint-policy-unsupported or policy-diverged warning that used to print to stderr (visible in lazygit's captured-output panel, since child stdout/stderr is piped, not painted directly to the raw terminal) will now silently downgrade to `logging.Warn` only — the user loses visibility into "your checkpoint work is being skipped" specifically in the client where they're most likely to be committing repeatedly. This is a real behavior change riding along on a fix aimed at a different mechanism (`/dev/tty` blocking read), and the existing unconditional `warnIfAttributionDiverged` proves the codebase itself doesn't believe plain-stderr writes need this gate.
+   - **Deeper/better placement**: gate categories (a) and (b) on two different predicates — `CanPromptInteractively()` (raw-mode-aware) for anything that opens `/dev/tty` or runs a huh/bubbletea program, and a plain `IsTerminalWriter(os.Stderr)`-style check (no raw-mode logic) for one-shot warnings that only write, never read. `checkpoint_policy.go` and `hooks_git_cmd.go`'s warning branches should move to the latter.
+
+2. **Generality vs. special case — confirmed generic, no lazygit leak.** `grep -rln "lazygit" --include="*.go"` only matches comments/docs (`rawmode.go`, `rawmode_pty_test.go`, `interactive.go`) — no env var, string match, or process-name sniff. The signal (`ICANON` off via `TIOCGETA`/`TCGETS`, `cmd/entire/cli/interactive/rawmode_darwin.go:15`, `rawmode_linux.go:15`) catches any full-screen TUI parent (gitui, tig, vim's `:!git commit`, etc.), and `rawmode_pty_test.go` tests the raw-mode *state* on a real pty, not lazygit specifically. A deeper fix was suggested in the prompt — a `commit_linking` settings-level default or first-run behavior — but that's a different, complementary layer, not a competitor: it would still need `askConfirmTTY` (`manual_commit_hooks.go:60`) as its interactive path, and that function is inherently fragile (raw `/dev/tty` read/write, no line editing, no signal handling beyond EOF) regardless of who owns the terminal. This PR's fix and a "smarter default to reduce how often we hit `askConfirmTTY` at all" fix operate at different altitudes and aren't in tension — the reviewed change doesn't foreclose the latter.
+
+3. **Self-consistency — none found.** I checked every file that both calls `CanPromptInteractively()` and drives a `tea.Program`/`huh.NewForm`/spinner (`setup_github.go`, `setup.go`, `investigate/cmd.go`, `review/cmd.go`, `trail_resume_cmd.go`, plus all five `*_tui.go` Update functions: `activity_tui.go`, `dispatch_tui.go`, `experts_tui.go`, `recap_tui.go`, `search_tui.go`). In every case the call is a **sequential pre-flight gate** — checked before `form.Run()`/`tea.NewProgram(...).Run()` starts, never from inside an `Update()`, a huh field `Validate`/`Action` callback, or a spinner action while a program is running. huh/bubbletea restore the terminal to cooked mode before `Run()` returns, so no nested-raw-mode self-defeat path exists today.
+
+4. **Fail-open direction — correct at the (a) sites I inspected, one deliberate exception noted.** The suppressed-prompt fallback is genuinely the safer/equivalent branch everywhere I checked:
+   - `manual_commit_hooks.go:504-509`: falls back to auto-linking the commit (`addCheckpointTrailer`) — matches the prompt's own default-Yes, so suppression changes *when* linking happens, not *whether* the user's session gets tracked.
+   - `resume_picker.go:69-71`, `checkpoint_resume.go:251-254`, `attach.go:861-863`: fall back to plain-text listing/instructions (the documented "Agent-Safe CLI Fallbacks" pattern from CLAUDE.md) — not a silent no-op.
+   - `trail_resume_cmd.go:267-271`: falls back to `resumeTrailLatest` (auto-resume latest), a reasonable default, not a hang or a failure.
+   - `investigate/cmd.go` `confirmUntrustedIssueSeed` (line ~404-427) is the one place fail-open would be wrong, and the code already fails **closed** there (refuses to proceed without `--allow-untrusted-seed`) — correct, and unaffected by this change since it's a pre-existing design choice, not new fallout from raw-mode detection.
+   No site was found where the non-interactive branch is worse than hanging/racing would have been.
+
+5. **Docs at the right altitude — confirmed, not buried.** `CLAUDE.md`'s "Spawning subprocesses in tests (TTY detection)" section documents `CanPromptInteractively()`'s full precedence list; the diff (`git diff CLAUDE.md`) expands item 5 in place with the raw-mode rationale and a pointer to `interactive/rawmode.go`, right next to the four env-var/testing.Testing() precedence rules a future maintainer would already be reading to understand this function. The package-level doc comment on `CanPromptInteractively` (`interactive.go:21-35`) carries the same explanation, and `rawmode.go`'s file-level comment holds the full "why terminal mode, not fd plumbing" rationale — three consistent, non-duplicated tiers (code comment → package doc → CLAUDE.md), not scattered or hidden.
+
+**Bottom line finding to act on:** `cmd/entire/cli/strategy/checkpoint_policy.go:59,69,79,103` and `cmd/entire/cli/hooks_git_cmd.go:91,114` gate plain-stderr warnings on the newly-raw-mode-aware `CanPromptInteractively()`, silently suppressing user-visible checkpoint-policy warnings under any raw-mode TUI parent — inconsistent with the ungated `warnIfAttributionDiverged` in the same package (`manual_commit_hooks.go:2032`) which prints the same class of message unconditionally. Recommend splitting the "can I write a one-shot stderr warning" decision from "can I block on a `/dev/tty` prompt" so this fix doesn't also cost users policy-warning visibility while lazygit is open.</result>
+<usage><subagent_tokens>92872</subagent_tokens><tool_uses>33</tool_uses><duration_ms>349694</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aaad404e84bd29b83</task-id>
+<tool-use-id>toolu_01Byq53K1uMvUhcD6PtVkQ1Q</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/435ae99e-6528-4dcd-a7d5-4f0604c68c2f/tasks/aaad404e84bd29b83.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review of rawmode change" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Findings
+
+**1. Ready-made cross-platform termios reader already in the dependency graph — the new per-OS ioctl files duplicate it**
+
+- File: `cmd/entire/cli/interactive/rawmode_darwin.go:14-22`, `cmd/entire/cli/interactive/rawmode_linux.go:14-22`
+- `github.com/charmbracelet/x/termios` v0.1.1 is **already** in the build graph (`go mod why github.com/charmbracelet/x/termios` → required by `charm.land/bubbletea/v2` → `github.com/charmbracelet/ultraviolet` → `github.com/charmbracelet/x/termios`, and currently listed as `// indirect` in go.mod). It exports:
+  ```go
+  // termios.go
+  func GetTermios(fd int) (*unix.Termios, error) {
+      return unix.IoctlGetTermios(fd, ioctlGets)
+  }
+  ```
+  This is a non-mutating read (unlike `x/term`'s `MakeRaw`/`SetState`), it returns the real `*unix.Termios` (exported `Lflag` field, so `ICANON` is directly checkable), and it already resolves the darwin-vs-linux ioctl-number split internally (`termios_bsd.go`: `ioctlGets = unix.TIOCGETA`; `termios_linux.go`: `ioctlGets = unix.TCGETS`).
+- Cost of the current approach: two near-identical 9-line files (`rawmode_darwin.go`, `rawmode_linux.go`) reimplement exactly what `termios.GetTermios` already does, plus they hand-pick `TIOCGETA`/`TCGETS` per OS — logic that already exists and is already pulled in.
+- Fix: replace both platform files with one call in a single non-Windows file:
+  ```go
+  t, err := termios.GetTermios(int(f.Fd()))
+  if err != nil { return false }
+  return t.Lflag&amp;unix.ICANON == 0
+  ```
+  and promote `github.com/charmbracelet/x/termios` from `// indirect` to a direct require (it's a leaf package — only depends on `golang.org/x/sys/unix` and stdlib `syscall` — so no cycle risk importing it from `cmd/entire/cli/interactive`).
+
+**2. `golang.org/x/term` (existing direct dep) has no usable raw-mode probe — confirmed, not a finding against the current code**
+
+- Checked `$(go env GOMODCACHE)/golang.org/x/term@v0.45.0/{term.go,term_unix.go}`. Public surface: `IsTerminal`, `MakeRaw`, `GetState`, `Restore`, `GetSize`, `ReadPassword`. `MakeRaw`/`Restore` mutate. `GetState` is non-mutating but returns `*term.State{ state{ termios unix.Termios } }` — `state` and its `termios` field are **unexported**, so a caller cannot read `Lflag`/`ICANON` off it. No exported API in `x/term` answers "is this fd currently in canonical/raw mode" without mutating. So `x/term` is correctly *not* reused here — but see finding 1, `charmbracelet/x/termios` (already a transitive dep) does expose exactly that, unlike `x/term`.
+
+**3. Per-OS file-layout convention is followed correctly, but the OS split itself is unnecessary busywork given finding 1**
+
+- Compared with `cmd/entire/cli/proclive/proc_darwin.go` / `proc_linux.go` / `proc_other.go` — the new `rawmode_darwin.go`/`rawmode_linux.go`/`rawmode_other.go` triple matches this repo's established `_darwin.go`/`_linux.go`/`_other.go` convention exactly (also matches `execx_windows.go`, `procutil_windows.go`, etc. elsewhere). This part is not a reuse problem.
+- I verified whether a single shared file (à la `x/term`'s own `term_unix.go` + 2-line `term_unix_bsd.go`/`term_unix_other.go` constant split) is even possible: `golang.org/x/sys/unix.IoctlGetTermios` has signature `func(fd int, req uint) (*Termios, error)` on **both** darwin and linux (`ioctl_unsigned.go`, build tag `darwin || dragonfly || freebsd || hurd || linux || netbsd || openbsd`) — same file, same signature, so `req`'s type does not differ between the two platforms here (the signed/unsigned split in `x/sys/unix` only affects `aix || solaris`, not darwin/linux). So a shared `rawmode_unix.go` (`//go:build darwin || linux`) with just a 2-line ioctl-constant split (mirroring `x/term`'s `term_unix_bsd.go`/`term_unix_other.go`) was technically viable even without adopting `charmbracelet/x/termios`.
+- However, this is moot if finding 1 is applied: `termios.GetTermios` already hides the OS split entirely, so the cleanest fix is deleting `rawmode_darwin.go` and `rawmode_linux.go` outright rather than merging them.
+
+**4. New `github.com/creack/pty` direct dependency for tests — no existing pty helper found, but check the already-`go.sum`'d `charmbracelet/x/xpty` before adding it**
+
+- `go mod why github.com/creack/pty` → only `cmd/entire/cli/interactive` and its test import it; this is a genuinely new dependency, not previously used anywhere (`grep -rln "creack/pty\|charmbracelet/x/xpty"` found only the new `rawmode_pty_test.go`).
+- No existing repo helper opens a real pty for tests (checked `testutil` packages and all `pty.` grep hits — every other match is unrelated Bubble Tea `charm.land/*` TUI code, not OS pty creation).
+- `github.com/charmbracelet/x/xpty@v0.1.3` is present in `go.sum` (transitively pulled in, likely as a test-only dependency of a charm.land package) but is **not** in go.mod's require list at all (no version selected for direct import), so it isn't a free/zero-cost alternative — adding it would still require a new go.mod entry just like `creack/pty`, and its purpose (Bubble Tea's virtual pty for rendering tests) may not even fit a raw unix-pty-pair need. Not a clear win; flagging only because it exists in the sum file, but I would not block on it — `creack/pty` is a reasonable, minimal, standard choice here and this is not a real duplication issue.
+
+**5. `rawmode.go` doc-only file is a novelty, not the repo's `doc.go` convention**
+
+- Repo-wide, only two doc-only files exist: `api/checkpoint/doc.go` and `cmd/entire/cli/recap/doc.go`. Both hold the actual `// Package X ...` godoc comment for their package (e.g. `recap/doc.go`: `// Package recap contains the server-backed data types... \npackage recap`).
+- `cmd/entire/cli/interactive/rawmode.go` does **not** carry the package doc — `package interactive` appears with no `// Package interactive` comment, and the real package doc already lives on `interactive.go:1` (`// Package interactive provides TTY-related helpers...`). So `rawmode.go` is a bare rationale/design-notes file with no package-doc role, which is a different (and unprecedented in this repo) pattern from the two existing `doc.go` files.
+- This is not a duplication/maintenance-burden issue in the same sense as findings 1–3, but per the review's explicit ask: it does not match the existing `doc.go` convention. If the intent was documentation-as-code, the established local pattern would be to fold this rationale as a doc comment on `rawmode_unix.go`/`ttyInRawMode` itself (as `proclive.go` does for its own package, with per-function rationale on `procStat`/`bootID` in the per-OS files) rather than a separate doc-only file.
+
+No findings on: an existing repo-internal termios/raw-mode helper (none found — `grep` for `IoctlGetTermios|TIOCGETA|TCGETS|ICANON` outside the new files only hits `term.GetSize`/`term.IsTerminal` call sites, which don't answer this question).</result>
+<usage><subagent_tokens>85407</subagent_tokens><tool_uses>32</tool_uses><duration_ms>2453538</duration_ms></usage>
+</task-notification>

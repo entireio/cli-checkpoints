@@ -1,0 +1,73 @@
+yes, push and take it out of draft
+
+---
+
+please comment
+
+---
+
+can you take a look at the findings posted on the trail
+
+---
+
+can you do an adversarily review through a subagent on the whole change/concept
+
+---
+
+<task-notification>
+<task-id>a8b4f6b2587f051c1</task-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments-2/1402f853-f602-4928-816b-36b8a86e8d62/tasks/a8b4f6b2587f051c1.output</output-file>
+<status>completed</status>
+<summary>Agent "Adversarial architecture and concept review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>The isolation audit is back and it materially qualifies one of the credits I gave. Addendum:
+
+---
+
+# Addendum: test-verification gaps (partially retracts credit (c)#8)
+
+I credited test hygiene as "above the bar." That holds for the unit tests, but **not** for the four integration tests covering the riskiest path in the PR. Correcting:
+
+### The integration tests have silently opted out of the repo's hermeticity tripwire
+
+`cmd/entire/cli/integration_test/setup_test.go:26-42` sets `ENTIRE_TEST_GIT_HERMETIC=1` process-wide and states the assumption that makes it work:
+
+&gt; "isolation must come from the environment, which children inherit **because all integration env building starts from `os.Environ()` (`testutil.GitIsolatedEnv`)**" … "The config lives in the file because `GitIsolatedEnv` strips inherited `GIT_CONFIG_*` env"
+
+The flag is inert on its own. It only bites through the per-host `http.&lt;url&gt;.proxy` entries that `testutil.GitIsolatedEnv()` writes into an isolated `GIT_CONFIG_GLOBAL` (`testutil/testutil.go:289-302`), which route `github.com`/`gitlab.com` to a dead loopback address so a stray network dial fails fast. `hermeticity_test.go:14-19` exists specifically to prove this fires, against named regressions (#1463, 53bc37a88).
+
+The new helper at `integration_test/plugin_remote_install_test.go:124` builds the child env from bare `os.Environ()` and never calls `GitIsolatedEnv()`. Every other integration spawn does (`testenv.go:137, 679, 1112`; `hooks.go:210, 429`). Consequence: the child gets `ENTIRE_TEST_GIT_HERMETIC=1` with **no config file backing it** — flag set, tripwire absent, developer's real global git config inherited.
+
+Why this matters beyond hygiene: **if index-URL resolution regressed to the built-in default `https://github.com/entireio/plugin-index`, these four tests would quietly clone from the real network and pass.** That is the exact code path carrying F1 and F2. The tests that are supposed to guard the trust model cannot detect the most likely way it breaks.
+
+Second defect in the same helper: `cmd.Dir` is never set (`plugin_remote_install_test.go:135-144`), against `testenv.go:174`'s `cmd.Dir = env.RepoDir`. The spawned `entire` therefore inherits the test process CWD — inside the real repo — and resolves `.entire/settings.json` from it (`settings.go:521-540`). The harness is an unintentional live demonstration of **F1**: a plugin command reading repo-committed settings from whatever directory it happens to be standing in.
+
+### A production finding the audit surfaced indirectly: git shell-outs have no timeout
+
+Two dep-planning tests fire `git ls-remote` at `https://x.example/entire-sem` with `context.Background()` (`plugin_deps_test.go:78, 311, 328`). The test smell points at a production gap: `gitQuiet` is `exec.CommandContext(ctx, …)` (`plugin_gitremote.go:27-31`) and `main.go:26` builds the root context with `context.WithCancel(context.Background())` — no deadline anywhere. So `listRemoteSemverTags` and `fetchPluginMetadataAtTag` are unbounded. `pluginHTTPClient` has a 5-minute cap (`plugin_fetch.go:84`); the git half has none.
+
+That is worse under C1: dependency planning issues one `ls-remote` plus one-to-two shallow clones **per dependency**, so a single unreachable `requires[].repo_url` — author-controlled — hangs `entire plugin install` indefinitely with no output, before the user has confirmed anything. Give `gitQuiet` a per-invocation deadline.
+
+### Also worth fixing (lower stakes)
+
+- `plugin_index_test.go:78-84` asserts TTL-cached behavior against a TTL sourced from `settings.Load(ctx)` on the developer's real repo (`plugin_index.go:203`). Another argument for C3: the knob is so entangled that its own test reads ambient config.
+- `plugin_index_test.go:166-171` sets `XDG_CACHE_HOME` unnecessarily — `SyncPluginIndex` returns at the URL validation (`plugin_index.go:167-169`) before touching the cache — which needlessly forfeits `t.Parallel()`.
+- `plugin_deps_test.go` / `plugin_install_remote_test.go` / `plugin_index_test.go` don't call `testutil.IsolateGitConfigEnv(t)`, unlike 16 existing call sites in the package, so in-process `gitQuiet` invocations inherit the developer's `url.*.insteadOf` and credential helpers.
+- `plugin_install_remote_test.go:136-150` hand-rolls `git -c user.name=… commit --no-gpg-sign` instead of `testutil.GitAdd`/`GitCommit`. It satisfies the hard rule; it just duplicates helpers the file already depends on.
+
+### What the audit confirmed as genuinely clean
+
+No `t.Parallel()` paired with `t.Setenv`/`t.Chdir` anywhere (no panics). No raw `git init` or `go-git PlainInit` — all repo creation goes through `testutil.InitRepo`. Every test reaching managed storage sets `ENTIRE_PLUGIN_DIR` via `withPluginDir`, which matters because `pluginParentDir()` (`plugin_store.go:63`) has **no** `testdirs` fallback and would otherwise write to `~/.local/share/entire/plugins`. All eight `SyncPluginIndex` tests set `XDG_CACHE_HOME`. `withIsolatedPath` (`plugin_deps_test.go:19-26`) is a thoughtful addition that stops a developer's real plugin dir leaking into `dependencySatisfied`'s `LookPath` fallback. Zero intentional real-network calls across 66 tests. `execx.NonInteractive` is used for every spawn.
+
+---
+
+## Bottom line: unchanged — **ship reduced**
+
+The additions don't move the recommendation, but they add one blocker-adjacent item to the fix list: **route the integration tests' child env through `testutil.GitIsolatedEnv()` and set `cmd.Dir`.** Until that lands, the integration coverage for remote install and index resolution is not trustworthy evidence that F1/F2 fixes actually took — and given those are the two findings I'd block on, the tests that verify them need to be hermetic first.
+
+Revised order of work: (1) fix the integration harness so the tests can be believed; (2) F1 + F2 (index URL out of repo-committed settings; HTTPS/SSH-only on all resolution paths); (3) F3 + F4 (one URL validator; lenient `entire-plugin.yml` decoding, before third-party files exist); (4) bound `gitQuiet` with a deadline; (5) the cuts — `requires[]`, `browse`, `index_ttl_hours`, `platforms`; (6) add debug logging and install telemetry; (7) rename the self-updater off `upgrade`.
+
+**Files referenced in this addendum (all absolute):**
+`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/integration_test/plugin_remote_install_test.go`, `integration_test/setup_test.go`, `integration_test/hermeticity_test.go`, `cmd/entire/cli/testutil/testutil.go`, `cmd/entire/cli/plugin_deps_test.go`, `cmd/entire/cli/plugin_index_test.go`, `cmd/entire/cli/plugin_install_remote_test.go`, `cmd/entire/cli/plugin_store.go`, `cmd/entire/cli/plugin_gitremote.go`, `cmd/entire/main.go`.</result>
+<usage><subagent_tokens>187419</subagent_tokens><tool_uses>40</tool_uses><duration_ms>1468523</duration_ms></usage>
+</task-notification>

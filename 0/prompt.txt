@@ -1,0 +1,91 @@
+entire enable displays an option to choose between backends git-refs and branch. We have set git-refs as default. Let's take out this option from the interactive mode and just choose git-refs as default backend, you can always go back an use our branch strategy via flags.
+
+---
+
+<task-notification>
+<task-id>ac0907b3aaf653269</task-id>
+<tool-use-id>toolu_013hyukH7q7K2fGd7EVSHA35</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-exploring-entire/c2e77422-82c1-4376-bbaf-4abf6d5ba535/tasks/ac0907b3aaf653269.output</output-file>
+<status>completed</status>
+<summary>Agent "Find backend selection in enable" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have everything. Here is the complete map.
+
+## Summary
+
+All checkpoint-backend selection logic for `entire enable` lives in **`cmd/entire/cli/checkpoint_backend.go`** (the picker, flag resolution, apply/persist helpers) and **`cmd/entire/cli/setup.go`** (the enable command, flag registration, and consumption). The two selectable backends are `git-refs` (recommended/default) and `git-branch` (the "branch" strategy).
+
+### 1. Interactive prompt/form (huh Select via NewAccessibleForm)
+
+`cmd/entire/cli/checkpoint_backend.go:101-117` — `promptCheckpointBackend`, with options built by `checkpointBackendChoices` at `:84-89`:
+
+```go
+// checkpointBackendChoices() — lines 84-89
+return []huh.Option[string]{
+    huh.NewOption("Refs — one git ref per checkpoint (recommended)", checkpoint.BackendTypeGitRefs),
+    huh.NewOption("Branch — one shared branch, entire/checkpoints/v1", checkpoint.BackendTypeGitBranch),
+}, checkpoint.BackendTypeGitRefs
+
+// promptCheckpointBackend() — lines 101-117
+opts, recommended := checkpointBackendChoices()
+choice := recommended
+form := NewAccessibleForm(
+    huh.NewGroup(
+        huh.NewSelect[string]().
+            Title("Checkpoint storage").
+            Description("How Entire stores committed session checkpoints in your repo.").
+            Options(opts...).
+            Value(&amp;choice),
+    ),
+)
+if err := form.RunWithContext(ctx); err != nil {
+    return "", handleFormCancellation(w, "Checkpoint storage selection", err)
+}
+return choice, nil
+```
+
+The prompt is invoked from the setup flow at **`cmd/entire/cli/setup.go:1374`** inside `resolveFirstRunCheckpointBackend` (`:1370-1396`), gated on: no `--checkpoint-backend` flag, `firstRun`, not `--yes`, `ENTIRE_CHECKPOINTS_PRIMARY` not set, and an interactive TTY.
+
+### 2. Where the default (git-refs) is set
+
+There are two distinct "defaults" — note a subtlety:
+
+- **First-run written default = git-refs.** `firstRunCheckpointBackendDefault()` at **`cmd/entire/cli/setup.go:1405-1410`** returns `checkpointBackendRefsAlias` ("refs"), unless `ENTIRE_CHECKPOINTS_PRIMARY` is set (then returns "" → write nothing). The interactive picker also pre-selects git-refs (`checkpointBackendChoices` returns `checkpoint.BackendTypeGitRefs` as `recommended`, `checkpoint_backend.go:88`).
+- **Config-less runtime fallback = git-branch** (intentionally, so pre-existing repos with no `checkpoints` block are untouched): `resolvePrimaryType` at **`cmd/entire/cli/checkpoint/open.go:128-135`** returns `BackendTypeGitBranch` when nothing is configured. Backend type constants: `cmd/entire/cli/checkpoint/registry.go:19` (`BackendTypeGitBranch = "git-branch"`) and `:27` (`BackendTypeGitRefs = "git-refs"`).
+
+So git-refs is the default *written into new settings*, while the *implicit fallback for repos with no config block* remains git-branch.
+
+### 3. Non-interactive flag: `--checkpoint-backend`
+
+- Flag name constant: **`cmd/entire/cli/setup.go:41`** — `flagCheckpointBackend = "checkpoint-backend"`.
+- Struct field: **`cmd/entire/cli/setup.go:69-72`** — `EnableOptions.CheckpointBackend string`.
+- Registered on both `enable` and `configure`: **`cmd/entire/cli/setup.go:788`** and **`:934`**:
+  ```go
+  cmd.Flags().StringVar(&amp;opts.CheckpointBackend, flagCheckpointBackend, "",
+      "Checkpoint storage backend: refs (one git ref per checkpoint; recommended) or branch (shared entire/checkpoints/v1 branch)")
+  ```
+- Accepted values resolved by `resolveCheckpointBackendType` (`checkpoint_backend.go:30-42`): friendly aliases `"branch"`/`"refs"` (`:21-22`) or canonical `"git-branch"`/`"git-refs"`, case-insensitive, validated via `checkpoint.ValidatePrimaryBackend`.
+- Detection helper `hasCheckpointBackendFlag` at `setup.go:113-114`; up-front validation for `enable` at `setup.go:831-833`.
+
+### 4. Where the chosen value is consumed/stored
+
+Two paths, both ending in `applyCheckpointBackend` (`checkpoint_backend.go:50-60`), which sets `s.Checkpoints.Primary = settings.BackendConfig{Type: typ}` and drops any mirror of the same type:
+
+- **Fresh/first-run enable (interactive setup):** `setup.go:1242-1248` — calls `resolveFirstRunCheckpointBackend` (which runs the prompt) then `applyCheckpointBackendFlag(settings, backend)` on the in-memory settings before save.
+- **Fresh enable via `--agent` (non-interactive):** `setup.go:1917-1922` — defaults to git-refs on first run, then `applyCheckpointBackendFlag(targetSettings, opts.CheckpointBackend)`.
+- **`entire configure` / enable on already-set-up repos:** `updateCheckpointBackend` at `checkpoint_backend.go:123-148` loads the target settings file, calls `applyCheckpointBackend`, saves, and prints `✓ Checkpoint backend set to &lt;type&gt;`. Dispatched from `setup.go:757-759`.
+- `applyCheckpointBackendFlag` itself (`checkpoint_backend.go:67-77`) is the no-op-if-empty wrapper used by the two fresh-repo paths.
+
+Stored shape: `settings.CheckpointsConfig{Primary: BackendConfig, Mirrors: []BackendConfig}` in `cmd/entire/cli/settings/checkpoints.go` (`Primary` at `:36`), serialized to the `checkpoints` block of the settings JSON.
+
+I did not modify anything.</result>
+<usage><subagent_tokens>65885</subagent_tokens><tool_uses>14</tool_uses><duration_ms>77857</duration_ms></usage>
+</task-notification>
+
+---
+
+I did switch the current branch to git-refs-as-default-backend where this changes are suppost to go
+
+---
+
+great, lets do a clean up first. Check any test that is not needed after deleting this option. We don't need to test the negative like, making sure that git backend option is not shown. we don't need that kind of testing for this.

@@ -1,0 +1,134 @@
+/simplify
+
+---
+
+<task-notification>
+<task-id>aad52ee3d1011e271</task-id>
+<tool-use-id>toolu_013SYdk8Fo2SfegDYqdRqstG</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/a0256d6a-35d7-442d-802d-6f4722d32b70/tasks/aad52ee3d1011e271.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Findings below. I read the full diff, `capabilities.go`, `integration_test/{testenv.go,hooks.go,codex_image_externalize_test.go,codex_post_tool_use_test.go,subagent_checkpoints_test.go}`, `checkpoint/persistent.go`, `codex/{transcript.go,codex.go}`, and `agent/capabilities_test.go`.
+
+## Findings
+
+**1. `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/agent/capabilities.go:96` — `AsTranscriptSanitizer` re-implements `builtinCapability[T]`**
+Use `return builtinCapability[TranscriptSanitizer](ag)`. The existing generic at `capabilities.go:50` is documented as exactly this: *"returns the agent as T by type assertion alone, for built-in-only capabilities that have no DeclaredCaps gate."* The stated justification ("resolves by type assertion alone with no DeclaredCaps gate") is the generic's whole purpose, so it does not justify the hand-written copy — it argues *for* it. The correct precedent is `AsSessionBaseDirProvider` (:187), `AsModelExtractor` (:195), `AsSkillEventExtractor` (:202), all one-liners over `builtinCapability`. `AsSidecarImageProvider` (:84) is the wrong model to copy — it predates or missed the generic and is itself a latent cleanup. Cost: the file now carries three idioms for one decision (`declaredCapability`, `builtinCapability`, hand-rolled) and three hand-rolled instances (:84, :143, :96); any future change to how nil agents or embedded/wrapped agents resolve has to be applied in N places instead of one.
+
+**2. `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/integration_test/codex_shadow_sanitize_test.go:88` — `codexHooker` is a verbatim lift of an existing inline closure, left duplicated**
+The body is line-for-line the `hook := func(name string, extra map[string]any)` closure at `codex_image_externalize_test.go:61-80` (same base map: `session_id`/`transcript_path`/`cwd`/`model: "gpt-5"`/`permission_mode: "default"`, same merge loop, same marshal, same `runner.runCodexHook`). Extracting it into a named helper is right; putting it in the test file instead of `hooks.go` means both copies now exist. It belongs beside `NewCodexHookRunner`/`runCodexHook` at `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/integration_test/hooks.go:571` as a `(*CodexHookRunner)` method, with `codex_image_externalize_test.go` switched over. Cost: the Codex hook stdin contract is encoded twice; adding a newly-required field (e.g. `turn_id`, which `SimulateCodexPostToolUseApplyPatch` already sends but neither closure does) means editing two sites, and the next Codex test copies whichever one it finds first.
+
+**3. `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/integration_test/codex_shadow_sanitize_test.go:113` — `applyPatchHook` duplicates `SimulateCodexPostToolUseApplyPatch`**
+`/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/integration_test/hooks.go:593` `(*CodexHookRunner).SimulateCodexPostToolUseApplyPatch` builds the identical `post-tool-use` map (`tool_name: "apply_patch"`, `tool_input: {"command": patch}`, `tool_response: "Success."`). The only reasons the new helper exists are a configurable `tool_use_id` (existing helper hardcodes `"test-call"`) and a non-nil `transcript_path`. That makes this the third literal copy of the codex-rs `PostToolUseCommandInput` shape (also inline at `codex_image_externalize_test.go:86-89`, and a `shell` variant at `codex_post_tool_use_test.go:108-120`). Fix: parameterize the existing method — either add `toolUseID`/`transcriptPath` args, or give it an input struct following the file's own established `PreTaskInput`/`PostTaskInput` pattern (`hooks.go:125` and `:162`). Cost: an on-wire schema asserted in three places; a field rename in codex-rs breaks tests one file at a time and each fix looks local.
+
+**4. `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/integration_test/codex_shadow_sanitize_test.go:39` — `findShadowSessionTranscript` re-implements branch-tree resolution**
+The suffix search itself is genuinely new (no existing helper finds a file in a branch by prefix/suffix). But lines 41-58 are the fourth copy of `gitrepo.OpenPath` → `repo.Reference(plumbing.NewBranchReferenceName(...), true)` → `CommitObject` → `Tree`, already present in `TestEnv.ReadFileFromBranch` (`/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/integration_test/testenv.go:902`), `TestEnv.FileExistsInBranch` (`testenv.go:864`), and `verifyShadowCheckpointStorage` (`subagent_checkpoints_test.go:295`). It also takes `repoDir, branchName` rather than the `*TestEnv` every other branch reader hangs off. Fix: add it to `testenv.go` next to `ReadFileFromBranch` as e.g. `(env *TestEnv) FindFileInBranch(branch, prefix, suffix string) (string, bool)`, and let the subagent test's inline walk use it. Cost: `ReadFileFromBranch`'s remote-ref fallback (`refs/heads/` retry, testenv.go:915) is silently absent from the new copy, which is the standard drift you get from a fourth hand-rolled resolver.
+
+**5. `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/agent/codex/transcript.go:417` — `sanitizeRestoredTranscript` is now the third name for one transform**
+`SanitizePortableTranscript` (:388) is the implementation; the new `(*CodexAgent).SanitizeTranscriptForStorage` (:413) is required by the interface and can't go away; `sanitizeRestoredTranscript` (:417) is a bare pass-through with exactly one caller, `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/agent/codex/codex.go:178`. Delete it and call `SanitizePortableTranscript` directly there; retarget `transcript_test.go:329` and `:343` at `SanitizePortableTranscript`. Cost: low, and pre-existing — but the new method turns a two-name situation into a three-name one, and a reader deciding "which sanitizer do I call from a new path?" now has three identical candidates with no distinguishing behavior.
+
+**6. `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/strategy/manual_commit_hooks.go:2850` — finalize hand-rolls the pipeline this PR just centralized**
+`prepareTranscriptForStorage` (`/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/strategy/manual_commit_condensation.go:192`) exists precisely to make sanitize→externalize atomic and self-documenting, and `CondenseSession` uses it. Finalize instead calls `agent.SanitizeTranscriptForStorage` at :2850 and then re-derives the externalize step inline at :2877-2889. The blocker is real — finalize needs the `externalizationRan` bool that `externalizeSessionImages` (`manual_commit_condensation.go:159`) swallows — so the fix is to surface that flag from `externalizeSessionImages`/`prepareTranscriptForStorage` and call the helper. Cost: the load-bearing ordering invariant that the PR documents in four places (CLAUDE.md, the arch doc table, the helper's doc comment, `CondenseResult.TranscriptSizeBaseline`) is enforced by the helper in one path and by comment-and-convention in the other, so the two can drift with no compile or test signal.
+
+## Checked and clean — not findings
+
+- **`mockSanitizingAgent` (`agent/transcript_sanitizer_test.go:11`)** already embeds `mockBaseAgent` from `capabilities_test.go:14`, which is the right reuse. `mockFullAgent` (`capabilities_test.go:50`) is not a substitute: it implements `CapabilityDeclarer`, which would put a `DeclaredCaps` gate into a test whose subject is explicitly the ungated path, and the new mock needs `calls`/`returnNil` knobs. No new base type was invented.
+- **`agent.SanitizeTranscriptForStorage(ag, data)` (`capabilities.go:111`)** follows the existing package-level convenience-wrapper pattern of `agent.ExtractSkillEvents` (`/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/agent/skill_events_extract.go:12`) — nil/empty guard, `As*` resolve, fail-soft. Consistent, not duplicated.
+- **`checkpoint.sanitizeForAgentType` (`checkpoint/persistent.go:1035`)** is a net de-duplication: it replaces two previously-inline `if agent == AgentTypeCodex { codex.SanitizePortableTranscript(...) }` blocks (the old `writeTranscript` and `replaceTranscript` bodies). Nothing else in the `checkpoint` package covers it; the only other agent-type dispatch there is `compactAgentName` (`persistent.go:1155`), which resolves a display slug via `agent.GetByAgentType` with a graceful fallback — a different job, and the doc comment correctly explains why that registry route is not used here.
+
+Minor, your call: the new file adds `codexRolloutWithEncryptedReasoning` (:25) but then hand-builds another rollout literal inline at ~:288, and `codex_image_externalize_test.go:45-52` has a third. There is no shared Codex rollout builder to reuse — `TranscriptBuilder` (`integration_test/transcript.go:15`) is Claude-format only — so this isn't re-implementation of an existing helper, but a `codexRollout(...)` builder in `transcript.go` alongside `TranscriptBuilder` would retire all three.</result>
+<usage><subagent_tokens>88349</subagent_tokens><tool_uses>30</tool_uses><duration_ms>201735</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a4803b1079dd5f854</task-id>
+<tool-use-id>toolu_01S5WPjiJ22tP2Xh75ZNGvAV</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/a0256d6a-35d7-442d-802d-6f4722d32b70/tasks/a4803b1079dd5f854.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Verdict up front
+
+The change is a large net win (moving sanitize ahead of redaction removes the entropy-layer scan over megabytes of base64). Everything below is about the *extra* passes it leaves on the table, not about the direction of the fix.
+
+### Pass count for one Codex transcript (size S), single Stop hook process
+
+| Where | Passes | Necessary? |
+|---|---|---|
+| `lifecycle.go:749` (Stop, reads live rollout) | 1 | yes — this is the whole point |
+| `manual_commit_hooks.go:2850` (finalize, re-reads the *same* live rollout) | 1 | no — same bytes, same process |
+| `persistent.go:2086` (`replaceTranscript`, once per checkpoint in the turn) | N | no — input already sanitized at 2850 |
+| **Stop total** | **2 + N** | **1 suffices** |
+| `manual_commit_condensation.go:198` (CondenseSession, live rollout) | 1 | yes — distinct read |
+| `persistent.go:1080` (`writeTranscript`) | 1 | no — input already sanitized at 198 |
+| **Commit total** | **2** | **1 suffices** |
+
+A "commit mid-turn, then Stop" sequence therefore runs 5 full sanitize passes (N=1) where 2 distinct reads would justify 2.
+
+Cost of one redundant pass, precisely: `splitJSONL` (`bytes.Split` over S, slice headers only) + `json.Unmarshal` of every line into `rolloutLine` **plus a full `map[string]any` deep unmarshal of every `response_item` payload** + `ReassembleJSONL`, which is `strings.Builder` writes **followed by `[]byte(result.String())` — two full-size copies**. So ~2S of transient garbage (≈50MB at S=25MB) plus a deep JSON parse of the entire conversation, per redundant pass.
+
+## Findings
+
+**1. `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/strategy/manual_commit_hooks.go:2850`** (read at `:2801`)
+Finalize re-reads and re-sanitizes the exact bytes `lifecycle.go:749` already read and sanitized moments earlier in the same process. Verified single call chain: `handleLifecycleTurnEnd` (writes sanitized `full.jsonl` at :751) → `SaveStep` → `transitionSessionTurnEnd` (:912 or :991) → `HandleTurnEnd` → `finalizeAllTurnCheckpoints`. Cost: one extra full-file `os.ReadFile` of S plus one extra O(S) parse+reassemble per Stop that had mid-turn commits. Cheaper: thread the already-sanitized `storedTranscript` (or just the `.entire/metadata/&lt;session&gt;/full.jsonl` path, which is sanitized-but-not-redacted — exactly what finalize wants as input) through `HandleTurnEnd` and drop the `SanitizeTranscriptForStorage` call. Note `ExtractSkillEvents` at :2849 deliberately wants pre-sanitization bytes, so it would need the raw read kept only if skill events actually depend on stripped items — they don't (reasoning/compaction payloads carry no skill events), so the raw read looks droppable too.
+
+**2. `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/checkpoint/persistent.go:2086`**
+`replaceTranscript` sanitizes inside the per-checkpoint loop. Its only production caller is `finalizeAllTurnCheckpoints` (`manual_commit_hooks.go:2958` → `Write` → `backfillTranscript` → `:401`), which sanitized at :2850. So this is N redundant O(S) passes per Stop for N turn checkpoints. The line itself predates the diff (it was the inline `if agentType == codex` block), but the diff is what makes it provably redundant. Note the contrast: `PrecomputedTranscriptBlobs` exists precisely to hoist per-turn chunk/zlib work out of this loop — sanitize is the one remaining O(S) op still inside it. Cheapest fix: delete it (input is guaranteed sanitized); second-cheapest: hoist into `PrecomputeTranscriptBlobs` so it runs once per turn.
+
+**3. `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/checkpoint/persistent.go:1080`**
+`writeTranscript` sanitizes `opts.Transcript.Bytes()`, which on the condensation path is already sanitized (`manual_commit_condensation.go:198`) *and* externalized *and* redacted. One redundant O(S) pass per session per commit. The only input that can reach here unsanitized is the `TranscriptPath` disk-fallback branch at :1068-1072 — so move `sanitizeForAgentType` inside that `if len(transcriptBytes) == 0 &amp;&amp; opts.TranscriptPath != ""` block. That keeps the stated safety property with zero cost on the hot path.
+
+**4. `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/agent/codex/transcript.go:388`**
+`SanitizePortableTranscript` has no "nothing to do" fast path, which is what makes the diff's "idempotent, so call it everywhere" architecture expensive rather than free. An already-sanitized transcript still costs the full deep parse plus 2×S of copying. Two cheap alternatives, both preserving the belt-and-braces argument in the `sanitizeForAgentType` doc comment: (a) pre-scan guard — `bytes.Contains` for the four markers the transform actually acts on (`encrypted_content`, `"compaction"`, `"compaction_summary"`, `"compacted"`) and return `data` unchanged if none present; that is one SIMD-accelerated scan over S (single-digit ms at 25MB) instead of a deep parse; (b) track a `changed bool` across the line loop and `return data` when no line was dropped or re-marshalled, which alone eliminates the 2×S copy. Also independently: `agent.ReassembleJSONL` (`/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/agent/chunking.go:109`) copies twice via `[]byte(result.String())`; `bytes.Join(chunks, []byte("\n"))` halves that for every caller, including the non-redundant first pass.
+
+**5. `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/strategy/manual_commit_condensation.go:196` and `:466`**
+Answering Q2 directly: the sanitized transcript is computed **once** and not recomputed — good. But `prepareTranscriptForStorage` returns the whole multi-MB `sanitized` slice whose *only* consumer is `int64(len(sanitizedTranscript))` at :466. When `externalize_images` is on, `externalized` is a distinct buffer, so the pre-externalization buffer stays reachable from `sanitizedTranscript` across redaction, chunking, zlib, and the git blob writes (lines 345-466) purely to read its length. Cheaper: have `prepareTranscriptForStorage` return `sanitizedSize int64` instead of `sanitized []byte`. When externalization is off the two slices alias, so there is no waste in the default configuration — this is a peak-RSS finding only for the externalization-enabled path.
+
+## Areas that are already efficient (no finding)
+
+- **`lifecycle.go:749` double retention.** `transcriptData` and `storedTranscript` are both live, but the raw is genuinely still needed afterwards (`CalculateTokenUsage` at :949, `ExtractAllModifiedFiles` at :815), and for a non-sanitizer agent `storedTranscript` aliases `transcriptData` with zero copy. Justified. The added `slog.Int` len fields are free.
+- **`manual_commit_hooks.go:2850` reassignment.** `fullTranscript = Sanitize(...)` drops the raw reference immediately, so finalize does not hold raw+sanitized simultaneously. Correct choice.
+- **`replaceTranscript` ordering.** The sanitize sits *after* the content-hash short-circuit (`persistent.go:2016-2026`), so an unchanged transcript costs nothing. Good.
+- **`codexHooker` (`/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/integration_test/codex_shadow_sanitize_test.go:409`).** The closure captures only `*testing.T`, three strings, and a 2-field `CodexHookRunner`. `NewCodexHookRunner` is a struct literal, and the test binary path comes from `getTestBinary()` per call. No large retention — nothing to flag.
+- **Startup / capability resolution.** `AsTranscriptSanitizer` (`/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/agent/capabilities.go:61`) is a bare type assertion with no `DeclaredCaps` negotiation and no registry lookup; `sanitizeForAgentType` is a compile-time dispatch. No `init()` work, no goroutines, no I/O added. The only blocking work added to a hot path is the sanitize itself at `lifecycle.go:749`, which is the point of the change and pays for itself many times over against the redaction it avoids.</result>
+<usage><subagent_tokens>97265</subagent_tokens><tool_uses>34</tool_uses><duration_ms>309709</duration_ms></usage>
+</task-notification>
+
+---
+
+squash where it belongs please
+
+---
+
+can you explain me: CheckpointTranscriptStart line-offset drift — counted on the raw transcript, applied to the sanitized stored one. Pre-existing; needs a migration story for in-flight sessions.
+
+---
+
+taking a step back: why are the compaction lines dropped?
+
+---
+
+how long is this line numbering broken then, can you give me the PR for the "fixing codex resume"
+
+---
+
+during sanitization, do we now how many lines we drop, could we not just update offset?
+
+---
+
+2 would apply to all agents?
+
+---
+
+ok, let's try option 1 by running a codex e2e resume test
+
+---
+
+I think this could also be just a distinct PR doesn't it? based of main
+
+---
+
+ok, so maybe just fold it into one PR then?

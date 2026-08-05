@@ -1,0 +1,323 @@
+one more on this: we have these e2e tests for months, I have run them multiple times and never saw a seg fault.. so why now, any ideas?
+
+---
+
+I did run test:ci quite often and never saw it, yesterday in this session we saw it twice... with a 1/3 chance this is still somehow not making sense to me
+
+---
+
+ok, can you summarize me again what we think the issue is to pass on to golang?
+
+---
+
+can you create me a secret gist out of the report
+
+---
+
+can you run this against a subagent running fable and double check again? my gut feeling is still that we might miss something here, maybe ask the subagent to come up with challenging theories and then we analyze them
+
+---
+
+<task-notification>
+<task-id>a73b62d356ed2d227</task-id>
+<tool-use-id>toolu_01QGuYmjfZphvjZapLAo3j33</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/540681cb-37a8-48d9-b289-533d545fbe66/tasks/a73b62d356ed2d227.output</output-file>
+<status>completed</status>
+<summary>Agent "Adversarially review segfault diagnosis" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Both draft files are identical, both carry the wrong version-range claim. The repo is back on `soph/no-race-integration-darwin`, clean. Investigation complete — here is the full adversarial report.
+
+---
+
+# Verdict up front
+
+**Your diagnosis is correct — and it is a duplicate.** The mechanism you identified was reported upstream as [golang/go#79804](https://github.com/golang/go/issues/79804) ("runtime: SIGSEGV on child side of fork pre-exec with -race on darwin/arm64", filed 2026-06-03, closed), fixed on tip in `0607ffa8e9bd` ([CL 786620](https://go-review.googlesource.com/c/go/+/786620), PR #79805), backported via [#79806](https://github.com/golang/go/issues/79806), and **shipped in go1.26.5 on July 1, 2026**. The fix commit message is your diagnosis verbatim: *"On darwin, rawSyscall, rawSyscall6, and rawSyscall9 are Go functions (not assembly as on Linux) that get race-detector instrumentation. When forkAndExecInChild calls rawSyscall in the forked child process, the TSan ThreadState pointer is invalid, causing SIGSEGV in TraceSwitchPartImpl."* It also fixes the stale "assembly functions" comment in `exec_libc2.go` — your entire "Suggested fix" section shipped a month ago.
+
+The brutal part: **the fix has been sitting on your own disk since Aug 4, 11:16** — nine hours *before* your first crash. `diff ~/.local/share/mise/installs/go/1.26.{4,5}/src/syscall/syscall_darwin.go` shows 1.26.5 adding `//go:norace` to `rawSyscall`/`rawSyscall6`/`rawSyscall9` *and* `errno`/`errnoX`/`errnoPtr`, with the Linux rationale ported word-for-word. Your draft's "Present in go1.26.0 through go1.26.5" is flat wrong; go.mod/mise pin you to 1.26.4, which is why you kept crashing.
+
+**Do not file `golang-issue.md`. Instead: bump `go = '1.26.4'` → `1.26.5` in `/Users/soph/Work/entire/devenv/cli/mise.toml` and go.mod — which also makes the `soph/no-race-integration-darwin` workaround branch unnecessary** (it permanently sacrifices race coverage that the toolchain bump restores).
+
+# 1. The symbolization attack — your reasoning was unsound, your conclusion survives anyway
+
+You asked whether "the chain reads coherently, so the mapping must be right" is sound. **It is not, and I can show it producing garbage**: I rebuilt `cli.test` at `e158ad9ce` (text size 0x3c28000 — exact match to the crashed cli.test image) and symbolized the fourth crash report you never mentioned (`cli.test-2026-08-04-215910.ips`). The std frames resolve perfectly; the repo-code frames resolve to *visible nonsense* — `runMCPServer` attributed to `fmt/errors.go`, `cleanPromptForCommit` "calling itself" from a different file, `execLogout` inside `logout_test.go`. Near-miss builds produce chains that are right-neighborhood but wrong-function. Coherence alone proves nothing.
+
+What rescues your mapping is a property you asserted but never established, which I have now proven:
+
+- **Builds are bit-reproducible.** Two consecutive builds at `e2f10cb17` → identical LC_UUID (`75C0BA2C…`). My in-place rebuild at `e158ad9ce` reproduced your `keep.test` UUID **exactly** (`4AD6D5D9…`) — so keep.test was built from `e158ad9ce`, and the pipeline is deterministic end to end. (No VCS stamping in test binaries — `go version -m` shows none — so UUID deltas are pure source deltas.)
+- **Std-lib layout is invariant to repo-code changes.** Across five binaries (rebuilds of `e2f10cb17`, `cbcee407d`, `e158ad9ce`, your keep.test — including two different text sizes 0x2624000/0x262c000): `syscall.rawSyscall` at `0x1000f7f90`, `forkAndExecInChild` at `0x1000ede00`, `Cmd.Start` at `0x100240100`, `TraceSwitchPartImpl` at `0x100018e04` — identical everywhere. The crash reports themselves prove the same: three different slice_uuids, identical std-frame offsets. The unknown WIP deltas mathematically could not have moved the frames your diagnosis rests on.
+- **Instruction-level proof.** The 20:42 frame `0xf7fb4` is the return address of `CALL runtime.racefuncenter` inside `rawSyscall`. Frames `0xee13c`/`0xee37c` sit immediately after `CALL syscall.rawSyscall` at the child's **chdir** (`exec_libc2.go:184`) and **dup2** (`:247`) call sites. Crash PC = `TraceSwitchPartImpl+0x178`, a null-`ThreadState`-field deref at 0x8. The "missing rawSyscall frame" in two reports is just the FP-less race-call assembly thunks swallowing a frame.
+
+**Where your account was wrong:** the reports have *three different* slice_uuids, not one; exact-UUID reconstruction of all three crashed binaries **failed** (every crash-time tree contained uncommitted WIP — even 20:42, which you believed was the clean tree); and there was a fourth report from a different package binary you didn't inventory. None of this changes the conclusion; all of it should have been checked before writing "the mapping must be right."
+
+Mechanism, verified in your binary: `go tool objdump` on keep.test shows 1.26.4's `rawSyscall` contains `racefuncenter` + **four `racewrite` calls** (it builds a `[]uintptr` for the variadic `rawsyscalln`) + `racefuncexit`. It's real instrumented memory traffic, not just enter/exit — worth knowing, since 1.26.5 also had to norace the `errno` helpers.
+
+# 2. Refuted evidence
+
+- **Evidence 5 ("silent crash") is dead as stated.** The 21:50:19 report's child `procLaunch` is 21:50:18.4; `pr2ci.log`'s last write was 21:33. That run had printed its final package results and exited 17 minutes before the crash. The report belongs to some unlogged terminal run (or a leaked process). Silent crashes remain *possible in principle* (a caller that ignores the exec error), but you have zero demonstrated instances. Cut it.
+- **Evidence 4's rates are statistically meaningless.** 0/8 vs 1/4 (Fisher p≈0.33), and the "concurrent binaries" framing is a guess — `./...` also simply executes far more forks. Also: the Aug 5 `all3` crash produced **no** .ips at all (ReportCrash throttling), so .ips counting undercounts.
+- **The macOS 26.6 coincidence is resolved**: #79804 was filed June 3, 2026, on a macOS that predates 26.6. The OS update is a red herring; your ~4-day .ips retention plus an unusually fork-race-heavy day explains "noticed now."
+
+# 3. Alternative theories, ranked — all falsified
+
+1. **pthread_atfork / framework handler** — falsified: crash PC at the toolchain-invariant TSan offset (`0x18f7c` in all four reports, two different binaries), reached from `rawSyscall` call sites. (Test would have been: otool -L + PC outside main image.)
+2. **Runtime child-side work (`AfterForkInChild`, sigaction)** — falsified by return addresses at chdir/dup2 rawSyscall sites, not runtime code.
+3. **nosplit stack overflow from added instrumentation** — falsified: the linker statically rejects nosplit overflows at build time; fault at exactly 0x8 is a null-field deref, not a guard page; and racefuncenter runs on a TSan call path that switches stacks.
+4. **Resource exhaustion (TSan shadow VA, fds, proc limits)** — wrong signature: shadow-map failure aborts at process start with a TSan message; fd/proc exhaustion yields EMFILE/EAGAIN from fork, not child SIGSEGV mid-`TraceSwitchPartImpl`.
+5. **`execx.NonInteractive`/Setsid specifics** — falsified: crashes hit plain `testutil` `git commit` spawns (all3.log) and stop-hook `entire` spawns (ci2.log) alike, at generic chdir/dup2 sites.
+6. **Stray go1.26.5 involvement** — inverted: 1.26.5 *contains the fix*; and the crashed binaries' std offsets exactly match 1.26.4-built binaries, fingerprinting the toolchain.
+7. **TSan fork-unsafety independent of instrumentation (would implicate 1.25.x too)** — impossible on 1.25.6: `rawSyscall` had no Go body, so no TSan entry exists between fork and exec; the return addresses prove entry came from `rawSyscall`'s instrumentation.
+
+# 4. What you should have checked and didn't
+
+1. **The 1.26.5 diff on your own machine** — one `diff` command; it falsifies your version-range claim and hands you the upstream fix.
+2. **The upstream tracker for the asi string** — #79804's title is nearly your `.ips` annotation. One search.
+3. **`go tool objdump` of `rawSyscall` in your own binary** — direct mechanical proof (and reveals the racewrites).
+4. **`procLaunch`/`captureTime` in the .ips** before pairing reports to runs.
+5. **All the .ips files** — the cli.test report was sitting next to the three you catalogued and strengthens your case (cross-package).
+6. **Build determinism** before arguing about UUIDs at all.
+7. **The decisive experiment: rerun under go1.26.5.** Still worth doing as final confirmation before you land anything: with the fix, crashes should drop to zero; the workaround branch becomes moot.
+
+# 5. Sentences in `golang-issue.md` that overclaim
+
+- *"Present in go1.26.0 through go1.26.5."* — **false**; fixed in 1.26.5.
+- *"It is also frequently **silent** … We have one crash report that belongs to a run which passed with no mention of a segfault anywhere in its output."* — refuted pairing (21:33 vs 21:50:18).
+- *"This likely makes the problem considerably more common than the reported-failure rate suggests."* — speculation stacked on the refuted claim.
+- The rates table caption *"(many race-instrumented package binaries concurrently)"* — implies a concurrency mechanism you never established, from n=12 runs.
+- *"Related issues: #49138, #50172, #50323"* — while omitting the one issue that actually matters, #79804.
+
+Everything else in the draft checked out under attack: the 1.25.6 bodiless declaration, 1.26.0 lacking norace, the "26 rawSyscall + 1 rawSyscall6" call counts (verified: 26 and 1), the darwin-only scope (matches upstream's fix), and the Linux-comment quote. You were right. You were also five weeks late, one `diff` short, and one wrong sentence away from filing a duplicate against a fixed release.
+
+Key artifacts: rebuilt binaries `re-*.test` and `keep.test` in the scratchpad; crash reports in `~/Library/Logs/DiagnosticReports/`; draft at `scratchpad/golang-issue.md` (and its identical twin `syscall-darwin-rawsyscall-norace-fork-child.md` — correct both). Your repo was checked out to historical commits during reconstruction and is restored to `soph/no-race-integration-darwin`, clean.
+
+Sources: [golang/go#79804](https://github.com/golang/go/issues/79804), [golang/go#79806 (1.26 backport)](https://github.com/golang/go/issues/79806), [backport commit 2055b1a15dec](https://github.com/golang/go/commits/release-branch.go1.26/src/syscall/syscall_darwin.go), [CL 786620](https://go-review.googlesource.com/c/go/+/786620)</result>
+<usage><subagent_tokens>164398</subagent_tokens><tool_uses>43</tool_uses><duration_ms>4819910</duration_ms></usage>
+</task-notification>
+
+---
+
+yes, let's do that. 1.26.5 is the latest go version?
+
+---
+
+ok, now back to the initial work here, on 1897 can you confirm again: If a remote with multiple urls gets the refs pushed and one of the url fails, we don't unqueue those refs because the push (of all urls) is handled as one push, right?
+
+---
+
+is the ordering of urls in .git/config for a remote deterministic? like first in file is first to push too? you can use ../../research/git for the git cli sources
+
+---
+
+ok, so I think the idea for refs should be: we push only to the first push url
+
+---
+
+one more question on how git works: if multiple urls are configured for a single remote and one of them fails during push, it continues with the ones coming after?
+
+---
+
+ok, so this means: 
+
+- we get push urls, take the first one
+- we try to push refs there, if it works -> don, if it does not work we surface the error
+
+And we ignore all other urls
+
+---
+
+yes, do that, I have two more additions to do after:
+
+- when running entire enable we check if there are multiple remotes and should print a warning explaining the behavior
+- when running entire doctor we show the same warning
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>a26f3dbda1c6b9fb9</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/540681cb-37a8-48d9-b289-533d545fbe66/tasks/a26f3dbda1c6b9fb9.output</output-file>
+<status>completed</status>
+<summary>Agent "Review diff for reuse" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Findings, ranked.
+
+**1. `cmd/entire/cli/remote_topology.go:152` — `redactForDisplay` is the same function as `strategy/refs_push_destination.go:103` `displayURL`, and it re-inlines `remote.IsURL`.**
+Both are "redact if URL-shaped, else pass the filesystem path through", both carry the same rationale comment about `RedactURL` turning `/path` into `:///path`. `displayURL` at least calls `remote.IsURL` (`cmd/entire/cli/checkpoint/remote/git.go:497`); `redactForDisplay` hand-rolls that predicate as `strings.Contains(u, "://") || strings.Contains(u, "@")` even though the `cli` package already imports `checkpoint/remote` (see `cmd/entire/cli/git_operations.go:26`). This makes a third copy of the same predicate — `cmd/entire/cli/repo_mirror_use.go:70` inside `redactGitArgs` is the pre-existing one, with a comment explaining the exact same hazard.
+Fix: put one `RedactURLOrPath` next to `gitremote.RedactURL` (`cmd/entire/cli/gitremote/gitremote.go:198`), forward it from `checkpoint/remote/util.go` the way `RedactURL` is already forwarded at :491, then delete both `redactForDisplay` and `displayURL` and reduce `redactGitArgs` to a map over it. Cost of not doing it: three places that must independently keep credential-redaction correct for non-URL inputs.
+
+**2. `cmd/entire/cli/integration_test/multi_pushurl.go:134` — `AddUnreachableFirstPushURL` is a verbatim copy of `AddUnreachableSecondPushURL` (:90) with the slice literal reordered.**
+The only difference in 20 lines is `[]string{missing, originalURL}` vs `[]string{originalURL, missing}`. Beyond that, all three setup helpers repeat the identical 8-line `git remote set-url --add --push` loop with identical `Fatalf` text: :63-70, :97-104, :141-148.
+Fix: one private `func (env *TestEnv) setPushURLs(remoteName string, urls ...string)` carrying the loop plus `setGitConfigBaseline()`, then `AddUnreachableFirstPushURL`/`AddUnreachableSecondPushURL` become two-line wrappers over a shared `addUnreachablePushURL(remoteName string, first bool)`, and `AddSecondPushURL` keeps only its bare-repo creation and the 2-URL assertion.
+
+**3. `cmd/entire/cli/remote_topology.go:76-84` + `:106-119` — the "first push URL wins for refs" rule is now implemented twice, once to do it and once to describe it.**
+`strategy/refs_push_destination.go:88-96` decides `len(urls) &gt;= 2 → urls[0]`; `remote_topology.go` makes its own `gitremote.GetPushURLs` call, re-applies the `&gt;= 2` test, and re-renders the same conclusion (`→` marker on index 0 when `PrimaryIsRefs`, "Checkpoints go to the first URL only") — a near-duplicate of `warnIgnoredPushURLs` (`refs_push_destination.go:113-119`). The "set `checkpoint_remote`" advice is likewise written twice in two different phrasings (`remote_topology.go:130` vs `refs_push_destination.go:119`).
+The `cli` package already imports `strategy`, so the seam is cheap: export one `strategy.RefsPushDestinationForRemote(ctx, remoteName) (target string, ignored int)` and have `inspectRemoteTopology` ask instead of re-deriving. Cost of not doing it: the doctor/enable advice is a second, independently-maintained model of push behavior and can silently start lying if the selection rule ever changes.
+
+**4. Low — `strategy/refs_push_destination.go:75, 86, 89` — `display` is set to `displayPushTarget(target)` in two branches and to the hand-inlined equivalent (`display: target`) in the other two.**
+`displayPushTarget` (`strategy/push_common.go:142`) returns `target` unchanged for non-URL targets, and both `display: target` branches are already past the `remote.IsURL` check, so they are the same value written two ways. The field itself is justified (the multi-URL string can't come from `displayPushTarget`), but it should either call `displayPushTarget` uniformly or become a method deriving display from `target` + `ignoredPushURLs` rather than a stored copy.
+
+**5. Not reuse, but it came in with this diff — `cmd/entire/cli/doctor.go:452`.**
+`checkCheckpointDestination`'s doc comment was appended to the end of `checkCodexHookTrust`'s comment block, so the new function's doc is preceded by three lines of unrelated Codex prose ("Both checks are structural…") and `checkCodexHookTrust` (:485) is now undocumented. Move the Codex block back down.
+
+Verified and **not** duplication, so don't chase these:
+- `gitremote.GetPushURLs` is genuinely new. `GetRemoteURL`/`GetRemoteURLInDir` read the *fetch* URL; nothing in `checkpoint/remote/util.go` or `repo_mirror_use.go` ran `get-url --push --all`. The only other copy is the test helper `env.PushURLs` (`multi_pushurl.go:170`), which should stay independent.
+- The `checkpoint/remote.GetPushURLs` forwarder is not a needless layer: that file is a deliberate facade (`GetRemoteURL` :284, `GetRemoteURLInDir` :304, `RedactURL` :491 are all forwarders) and `strategy` never imports `gitremote` directly.
+- `remote_topology.go` correctly reuses `listGitRemotes` (`repo_mirror_use.go:92`), `settings.Load`, `settings.LoadCheckpointsConfig`, and `checkpoint.PrimaryIsRefs` — no re-derivation of those.
+- `dest.checkpointRemote` gating `printCheckpointRemoteHint` is not redundant with that function's internal `remote.IsURL` guard: the new first-push-URL target *is* URL-shaped but isn't a checkpoint remote, so the field is load-bearing.</result>
+<usage><subagent_tokens>116778</subagent_tokens><tool_uses>34</tool_uses><duration_ms>235744</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aecf7395a8257b69f</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/540681cb-37a8-48d9-b289-533d545fbe66/tasks/aecf7395a8257b69f.output</output-file>
+<status>completed</status>
+<summary>Agent "Review diff for simplification" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Ranked by value.
+
+**1. `cmd/entire/cli/doctor.go:438-465` — the new function was inserted *inside* `checkCodexHookTrust`'s doc comment, orphaning it.** Lines 438-451 ("checkCodexHookTrust warns about two kinds of drift…") now read as the first half of `checkCheckpointDestination`'s doc, and `checkCodexHookTrust` (line 485) has no comment at all. Move `checkCheckpointDestination` below `checkCodexHookTrust` (or at least below line 451's comment block).
+
+**2. `doctor.go:456-465` + `remote_topology.go:139-147` — two functions with the identical 4-step body; collapse to one.** Both do inspect → `hasAmbiguousDestination` guard → header line → `describeCheckpointDestination(w, "  ")`; only the header text and blank-line placement differ. Simpler form: `printCheckpointDestinationNote(ctx, w, header string)`, and delete `checkCheckpointDestination` — doctor calls `printCheckpointDestinationNote(cmd.Context(), cmd.OutOrStdout(), "Checkpoint destination: REVIEW")`. That also removes the third, redundant `hasAmbiguousDestination()` check at `remote_topology.go:101` (both callers already gate). Cost: doctor gains a leading blank line and loses its trailing one — cosmetic, and doctor's neighbouring checks (`checkClaudeCodeHookDrift`) print no trailing blank anyway.
+
+**3. `remote_topology.go:100` — `indent string` is called with `"  "` at both call sites, nowhere else.** Speculative generality that costs 12 `%s`/`indent` format-arg pairs. Drop the param and inline the two spaces into the format strings.
+
+**4. `strategy/refs_push_destination.go:19` + `:64-96` — `display` should be a method, and then 5 returns collapse to 3.** `display` is a pure function of the other two fields: for the first four branches it is exactly `displayPushTarget(target)` (in branches 3/4 `target` is a remote name, so `displayPushTarget(target) == target` — verified at `push_common.go:142`), and in the multi-URL branch it is derivable from `target` + `ignoredPushURLs+1`. Concretely:
+
+```go
+func (d refsPushDestination) display() string {
+	if d.ignoredPushURLs &gt; 0 {
+		return fmt.Sprintf("%s (first of %d push URLs)", displayURL(d.target), d.ignoredPushURLs+1)
+	}
+	return displayPushTarget(d.target)
+}
+```
+
+Then the resolver's branches 1+2 merge (they differ only in `checkpointRemote`), and branches 3+4 return the *identical* struct, so the error branch keeps only its `logging.Debug`:
+
+```go
+if ps.hasCheckpointURL() || remote.IsURL(target) {
+	return refsPushDestination{target: target, checkpointRemote: ps.hasCheckpointURL()}
+}
+urls, err := remote.GetPushURLs(ctx, target)
+if err != nil {
+	logging.Debug(ctx, …) // keep the existing comment
+}
+if len(urls) &lt; 2 {
+	return refsPushDestination{target: target}
+}
+return refsPushDestination{target: urls[0], ignoredPushURLs: len(urls) - 1}
+```
+
+Note on your hypotheses: `ignoredPushURLs` does earn being a count — it's printed twice (`"%d other push URL(s)"` at :117, and `len(urls)` in the display string). A bool would lose both. `checkpointRemote` is a duplicate of `ps.hasCheckpointURL()`, but it's load-bearing (it suppresses a now-false-positive `printCheckpointRemoteHint` for a self-picked URL); leave it.
+
+**5. `integration_test/multi_pushurl.go:134-153` — `AddUnreachableFirstPushURL` is a verbatim copy of `AddUnreachableSecondPushURL` (:90-109) with the slice literal order swapped.** Extract the loop (which `AddSecondPushURL:63-70` also duplicates) into `func (env *TestEnv) addPushURLs(remoteName string, urls ...string)` that runs `git remote set-url --add --push` per URL and calls `setGitConfigBaseline()`. Each public helper then becomes 4 lines and keeps its own doc comment.
+
+**6. `remote_topology.go:36-39` — `CheckpointRemote string` is a bool in string clothing.** Its only read is `!= ""` at :91; the repo name is never printed. Make it `checkpointRemotePinned bool`.
+
+**7. `remote_topology.go:152-157` vs `refs_push_destination.go:103-107` — `redactForDisplay` and `displayURL` are the same function, duplicated across packages.** The cli copy even inlines `remote.IsURL`'s exact expression (`strings.Contains(u,"://") || strings.Contains(u,"@")`, cf. `checkpoint/remote/git.go:497`), and the cli package already imports `checkpoint/remote` (`git_operations.go:14`). One helper — `gitremote.RedactURLForDisplay` — with the "RedactURL renders a plain path as `:///path`" rationale moved onto it. Stronger option: make `gitremote.RedactURL` (`gitremote.go:198`) return `rawURL` unchanged when the parse yields an empty scheme, and delete both wrappers — but that changes output for existing callers, so check them first.
+
+**8. `multi_pushurl_test.go:377-427` — the three doctor subtests are one table.** Each is: build env, `StoreGitRefs`, `SetupBareRemote`, optional extra setup, `RunCLI("doctor")`, substring assertions. Table of `{name string; setup func(*TestEnv); want, absent []string}` cuts ~48 lines to ~25. (Do **not** table-drive the three `_Refs_*` tests above — their per-test rationale comments are the point.)
+
+**9. `strategy/manual_commit_push.go:281-282` and `:312-313` — the two-line `resolve` + `warnIgnoredPushURLs` pair is duplicated at both call sites.** `flushCheckpointRefsQueue` already writes to `os.Stderr` (:363), so move the warn to the top of `flush`; both call sites become `flushCheckpointRefsQueue(ctx, repo, resolveRefsPushDestination(ctx, ps))`. Putting it before the queue drain preserves current behavior exactly. (Putting it *after* the `len(existing) == 0` early return would additionally stop the warning firing on every push with an empty queue — better UX, but that's a behavior change, so your call.)
+
+**10. `manual_commit_push.go:332` — `pushTarget := dest.target` doesn't earn its keep.** Three uses (:368, :386, :404), and it reads inconsistently next to `dest.display` on :363. Drop the alias; use `dest.target`.
+
+**11. `refs_push_destination.go:113` — `errOut io.Writer` is always `os.Stderr` and no test injects it.** Same speculative generality as `indent`, but lower stakes and mildly defensible; take it or leave it.
+
+**12. Stale rationale the diff invalidated but didn't touch: `multi_pushurl_test.go:25-28` and `multi_pushurl.go:16-24`.** Both still state "the CLI has no per-URL control at all: it can only decide whether to push checkpoints… not where they land" and "hands `git push &lt;name&gt;` the remote name, letting git fan out again". After this change that's true only for the git-branch backend. Add the git-refs carve-out; a wrong comment is worse than none.
+
+**13. Nits.** `remoteTopology` uses exported field names on an unexported, never-serialized struct (`refsPushDestination` next door is lowercase). `remote_topology.go:59-62` is `t.Remotes = slices.Sorted(maps.Keys(remotes))` in one line (no other repo site uses that idiom, so optional). `hasAmbiguousDestination` is one expression: `return t.CheckpointRemote == "" &amp;&amp; (len(t.Remotes) &gt; 1 || t.MultiURLRemote != "")`.
+
+Already fine, no change needed: `checkpoint/remote.GetPushURLs` (`util.go:291`) is a pass-through wrapper, but it matches the existing `GetRemoteURL`/`GetRemoteURLInDir` facade and `strategy` doesn't import `gitremote` directly. `MultiURLRemote`+`PushURLs` are technically redundant (`MultiURLRemote != ""` iff `len(PushURLs) &gt; 1`) but both values are printed.
+
+One thing that makes all of the above cheap: there is no unit test anywhere for `resolveRefsPushDestination`, `warnIgnoredPushURLs`, `remoteTopology`, or `gitremote.GetPushURLs` — the only coverage is the integration tests asserting on `doctor` output substrings, so no test pins the struct shapes.</result>
+<usage><subagent_tokens>125682</subagent_tokens><tool_uses>21</tool_uses><duration_ms>284003</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a466f2ac5866f0755</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/540681cb-37a8-48d9-b289-533d545fbe66/tasks/a466f2ac5866f0755.output</output-file>
+<status>completed</status>
+<summary>Agent "Review diff for altitude" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Altitude review
+
+**1. `cmd/entire/cli/strategy/refs_push_destination.go:15` — `refsPushDestination` is the right type built one level too high; it belongs on `pushSettings`.**
+`pushSettings` already knows the destination's *provenance* (`hasCheckpointURL`) but exposes only a bare string via `pushTarget()`. So every downstream consumer re-derives provenance from string shape: `displayPushTarget` (`push_common.go:142`) maps *any* URL to the literal words "checkpoint remote", and `printCheckpointRemoteHint` (`push_common.go:248`) prints "a checkpoint remote is configured" for *any* URL. That heuristic was only ever true because a URL target implied checkpoint_remote. This change is the first case where it isn't — and it responds by building a parallel struct that carries the truth for one backend only.
+
+The tell is inside the new file: at `:75` the bare-URL case sets `display: displayPushTarget(target)` → "checkpoint remote" while `checkpointRemote: false`. The same struct simultaneously says "this is not a checkpoint remote" and prints "checkpoint remote". That inconsistency is inherited from `displayPushTarget`, and the git-branch path still has it live: push straight to a URL (`git push https://… HEAD`) with no checkpoint_remote configured and `doPushRef` prints "Pushing … to checkpoint remote".
+
+Deeper place: make `pushSettings.pushTarget()` return a destination value (`target` + a `kind`: remote name / checkpoint-remote URL / resolved push URL / bare URL), and have `displayPushTarget`, `printCheckpointRemoteHint`, and `printProtectedRefBlock` take that value instead of a string. Both backends then resolve destinations through one mechanism, single-vs-fan-out becomes a field, and the branch path's existing mislabel is fixed rather than routed around.
+
+**2. `cmd/entire/cli/remote_topology.go:46` — `inspectRemoteTopology` re-derives destination facts, and its rules already disagree with `resolvePushSettings`.** Two concrete divergences, at birth:
+- It reports the first *sorted* remote that fans out (`:74-85`). The push path resolves whichever remote git handed the hook. A repo with a fanning-out `backup` remote that pushes to `origin` gets warned about a destination rule that never applies to it.
+- It goes silent whenever `settings` contains a `checkpoint_remote` (`:90-95`). But `resolvePushSettings` only *honors* checkpoint_remote when `remote.PushURL` returns `enabled` — owner/fork mismatch, unparseable push URL, and un-derivable protocol all fall back (`checkpoint_remote.go:70-81`, `remote/util.go:230-236`). In those cases doctor says nothing while pushes really do go first-URL-only. This is the exact class of bug the CLAUDE.md "ask the client, don't re-resolve" rule for `CoreOrigin()` exists to prevent.
+
+Related, same root: writes now go to the push remote's *first push URL* while reads (`remote.FetchCheckpointRef` → `fetchURLAuthoritative`) go to **origin's fetch URL** — which per the new `GetPushURLs` doc comment "can name a different repository entirely." Nothing checks those two agree because they're resolved in two packages.
+
+Deeper place: one exported resolver next to `PushURL`/`FetchURL` in `cmd/entire/cli/checkpoint/remote/util.go` — e.g. `ResolveCheckpointDestination(ctx, pushRemote) (target, kind, ignoredURLs)` — consumed by `strategy` for the push and by doctor/enable for the description. Doctor and enable then *report* the resolution instead of guessing at it. `entire status` reports nothing about remotes today, so no divergence there yet, but it's the third consumer waiting.
+
+**3. `cmd/entire/cli/strategy/refs_push_destination.go:23` + `manual_commit_push.go:385` — `checkpointRemote bool` threaded through a struct to gate a hint is a patch, not a fix.** Answering your question directly: yes, `printCheckpointRemoteHint` should decide — but it *can't* today, because all it gets is a string whose shape used to imply provenance and no longer does. Give it the destination value from finding 1 and the `if dest.checkpointRemote` at the call site disappears, and the three existing call sites in `push_common.go:187,207,222` get the same correctness for free.
+
+**4. `cmd/entire/cli/remote_topology.go:100` — the third copy of the explanation also re-implements the rule, and it's already wrong.** `describeCheckpointDestination` branches on `t.PrimaryIsRefs` (`:114-121`) to describe behavior owned by `strategy`. The branch-path text — "checkpoint sync reports a warning and retries on the next push" — describes the *refs* behavior; the branch path drops the failure (which is precisely what the test comment you deleted at `multi_pushurl_test.go:249-250` said). It has drifted before the PR even lands. Plus "set checkpoint_remote in .entire/settings.json" now exists at four sites (`remote_topology.go:130`, `refs_push_destination.go:119`, `push_common.go:288`, `push_common.go:450`) in three wordings. Deeper place: the resolver from finding 2 owns the rule *and* renders the explanation; pre-push, enable, and doctor become three call sites of one function with an indent/prefix parameter.
+
+**5. `cmd/entire/cli/strategy/manual_commit_push.go:331` — the `display` field / new `flushCheckpointRefsQueue` signature: not too deep in principle, wrong only because of finding 1.** Push machinery already prints its own progress, so a destination knowing its own name is fine — as a method on the destination type, computed where it renders. Precomputing it in the resolver was forced by `displayPushTarget` being unable to name a resolved push URL correctly. Note the giveaway at `:332`: the function takes the struct and immediately does `pushTarget := dest.target`, using only the routing field plus one presentation field.
+
+**6. `refs_push_destination.go:103` and `remote_topology.go:152` — `displayURL` and `redactForDisplay` are the same helper written twice, both compensating for `gitremote.RedactURL` rendering a plain path as `:///path/to/repo`.** `redactForDisplay` even inlines `remote.IsURL`'s exact predicate (`gitremote.go:198`, `remote/git.go:497`). Deeper place: one display-safe redaction in `gitremote` next to `RedactURL` (or make `RedactURL` path-aware — no caller wants `:///tmp/x.git`).
+
+**7. `cmd/entire/cli/gitremote/gitremote.go:77` — `GetPushURLs` landed at only one of the two existing depths.** `GetRemoteURL` has a `GetRemoteURLInDir` sibling; `GetPushURLs` has none, so `remote_topology.go` mixes a dir-aware call (`listGitRemotes(ctx, repoRoot)`, `:54`) with a cwd-dependent one (`gitremote.GetPushURLs(ctx, name)`, `:79`) in the same function. Separately, `listGitRemotes` still lives in `repo_mirror_use.go:92` (a command file, behind the `gitRunner` test seam) and is now consumed by a second command file — "list this repo's remotes" is a `gitremote` fact.
+
+**8. `cmd/entire/cli/integration_test/multi_pushurl.go:134` — `AddUnreachableFirstPushURL` is `AddUnreachableSecondPushURL` with the slice order flipped.** Three helpers now repeat the same "`set-url --add --push` in order, then `setGitConfigBaseline()`" body; one `setPushURLs(remoteName, urls...)` primitive underneath, with position as the parameter. Likely trips `mise run dup` at threshold 50.
+
+**What's at the right altitude:** the *decision* — one deterministic destination for refs, fan-out kept for branch — is genuinely backend-shaped (the push queue records a ref with no per-destination state; the v1 branch has no queue to keep coherent), so two behaviors is correct and the file documents why. Warning the user is the right response to the trade-off, and `entire enable` + `entire doctor` in package `cli` are the right places to say it. It's the plumbing depth that's off, not the behavior: what doctor/enable *consume* should be the resolver's answer, not their own re-derivation of it.</result>
+<usage><subagent_tokens>127656</subagent_tokens><tool_uses>25</tool_uses><duration_ms>282442</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a650a158af0fd794f</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/540681cb-37a8-48d9-b289-533d545fbe66/tasks/a650a158af0fd794f.output</output-file>
+<status>completed</status>
+<summary>Agent "Review diff for efficiency" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Efficiency findings, ranked.
+
+**1. `cmd/entire/cli/strategy/manual_commit_push.go:281-284` — the new subprocess runs before we know there is anything to push.** `resolveRefsPushDestination` (→ `git remote get-url --push --all`) and `warnIgnoredPushURLs` both execute *before* `flushCheckpointRefsQueue` drains the queue and returns early on `len(queued)==0` / `len(existing)==0`. git-refs is the first-run default backend (`firstRunCheckpointBackendDefault`), so **every** `git push` by every user now pays one extra fork/exec of git — measured ~14 ms on this machine — and in the overwhelmingly common case (no checkpoints pending) it is pure waste: the resolved destination is never used, and `display` (`fmt.Sprintf` + `RedactURL`) is built eagerly for output that never prints. Worse for multi-URL users: the two-line "Checkpoints go to one repository…" stderr warning fires on every push including no-op ones.
+Fix: pass `ps` into `flushCheckpointRefsQueue` and call `resolveRefsPushDestination` + `warnIgnoredPushURLs` after the two early returns (they are only needed at the `Fprintf` on line 363 and the push itself). Same one-line change applies to `PushQueuedCheckpointRefs` (lines 312-313).
+
+**Subprocess delta per `git push`, git-refs backend:**
+| topology | before | after |
+|---|---|---|
+| single remote, single URL (default) | 0 `git remote get-url*` | **1** |
+| multi push URL remote | 0 | **1** |
+| `checkpoint_remote` set (works) | 2 (`GetRemoteURL` origin + push remote, inside `resolvePushSettings`) | 2 — early return at `hasCheckpointURL`, no duplication |
+| `checkpoint_remote` set but disabled/unresolvable | 2 | **3** (rare; the 3rd re-reads overlapping config) |
+
+So: no double-fetch of the same info in the normal paths — the cost is one *new*, unconditional spawn on the hot path, removable entirely by reordering.
+
+**2. `cmd/entire/cli/strategy/refs_push_destination.go:78` — new subprocess has no `perf` span.** It sits between the existing `resolve_push_settings` span (line 70-72 of `manual_commit_push.go`) and `push_checkpoint_refs` (line 345), so pre-push traces under-account for it. Either wrap it or — better — resolve the destination inside `resolvePushSettings`, which already holds the loaded settings and is already spanned; that also gives one obvious place to cache the result.
+
+**3. `cmd/entire/cli/remote_topology.go:54-83` — the whole inspection runs even when it is guaranteed to report nothing.** `CheckpointRemote != ""` makes `hasAmbiguousDestination()` false unconditionally, but it is read at line 64 — *after* `listGitRemotes` (line 54) and *before* the N-call push-URL loop (line 77), with no early return. Every repo with a pinned `checkpoint_remote` burns 1+N git spawns plus 5 file reads in both `entire enable` and `entire doctor` and discards all of it. Move the `settings.Load` / `CheckpointRemote` check to the top and `return t` when set. Free win.
+
+**4. `cmd/entire/cli/remote_topology.go:54 + 77` — N+1 subprocesses where 1 suffices.** `git remote` then `git remote get-url --push --all &lt;name&gt;` per remote. Verified equivalents in a single call: `git remote -v` prints one `(push)` line per pushurl and already applies git's own pushurl-replaces-url rule; `git config --get-regexp '^remote\..*\.(push)?url$'` gives the same in config order. Worth doing but low value — not a hot path, N is typically 1-3 (~15-45 ms once per command). Bonus: the single call removes an inconsistency where `listGitRemotes` runs in `repoRoot` while `gitremote.GetPushURLs` inherits process CWD.
+
+**5. `cmd/entire/cli/remote_topology.go:64,70` — `settings.Load` and `LoadCheckpointsConfig` do hit disk every call and are not cached** (`loadMergedSettings` reads settings.json + clone preferences + settings.local.json; `LoadCheckpointsConfig` reads 2 more via `rawCheckpointsBlock`) — 5 small reads + JSON decode/validate. Neither caller has them in hand: `runSessionsFix` in `doctor.go` calls no `settings.Load`, and `setup.go`'s only nearby load is line 232 in a different function. Verdict: acceptable as-is, once per user-invoked command; not worth plumbing values through. (Fixing #3 removes most of it anyway.)
+
+**6. Minor / no action:**
+- `checkpoint/remote/util.go:294` — `GetPushURLs` is a pure pass-through over `gitremote.GetPushURLs` adding only an error wrap. No runtime cost, one more indirection; consistent with the existing `GetRemoteURL` wrapper, so fine.
+- `remote_topology.go:101` — `describeCheckpointDestination` re-checks `hasAmbiguousDestination()` that both callers (`:141`, `doctor.go:458`) already checked. Field comparisons only, no IO; harmless.
+- `refs_push_destination.go:120` — `warnIgnoredPushURLs`'s `io.Writer` param is dead flexibility: both call sites hardcode `os.Stderr` while the package already has the injectable `stderrWriter` (`manual_commit_hooks.go:820`). Pass `stderrWriter` or drop the param.
+- No closure/retention problems: `refsPushDestination` is a 4-field value passed by copy, `warnIgnoredPushURLs` captures nothing, no goroutines or long-lived captures introduced.</result>
+<usage><subagent_tokens>140532</subagent_tokens><tool_uses>37</tool_uses><duration_ms>419544</duration_ms></usage>
+</task-notification>

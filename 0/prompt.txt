@@ -1,0 +1,1146 @@
+/simplify
+
+---
+
+<task-notification>
+<task-id>ab36ef3908def6fdb</task-id>
+<tool-use-id>toolu_011JdRQ8Y2fAMyisV1i1GA8X</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments-2/1402f853-f602-4928-816b-36b8a86e8d62/tasks/ab36ef3908def6fdb.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review of plugin diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Efficiency review: wasted work in the plugin system diff
+
+### 1. Duplicated network work between `planDeps` and `ExecuteDepPlan` — the one finding that matters
+
+**`cmd/entire/cli/plugin_deps.go:173,180` + `cmd/entire/cli/plugin_install_remote.go:71,99`** — dependency planning performs the exact git operations the subsequent install repeats, and throws both results away.
+
+Per dependency that produces a `DepAction`, planning does:
+- `listRemoteSemverTags` (plugin_deps.go:173) → 1 `git ls-remote --tags`
+- `fetchPluginMetadataAtTag` (plugin_deps.go:180) → 1 `git clone --depth 1 --filter=blob:none` + 1 `git show` (a separate promisor-remote blob fetch — see the comment at plugin_gitremote.go:232). On a server with `uploadpack.allowFilter` off, the filtered clone fails and a full shallow clone runs too, making it 3 git invocations.
+
+Then `ExecuteDepPlan` (plugin_deps.go:239) → `InstallPluginFromRepo` re-runs both against the same URL, seconds later, in the same process: `listRemoteSemverTags` at plugin_install_remote.go:71 and `fetchPluginMetadataAtTag` at plugin_install_remote.go:99.
+
+**Cost: 4 git network operations per dependency where 2 suffice.** For N=3 dependencies: 12 git operations, 6 avoidable. Each `ls-remote` is a TLS handshake plus ref advertisement (~300–800ms to a public forge); each clone+show is two fresh connections (~1–2s). That is roughly **1.5–3s of duplicate network time per dependency**, ~5–9s for a 3-dep install, on a command the user is watching.
+
+Root cause is a data-handoff gap: `planDeps` has the resolved `tag` (line 172) and the parsed `meta` (line 180) in hand and discards both, because `DepAction` has only `Name/RepoURL/MinVersion/Upgrade/CurrentTag` — no `Tag`, no metadata.
+
+**Cheaper alternative:** add `Tag string` and `Meta *PluginMetadata` to `DepAction`, and add a `ResolvedTag` field to `RemoteInstallOptions` that skips the `ls-remote` and the metadata clone when populated. Note `Pin` cannot be reused for this: plugin_install_remote.go:190 sets `Pinned: opts.Pin != ""`, so passing the resolved tag as `Pin` would mark every dependency pinned and make `plugin upgrade` skip it permanently.
+
+Secondary instance of the same pattern: **plugin_install_remote.go:227 vs :71** — `UpgradeInstalledPlugin` calls `listRemoteSemverTags`, and when an upgrade actually proceeds (line 243) `InstallPluginFromRepo` calls it again. Up-to-date plugins return early at line 237 and do only one, so for `upgrade --all` over M plugins with K actually upgrading: M+K `ls-remote` where M suffices, K avoidable.
+
+---
+
+### 2. A full asset download issued only to be deleted
+
+**`cmd/entire/cli/plugin_fetch.go:336-341`** — on the fallback probe path without `--allow-unverified`, the matched asset is downloaded in full via `fetchAndVerify`, then `os.Remove`d, then the function returns `errUnverifiedAsset`.
+
+**Cost:** one complete asset transfer (the file header at line 105 says real plugin binaries are tens of MB) moved across the network purely to answer the yes/no question "does this asset exist?", then discarded. If the user then re-runs with `--allow-unverified`, the same bytes transfer a second time — **~40 MB for a 20 MB release where ~20 MB plus one metadata request would do.**
+
+**Cheaper alternative:** probe with `HEAD` and only `GET` the winner. A 200 on `HEAD` proves existence for one RTT and zero body bytes; the `!allowUnverified` branch can then return `errUnverifiedAsset` without transferring anything, and the `allowUnverified` branch does the single `GET` it actually needs. Needs a `GET` fallback on 405/501 for hosts that don't implement `HEAD` on release assets.
+
+Scope is honest and narrow: this only fires for releases that publish no `checksums.txt` under any of the three candidate names (plugin_fetch.go:294-319 is tried first and normally wins), which the design already discourages. But it is exactly the path the code deliberately keeps alive (comment at lines 326-330).
+
+On the rest of the probe loop: the candidate count is 36 on darwin/arm64 (2 OS aliases × 3 arch aliases incl. `all` × 2 stem forms × 3 extensions) and 12 on linux/windows. Those are 404s on a reused keep-alive connection and the loop returns at the first hit, so **only one wasted full download occurs, not 36.** Ordering is already correct — ext-major with `darwin_arm64.tar.gz` first — so there is no win available from reordering. I would not change the candidate generation.
+
+---
+
+### 3. Redundant local I/O — real, O(n²)-shaped, and almost certainly not worth fixing for speed
+
+**`cmd/entire/cli/plugin_deps.go:289-291 vs :212`** — `RunPluginDoctor` builds `installedByName` from `ListInstalledPlugins()`, then never passes it to `dependencySatisfied`, which calls `FindInstalledPlugin` → a fresh full `ListInstalledPlugins()` (1 `ReadDir` + one `Lstat` per entry) on every requirement. For M installed plugins × R requirements each: up to M·R full directory scans. At M=10, R=2: 20 `ReadDir` + ~200 `Lstat` where the map already in scope answers every query. **Cheaper: thread the map through as a parameter.**
+
+**`plugin_deps.go:202 vs :131/:143`** — every requirement reads the dependency's `manifest.yml` twice: once inside `dependencySatisfied` (line 202), then again in `planDeps` in *both* branches (line 131 satisfied, line 143 unsatisfied). **Cheaper: have `dependencySatisfied` return the `*PluginManifest` it already loaded.**
+
+**`plugin_deps.go:324,332`** — in doctor, the unsatisfied branch calls `LoadPluginManifest(req.Name)` at line 332 for a file `dependencySatisfied` just read at line 202. Straight-line duplicate read.
+
+**Total manifest reads for one `plugin doctor`:** M from `ListPluginManifests` (line 310) + M·R from `dependencySatisfied` + up to M·R more from the line-332 re-read. At M=10, R=2 that is **30–50 reads + YAML parses where 10 suffice**, and since dependencies are themselves installed plugins the M·R term is O(M²) in a dense graph.
+
+**Honest assessment: do not fix this for performance.** These are sub-kilobyte page-cached files; 40 extra reads and parses is well under a millisecond, against a doctor run whose real cost is `checkManagedBinaryIntegrity` → `fileSHA256` hashing every managed binary in full (M × tens of MB — inherent to the check, not waste). Fix it because passing the map and the loaded manifest is simpler code, not because it is slow.
+
+**`plugin_deps.go:301,417`** — `quarantinedPath` spawns an `xattr` subprocess per installed plugin on macOS: N fork/execs at ~5–10ms each, ~50–100ms at N=10. **Cheaper: one batched `xattr -p com.apple.quarantine f1 f2 …`, or `unix.Getxattr` directly.** This is the largest avoidable cost in doctor after the SHA-256 hashing, and still imperceptible in an interactive command.
+
+**`plugin_group.go:626 vs :165`** — `plugin browse` syncs the index, then `runRemoteInstall` syncs it again for the same URL. The second is within the TTL so there is no network hop, but it re-acquires the flock, re-reads `index.json`, re-parses the JSON, and re-runs `validatePluginName`+`validatePluginRepoURL` over every entry (~400 calls for a 200-entry catalog). Sub-millisecond. **Cheaper: pass the loaded `*PluginIndex` into `runRemoteInstall`.** Mentioned for completeness, not worth a commit on its own.
+
+---
+
+### 4. Sequential fan-out
+
+**`cmd/entire/cli/plugin_group.go:479`** — `plugin upgrade --all` iterates plugins one at a time, each doing at least one `git ls-remote`. At M=10 that is 10–13 sequential network round trips, **~4–10s wall clock where a bounded `errgroup` (limit 4–8) would land near 1s.** The work is genuinely independent: distinct repos, distinct `pkg/&lt;name&gt;/` dirs, distinct `bin/` filenames placed by atomic rename. The only obstacle is that the per-plugin status lines are printed inline as the loop runs; buffering results and printing in name order preserves the current output exactly.
+
+`ExecuteDepPlan` (plugin_deps.go:238) is sequential and **that is fine** — N is small, the order was shown to the user in the confirmation prompt, and dependency installs benefit from deterministic failure attribution. The `downloadPluginAsset` probe loop must stay sequential; preference order is the whole point.
+
+---
+
+### 5. Dispatch path and startup — clean
+
+`cmd/entire/cli/plugin.go` is untouched by the diff (confirmed: the only changes outside the plugin_* files are a `darwinGOOS` const added in `explain.go:55` and a literal-to-const swap in `login.go:530`). `PrependPluginBinDirToPATH` (plugin_store.go:178) is unchanged. No `init()` was added in any of the seven new files. Every new code path — `SyncPluginIndex`, `ListPluginManifests`, dependency planning — sits inside a `plugin` subcommand's `RunE`. `entire &lt;name&gt;` dispatch remains zero-cost and no per-command startup work was added.
+
+### 6. Closures captured into long-lived values — clean, both of them
+
+**`plugin_fetch.go:94-102`** — `pluginHTTPClient.CheckRedirect` is package-level and long-lived, but captures **nothing**: it references only the `maxAssetRedirects` const and the package-level `requireSecureAssetURL` func. Zero retained scope. No change warranted.
+
+**`plugin_fetch.go:269-278`** — the `assetURL` closure captures `meta` (a small `*PluginMetadata`), plus the `name`/`tag`/`repoURL` strings. It is a local variable, invoked synchronously, and never stored in a struct field, package var, or cached object — it does not outlive `downloadPluginAsset`. It also earns its keep by not duplicating the meta-vs-convention branch four times. No finding; a struct copying only the needed fields would be strictly more code for identical behavior.
+
+One genuine (tiny) redundancy inside it: `releaseAssetBaseURL` at line 273 re-runs `url.Parse` plus string manipulation on every call, so the fallback probe loop re-derives the identical base string up to 36 times. **Cheaper: compute the base once before the loop.** This is ~20µs total, dwarfed by the 36 network round trips in the same loop — a tidiness point, not a performance one.
+
+---
+
+## Prioritized
+
+1. **Carry the resolved tag and metadata from `planDeps` into `ExecuteDepPlan`** (plugin_deps.go:173,180 → plugin_install_remote.go:71,99). Halves the git network operations for dependency installs: 4 per dep → 2, saving ~1.5–3s per dependency. The only finding with a user-visible number.
+2. **Probe with `HEAD` in `downloadPluginAsset`'s fallback** (plugin_fetch.go:336-341). Eliminates one full tens-of-MB transfer per unverified-install rejection.
+3. **Drop the duplicate `ls-remote` in `UpgradeInstalledPlugin`** (plugin_install_remote.go:227 vs :71) and **parallelize `upgrade --all`** (plugin_group.go:479). Turns a ~4–10s no-op scan into ~1s.
+4. Optional, code-clarity not speed: thread `installedByName` and the already-loaded manifest through `dependencySatisfied` (plugin_deps.go:212,202,332); batch the `xattr` probe (plugin_deps.go:301); hoist `releaseAssetBaseURL` out of the probe loop (plugin_fetch.go:273).
+
+No files were modified.</result>
+<usage><subagent_tokens>114879</subagent_tokens><tool_uses>16</tool_uses><duration_ms>573624</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a8fe440d863eeff49</task-id>
+<tool-use-id>toolu_01RguyvVFsdqUds5BoU11EYu</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments-2/1402f853-f602-4928-816b-36b8a86e8d62/tasks/a8fe440d863eeff49.output</output-file>
+<status>completed</status>
+<summary>Agent "Find existing redaction and hashing helpers" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Search complete. Here are the findings.
+
+---
+
+# Pre-existing helpers that duplicate the new plugin code
+
+## 1. URL credential/userinfo redaction — **MULTIPLE MATCHES** (strongest duplication)
+
+### 1a. `gitremote.RedactURL` — the canonical repo-wide helper
+`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/gitremote/gitremote.go:167-183`
+
+```go
+// RedactURL removes credentials and query parameters from a URL for safe logging.
+// SCP-style SSH URLs (e.g., git@github.com:org/repo.git) are returned as-is
+// since they contain no embedded credentials.
+func RedactURL(rawURL string) string {
+	// SCP-style SSH: user@host:path — no credentials to redact.
+	if strings.Contains(rawURL, ":") &amp;&amp; !strings.Contains(rawURL, "://") {
+		return rawURL
+	}
+
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "&lt;unparseable&gt;"
+	}
+	u.User = nil
+	u.RawQuery = ""
+	return u.Scheme + "://" + u.Host + u.Path
+}
+```
+
+This is already the shared chokepoint: re-exported at `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/checkpoint/remote/util.go:479-482`
+
+```go
+// RedactURL removes credentials and query parameters from a URL for safe logging.
+func RedactURL(rawURL string) string {
+	return gitremote.RedactURL(rawURL)
+}
+```
+
+and consumed by `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/repo_mirror_use.go:71,208,222,273`, `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/git_operations.go:26,523`, `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/search/github.go:30`.
+
+**Duplicated by** the new `redactURL` at `plugin_gitremote.go:68-75`. Behavioral difference worth flagging: the new one keeps `RawQuery` and returns non-URL input unchanged; `gitremote.RedactURL` also strips the query and returns `"&lt;unparseable&gt;"`. A signed-URL query param (GitHub/GitLab asset redirect URLs routinely carry `?token=`/`X-Amz-Signature=`) survives the new helper but not the pre-existing one — so the pre-existing one is *strictly safer* for the asset-download error paths.
+
+### 1b. `redactGitArgs` — argv-level redaction (already exists)
+`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/repo_mirror_use.go:59-78`
+
+```go
+// redactGitArgs returns args with anything that could carry credentials replaced
+// by its redacted form, so the argv echoed in an error message is safe to print.
+...
+// Only URL-shaped args are touched: gitremote.RedactURL would turn a bare word
+// ... into "://".
+func redactGitArgs(args []string) []string {
+	safe := make([]string, len(args))
+	for i, a := range args {
+		if strings.Contains(a, "://") || strings.Contains(a, "@") {
+			safe[i] = gitremote.RedactURL(a)
+		} else {
+			safe[i] = a
+		}
+	}
+	return safe
+}
+```
+
+### 1c. `redactURLsInText` / `redactArgsForError` / `redactURLUserinfo` — free-text scrubbing
+`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/investigate/issuelink.go:101-144`
+
+```go
+func redactArgsForError(args []string) string {
+	out := make([]string, len(args))
+	for i, a := range args {
+		out[i] = redactURLUserinfo(a)
+	}
+	return strings.Join(out, " ")
+}
+
+// redactURLUserinfo returns s with any URL userinfo elided. Returns s
+// unchanged when it does not parse as a URL or has no userinfo component.
+func redactURLUserinfo(s string) string {
+	u, err := url.Parse(s)
+	if err != nil || u.User == nil {
+		return s
+	}
+	return u.Redacted()
+}
+
+// redactURLsInText walks the whitespace-separated tokens in text, replaces
+// any token that parses as a URL with userinfo by its Redacted() form,
+// and rejoins. Used to scrub gh stderr (and any other free-form text)
+// before it lands in an error message or log. ...
+func redactURLsInText(text string) string {
+	if text == "" {
+		return text
+	}
+	const trim = `.,;:!?)]}&gt;'"`
+	fields := strings.Fields(text)
+	for i, f := range fields {
+		trail := ""
+		for len(f) &gt; 0 &amp;&amp; strings.ContainsRune(trim, rune(f[len(f)-1])) {
+			trail = string(f[len(f)-1]) + trail
+			f = f[:len(f)-1]
+		}
+		fields[i] = redactURLUserinfo(f) + trail
+	}
+	return strings.Join(fields, " ")
+}
+```
+
+`redactURLUserinfo` is byte-for-byte the same idea as the new `redactURL` (`plugin_gitremote.go:68`) except it uses `u.Redacted()` (yields `user:xxxxx@`) instead of `u.User = nil`. `redactURLsInText` is the same idea as the new `redactCredentials` (`plugin_gitremote.go:81`) but token-aware instead of regex-based.
+
+### 1d. `httpdebug.RedactURLCredentials` — exported regex scrubber, exactly the new `redactCredentials`
+`/Users/soph/Work/entire/devenv/cli_experiments_2/internal/remotehelper/httpdebug/redact.go:65-77`
+
+```go
+// urlUserinfoRedactor matches the userinfo of an http/https URL —
+// everything between `://` and the next `@` that doesn't cross a
+// path/query/fragment boundary or whitespace. Covers `user@`,
+// `user:pass@`, and `x-token:&lt;pw&gt;@` shapes ...
+var urlUserinfoRedactor = regexp.MustCompile(`(https?://)[^@/?#\s"'&lt;&gt;]+@`)
+
+// RedactURLCredentials replaces the userinfo of any http/https URL in
+// s with Placeholder. Safe to run over arbitrary text — header dumps,
+// HTML bodies, log lines.
+func RedactURLCredentials(s []byte) []byte {
+	return urlUserinfoRedactor.ReplaceAll(s, []byte(`${1}`+Placeholder+`@`))
+}
+```
+
+Compare to the new `plugin_gitremote.go:79-83`:
+```go
+var credentialInURL = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@\s]*@`)
+func redactCredentials(text string) string {
+	return credentialInURL.ReplaceAllString(text, "${1}")
+}
+```
+Same regex shape, same purpose. (The new one is scheme-generic, which matters for `ssh://`; the pre-existing one is http/https-only but replaces with a visible `***REDACTED***` marker rather than silently deleting.)
+
+### 1e. `redact.String` / `redact.Bytes` — the project-wide secret redactor already has a credentialed-URI rule
+`/Users/soph/Work/entire/devenv/cli_experiments_2/redact/redact.go:25-28`, applied at `:232-233`, exported at `:171` (`func String(s string) string`) and `:502` (`func Bytes(b []byte) []byte`)
+
+```go
+// credentialedURIPattern matches URLs that embed userinfo with a password, such
+// as REDACTED or REDACTED ...
+var credentialedURIPattern = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]{1,31}://[^\s/?#@"'` + "`" + `&lt;&gt;:]*:[^\s/?#@"'` + "`" + `&lt;&gt;]+@[^\s"'` + "`" + `&lt;&gt;]+`)
+```
+
+---
+
+## 2. SHA-256 hex digest of a file on disk — **ONE MATCH** (near-identical body)
+
+`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/investigate/loop.go:533-568`
+
+```go
+// fileFingerprint returns "&lt;size&gt;:&lt;sha256&gt;" for the file at path, or the
+// empty string when the file is missing or unreadable. Used to drive
+// PlanChanged across a turn.
+// ... (Includes a content SHA rather than mtime ...)
+func fileFingerprint(ctx context.Context, path string) string {
+	info, err := os.Stat(path)
+	if err != nil {
+		logging.Debug(ctx, "investigate: stat findings doc failed",
+			slog.String("path", path), sErr(err))
+		return ""
+	}
+	f, err := os.Open(path) //nolint:gosec // path is the findings doc the caller already validated
+	if err != nil {
+		logging.Debug(ctx, "investigate: open findings doc for hashing failed",
+			slog.String("path", path), sErr(err))
+		return fmt.Sprintf("%d:m%d", info.Size(), info.ModTime().UnixNano())
+	}
+	defer func() { _ = f.Close() }()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		logging.Debug(ctx, "investigate: hash findings doc failed",
+			slog.String("path", path), sErr(err))
+		return fmt.Sprintf("%d:m%d", info.Size(), info.ModTime().UnixNano())
+	}
+	return fmt.Sprintf("%d:%s", info.Size(), hex.EncodeToString(h.Sum(nil)))
+}
+```
+
+The `os.Open` → `sha256.New` → `io.Copy(h, f)` → `hex.EncodeToString(h.Sum(nil))` core is identical to the new `fileSHA256` at `plugin_fetch.go:553-564`. It is unexported in package `investigate` and returns a `size:hex` composite, so it is not directly callable — but it is the only other file-digest site in the repo, and the pair is the natural candidate for one shared `fileutil.SHA256Hex(path) (string, error)`.
+
+No `HashFile`, `FileSHA`, `Sha256File`, or generic checksum-verify helper exists anywhere else — every other `sha256` use in the repo hashes in-memory bytes via `sha256.Sum256`.
+
+---
+
+## 3. Atomic file write (temp + rename) — **ONE CANONICAL HELPER + 8 inline copies**
+
+### 3a. `jsonutil.WriteFileAtomic` — the exported helper, more durable than the new code
+`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/jsonutil/write.go:10-72`
+
+```go
+// WriteFileAtomic writes data to filePath atomically by writing to a temp file
+// in the same directory, fsyncing it, renaming into place, and fsyncing the
+// parent directory. ...
+// perm is applied to the temp file via Chmod before rename so the final file
+// lands with the requested permission regardless of the temp file's default.
+func WriteFileAtomic(filePath string, data []byte, perm fs.FileMode) error {
+	dir := filepath.Dir(filePath)
+	base := filepath.Base(filePath)
+	tmp, err := os.CreateTemp(dir, base+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp for %s: %w", filePath, err)
+	}
+	tmpName := tmp.Name()
+	removeTmp := true
+	defer func() {
+		if removeTmp {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write temp for %s: %w", filePath, err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("sync temp for %s: %w", filePath, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp for %s: %w", filePath, err)
+	}
+	if err := os.Chmod(tmpName, perm); err != nil {
+		return fmt.Errorf("chmod temp for %s: %w", filePath, err)
+	}
+	if err := os.Rename(tmpName, filePath); err != nil {
+		return fmt.Errorf("rename temp to %s: %w", filePath, err)
+	}
+	removeTmp = false
+	// Best-effort: the rename succeeded, so don't propagate failures here. ...
+	if d, err := os.Open(dir); err == nil { //nolint:gosec // G304: ...
+		_ = d.Sync() //nolint:errcheck // best-effort directory fsync; ...
+		_ = d.Close()
+	}
+	return nil
+}
+```
+
+Callers: `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/settings/settings.go:648,806,1531`, `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/trail_context_cache.go:127`, `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/checkpoint/fsstore/fsstore.go:102`, `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/investigate/manifest.go:136`, `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/investigate/state.go:147`.
+
+This is a direct reuse candidate for the new `SavePluginManifest` (`plugin_manifest.go:214`) and, with `perm=0o755`, for `writeExecutableLimited` (`plugin_fetch.go:584`) — note the new code has **no fsync at all**, so it is weaker than the helper it duplicates.
+
+### 3b. Same pattern, unexported, 8 more places
+- `/Users/soph/Work/entire/devenv/cli_experiments_2/internal/entireclient/contexts/contexts.go:251-283` — `func writeNoLock(path string, f *File) error` (CreateTemp + Write + Sync + Close + Chmod 0600 + Rename; the closest structural twin of `writeExecutableLimited`)
+- `/Users/soph/Work/entire/devenv/cli_experiments_2/internal/entireclient/discovery/cache.go:158-169`:
+```go
+// writeCacheBytesAtomic writes data via a tmp file + rename so a reader never
+// observes a half-written cache.
+func writeCacheBytesAtomic(path string, data []byte) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return fmt.Errorf("write cache tmp: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp) //nolint:gosec // cleanup best-effort
+		return fmt.Errorf("rename cache: %w", err)
+	}
+	return nil
+}
+```
+- `/Users/soph/Work/entire/devenv/cli_experiments_2/internal/entireclient/tokenstore/file.go:105-123`
+- `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/versioncheck/versioncheck.go:142-175` — `saveCache` (CreateTemp + Write + Close + Rename)
+- `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/checkpoint/pushqueue.go:216-229`
+- `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/session/state.go:650`
+
+### 3c. Atomic binary replace via tmp + rename with symlink/hardlink/copy fallback — **directly duplicated by `replaceBinary`**
+`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/plugin_store.go:385-439` and `:441-460`:
+
+```go
+// makeInstallTmpPath returns a unique scratch path inside binDir for the
+// in-progress install. The `.install-` prefix is deliberately distinct from
+// pluginBinaryPrefix so ListInstalledPlugins ignores it; a 16-char hex
+// suffix from crypto/rand makes collisions vanishingly unlikely and keeps
+// concurrent installs safe from each other.
+func makeInstallTmpPath(binDir string) (string, error) {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("generate install tmp suffix: %w", err)
+	}
+	return filepath.Join(binDir, ".install-"+hex.EncodeToString(b[:])), nil
+}
+
+// materializeManagedEntry creates dest as a reference to src, falling back
+// through symlink → hardlink → copy in that order. ...
+// On a successful copy the file mode of the source is preserved so the
+// executable bit survives.
+func materializeManagedEntry(src, dest string, srcInfo os.FileInfo) error {
+	if err := os.Symlink(src, dest); err == nil {
+		return nil
+	}
+	if err := os.Link(src, dest); err == nil {
+		return nil
+	}
+	return copyFileStreaming(src, dest, srcInfo)
+}
+```
+
+`plugin_store.go` is **not** in the exclusion list (added in commit `0cf34a839`, two commits before the new work) and already implements "tmp + atomic rename, previous install intact on failure" including the Windows `MoveFileEx` reasoning. `replaceBinary` (`plugin_install_remote.go:264`) reimplements this.
+
+---
+
+## 4. Writing a file with the executable bit / 0755 — **THREE MATCHES**
+
+### 4a. `copyFileStreaming` — streams with explicit exec-mode preservation and 0o755 default
+`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/plugin_store.go:462-495`
+
+```go
+// copyFileStreaming copies src to dest in fixed-size buffers, preserving the
+// source's executable mode. Plugin binaries can be tens of megabytes; using
+// io.Copy avoids the heap spike of reading the whole file into memory.
+func copyFileStreaming(src, dest string, srcInfo os.FileInfo) error {
+	mode := srcInfo.Mode().Perm()
+	if mode == 0 {
+		mode = 0o755
+	}
+	in, err := os.Open(src) //nolint:gosec // src is the user-provided plugin executable; reading it is the point
+	if err != nil {
+		return fmt.Errorf("open source for copy fallback: %w", err)
+	}
+	defer in.Close()
+
+	// G304: dest is always inside the managed bin dir. ...
+	out, err := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode) //nolint:gosec // dest is constrained to the managed bin dir
+	if err != nil {
+		return fmt.Errorf("open destination for copy fallback: %w", err)
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		_ = os.Remove(dest)
+		return fmt.Errorf("copy fallback: %w", err)
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(dest)
+	...
+```
+
+This is the closest pre-existing analogue of the new `writeExecutable` / `writeExecutableLimited` (`plugin_fetch.go:570`, `:584`) — same package, same managed-bin-dir target, same `io.Copy` + 0o755 rationale. The new code notably does *not* reuse it (and the new code's `O_CREATE`-symlink concern is already avoided here by `plugin_store.go`'s tmp+rename at `:397-407`).
+
+### 4b. `writeHookFile` — exec bit via `os.WriteFile(..., 0o755)`
+`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/strategy/hooks.go:361-377`
+
+```go
+// writeHookFile writes a hook file if it doesn't exist or has different content.
+// Returns true if the file was written, false if it already had the same content.
+func writeHookFile(path, content string) (bool, error) {
+	// Check if file already exists with same content
+	existing, err := os.ReadFile(path) //nolint:gosec // path is controlled
+	if err == nil &amp;&amp; string(existing) == content {
+		return false, nil // Already up to date
+	}
+
+	// Git hooks must be executable (0o755)
+	if err := os.WriteFile(path, []byte(content), 0o755); err != nil { //nolint:gosec // Git hooks require executable permissions
+		return false, fmt.Errorf("failed to write hook file %s: %w", path, err)
+	}
+	return true, nil
+}
+```
+
+### 4c. Executable-bit restore in rewind
+`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/strategy/manual_commit_rewind.go:438-444`
+
+```go
+		// Write file with appropriate permissions via os.Root
+		var perm os.FileMode = 0o644
+		if f.Mode == filemode.Executable {
+			perm = 0o755
+		}
+		if err := osroot.WriteFile(repoRootHandle, f.Name, []byte(contents), perm); err != nil {
+```
+
+Also relevant: `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/osroot/osroot.go:39` — `func WriteFile(root *os.Root, name string, data []byte, perm os.FileMode) (retErr error)`, the symlink-escape-safe write primitive whose safety property `writeExecutableLimited` re-derives with tmp+rename.
+
+---
+
+## 5. Semver comparison / canonicalization — **TWO MATCHES**, one is an exact duplicate
+
+### 5a. `semverWithV` — byte-for-byte the new `canonicalSemver`
+`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/agent/skilldiscovery/scan.go:141-148`
+
+```go
+// semverWithV ensures a version string has the "v" prefix golang.org/x/mod/semver
+// requires. Plugin version dirs are usually bare (e.g. "0.1.0").
+func semverWithV(s string) string {
+	if strings.HasPrefix(s, "v") {
+		return s
+	}
+	return "v" + s
+}
+```
+
+vs. the new `plugin_gitremote.go:178-184`:
+```go
+// canonicalSemver maps a tag to the "v"-prefixed form x/mod/semver expects.
+func canonicalSemver(tag string) string {
+	if strings.HasPrefix(tag, "v") {
+		return tag
+	}
+	return "v" + tag
+}
+```
+Identical. Its descending-sort caller is also the same shape as `listRemoteSemverTags`:
+`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/agent/skilldiscovery/scan.go:115-139` — `func PickLatestVersion(entries []os.DirEntry) (string, bool)`, using `semver.IsValid(semverWithV(d))` and `sort.Slice(... semver.Compare(...) &gt; 0)`.
+
+### 5b. `versioncheck` — where version comparison already lives
+`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/versioncheck/versioncheck.go:283-325`
+
+```go
+// isOutdated compares current and latest versions using semantic versioning.
+// Returns true if current &lt; latest.
+func isOutdated(current, latest string) bool {
+	// Ensure versions have "v" prefix for semver package
+	if !strings.HasPrefix(current, "v") {
+		current = "v" + current
+	}
+	if !strings.HasPrefix(latest, "v") {
+		latest = "v" + latest
+	}
+
+	// Local/unreleased builds shouldn't trigger update notifications.
+	// Normal prereleases (e.g., "1.0.0-rc1") should still be compared normally.
+	if isDevBuild(current) {
+		return false
+	}
+
+	// semver.Compare returns -1 if current &lt; latest
+	return semver.Compare(current, latest) &lt; 0
+}
+
+// isDevBuild reports whether v identifies a local, unreleased build that
+// should not be nagged to update. ...
+func isDevBuild(v string) bool {
+	if v == "" || v == "dev" {
+		return true
+	}
+	if !strings.HasPrefix(v, "v") {
+		v = "v" + v
+	}
+	return !semver.IsValid(v) || module.IsPseudoVersion(v) || semver.Build(v) != ""
+}
+
+func versionCacheKey(version string) string {
+	if version == "" || strings.HasPrefix(version, "v") {
+		return version
+	}
+	return "v" + version
+}
+```
+Plus `isNightly` at `:213-219` (same `v`-prefix normalization a third time) and `displayVersion` at `:327-329`.
+
+So the "add a `v`, then `semver.Compare`" idiom now exists **four independent times**: `versioncheck.isOutdated`, `versioncheck.isDevBuild`, `versioncheck.isNightly`, `versioncheck.versionCacheKey`, `skilldiscovery.semverWithV`, and the new `canonicalSemver`. `golang.org/x/mod/semver` is already a direct dependency via `versioncheck` and `skilldiscovery`.
+
+---
+
+## 6. Git subprocess with timeout + non-interactive env — **FOUR MATCHES**, one nearly identical
+
+### 6a. `gitrepo.gitPlumbingEnv` + `execGit` — timeout + `GIT_TERMINAL_PROMPT=0` + `LC_ALL=C`, with the *same* stated rationale
+`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/gitrepo/reftable.go:130-167`
+
+```go
+func (s *reftableStorer) execGit(args ...string) (string, []byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), reftableGitTimeout)
+	defer cancel()
+
+	full := append([]string{"--git-dir", s.gitDir}, args...)
+	cmd := exec.CommandContext(ctx, "git", full...)
+	cmd.Env = gitPlumbingEnv()
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &amp;stdout
+	cmd.Stderr = &amp;stderr
+	err := cmd.Run()
+	// On our timeout the process is killed and Run reports the kill as an
+	// *exec.ExitError, which would be indistinguishable from a genuine
+	// non-zero exit. Re-wrap with the context error so callers (refLookupAbsent)
+	// never mistake a wedged git for a definitive "ref not found".
+	if err != nil &amp;&amp; ctx.Err() != nil {
+		err = fmt.Errorf("git %s timed out after %s: %w", strings.Join(args, " "), reftableGitTimeout, ctx.Err())
+	}
+	return strings.TrimRight(stdout.String(), "\n"), stderr.Bytes(), err
+}
+
+// gitPlumbingEnv builds the environment for a reftable git plumbing command.
+// LC_ALL=C / LANG=C force untranslated (English) diagnostics so the stderr
+// classification (isRefCASConflict, and RemoveReference's idempotency check)
+// stays correct on a localized machine — git's error messages are i18n'd, and
+// matching translated text would silently misclassify CAS conflicts and delete
+// failures. GIT_TERMINAL_PROMPT=0 keeps git non-interactive. The forced values
+// are appended last so they override anything the caller's environment set
+// (os/exec keeps the last value for a duplicate key). Mirrors the sibling
+// shell-out in checkpoint/shadow_ref.go.
+func gitPlumbingEnv() []string {
+	return append(os.Environ(),
+		"GIT_TERMINAL_PROMPT=0",
+		"LC_ALL=C",
+		"LANG=C",
+	)
+}
+```
+
+This is the same construction as the new `runGitQuiet` (`plugin_gitremote.go:45-61`) — `context.WithTimeout` + `append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "LC_ALL=C", ...)` — and its doc comment gives the *identical* justification for `LC_ALL=C` (substring-matching i18n'd git stderr). Note `gitPlumbingEnv` also sets `LANG=C`, which the new code omits; `LC_ALL` alone is normally sufficient but the pre-existing helper's comment explains why both are forced. The new helper adds `GIT_SSH_COMMAND=ssh -oBatchMode=yes`, which `gitPlumbingEnv` does not need (local plumbing).
+
+The doc comment even says "**Mirrors the sibling shell-out in checkpoint/shadow_ref.go**" — i.e. this was *already* a known duplication before the new code added a third copy.
+
+### 6b. `checkpoint.casUpdateShadowBranchRef` — the sibling it refers to
+`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/checkpoint/shadow_ref.go:81-85`
+
+```go
+	cmd := exec.CommandContext(ctx, "git", "update-ref", refName, newValue, oldValue)
+	cmd.Dir = repoRoot
+	// Force English diagnostics so the CAS-conflict pattern match below
+	// isn't defeated by a translated stderr message in a non-C locale.
+	cmd.Env = append(os.Environ(), "LC_ALL=C", "LANG=C")
+```
+
+### 6c. `remote.disableTerminalPrompt` + `withBatchModeSSH` — the batch-mode SSH logic, done properly
+`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/checkpoint/remote/git.go:745-752`
+
+```go
+// disableTerminalPrompt sets GIT_TERMINAL_PROMPT=0 on the command,
+// initializing cmd.Env from os.Environ() if nil.
+func disableTerminalPrompt(cmd *exec.Cmd) {
+	if cmd.Env == nil {
+		cmd.Env = os.Environ()
+	}
+	cmd.Env = append(cmd.Env, "GIT_TERMINAL_PROMPT=0")
+}
+```
+
+Crucially, this package already solved the `GIT_SSH_COMMAND` precedence problem that the new `runGitQuiet` hardcodes over:
+- `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/checkpoint/remote/git.go:114` — `func hasExplicitBatchMode(sshCmd string) bool`
+- `:121` — `func envLookup(env []string, key string) (string, bool)`
+- `:134` — `func gitConfigSSHCommand(ctx context.Context, env []string) string`
+- `:148` — `func effectiveSSHCommand(ctx context.Context, env []string) string` — resolves in git's own precedence order: `GIT_SSH_COMMAND` env → `core.sshCommand` → `GIT_SSH` → `ssh`
+- `:172` — `func withBatchModeSSH(ctx context.Context, env []string) []string` — "returns env with GIT_SSH_COMMAND set so ssh runs with BatchMode=yes. The base ssh invocation is resolved via effectiveSSHCommand ... so a custom [ssh command is preserved]"
+- `:191` — `func applyNonInteractiveSSH(ctx context.Context, cmd *exec.Cmd)`
+- `:59` — `func WithNonInteractiveSSH(ctx context.Context) context.Context` / `:64` — `func IsNonInteractiveSSH(ctx context.Context) bool`
+
+The new `runGitQuiet` sets `GIT_SSH_COMMAND=ssh -oBatchMode=yes` unconditionally, which **clobbers** a user's `GIT_SSH_COMMAND` / `core.sshCommand` — exactly the bug `effectiveSSHCommand`/`withBatchModeSSH` exist to prevent (documented at `git.go:51-58` as issue #1523).
+
+### 6d. `gitexec.Run` — the minimal shared "run git, capture stderr, wrap" helper
+`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/gitexec/gitexec.go:13-33`
+
+```go
+// Run runs `git &lt;args&gt;` in repoRoot and returns stdout as a string.
+// stderr is captured separately and surfaced in the error wrap on non-zero
+// exit. Stdout and stderr are NOT combined — git emits warnings on stderr
+// even on successful commands (shallow-clone notices, safe.directory
+// advisories, etc.) and merging them would corrupt parsed output (e.g.,
+// strconv.Atoi on the result of `rev-list --count` would fail).
+func Run(ctx context.Context, repoRoot string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = repoRoot
+	var stderr strings.Builder
+	cmd.Stderr = &amp;stderr
+	out, err := cmd.Output()
+	if err != nil {
+		stderrTxt := strings.TrimSpace(stderr.String())
+		if stderrTxt != "" {
+			return "", fmt.Errorf("git %s: %w (stderr: %s)", args[0], err, stderrTxt)
+		}
+		return "", fmt.Errorf("git %s: %w", args[0], err)
+	}
+	return string(out), nil
+}
+```
+The `fmt.Errorf("git %s: %w", args[0], err)` wrap is identical to `runGitQuiet`'s.
+
+### 6e. `execx.NonInteractive` — OS-level non-interactivity, stronger than env vars
+`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/execx/execx.go:14-24`
+
+```go
+// NonInteractive returns an *exec.Cmd detached from the parent's controlling
+// TTY. In the child, /dev/tty cannot be opened, so
+// interactive.CanPromptInteractively() returns false — no env var required.
+//
+// On Windows the child runs with DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+// so it has no inherited console.
+func NonInteractive(ctx context.Context, name string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, name, args...)
+	detachFromTTY(cmd)
+	return cmd
+}
+```
+The package doc explicitly frames this as "**replacing env-var signalling with real OS state**" — i.e. the repo has an existing, deliberate policy that the new code's env-var approach works around. This also makes the `-oBatchMode=yes` hack unnecessary: with no `/dev/tty`, ssh cannot prompt for a passphrase.
+
+Also `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/interactive/interactive.go:74-80` already reads `GIT_TERMINAL_PROMPT == "0"` as the repo's non-interactive signal.
+
+---
+
+## 7. Extracting stderr from `exec.ExitError` — **FIVE MATCHES**, all the same 5-line body
+
+The new `stderrSuffix` (`plugin_gitremote.go:186-195`) is the sixth copy.
+
+### 7a. `ghRunnerErr` — closest match (same signature shape, same `len(...) &gt; 0` guard)
+`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/setup_github.go:1060-1069`
+
+```go
+// ghRunnerErr extracts an exec.ExitError's stderr into the returned
+// error so the user sees a useful diagnostic when gh/git fail under a
+// captured-stdout call.
+func ghRunnerErr(err error) error {
+	var exitErr *exec.ExitError
+	if errors.As(err, &amp;exitErr) &amp;&amp; len(exitErr.Stderr) &gt; 0 {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(exitErr.Stderr)))
+	}
+	return err
+}
+```
+
+### 7b. `wrapExecError`
+`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/setup_github.go:824-834`
+
+```go
+// wrapExecError formats err with stderr from *exec.ExitError when available,
+// so callers see git's actual complaint instead of an opaque "exit status N".
+func wrapExecError(prefix string, err error) error {
+	var ee *exec.ExitError
+	if errors.As(err, &amp;ee) {
+		if stderr := strings.TrimSpace(string(ee.Stderr)); stderr != "" {
+			return fmt.Errorf("%s: %w: %s", prefix, err, stderr)
+		}
+	}
+	return fmt.Errorf("%s: %w", prefix, err)
+}
+```
+
+### 7c. `gitOutputError`
+`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/trail_checkout_worktree.go:425-433`
+
+```go
+// gitOutputError formats a failed git invocation, including git's stderr
+// (captured by cmd.Output in ExitError.Stderr) when it carries a diagnostic —
+// the bare error is usually just "exit status 128".
+func gitOutputError(action string, err error) error {
+	var exitErr *exec.ExitError
+	if errors.As(err, &amp;exitErr) &amp;&amp; len(bytes.TrimSpace(exitErr.Stderr)) &gt; 0 {
+		return fmt.Errorf("%s: %s: %w", action, bytes.TrimSpace(exitErr.Stderr), err)
+	}
+	return fmt.Errorf("%s: %w", action, err)
+}
+```
+
+### 7d. `remote.formatGitCommandError` — **the one that also redacts**, i.e. exactly `stderrSuffix` + `redactCredentials` combined
+`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/checkpoint/remote/git.go:470-494`
+
+```go
+// formatGitCommandError enriches an exec error from git Output() so callers see
+// useful detail: context deadline expiry by name, and git's stderr (auth denied,
+// repository not found, DNS) which ExitError otherwise hides behind "exit status N".
+// When remote is a URL it may carry credentials that git echoes into stderr;
+// those are redacted before the error is returned (same pattern as FetchBlobs).
+func formatGitCommandError(ctx context.Context, err error, remote string) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("deadline exceeded: %w", err)
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &amp;exitErr) {
+		if stderr := strings.TrimSpace(string(exitErr.Stderr)); stderr != "" {
+			if remote != "" {
+				stderr = strings.ReplaceAll(stderr, remote, RedactURL(remote))
+			}
+			// Collapse whitespace so multi-line git stderr stays one log/attr value.
+			stderr = strings.Join(strings.Fields(stderr), " ")
+			return fmt.Errorf("%w (%s)", err, stderr)
+		}
+	}
+	return err
+}
+```
+This is the single best reuse target for the new code's error paths: it handles the deadline case by name (the new `runGitQuiet` doesn't distinguish it), redacts the remote, *and* collapses multi-line stderr for logging.
+
+### 7e. `resolveGitCommonDir` (inline, same body)
+`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/checkpoint/git_common_dir.go:29-37`
+
+```go
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &amp;exitErr) {
+			if detail := strings.TrimSpace(string(exitErr.Stderr)); detail != "" {
+				return "", fmt.Errorf("resolve git common dir: %w: %s", err, detail)
+			}
+		}
+		return "", fmt.Errorf("resolve git common dir: %w", err)
+	}
+```
+
+Further inline copies at `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/strategy/common.go:1542-1545`, `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/agent/cursor/images.go:216-218`, `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/gitrepo/reftable.go:181-193` (`refLookupAbsent`).
+
+---
+
+## 8. Loopback / localhost host check — **THREE MATCHES**, one already duplicated verbatim across packages
+
+### 8a. `auth.isLoopbackHost`
+`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/auth/cell_data_api.go:512-518`
+
+```go
+func isLoopbackHost(host string) bool {
+	switch host {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	return false
+}
+```
+
+### 8b. `coreapi.isLoopbackHost` — same name, same body, different package
+`/Users/soph/Work/entire/devenv/cli_experiments_2/internal/coreapi/cross_juris_transport.go:389-398`
+
+```go
+// isLoopbackHost reports whether host is a loopback name or IP. Used
+// only to widen isSafeOrigin for local/test fixtures — production
+// federation traffic is always https.
+func isLoopbackHost(host string) bool {
+	switch host {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	return false
+}
+```
+
+### 8c. `auth.isLoopbackHTTP` — the scheme+host gate, exactly the new `requireSecureAssetURL` shape
+`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/auth/exchange.go:39-51`
+
+```go
+// isLoopbackHTTP reports whether u is an http:// URL pointing at a
+// loopback hostname (localhost, 127.0.0.1, ::1). Used to scope the
+// "auto-permit insecure HTTP" path on the tokenmanager so production
+// misconfigurations fail loudly while loopback-only local-dev flows
+// keep working.
+func isLoopbackHTTP(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme != schemeHTTP {
+		return false
+	}
+	host := u.Hostname()
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+```
+
+### 8d. `coreapi.isSafeOrigin` — "https, or http only on loopback", i.e. the new `requireSecureAssetURL`'s exact policy
+`/Users/soph/Work/entire/devenv/cli_experiments_2/internal/coreapi/cross_juris_transport.go:375-387`
+
+```go
+// isSafeOrigin reports whether u is acceptable as a destination for the
+// user's login JWT. https is always allowed; http is allowed only for
+// loopback so httptest fixtures keep working.
+func isSafeOrigin(u *url.URL) bool {
+	switch u.Scheme {
+	case "https":
+		return u.Host != ""
+	case "http":
+		return isLoopbackHost(u.Hostname())
+	default:
+		return false
+	}
+}
+```
+
+Related: `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/auth/cell_data_api.go:481-490` (`isLoopbackOrigin`, "at any scheme"), `:35-37` (`insecureHTTPEnabled`), consumed at `cell_data_api.go:366,607`, `client.go:70`, `data_api.go:85,127`, `refresh.go:227`, `control_plane.go:98`.
+
+Honest caveat: the new `isLoopbackHost` at `plugin_fetch.go:72-80` uses `net.ParseIP(host).IsLoopback()`, which is **stronger** than all three pre-existing versions (it covers `127.0.0.2`, `127.x.x.x`, and `[::1]` forms the string-switch misses). The right consolidation is to promote the new implementation into a shared location and retire the three string switches, not to adopt the weaker existing ones.
+
+---
+
+## 9. Git remote URL validation / parsing — **TWO MATCHES**
+
+### 9a. `gitremote.ParseURL` — handles scp-like AND `://` forms, with a control-char security gate
+`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/gitremote/gitremote.go:110-155` (full body quoted in §1a's file), plus its shared validator:
+
+`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/gitremote/gitremote.go:202-218`
+
+```go
+func splitOwnerRepo(path string) (string, string, error) {
+	path = strings.TrimSuffix(path, ".git")
+	parts := strings.SplitN(path, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", fmt.Errorf("cannot parse owner/repo from path: %s", path)
+	}
+	// Reject control characters (newlines, ANSI escapes, ...). The SCP-style
+	// branch in ParseURL bypasses net/url.Parse's built-in control-char
+	// rejection, so a crafted origin URL could otherwise smuggle a newline or
+	// escape into owner/repo and, via plain-text consumers like `entire
+	// agent-help`, into an agent's context or a user's terminal. This shared
+	// chokepoint protects every caller; the tainted bytes are not echoed back.
+	if strings.IndexFunc(parts[0]+"/"+parts[1], unicode.IsControl) &gt;= 0 {
+		return "", "", errors.New("invalid control character in remote owner/repo")
+	}
+	return parts[0], parts[1], nil
+}
+```
+
+The key detail: `ParseURL`'s scp-like detection is `strings.Contains(rawURL, ":") &amp;&amp; !strings.Contains(rawURL, "://")` at `:114`, versus the new `scpLikeGitURL` regex at `plugin_gitremote.go:98`. And `splitOwnerRepo` is the existing **shared chokepoint** for the control-character injection class — the new `validatePluginRepoURL` and `pluginNameFromRepoURL` (`plugin_gitremote.go:250`) do their own basename splitting (`strings.LastIndexAny(trimmed, "/:")`) without any control-char rejection, so they bypass that chokepoint.
+
+Also directly relevant to `normalizeRepoURL` (new, `plugin_index.go:118`) and `pluginNameFromRepoURL`: `gitremote.Info` already gives you `Owner`/`Repo`/`Host`/`CanonicalHost()`/`HostPort()` from one parse.
+
+### 9b. `search.ParseGitHubRemote` — the existing "validate a remote URL against a host" precedent
+`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/search/github.go:12-33`
+
+```go
+// ParseGitHubRemote extracts owner and repo from a git remote URL that resolves
+// to GitHub. It accepts direct GitHub remotes (SCP-style SSH, ssh://, and
+// https://) as well as Entire mirror remotes (entire://host/gh/owner/repo),
+// whose forge prefix maps back to github.com. Remotes resolving to any other
+// host, or whose path holds extra segments beyond owner/repo, are rejected.
+func ParseGitHubRemote(remoteURL string) (owner, repo string, err error) {
+	remoteURL = strings.TrimSpace(remoteURL)
+	if remoteURL == "" {
+		return "", "", errors.New("empty remote URL")
+	}
+	info, err := gitremote.ParseURL(remoteURL)
+	if err != nil {
+		return "", "", fmt.Errorf("parsing remote URL: %w", err)
+	}
+	if host := info.CanonicalHost(); host != "github.com" {
+		return "", "", fmt.Errorf("remote is not a GitHub repository (host: %s)", host)
+	}
+	if strings.Contains(info.Repo, "/") {
+		return "", "", fmt.Errorf("remote path has extra segments beyond owner/repo: %s", gitremote.RedactURL(remoteURL))
+	}
+	return info.Owner, info.Repo, nil
+}
+```
+
+This is the model the new `releaseAssetBaseURL` (`plugin_fetch.go:114`, host-dispatching GitHub vs GitLab vs Gitea) should follow — it already does host-family dispatch on a parsed `Info` rather than on raw string prefixes.
+
+Supporting primitives: `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/checkpoint/remote/git.go:496-499` — `func IsURL(target string) bool { return strings.Contains(target, "://") || strings.Contains(target, "@") }` — and `:741-743` — `func isLocalPath(target string) bool { return filepath.IsAbs(target) || strings.HasPrefix(target, "./") || strings.HasPrefix(target, "../") }` (relevant to the new code's decision to reject bare absolute paths).
+
+---
+
+# Summary table
+
+| # | Category | Verdict | Best pre-existing target |
+|---|---|---|---|
+| 1 | URL credential redaction | **5 matches** | `gitremote.RedactURL` (`gitremote.go:170`) — already the shared chokepoint, and strips `RawQuery` which the new one keeps |
+| 2 | SHA-256 of a file on disk | **1 match** | `investigate/loop.go:544` `fileFingerprint` — same 5-line core, unexported |
+| 3 | Atomic write (temp+rename) | **1 exported + 8 inline** | `jsonutil.WriteFileAtomic` (`jsonutil/write.go:31`) — has fsync + dir-fsync the new code lacks; plus `plugin_store.go:397-460` for the binary case |
+| 4 | Executable bit / 0755 write | **3 matches** | `plugin_store.go:465` `copyFileStreaming` — same package, same target dir, same rationale |
+| 5 | Semver canonicalization | **exact duplicate** | `skilldiscovery/scan.go:143` `semverWithV` ≡ new `canonicalSemver`; `versioncheck` does comparison at `versioncheck.go:285,310` |
+| 6 | git subprocess + timeout + non-interactive env | **4 matches** | `gitrepo.gitPlumbingEnv` (`reftable.go:161`) for env; `remote.withBatchModeSSH`/`effectiveSSHCommand` (`git.go:172,148`) for the SSH precedence the new code clobbers; `execx.NonInteractive` for the OS-level approach |
+| 7 | stderr from `exec.ExitError` | **5 matches** | `remote.formatGitCommandError` (`git.go:475`) — does stderr + redaction + deadline naming in one |
+| 8 | Loopback host check | **3 matches** | `auth/cell_data_api.go:512`, `coreapi/cross_juris_transport.go:392` (identical bodies); `isSafeOrigin` (`:378`) matches the new https-or-loopback policy. New impl is stronger — promote it, don't adopt them |
+| 9 | git remote URL parse/validate | **2 matches** | `gitremote.ParseURL` (`gitremote.go:111`) + `splitOwnerRepo` (`:202`), the existing control-char injection chokepoint |
+
+No category is empty — **NONE** does not apply to any of the nine.
+
+Two cross-cutting notes for the reviewer: (a) the new `runGitQuiet`'s unconditional `GIT_SSH_COMMAND=ssh -oBatchMode=yes` overrides a user's `GIT_SSH_COMMAND`/`core.sshCommand`, which `checkpoint/remote/git.go:148-189` exists specifically to avoid (documented as issue #1523); (b) the new `redactURL` retains `RawQuery`, so a signed asset-redirect URL's `?token=`/`X-Amz-Signature=` reaches logs where `gitremote.RedactURL` would have stripped it.</result>
+<usage><subagent_tokens>105446</subagent_tokens><tool_uses>52</tool_uses><duration_ms>746262</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>acd550bab8330ea9a</task-id>
+<tool-use-id>toolu_014uJiN5bUonWN26oHti6xTi</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments-2/1402f853-f602-4928-816b-36b8a86e8d62/tasks/acd550bab8330ea9a.output</output-file>
+<status>failed</status>
+<summary>Agent "Reuse review of plugin diff" failed: Agent terminated early due to an API error: API Error: Response stalled mid-stream. The response above may be incomplete.</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Found a strong candidate. Let me verify both.</result>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ab45cedbfa098302e</task-id>
+<tool-use-id>toolu_01ESddaQeJnw56xMy5djPMHM</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments-2/1402f853-f602-4928-816b-36b8a86e8d62/tasks/ab45cedbfa098302e.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review of plugin diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Simplification Review — plugin system diff
+
+Read every production file in the diff plus all five new test files. Findings ordered by value; each names the concrete alternative.
+
+---
+
+### Worth changing
+
+**1. `plugin_fetch.go:268-319` — `assetURL`'s error is loop-invariant, so three call sites pay for it**
+
+The closure returns `(string, error)`, but the only error path is `releaseAssetBaseURL(repoURL, tag)`, which does not depend on the `asset` argument. It is called ~50 times across two loops and each of the three call sites carries `if err != nil { return nil, err }`. Resolve the prefix once:
+
+```go
+assetURL := func(asset string) string { return expandDownloadTemplate(meta.DownloadURL, name, tag, asset) }
+if meta == nil || meta.DownloadURL == "" {
+    base, err := releaseAssetBaseURL(repoURL, tag)
+    if err != nil { return nil, err }
+    assetURL = func(asset string) string { return base + asset }
+}
+```
+
+Cost: −12 lines, three error blocks gone, both loop bodies drop a nesting level. This is also the change that makes `downloadPluginAsset`'s 7 parameters stop mattering — the body shrinks to two short loops.
+
+**2. `plugin_deps.go:118-153` and `:318-336` — the manifest is loaded twice per requirement, in both branches**
+
+`dependencySatisfied(req)` calls `LoadPluginManifest(req.Name)` at line 202. `planDeps` then calls it *again* at line 131 (satisfied branch) and line 143 (unsatisfied branch) — the same four lines duplicated in adjacent branches of one `if`. `RunPluginDoctor` repeats the pattern: line 324 calls `dependencySatisfied`, line 332 re-loads the same manifest.
+
+Minimal fix: hoist one `m, err := LoadPluginManifest(req.Name)` above the `if satisfied`. Better: change the signature to `dependencySatisfied(req, m)` so the manifest is loaded once at each of the two call sites. Cost: −8 lines, two redundant file reads per requirement removed, and the `m` variable stops being re-derived in three places.
+
+**3. `plugin_install_remote_test.go` — the same 4-line preamble, eight times**
+
+Lines 93-96, 162-165, 191-194, 221-224, 265-268, 291-294, 339-342, 368-371 are all:
+
+```go
+srv := pluginReleaseServer(t, "0.1.0")
+defer srv.Close()
+meta := fmt.Sprintf("name: demo\ndownload_url: \"%s/dl/{tag}/{asset}\"\n", srv.URL)
+repoURL := newTaggedPluginRepo(t, meta, remoteTestTagOld)
+```
+
+One helper returning `(repoURL, srvURL string)` — two tests (lines 126, 379) need `srv.URL` afterwards — plus `t.Cleanup(srv.Close)` inside `pluginReleaseServer` instead of eight `defer`s. Cost: −28 lines; the `download_url` template literal drops from **10 copies to 1** (currently 93-96 ×8, 126, 379, and again in the integration test at 166/205/235/237).
+
+**4. `plugin_fetch_test.go` — nine hand-rolled `httptest` servers, two shapes**
+
+Five are "write a fixed body" (lines 393-395, 494-496, 507-509, 676-678, 766-768). Four are "serve checksums and/or one asset, 404 otherwise" (134-140, 432-441, 458-464, 527-536). Two helpers — `staticServer(t, body)` and `releaseServer(t, checksums, asset string, payload []byte)`, both registering `t.Cleanup(srv.Close)` — collapse all nine to one-liners. Cost: ≈−40 lines, and the `//nolint:errcheck // test server write` comment goes from **11 occurrences to 2**.
+
+**5. `plugin_group.go:144, 529, 612, 656, 706` — `--index` registered five times, verbatim**
+
+Five `var indexFlag string` declarations plus five identical `StringVar(..., "index", "", "Plugin index URL (overrides "+pluginIndexEnvVar+" and the built-in default)")` calls. Two options:
+
+- `addIndexFlag(cmd, &amp;indexFlag)` helper — five one-line calls, help text defined once (−8 lines, zero behavior change). **Recommended.**
+- One `cmd.PersistentFlags().StringVar(...)` on the `plugin` group root (saves the five locals too). There is precedent — `trail_cmd.go:77` puts `--repo` on the group this way — but it would surface `--index` in the help for `list`/`remove`/`upgrade`/`doctor`, where it is meaningless.
+
+Related: `SyncPluginIndex(ctx, resolvePluginIndexURL(indexFlag), false)` appears verbatim at lines 165, 194, 516, 566, 626. A `syncIndex(ctx, indexFlag)` wrapper folds the two calls into one at five sites.
+
+**6. `plugin_group.go:158-196` — both branches of the `if/else` open with the same index sync**
+
+Lines 165 and 194 are the same `SyncPluginIndex` call, forcing the `var idx`/`var err`/`var idxErr` shuffle above. Hoist it:
+
+```go
+idx, idxErr := SyncPluginIndex(ctx, resolvePluginIndexURL(flags.index), false)
+if classifyInstallArg(arg) == installFromIndex {
+    if idxErr != nil { return fmt.Errorf("resolve %q via plugin index: %w", arg, idxErr) }
+    ...
+} else {
+    trusted = idxErr == nil &amp;&amp; idx.HasRepoURL(repoURL)
+}
+```
+
+Behavior is identical (both branches sync unconditionally, first thing). Cost: −5 lines, three pre-declared vars gone.
+
+**7. `plugin_fetch.go:144-176` — a three-function alias chain whose parameters are never used as parameters**
+
+`archAliases(goarch)` has exactly one caller (`platformArchAliases`), which has exactly one caller (`assetCandidates:186`), which passes `runtime.GOOS`/`runtime.GOARCH`. `osAliases(goos)` likewise. No test calls any of the three. So the parameterization — the only reason to have three functions instead of ten lines inside `assetCandidates` — is paid for and unused.
+
+Pick one:
+- **Use it**: have `TestAssetCandidates_DarwinUniversal` (`plugin_fetch_test.go:693`) call `platformArchAliases("darwin", "arm64")` directly so the `darwin_all` logic is actually covered on Linux CI instead of `t.Skip`ped. Today that regression is untested everywhere except a Mac.
+- **Drop it**: inline all three into `assetCandidates` (−20 lines including the three doc comments and the 6-line archaeology block).
+
+The second is simpler; the first is more valuable. Either beats the status quo.
+
+**8. `cmd/entire/cli/integration_test/plugin_remote_install_test.go:237` — stale `repo_url:` in a `requires[]` fixture**
+
+```go
+"name: brainy\ndownload_url: \"%s/dl/{tag}/{asset}\"\nrequires:\n  - name: semy\n    repo_url: %s\n"
+```
+
+`PluginRequirement` no longer has that field (commit 4c781ae2 removed it); lenient decoding now silently ignores it. As written, a reader infers `requires[]` still takes a URL, and the test proves nothing about the ignore path because the leftover URL happens to equal the index URL. Either delete the `repo_url` line and its `semRepo` argument, or point it at an unreachable URL with a one-line comment ("a leftover repo_url must be ignored; the install must still come from the index") so it becomes real coverage of the documented behavior in `docs/architecture/external-commands.md:138`.
+
+---
+
+### Moderate
+
+**9. `plugin_fetch.go:370-391` vs `:404-433` — duplicated HTTP prologue**
+
+`httpGetSmall` and `fetchAndVerify` share twelve lines: `requireSecureAssetURL` → `NewRequestWithContext` → `pluginHTTPClient.Do` → wrap with `redactURL`. A shared `pluginGet(ctx, rawURL) (*http.Response, error)` leaves the differing status handling (404 → `errAssetNotFound`) at the call sites. LOC saving is small (~4 net), but the value is that credential redaction on the request path becomes one chokepoint instead of two blocks that must be kept in sync — the exact invariant `TestDownloadErrors_NeverLeakCredentials` exists to defend.
+
+**10. `plugin_fetch.go:331-348` — invertible nesting in the probe loop**
+
+```go
+fa, err := fetchAndVerify(ctx, u, asset, "", stagingDir)
+if errors.Is(err, errAssetNotFound) { continue }
+if err != nil { return nil, err }
+if allowUnverified { return fa, nil }
+_ = os.Remove(fa.Path)
+return nil, fmt.Errorf(...)
+```
+
+Same length, max nesting 3 → 2, and the "keep walking" case reads first instead of last.
+
+---
+
+### Matter of taste
+
+**11. `plugin_deps.go:27-36` — `DepAction.Upgrade` is `CurrentTag != ""`.** Both are set in the same branch (149-153) and nowhere else; `Upgrade` is read at `plugin_group.go:265` and `plugin_deps.go:240`. One field could go. Weak caveat: a manifest with an empty `Tag` would break the equivalence, so the explicit bool is defensible.
+
+**12. `plugin_fetch.go:250-262` — `fetchedAsset.Asset` is `filepath.Base(Path)`.** Derivable, but the field reads better at the two use sites than a `filepath.Base` call would.
+
+**Explicitly *not* redundant** (checked, because they look it): `fetchedAsset.Verified` is **not** `SHA256 != ""` — `SHA256` is always populated with the computed digest on success (`:455-460`), so `Verified` carries information nothing else does. `PluginManifest.Unverified` likewise has no other source. Leave both alone.
+
+**13. ~70 lines of rationale said twice, once on the code and once on its test.** Eight pairs, near-verbatim:
+
+| production comment | echoed at |
+|---|---|
+| `plugin_fetch.go:86-93` (CheckRedirect) | `plugin_fetch_test.go:654-656` |
+| `plugin_fetch.go:164-169` (`darwin_all`) | `plugin_fetch_test.go:689-692` |
+| `plugin_fetch.go:352-357` (`assetNameFromURL`) | `plugin_fetch_test.go:66-69` |
+| `plugin_fetch.go:574-583` (truncation) | `plugin_fetch_test.go:548-551` |
+| `plugin_install_remote.go:103-133` (name mismatch) | `plugin_install_remote_test.go:282-287` |
+| `plugin_manifest.go:78-94` (no `repo_url`) | `plugin_deps_test.go:352-356` |
+| `plugin_index.go:270-283` (version advisory) | `plugin_index_test.go:115-120` |
+| `plugin_deps.go:102-110` (strictness map) | `plugin_deps_test.go:293-298` |
+
+I am *not* suggesting these decisions go undocumented — each is genuinely non-obvious and several are security rationale. The suggestion is to keep the full argument in one place and reduce the other to a pointer (e.g. `// regression: see platformArchAliases`). At 4-14 lines each, the pairs are where comment volume starts obscuring the code rather than explaining it.
+
+**14. Small twins.** `extractFromTarGz:528` and `extractFromZip:548` end with the identical `"archive %s contains no %s entry"` error — one shared constructor. `gitTag` (`plugin_install_remote_test.go:64-70`) is the same `git -C dir tag` body as the loop inside `newTaggedPluginRepo` (`plugin_gitremote_test.go:30-34`); the loop could call the helper.
+
+**15. Cross-package test-helper triplication (structurally forced).** `pluginReleaseServer` (`plugin_install_remote_test.go:31-62`) and `startReleaseServer` (`integration_test/plugin_remote_install_test.go:57-91`) are ~35 near-identical lines including the same fiddly per-tag checksums routing; `newIndexRepo` and `newTaggedPluginRepo`/`newPluginRepo` are duplicated the same way. Unexported `_test.go` helpers can't cross packages, so this needs a move into `cmd/entire/cli/testutil` with the constants passed in. Only worth doing if the release-server logic changes again — if it drifts, one suite silently stops exercising the checksum path.
+
+**16. `plugin_fetch.go:72-80` adds a third `isLoopbackHost`.** The other two are `cmd/entire/cli/auth/cell_data_api.go:512` and `internal/coreapi/cross_juris_transport.go:392`, both string-switch versions. The new one is strictly better (parses IPs, `EqualFold` on `localhost`). Out of this diff's scope to unify, but the two older copies are now the odd ones out.
+
+---
+
+### Clean categories
+
+- **Dead code: none.** Every exported symbol in `plugin_deps.go`, `plugin_manifest.go`, `plugin_install_remote.go` and every unexported helper in `plugin_fetch.go`/`plugin_gitremote.go`/`plugin_index.go` is reachable from production code (verified by grep excluding `_test.go`). No orphaned constants or fields from the branch's 24 revisions, apart from finding 8.
+- **Both error sentinels are justified.** `errAssetNotFound` drives the tag walk at `plugin_install_remote.go:91`. `errUnverifiedAsset` is never `errors.Is`-checked in production — only wrapped — but its existence is what guarantees the unverified case does *not* match `errAssetNotFound`, and three tests assert on it. A plain `fmt.Errorf` would force substring matching. Keep both.
+- **`RemoteInstallOptions` has 5 fields, not 6**, and each is read: `RepoURL` (:64), `Pin` (:67, :190), `Force` (:137), `AllowUnverified` (:147), `ExpectedName` (:129). Not past the point where a different shape helps. Its overlap with `remoteInstallFlags` is a legitimate command-layer / library-layer split, not duplication.
+- **`SyncPluginIndex` and `planDeps`' recursion structure** are as flat as the logic allows; the depth bound and `considered` map are both load-bearing.
+
+**Estimated reduction from findings 1-8: ≈110 lines**, roughly 70 of them in tests, with no behavior change.</result>
+<usage><subagent_tokens>186434</subagent_tokens><tool_uses>29</tool_uses><duration_ms>1034836</duration_ms></usage>
+</task-notification>
+
+---
+
+is the test-helper deduplication only on things added in this PR anyway?
+
+---
+
+yes

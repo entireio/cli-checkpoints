@@ -1,0 +1,97 @@
+/simplify
+
+---
+
+<task-notification>
+<task-id>ab36ef3908def6fdb</task-id>
+<tool-use-id>toolu_011JdRQ8Y2fAMyisV1i1GA8X</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments-2/1402f853-f602-4928-816b-36b8a86e8d62/tasks/ab36ef3908def6fdb.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review of plugin diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Efficiency review: wasted work in the plugin system diff
+
+### 1. Duplicated network work between `planDeps` and `ExecuteDepPlan` — the one finding that matters
+
+**`cmd/entire/cli/plugin_deps.go:173,180` + `cmd/entire/cli/plugin_install_remote.go:71,99`** — dependency planning performs the exact git operations the subsequent install repeats, and throws both results away.
+
+Per dependency that produces a `DepAction`, planning does:
+- `listRemoteSemverTags` (plugin_deps.go:173) → 1 `git ls-remote --tags`
+- `fetchPluginMetadataAtTag` (plugin_deps.go:180) → 1 `git clone --depth 1 --filter=blob:none` + 1 `git show` (a separate promisor-remote blob fetch — see the comment at plugin_gitremote.go:232). On a server with `uploadpack.allowFilter` off, the filtered clone fails and a full shallow clone runs too, making it 3 git invocations.
+
+Then `ExecuteDepPlan` (plugin_deps.go:239) → `InstallPluginFromRepo` re-runs both against the same URL, seconds later, in the same process: `listRemoteSemverTags` at plugin_install_remote.go:71 and `fetchPluginMetadataAtTag` at plugin_install_remote.go:99.
+
+**Cost: 4 git network operations per dependency where 2 suffice.** For N=3 dependencies: 12 git operations, 6 avoidable. Each `ls-remote` is a TLS handshake plus ref advertisement (~300–800ms to a public forge); each clone+show is two fresh connections (~1–2s). That is roughly **1.5–3s of duplicate network time per dependency**, ~5–9s for a 3-dep install, on a command the user is watching.
+
+Root cause is a data-handoff gap: `planDeps` has the resolved `tag` (line 172) and the parsed `meta` (line 180) in hand and discards both, because `DepAction` has only `Name/RepoURL/MinVersion/Upgrade/CurrentTag` — no `Tag`, no metadata.
+
+**Cheaper alternative:** add `Tag string` and `Meta *PluginMetadata` to `DepAction`, and add a `ResolvedTag` field to `RemoteInstallOptions` that skips the `ls-remote` and the metadata clone when populated. Note `Pin` cannot be reused for this: plugin_install_remote.go:190 sets `Pinned: opts.Pin != ""`, so passing the resolved tag as `Pin` would mark every dependency pinned and make `plugin upgrade` skip it permanently.
+
+Secondary instance of the same pattern: **plugin_install_remote.go:227 vs :71** — `UpgradeInstalledPlugin` calls `listRemoteSemverTags`, and when an upgrade actually proceeds (line 243) `InstallPluginFromRepo` calls it again. Up-to-date plugins return early at line 237 and do only one, so for `upgrade --all` over M plugins with K actually upgrading: M+K `ls-remote` where M suffices, K avoidable.
+
+---
+
+### 2. A full asset download issued only to be deleted
+
+**`cmd/entire/cli/plugin_fetch.go:336-341`** — on the fallback probe path without `--allow-unverified`, the matched asset is downloaded in full via `fetchAndVerify`, then `os.Remove`d, then the function returns `errUnverifiedAsset`.
+
+**Cost:** one complete asset transfer (the file header at line 105 says real plugin binaries are tens of MB) moved across the network purely to answer the yes/no question "does this asset exist?", then discarded. If the user then re-runs with `--allow-unverified`, the same bytes transfer a second time — **~40 MB for a 20 MB release where ~20 MB plus one metadata request would do.**
+
+**Cheaper alternative:** probe with `HEAD` and only `GET` the winner. A 200 on `HEAD` proves existence for one RTT and zero body bytes; the `!allowUnverified` branch can then return `errUnverifiedAsset` without transferring anything, and the `allowUnverified` branch does the single `GET` it actually needs. Needs a `GET` fallback on 405/501 for hosts that don't implement `HEAD` on release assets.
+
+Scope is honest and narrow: this only fires for releases that publish no `checksums.txt` under any of the three candidate names (plugin_fetch.go:294-319 is tried first and normally wins), which the design already discourages. But it is exactly the path the code deliberately keeps alive (comment at lines 326-330).
+
+On the rest of the probe loop: the candidate count is 36 on darwin/arm64 (2 OS aliases × 3 arch aliases incl. `all` × 2 stem forms × 3 extensions) and 12 on linux/windows. Those are 404s on a reused keep-alive connection and the loop returns at the first hit, so **only one wasted full download occurs, not 36.** Ordering is already correct — ext-major with `darwin_arm64.tar.gz` first — so there is no win available from reordering. I would not change the candidate generation.
+
+---
+
+### 3. Redundant local I/O — real, O(n²)-shaped, and almost certainly not worth fixing for speed
+
+**`cmd/entire/cli/plugin_deps.go:289-291 vs :212`** — `RunPluginDoctor` builds `installedByName` from `ListInstalledPlugins()`, then never passes it to `dependencySatisfied`, which calls `FindInstalledPlugin` → a fresh full `ListInstalledPlugins()` (1 `ReadDir` + one `Lstat` per entry) on every requirement. For M installed plugins × R requirements each: up to M·R full directory scans. At M=10, R=2: 20 `ReadDir` + ~200 `Lstat` where the map already in scope answers every query. **Cheaper: thread the map through as a parameter.**
+
+**`plugin_deps.go:202 vs :131/:143`** — every requirement reads the dependency's `manifest.yml` twice: once inside `dependencySatisfied` (line 202), then again in `planDeps` in *both* branches (line 131 satisfied, line 143 unsatisfied). **Cheaper: have `dependencySatisfied` return the `*PluginManifest` it already loaded.**
+
+**`plugin_deps.go:324,332`** — in doctor, the unsatisfied branch calls `LoadPluginManifest(req.Name)` at line 332 for a file `dependencySatisfied` just read at line 202. Straight-line duplicate read.
+
+**Total manifest reads for one `plugin doctor`:** M from `ListPluginManifests` (line 310) + M·R from `dependencySatisfied` + up to M·R more from the line-332 re-read. At M=10, R=2 that is **30–50 reads + YAML parses where 10 suffice**, and since dependencies are themselves installed plugins the M·R term is O(M²) in a dense graph.
+
+**Honest assessment: do not fix this for performance.** These are sub-kilobyte page-cached files; 40 extra reads and parses is well under a millisecond, against a doctor run whose real cost is `checkManagedBinaryIntegrity` → `fileSHA256` hashing every managed binary in full (M × tens of MB — inherent to the check, not waste). Fix it because passing the map and the loaded manifest is simpler code, not because it is slow.
+
+**`plugin_deps.go:301,417`** — `quarantinedPath` spawns an `xattr` subprocess per installed plugin on macOS: N fork/execs at ~5–10ms each, ~50–100ms at N=10. **Cheaper: one batched `xattr -p com.apple.quarantine f1 f2 …`, or `unix.Getxattr` directly.** This is the largest avoidable cost in doctor after the SHA-256 hashing, and still imperceptible in an interactive command.
+
+**`plugin_group.go:626 vs :165`** — `plugin browse` syncs the index, then `runRemoteInstall` syncs it again for the same URL. The second is within the TTL so there is no network hop, but it re-acquires the flock, re-reads `index.json`, re-parses the JSON, and re-runs `validatePluginName`+`validatePluginRepoURL` over every entry (~400 calls for a 200-entry catalog). Sub-millisecond. **Cheaper: pass the loaded `*PluginIndex` into `runRemoteInstall`.** Mentioned for completeness, not worth a commit on its own.
+
+---
+
+### 4. Sequential fan-out
+
+**`cmd/entire/cli/plugin_group.go:479`** — `plugin upgrade --all` iterates plugins one at a time, each doing at least one `git ls-remote`. At M=10 that is 10–13 sequential network round trips, **~4–10s wall clock where a bounded `errgroup` (limit 4–8) would land near 1s.** The work is genuinely independent: distinct repos, distinct `pkg/&lt;name&gt;/` dirs, distinct `bin/` filenames placed by atomic rename. The only obstacle is that the per-plugin status lines are printed inline as the loop runs; buffering results and printing in name order preserves the current output exactly.
+
+`ExecuteDepPlan` (plugin_deps.go:238) is sequential and **that is fine** — N is small, the order was shown to the user in the confirmation prompt, and dependency installs benefit from deterministic failure attribution. The `downloadPluginAsset` probe loop must stay sequential; preference order is the whole point.
+
+---
+
+### 5. Dispatch path and startup — clean
+
+`cmd/entire/cli/plugin.go` is untouched by the diff (confirmed: the only changes outside the plugin_* files are a `darwinGOOS` const added in `explain.go:55` and a literal-to-const swap in `login.go:530`). `PrependPluginBinDirToPATH` (plugin_store.go:178) is unchanged. No `init()` was added in any of the seven new files. Every new code path — `SyncPluginIndex`, `ListPluginManifests`, dependency planning — sits inside a `plugin` subcommand's `RunE`. `entire &lt;name&gt;` dispatch remains zero-cost and no per-command startup work was added.
+
+### 6. Closures captured into long-lived values — clean, both of them
+
+**`plugin_fetch.go:94-102`** — `pluginHTTPClient.CheckRedirect` is package-level and long-lived, but captures **nothing**: it references only the `maxAssetRedirects` const and the package-level `requireSecureAssetURL` func. Zero retained scope. No change warranted.
+
+**`plugin_fetch.go:269-278`** — the `assetURL` closure captures `meta` (a small `*PluginMetadata`), plus the `name`/`tag`/`repoURL` strings. It is a local variable, invoked synchronously, and never stored in a struct field, package var, or cached object — it does not outlive `downloadPluginAsset`. It also earns its keep by not duplicating the meta-vs-convention branch four times. No finding; a struct copying only the needed fields would be strictly more code for identical behavior.
+
+One genuine (tiny) redundancy inside it: `releaseAssetBaseURL` at line 273 re-runs `url.Parse` plus string manipulation on every call, so the fallback probe loop re-derives the identical base string up to 36 times. **Cheaper: compute the base once before the loop.** This is ~20µs total, dwarfed by the 36 network round trips in the same loop — a tidiness point, not a performance one.
+
+---
+
+## Prioritized
+
+1. **Carry the resolved tag and metadata from `planDeps` into `ExecuteDepPlan`** (plugin_deps.go:173,180 → plugin_install_remote.go:71,99). Halves the git network operations for dependency installs: 4 per dep → 2, saving ~1.5–3s per dependency. The only finding with a user-visible number.
+2. **Probe with `HEAD` in `downloadPluginAsset`'s fallback** (plugin_fetch.go:336-341). Eliminates one full tens-of-MB transfer per unverified-install rejection.
+3. **Drop the duplicate `ls-remote` in `UpgradeInstalledPlugin`** (plugin_install_remote.go:227 vs :71) and **parallelize `upgrade --all`** (plugin_group.go:479). Turns a ~4–10s no-op scan into ~1s.
+4. Optional, code-clarity not speed: thread `installedByName` and the already-loaded manifest through `dependencySatisfied` (plugin_deps.go:212,202,332); batch the `xattr` probe (plugin_deps.go:301); hoist `releaseAssetBaseURL` out of the probe loop (plugin_fetch.go:273).
+
+No files were modified.</result>
+<usage><subagent_tokens>114879</subagent_tokens><tool_uses>16</tool_uses><duration_ms>573624</duration_ms></usage>
+</task-notification>

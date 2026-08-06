@@ -1,0 +1,211 @@
+/simplify
+
+---
+
+<task-notification>
+<task-id>a1905b405e0a0fa6e</task-id>
+<tool-use-id>toolu_01UMb9nLBe75o3K8X7oLRRSY</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/f81dadde-adb7-49eb-8641-b3c1627b2a40/tasks/a1905b405e0a0fa6e.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Findings, verified against the files.
+
+**1. `statusResult` exists only to cache errors — drop it**
+- File: `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/gitrepo/status.go:22-25`, `:67-72`
+- Cost: a package-level type plus a two-field struct literal and a two-value cache read, purely to memoize a failure. Both production callers (`getUntrackedFilesForState`, `calculatePromptAttributionAtStart`) treat a status error as "give up and skip", so a cached error buys nothing except suppressing a retry that would never be attempted twice anyway.
+- Simpler form: `results map[string]git.Status`, cache only successes.
+  ```go
+  if cached, ok := cache.results[root]; ok {
+      return cached, nil
+  }
+  status, err := worktree.Status()
+  if err != nil {
+      return nil, err //nolint:wrapcheck
+  }
+  cache.results[root] = status
+  return status, nil
+  ```
+  Removes the `statusResult` type (4 lines) and the `status, statusErr` two-value dance.
+
+**2. `!ok || cache == nil` — the nil half is unreachable**
+- File: `status.go:55-58`
+- Cost: a reader has to reason about how a typed-nil `*statusCache` could land in the context. It can't: `statusCacheKey{}` is referenced in exactly three places, all in this file (verified by grep), and `WithStatusCache` always stores a freshly allocated struct. A failed type assertion yields `(nil, false)`, which `!ok` already covers.
+- Simpler form: `if !ok { return worktree.Status() }`.
+
+**3. Doc block's second paragraph restates the `Status` doc, and its central claim is already stale**
+- File: `status.go:16-18` vs `:44-48`
+- Cost: 3 lines saying what the function's own doc comment says two declarations later ("first call computes, later calls reuse" ≡ "reusing a cached result when ctx carries a cache from WithStatusCache"). Worse, "Status is the single entry point for reading worktree status" is not true as of this commit — three direct `worktree.Status()` callers remain: `state.go:278` (`DetectFileChanges`), `rewind.go:1094`, `strategy/common.go:1192`. A false invariant in a doc comment is worse than no comment.
+- Simpler form: keep paragraph 1 (the "why it's expensive" rationale is genuinely non-obvious and worth its 5 lines), delete paragraph 2. If the single-entry-point rule is intended, it needs those three call sites converted; otherwise drop the sentence.
+
+**4. Dead `os.MkdirAll` in the ignore test**
+- File: `status_external_test.go:141-143`
+- Cost: 3 lines plus the entire `os` import, for work the next line already does — `testutil.WriteFile` (`testutil/testutil.go:70-75`) `MkdirAll`s the parent directory. The other three tests in the same file rely on exactly that.
+- Simpler form: delete the `if err := os.MkdirAll(...)` block; drop `"os"` from imports.
+
+**5. `filepath.ToSlash` loop where a map lookup does**
+- File: `status_external_test.go:157-161`
+- Cost: a 5-line range-and-compare instead of one lookup, inconsistent with `status["new.txt"]` (line 46) and `statusA["only-in-b.txt"]` (line 115) in the same file, which already assume slash-separated keys. It is also the file's only use of `filepath`.
+- Simpler form: `if _, ok := status["outer/ignored/deep/junk.txt"]; ok { t.Errorf(...) }`; drop `"path/filepath"`. With finding 4, the import block collapses to `context`, `testing`, `gitrepo`, `testutil`, `go-git`.
+
+**6. `TestStatus_WithoutCacheSeesWorktreeChanges` and `TestStatus_WithCacheReusesFirstResult` are mirror images**
+- File: `status_external_test.go:30-88`
+- Cost: ~58 lines where the only differences are the ctx constructor and the final assertion's polarity. Identical repo setup, identical write, identical first call.
+- Simpler form: one test with two subtests over `{name string; ctx func() context.Context; wantsNewFile bool}`, ~30 lines, no coverage lost.
+
+**7. `TestStatus_NestedIgnoreRuleStillIgnores` does not guard what its comment claims**
+- File: `status_external_test.go:128-162`
+- Cost: 35 lines that assert only that go-git honors a nested `.gitignore` — third-party behavior. The comment says it "guards the .gitignore placement that keeps go-git from walking e2e/artifacts", but the test never constructs the root-level `e2e/artifacts/` variant, never asserts anything about pruning or cost, and operates on its own temp repo — so reverting `e2e/.gitignore` back into the root `.gitignore` leaves it green. It cannot fail for the regression it names.
+- Simpler form: delete it. If a guard is genuinely wanted, it has to assert the *difference* between the two placements (e.g. both configurations ignore the file, but only the nested one prunes — measurable via a walk-count or a large synthetic tree), which is what the comment describes but the code doesn't do.
+- Also stale: the doc comment names `TestStatus_CachePrunesIgnoredSubtreeRule`, a function that does not exist.
+
+**Checked, not flagged**
+
+- `repo.Worktree()` in `calculatePromptAttributionAtStart` (`manual_commit_hooks.go:2495`) is **still needed** — `worktree` is used at line 2512 for `worktree.Filesystem().Root()`. Not redundant.
+- Per-worktree map keying: honestly, it is not exercised in production — both callers (`state.go:442`, `manual_commit_hooks.go:2505`) resolve the current worktree on one hook, so the map holds exactly one entry, and `TestStatus_CacheIsPerWorktree` is the only thing that ever puts a second key in it. But collapsing to a single slot saves ~4 lines while making the API silently wrong for any future second-worktree caller. Not worth the trade; keep the map.
+- The `sync.Mutex` is likewise unexercised (both calls are sequential) but is the correct default for a value handed around in a context.</result>
+<usage><subagent_tokens>69020</subagent_tokens><tool_uses>17</tool_uses><duration_ms>162794</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a62004c5b36f0d8bb</task-id>
+<tool-use-id>toolu_01FnkwCjUqpS1dzMMGPGsFGJ</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/f81dadde-adb7-49eb-8641-b3c1627b2a40/tasks/a62004c5b36f0d8bb.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I verified the go-git behavior in the module source, timed the CLI alternative, and checked the repo's existing conventions. Findings:
+
+---
+
+## 1. Both fixes work around go-git's `Status()`; the repo's own precedent says replace it
+
+**Files:** `cmd/entire/cli/gitrepo/status.go:33-41`, `.gitignore:52-55`, `e2e/.gitignore:1-10`
+
+Both fixes are shaped around *keeping* `worktree.Status()`. The codebase already contains two independent, documented conclusions that go-git's Status is the wrong tool:
+
+- `cmd/entire/cli/checkpoint/ephemeral.go:1116-1122` — "Uses git CLI instead of go-git because go-git's `worktree.Status()` does not respect global gitignore… See PR #129." So the *correctness* case is already settled in-repo.
+- `cmd/entire/cli/strategy/manual_commit_hooks.go:2550-2553` — "This is much faster than go-git's `worktree.Status()` which scans the entire working tree. `git diff --cached` uses native git's optimized index and filesystem monitors." So the *performance* case is already settled in-repo.
+
+CLAUDE.md:495-514 codifies exactly this pattern ("go-git v5 Bugs — Use CLI Instead"). This change is the third instance of the same problem and it went the other way.
+
+Measured, in this repo, right now:
+
+```
+git status --porcelain --untracked-files=all   →  0.02s
+go-git Worktree.Status() (pre-fix)             →  5.25s
+```
+
+I confirmed a CLI-backed `gitrepo.Status` is a genuine drop-in, not a rewrite:
+- go-git's `StatusCode` constants (`status.go:75-82`) are literally the porcelain-v1 XY characters `' ' ? M A D R C U`, so `git status --porcelain=v1 -z -uall` parses directly into a `git.Status` map with no caller changes at any of the five consumers.
+- Real git prunes correctly regardless of which `.gitignore` declares the rule — verified empirically in a scratch repo: a root-level `outer/ignored/` rule prunes `outer/ignored/deep/` from `git status -uall`.
+
+**Cost/fragility:** the current shape leaves the 5s landmine armed for every ignored directory that is not a direct child of the `.gitignore` declaring it, keeps the known global-gitignore correctness gap, and adds ~75 lines of caching machinery whose entire reason to exist is that the underlying call costs seconds.
+
+**Deeper fix:** implement `gitrepo.Status(ctx, repo)` over `git status --porcelain=v1 -z --untracked-files=all` with `cmd.Dir = worktree.Filesystem().Root()`. Both `.gitignore` files revert to the simple root rule, the memoization becomes unnecessary (20ms), the safety constraint on the cache disappears, and the global-gitignore gap closes. Note I checked and ruled out the obvious middle path: setting `Worktree.Excludes` does **not** help — `worktree_status.go:184-189` appends `w.Excludes` *after* `gitignore.ReadPatterns` has already done the expensive walk.
+
+---
+
+## 2. The `.gitignore` placement convention has no mechanical guard, and the test that claims to guard it doesn't
+
+**File:** `cmd/entire/cli/gitrepo/status_external_test.go:232-266`
+
+The test's doc comment says it "guards the `.gitignore` placement that keeps go-git from walking e2e/artifacts," but it only asserts that a nested-`.gitignore` rule still *ignores* the file. That assertion passes identically whether the rule lives in `outer/.gitignore` or in the root — go-git's `ReadPatterns` (`plumbing/format/gitignore/dir.go:53-83`) returns the union of all patterns found, so matching is correct in both placements; only the *walk pruning* differs. The test cannot fail when someone moves `artifacts/` back to the root `.gitignore`.
+
+The name/comment mismatch (`TestStatus_CachePrunesIgnoredSubtreeRule` in the comment vs `TestStatus_NestedIgnoreRuleStillIgnores` as the function) is the tell that the test drifted off the invariant it was written for.
+
+**Cost/fragility:** the only thing protecting a 5-second regression is two prose comments in two `.gitignore` files. Nothing in CI notices when someone adds `foo/bar/` to the root `.gitignore`.
+
+**Deeper fix (if fix 1 is not taken):** assert the actual property — build a repo with N ignored subdirectories declared from the *root*, and assert either (a) a wall-clock/`ReadDir`-count budget on `Status()`, or (b) directly that `gitignore.ReadPatterns` does not descend, by counting `ReadDir` calls through a counting `billy.Filesystem`. (b) is deterministic and CI-safe. A repo-level test that walks the actual root `.gitignore` and fails on any pattern containing a `/` before the final component would be even more direct.
+
+---
+
+## 3. `gitrepo.Status` declares itself "the single entry point" but three call sites still bypass it, with no lint rule
+
+**Files:** `cmd/entire/cli/state.go:278` (`DetectFileChanges`), `cmd/entire/cli/strategy/common.go:1192` (`checkCanRewindWithWarning`), `cmd/entire/cli/rewind.go:1094`
+
+`status.go:39-41` says "Status is the single entry point for reading worktree status," but only two of five call sites were migrated. `DetectFileChanges` in particular is on the hot TurnEnd/SubagentEnd path (`lifecycle.go:879`, `lifecycle.go:1160`) and still pays the full 5s walk if the ignore rule ever regresses.
+
+Meanwhile the repo already has the enforcement mechanism wired up. `.golangci.yaml:104-118` runs `forbidigo` with `analyze-types: true` and *already* forbids the two other go-git footguns with exactly this "use our helper" message shape:
+
+```yaml
+- pattern: '^.*\.Reset$'
+  msg: "go-git Reset deletes .gitignored dirs - use HardResetWithProtection() from common.go"
+  pkg: 'github\.com/go-git/go-git'
+```
+
+**Cost/fragility:** a convention documented only in one package's doc comment, with two-fifths adoption and zero enforcement, is a convention that will not survive. This is the same failure mode CLAUDE.md solved for `git.PlainOpen` — except there, CLAUDE.md explicitly tells reviewers to flag it (CLAUDE.md:490-493).
+
+**Deeper fix:** add the forbidigo rule (`pattern: '^.*\.Status$'`, `pkg: 'github\.com/go-git/go-git'`, msg pointing at `gitrepo.Status`), with `//nolint:forbidigo` inside `gitrepo/status.go` itself — matching the established `os.Getwd` exemption pattern used at 14 sites. Then migrate the remaining three callers.
+
+---
+
+## 4. Cache installed at one call site: the safety constraint is real but lives only in a comment
+
+**File:** `cmd/entire/cli/lifecycle.go:553-558`
+
+Opt-in-per-hook is the *correct* altitude given the constraint — a repo-keyed cache inside `gitrepo` would be actively unsafe, because `DetectFileChanges` at `lifecycle.go:879`/`1160` runs *after* the agent has edited files and must see fresh state. Installing at hook dispatch (`DispatchLifecycleEvent`, `lifecycle.go:50`) would be wrong for the same reason. So the placement itself is defensible.
+
+What is at the wrong altitude is how the constraint is expressed: it is a prose comment at the install site, and `WithStatusCache` is an exported function on a widely-imported package with nothing but a doc comment stopping someone from installing it in TurnEnd. There is no test asserting that TurnEnd/SubagentEnd do *not* carry a cache.
+
+**Cost/fragility:** a future "let's speed up TurnEnd too" change produces silently stale checkpoints — a data-correctness bug with no test coverage and no compile-time signal.
+
+**Deeper fix:** if fix 1 is taken, delete this entirely — a 20ms call does not warrant a cache with a correctness precondition. If it is kept, either (a) unexport it and expose a single `gitrepo.WithReadOnlyWorktreeWindow(ctx)` used only by pre-agent hooks, or (b) add an integration assertion that the TurnEnd path observes post-agent worktree changes.
+
+---
+
+## 5. Documentation the conventions need to survive was not written
+
+**Files:** `CLAUDE.md:466-514` (Git Operations), `docs/architecture/commit-hook-perf-analysis.md`
+
+CLAUDE.md's "Git Operations" section is the designated home for exactly this class of knowledge and has two sibling entries already (`gitrepo` for opens; git-CLI for reset/checkout). Neither the `gitrepo.Status` convention nor the `.gitignore` placement rule was added. CLAUDE.md:490-493 tells reviewers to flag bare `git.PlainOpen*`; there is no equivalent instruction for bare `worktree.Status()`, so reviewers have no reason to catch the drift described in finding 3.
+
+`docs/architecture/commit-hook-perf-analysis.md` is the existing home for go-git-specific perf pathologies (it already documents `repo.Reference()`'s packed-refs rescan in the same register). The `ReadPatterns` pruning defect and its 5.25s cost belong there, next to it.
+
+**Deeper fix:** add a "Reading worktree status" subsection under Git Operations covering the entry point, the reviewer instruction, and — if the `.gitignore` placement stays — the placement rule with its rationale. Append the `ReadPatterns` analysis to the perf doc. (`AGENTS.md` is a symlink to CLAUDE.md, so one edit covers both.)
+
+---
+
+## Bottom line
+
+`gitrepo` is the right *home* for a status entry point — it is already the sanctioned go-git chokepoint and already precedents a git-CLI-backed implementation behind a go-git-shaped API (`gitrepo/reftable.go`). The problem is the *content*: the new file adds a cache around a broken call instead of a correct implementation behind the same signature. Finding 1 subsumes findings 2 and 4 — replacing the body of `gitrepo.Status` with `git status --porcelain` makes the `.gitignore` placement trick, the cache, and the cache's correctness precondition all unnecessary, while closing a correctness gap the repo has known about since PR #129. Findings 3 and 5 apply either way.</result>
+<usage><subagent_tokens>93872</subagent_tokens><tool_uses>29</tool_uses><duration_ms>340664</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aedf257f08163ba23</task-id>
+<tool-use-id>toolu_01FPgwyEWN3JyZpAkEujhEEi</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/f81dadde-adb7-49eb-8641-b3c1627b2a40/tasks/aedf257f08163ba23.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I read the diff and verified each candidate against the codebase. Findings below.
+
+## Genuine reuse findings
+
+**1. `cmd/entire/cli/gitrepo/status_external_test.go:18` — `newRepoWithCommit` duplicates an existing helper in the same directory.**
+`initRepoWithFile(t, repoDir, name, content)` already exists at `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/gitrepo/repository_test.go:262` and does exactly the same thing (PlainInit + test user config + gpgsign=false + write file + add + commit), and it's already used by `TestOpenPath_MultipleAlternates`.
+Cost: an entire extra test package (`gitrepo_test`), a `testutil` import, the package-level comment justifying the import cycle, and ~10 duplicated helper lines — all of which exist only because the file was written externally. `repository_test.go` and `reftable_test.go` are both `package gitrepo`.
+Instead: write the tests in `package gitrepo` (they only use exported `Status`/`WithStatusCache`/`OpenPath`) and call `initRepoWithFile(t, dir, "tracked.txt", "initial")`. The other `testutil` calls collapse to `os.WriteFile`; the nested `.gitignore` in `TestStatus_NestedIgnoreRuleStillIgnores` does not need to be committed for the rule to apply — go-git reads patterns off the worktree filesystem (`plumbing/format/gitignore/dir.go:29`, `:52` in go-git v6.0.0-alpha.5), so `GitAdd`/`GitCommit` there are not load-bearing either.
+
+**2. `cmd/entire/cli/gitrepo/status_external_test.go:141` — redundant `os.MkdirAll`.**
+`testutil.WriteFile` already creates parent directories (`cmd/entire/cli/testutil/testutil.go:70-75`). The explicit `os.MkdirAll(...)` plus its error branch is 3 dead lines; `testutil.WriteFile(t, dir, "outer/ignored/deep/junk.txt", "junk")` on the next line is sufficient.
+
+**3. `cmd/entire/cli/state.go:273-281` — `DetectFileChanges` still hand-rolls the pattern the new helper encapsulates.**
+The diff converted `getUntrackedFilesForState` (same file, line 442) but left `DetectFileChanges` doing `repo.Worktree()` → `worktree.Status()` inline, so the new package doc's claim that "Status is the single entry point for reading worktree status" (`gitrepo/status.go:14`) is false on arrival. `gitrepo` is already imported in this file by the diff, so this is a 5-lines-to-1 change with no new dependency. (Note: its two lifecycle callers are `handleLifecycleTurnEnd`/`handleLifecycleSubagentEnd`, post-agent windows where the cache is deliberately absent — so this is about consistency and boilerplate, not perf.)
+
+**4. `cmd/entire/cli/strategy/common.go:1187-1195` and `cmd/entire/cli/rewind.go:1089-1097` — the last two copies of the same boilerplate.**
+Both do `repo.Worktree()` → `worktree.Status()` purely to read a status; neither uses the worktree for anything else. After this diff these are the only remaining non-test occurrences in the repo. Both packages already import `gitrepo` elsewhere; both should call `gitrepo.Status(ctx, repo)`.
+
+## Checked and clean (no finding)
+
+- **No existing context-scoped memo helper is duplicated.** All nine `With*(ctx) context.Context` helpers in the repo store scalars or flags, not memoized results: `settings/settings.go:42`, `checkpoint/refs_store.go:102`, `checkpoint/remote/git.go:59`, `logging/context.go:20,26`, `strategy/session_state.go:50`, `strategy/common.go:69`, `perf/context.go:18`, `internal/coreapi/oas_client_gen.go:439`. `WithStatusCache` follows the same unexported-empty-struct-key convention. There is no generic cache/singleflight package.
+- **`paths.WorktreeRoot` (`cmd/entire/cli/paths/paths.go:67-107`) is the repo's existing expensive-git-result memo**, but it is process-global with an explicit `ClearWorktreeRootCache()` escape hatch for tests. A process-global status cache would be wrong; the per-context scoping here is a deliberate and correct divergence, not a missed reuse.
+- **No existing go-git worktree-status wrapper for `gitrepo.Status` to fold into.** The other status readers are git-CLI based with different return shapes and deliberately different semantics (they use the CLI because go-git ignores global gitignore — documented at `checkpoint/ephemeral.go:1120` and `git_operations.go:210`): `collectChangedFiles` → `changedFilesResult` (`checkpoint/ephemeral.go:1238`), `collectUntrackedFiles`/`CollectUntrackedFiles` → `[]string` (`strategy/common.go:1532,1566`), `HasUncommittedChanges` → `bool` (`git_operations.go:212`). Worth knowing that `getUntrackedFilesForState` and `strategy.CollectUntrackedFiles` are two implementations of "untracked, non-ignored files", but that predates this diff and swapping the source would change what `DetectFileChanges` counts as pre-existing (global-gitignore mismatch), so I am not recommending it.
+- **No "read-only shared map" convention exists** to follow — `maps.Clone` at `session_adopt.go:552,566` is the only related precedent, and it clones rather than documents.</result>
+<usage><subagent_tokens>91166</subagent_tokens><tool_uses>37</tool_uses><duration_ms>543137</duration_ms></usage>
+</task-notification>

@@ -1,0 +1,181 @@
+/simplify
+
+---
+
+<task-notification>
+<task-id>a1212ab793bb5d8ef</task-id>
+<tool-use-id>toolu_01Aoo3orgRBA42Wc2J1yQaES</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/cce82d3e-e134-4b23-9375-0e18f59e5619/tasks/a1212ab793bb5d8ef.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## REUSE review — 1 actionable finding
+
+**1. `cmd/entire/cli/setup_import_test.go:516-538` — two new test importer types re-implement the existing `fixedDiscoverImporter` seam 150 lines above them.**
+
+`cancelOnDiscoverImporter` (516) and `recordDiscoverImporter` (529) are both `fixedDiscoverImporter` (line 357) with a side effect: same `agentimport.Importer` embed, same `Discover(string, string, time.Time, []string)` override. `cancelOnDiscoverImporter` = fixed + `cancel()`; `recordDiscoverImporter` = fixed with nil sessions + set a `*bool`.
+
+Cost: ~22 duplicated lines and two extra type names for what is one optional field on the existing seam. Add `onDiscover func()` to `fixedDiscoverImporter` and delete both new types — the 2 pre-existing call sites (414, 483) are unaffected by a nil hook:
+
+```go
+type fixedDiscoverImporter struct {
+	agentimport.Importer
+	sessions   []agentimport.SessionFile
+	onDiscover func()
+}
+func (f fixedDiscoverImporter) Discover(string, string, time.Time, []string) ([]agentimport.SessionFile, error) {
+	if f.onDiscover != nil { f.onDiscover() }
+	return f.sessions, nil
+}
+```
+New call sites become `fixedDiscoverImporter{Importer: claudeImp, sessions: sessions, onDiscover: cancel}` and `fixedDiscoverImporter{Importer: claudeImp, onDiscover: func() { secondReached = true }}`.
+
+## Checked and explicitly NOT actionable
+
+- **`logging.SetLogLevelGetter` + `logging.Init` + `defer logging.Close` (setup.go:900-902)** — verbatim at 11 sites (clean.go:69, rewind.go:70, reset.go:31, resume.go:85/175, checkpoint_resume.go:64, explain.go:308, import_cmd.go:65, trail_context_cache.go:412, investigate/cmd.go:340). No helper exists, and the one near-miss, `initHookLogging` (`cmd/entire/cli/hooks_git_cmd.go:129`), is **not** reusable here: it returns a no-op when `settings.IsSetUpAndEnabled(ctx)` is false — exactly the state `entire enable` runs in on a first-time repo — and additionally does session lookup + `EnsureRedactionConfigured`. Established convention; extracting a helper is a repo-wide change out of scope for this diff.
+- **`errors.Is(err, context.Canceled)` → `NewSilentError` (import_cmd.go:97, setup_import.go:268)** — the bare 2-line form exists at `doctor_migrate.go:58`/`:97`, `explain_export.go:637`, `repo_mirror_create_wizard.go:392`, plus ~10 other `context.Canceled` branches. But the diff's versions print partial-progress text ("Import interrupted after N turn(s)…") that no existing helper produces, and `main.go:92` already covers the signal→exit-130 case. No missed helper.
+- **`if err := ctx.Err(); err != nil { return err //nolint:wrapcheck // Propagating context cancellation }` (refs_store.go:245, agentimport.go x2)** — byte-identical to `persistent.go:865` and ~25 other sites in `cmd/entire/cli/checkpoint/`. Established convention, no helper.
+- **`context.WithoutCancel` (refs_store.go:227)** — only two other uses repo-wide (`checkpoint/remote/git.go:310`, `review/cmd.go:1560`), both the different `WithTimeout(WithoutCancel(ctx), d)` shape. Three sites, no helper to reuse or extract.
+- **`importHistoryFlagUsage()` / `noteImportHistoryNotApplicable()`** — no pre-existing flag-usage-builder or "note" helper in the `cli` package (`"Note: …"` is inlined at ~15 sites). Both new funcs are themselves the dedup (2 call sites each), so they add reuse rather than duplicate it. Minor and below the bar: `agentimport.LookbackDays` is now rendered into user text at three spots in `setup_import.go` (:43, :174, :212) with three different phrasings.
+- **`newImportProgressReporter`** — the diff correctly routes both the standalone command and the enable-time path through the existing shared helper (`import_progress.go:23`); no duplication introduced.</result>
+<usage><subagent_tokens>116451</subagent_tokens><tool_uses>24</tool_uses><duration_ms>179404</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ab5f0946df7cd8eae</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/cce82d3e-e134-4b23-9375-0e18f59e5619/tasks/ab5f0946df7cd8eae.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Findings (simplification only), most valuable first:
+
+**1. Every added prod-code rationale is re-told nearly verbatim in its test's doc comment — ~30 duplicated prose lines to keep in sync.** Four pairs:
+- `cmd/entire/cli/checkpoint/refs_store.go:216-226` (11-line `enqueueForPush` comment) vs `cmd/entire/cli/checkpoint/refs_store_test.go:769-776` (8 lines restating "ref already on disk / queue is the only push-discovery mechanism / writers are idempotent").
+- `refs_store.go:240-244` (`writeSession` guard rationale) vs `refs_store_test.go:741-745`.
+- `cmd/entire/cli/setup.go:892-899` (8-line `logging.Init` comment) vs `cmd/entire/cli/integration_test/enable_import_test.go:140-147` — the same "package logger stays nil → slog.Default() → prints to terminal, writes nothing to .entire/logs" paragraph twice.
+- `cmd/entire/cli/agentimport/agentimport.go:218-221` vs `agentimport_test.go:664-670` — "go-git object/ref writes and CreateCommit all ignore ctx" appears a third time in `refs_store.go:217`.
+Simpler form: keep the WHY once in the prod file; make each test comment one line stating what it pins (e.g. "pins that a ref written during shutdown is still queued — see enqueueForPush for why"). Cost as-is: four rationales that can drift from their code and from each other.
+
+**2. `cmd/entire/cli/setup_import.go:92-113` — the nested `if !opts.ImportHistory { if opts.Yes || !CanPromptInteractively() {…} }` can be one guard clause.** `selected := eligible` is declared at :91 but its meaning is only settled two branch levels down. Flatten to:
+```go
+if !opts.ImportHistory &amp;&amp; (opts.Yes || !interactive.CanPromptInteractively()) { log; hint; return }
+selected := eligible
+if !opts.ImportHistory { selected, err = sessionImportPrompt(...) ; … }
+```
+Same behaviour, one nesting level removed, and the default value sits next to its only reassignment.
+
+**3. `agentimport.go:218` — the per-session `ctx.Err()` buys little over the per-turn one at `:243`.** Answering the specific question: the store guard (`refs_store.go:240`) and the per-turn guard are both genuinely needed (the store guard covers every other caller and the branch-store parity; the per-turn guard is the only thing that stops a `DryRun` run, which writes nothing, and it avoids the per-session redaction work). The *per-session* guard is the near-redundant one: with the per-turn check present it only avoids one extra `os.ReadFile` + `SplitTurns` of the next session file (plus the zero-turn-session edge case) at the price of 7 lines and a `SessionsScanned` assertion in `agentimport_test.go:648`. If kept, its 4-line comment can collapse to one line since `:243`'s comment plus the store guard already carry the reasoning.
+
+**4. `cmd/entire/cli/setup_import_test.go:514-538` — two stub types where one does both jobs.** `cancelOnDiscoverImporter` and `recordDiscoverImporter` differ only in the side effect inside `Discover`. One type with an `onDiscover func()` and a `sessions` field covers both call sites at :577-578 and drops ~10 lines and one method.
+
+**5. `cmd/entire/cli/integration_test/enable_import_test.go` — the 3-line fixture-write stanza is now copy-pasted 6 times** (2 of them new, at :58-60 and :78-80). The file already has the `freshRepoEnv` precedent; a `writeClaudeHistory(t, env)` helper (or a `freshRepoEnvWithHistory`) removes the repetition. `TestEnable_RoutesLoggingToLogFile` correctly does not need it.
+
+**6. `setup_import.go:40-44` — `importHistoryFlagUsage()` has one call site (`setup.go:959`), no arguments, and a deterministic result.** A package-level `var importHistoryFlagUsage = fmt.Sprintf(...)` keeps the "lives next to the behaviour" property the doc comment argues for while dropping the function and the call. (A `const` is not possible — the `LookbackDays` interpolation is the whole point.)
+
+**7. Optional: the `if opts.ImportHistory { noteImportHistoryNotApplicable(w) }` guard is duplicated at `setup.go:1121-1123` and `setup_import.go:73-75`.** The two paths are mutually exclusive (`--agent` → `setupAgentHooksNonInteractive`, bare enable on a configured repo → `runEnableOnConfiguredRepo`), so there is no double-print, but both conditions are exactly "`opts.ImportHistory &amp;&amp; settings.IsSetUpAny(ctx)` at RunE entry". A single check in `RunE` before the branch at `setup.go:929/935` would replace both and let `maybeOfferSessionImport`'s `!firstRun` arm go back to a plain `return`. Costs a test update (`TestMaybeOfferSessionImport_ImportHistoryOnNonFirstRunIsReported`), so only worth it if you dislike the two-site invariant.
+
+Nothing else in the diff reads as gratuitous — the `errors.Is(err, context.Canceled)` branches in `import_cmd.go:94-100` and `setup_import.go:265-277` are distinct surfaces (command exit vs. multi-agent loop), not copy-paste.</result>
+<usage><subagent_tokens>108060</subagent_tokens><tool_uses>14</tool_uses><duration_ms>187763</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ad5254cb301e365b9</task-id>
+<tool-use-id>toolu_01EwNYCQgdFteCmgY3jAE3G4</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/cce82d3e-e134-4b23-9375-0e18f59e5619/tasks/ad5254cb301e365b9.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have everything I need. Here are the findings.
+
+## Altitude review — findings
+
+**1. `cmd/entire/cli/checkpoint/refs_store.go:243-250` — the guard is one level below the only entry point; `Write()` at :115 is the dispatcher.**
+All four write methods (`writeSession`, `backfillTranscript`, `backfillSummary`, `backfillAttribution`) are reached *only* through `gitRefsStore.Write` (verified: no other callers in the package). Same for `GitStore` via `persistent_write.go:12`. And every persistent write in the product funnels through `kindRoutingStore.Write` (`routing_store.go:206`) → `fanoutStore.Write` (`fanout.go:68`), per `open.go:88`/`:101`. One guard at either level covers all 4 kinds, both git backends, mirrors, and `fsstore` — and would have made this class of bug structurally impossible.
+
+The concrete payoff isn't just deleting 6 copies of the 3-line guard: **`GitStore.writeSession` (`persistent.go:61`) has no cancellation guard at all** — not at entry, and not on its path (`ensureSessionsBranch` :2163, `BuildTreeFromEntries` `ephemeral.go:1008`, `CreateCommit` :2460 all ignore ctx), even though its three backfill siblings each carry one. So the premises in the new comments are wrong: `refs_store_test.go` says *"Unlike the git-branch store, the git-refs store did not reject writes on a canceled context"* and `refs_store.go:244` says *"Parity with the backfill writers above"* — the git-branch store has the identical hole, and this diff leaves it open. On a git-branch-primary repo, `entire import` still ignores Ctrl-C at the store layer (agentimport's own loop guards save it, but the store contract doesn't).
+**Scope:** the deeper fix is cheap enough to be in scope — 2 lines in `kindRoutingStore.Write` closes both stores and all future ones. At minimum, fix the two comments in this PR, since they assert a parity that does not exist and will mislead the next reader.
+
+**2. `refs_store.go:227` `context.WithoutCancel` — correct altitude; do NOT push it down. Verified against all callers.**
+`resolveGitCommonDir`/`PushQueueForRepo` have four callers: `migrate.go:63` (resolved *before* the walk, cancel there is a clean abort), `manual_commit_push.go:327` (pre-push flush — a canceled ctx means don't push), `shadow_ref.go:47` via `repoDirs` (resolved at the top of `WriteTemporary`, clean abort), and `enqueueForPush`. Only `enqueueForPush` has the "work already committed locally, bookkeeping must still land" property. Making the resolver globally uncancellable would strip a legitimate abort signal from the other three. No change needed.
+*Optional nit:* move the `WithoutCancel` up one frame to `setRef` (`refs_store.go:201`), since the ref write happens there and `enqueueForPush` is its only callee — a no-op today, but it makes "past the point of no return" a property of the frame that crosses it. Follow-up at most.
+
+**3. `cmd/entire/cli/setup.go:900-903` — right depth, wrong duplication level: this is the 12th verbatim copy.**
+Existing copies: `clean.go:69`, `checkpoint_resume.go:64`, `resume.go:85` and `:175`, `hooks_git_cmd.go:137`, `reset.go:31`, `trail_context_cache.go:412`, `rewind.go:70`, `explain.go:308`, `import_cmd.go:65`, `investigate/cmd.go:340`. Each site independently re-derives the "must come after the repo check" ordering — the copy-pasted comment *is* the invariant, which is exactly what rots.
+A central `PersistentPreRunE` in `root.go` is **not** the right fix and is out of scope: many commands legitimately run outside a repo (`auth`, `org`, `api`, `version`, `repo clone`) and `Init` would create `.entire/logs/` in arbitrary directories; worse, setup's site must run *after* the GitHub bootstrap (setup.go:838-890, which may `git init` a repo that didn't exist), so a PreRun hook would be wrong for the very command in this diff. The right generalization is a package-local helper — `func initRepoLogging(ctx context.Context) func()` wrapping SetLogLevelGetter+Init+Close and returning a no-op closer. **In scope:** add the helper and use it at the new site; converting the other 11 is a follow-up.
+
+**4. `ImportHistory bool` on `EnableOptions` (setup.go:82-86) — right model, matches the existing convention.**
+`SearchSkill`/`AgentHelpSkill` (setup.go:87-88, flags at :956-957) are the identical shape: bool on `EnableOptions` + `--flag` + applied inside the setup flow. No deeper opt-in-step mechanism exists, and inventing one for a third instance would be over-engineering.
+*One consistency gap:* `flagSearchSkill`/`flagAgentHelpSkill` are both registered in `enableUsesSetupFlow` (setup.go:151) and `enableNeedsAgentManagement` (setup.go:158); `flagImportHistory` is in neither. Defensible (it's first-run-only and can't apply on a configured repo), but the registration list is now non-uniform — add a one-line comment at :151 stating the exclusion is deliberate, or the next flag author copies the wrong half of the pattern.
+
+**5. `cmd/entire/cli/setup_import.go:274-276` — swallowing the interrupt contradicts both `main.go`'s process-wide contract and setup's own existing mechanism.** *(strongest finding)*
+On Ctrl-C mid-import, `runSelectedImports` prints a note and `break`s; `maybeOfferSessionImport` returns void, so control falls through `setup.go:1349` (and `:1992`) straight to `fmt.Fprintln(w, "\nReady.")` and `return nil` — **exit 0**. `main.go:92-110` owns this policy centrally and documents why: `errors.Is(err, context.Canceled) &amp;&amp; procsignal.Load() != nil` re-raises the signal (exit 130) explicitly so *"an enclosing `while ...; do entire; done` loop actually breaks on a single Ctrl-C"*. A leaf that converts the cancellation into a printed line opts the whole command out of that.
+
+Setup already has the right shape for this exact case: `errBootstrapInterrupted` (`setup_github.go:95`, handled at `setup.go:861-864`) — user aborts mid-setup, print an explanatory message, return `NewSilentError(...)`, no "Ready.", non-zero exit. The import path should reuse that shape rather than invent a weaker one: propagate the cancellation (or have the caller check `ctx.Err()` before the "Ready." block) so the central handler exits 130 while the resumability hint still prints. **In scope** — it's the same bug class the PR is fixing, one layer up.
+
+Note the diff got this right on the other path: `import_cmd.go:94-100` returns `NewSilentError(err)`; `SilentError.Unwrap` (`errors.go:13`) keeps `errors.Is(err, context.Canceled)` true, and main.go checks the canceled case *before* the SilentError case, so the process still dies from the signal. Two sibling call sites, two different answers to the same question.
+
+**6. `setup.go:1120` + `setup_import.go:74` — the "flag doesn't apply here" policy now lives at two call sites.**
+`runEnableOnConfiguredRepo` never reaches the `maybeOfferSessionImport` gate, so the note is emitted twice over. Verified the three RunE paths (setup.go:929/935/939) are mutually exclusive, so there's no double-print today — this is purely about where the policy lives. A single check at the RunE fork (~setup.go:933) would cover all three paths and generalize to future first-run-only flags. Marginal, since the helper is already extracted; **follow-up or leave as-is.**
+
+**Not actionable / verified fine:** the per-loop `ctx.Err()` guards in `agentimport.Run` (both levels) match the established repo idiom (`migrate.go:69`, `parse_tree.go:355/370`, `ephemeral.go:187/219/230`) and are at the right depth — nothing below them observes ctx.</result>
+<usage><subagent_tokens>139950</subagent_tokens><tool_uses>39</tool_uses><duration_ms>317859</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a25012e15f5e60d8e</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/cce82d3e-e134-4b23-9375-0e18f59e5619/tasks/a25012e15f5e60d8e.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Cleaned up my scratch benchmark; tree is clean. Here are the findings.
+
+## Findings
+
+**1. HIGH — `cmd/entire/cli/checkpoint/refs_store.go:227` (`enqueueForPush`): a `git rev-parse --git-common-dir` fork on *every* checkpoint ref write is 73% of the cost of a checkpoint write.**
+
+Measured on this machine (M4 Max, darwin, temp repo, in-process Go benchmarks I wrote and then deleted):
+
+| | ns/op | ms |
+|---|---|---|
+| `resolveGitCommonDir` alone | 9,484,828 | 9.48 |
+| `gitRefsStore.Write` (full session write, 32KB transcript) | 12,936,344 | 12.94 |
+| same `Write` with a `sync.Once` memo prototyped on the store | 2,883,152 | **2.88** |
+
+So memoizing is a **4.5× speedup on every persistent checkpoint write**, saving ~10 ms each. `setRef` is called from all four write paths (refs_store.go:276, 306, 330, 354), so this is not import-specific — it is on the per-turn hook path too.
+
+Concrete import cost: this repo's real 30-day Claude Code window is ~1,100 turns (`~/.claude/projects/-Users-soph-Work-entire-devenv-cli`, `find -mtime -30`). At one write per turn (`writeTurn`, agentimport.go:370) that is **~1,100 subprocess spawns ≈ 10.4 s of pure fork/exec**, turning a ~14 s checkpoint-write phase into ~3 s. The diff puts this squarely on `entire enable --import-history`'s critical path.
+
+Why it's safe and why it belongs on the struct:
+- The git common dir cannot change for a repo's lifetime.
+- `gitRefsStore` already has exactly this memoization pattern for `fetchFailure` (refs_store.go:53-62), with the same justification ("a loop over N missing refs … pays a dead network once instead of N times").
+- Lifetime is right: the store is built once per `cp.Open` (registry.go:161, `gitRefsBackendFactory`), and `agentimport.Run` calls `cp.Open` **once** before the session loop (agentimport.go:196) — one store instance for the entire import.
+- Strongest precedent: `session.getGitCommonDir` (`cmd/entire/cli/session/state.go:794-820`) already caches *this exact value* process-wide, per-cwd, explicitly because it is a subprocess. `checkpoint.resolveGitCommonDir` is its unmemoized twin.
+
+**Recommendation:** memoize inside `resolveGitCommonDir` (`cmd/entire/cli/checkpoint/git_common_dir.go:14`) keyed by `worktree.Filesystem().Root()`, which it already computes. That covers `PushQueueForRepo` *and* the second unmemoized caller, `ephemeralStore.repoDirs` (`shadow_ref.go:47`), which pays the same 9.5 ms on every shadow-branch write — i.e. once per turn on the live agent hot path, called from `ephemeral.go:103` and `ephemeral.go:305`. A `sync.Once` on `gitRefsStore` mirroring `fetchFailure` is the more conservative variant but only fixes half of it.
+
+Minor related note: the diff's `context.WithoutCancel(ctx)` means the subprocess is now spawned even under a canceled ctx, where it previously failed without forking. That is at most once per run (the new `writeSession` guard bails first), so it's noise — but the memo makes it free.
+
+**2–5: checked, no action needed.**
+
+- **`ctx.Err()` per turn (agentimport.go:186, 243)** — fine. `cancelCtx.Err()` is one uncontended mutex lock/unlock (~20 ns). The per-turn work it guards is a 12.9 ms checkpoint write, or in `DryRun` a file read + JSONL split. Ratio is ~1:600,000. Per-turn is the right granularity.
+- **`logging.Init` on `entire enable` (setup.go:900-902)** — bounded, sub-millisecond, once per invocation. `paths.WorktreeRoot` is already warm: the git-repo check immediately above calls it and it is process-cached (`paths.go:74-81`), so Init reduces to `GetLogLevel` → `settings.Load` (which hits the already-cached `session.getGitCommonDir`) + one `MkdirAll` + one `OpenFile`. No new subprocess, no hot path.
+- **Closures / large-scope capture** — none. New test types `cancelOnDiscoverImporter` / `recordDiscoverImporter` (setup_import_test.go) hold a `[]SessionFile` + a `CancelFunc` / `*bool`, all test-scoped and short-lived. The production diff adds no closures beyond `defer logging.Close()`.
+- **Integration tests** — not slow. I ran them: all 7 tests in `enable_import_test.go` complete in **2.47 s wall** (parallel), 0.83–1.04 s each. The three new tests add 5 binary spawns total. The only trimmable item is `TestEnable_RoutesLoggingToLogFile` (0.84 s), a single file-existence assertion that could ride on an existing enable test — but it runs in parallel, so the wall-clock saving is ~0.</result>
+<usage><subagent_tokens>125714</subagent_tokens><tool_uses>38</tool_uses><duration_ms>957460</duration_ms></usage>
+</task-notification>
+
+---
+
+let's open a PR then, keep the description short and condensed
+
+---
+
+can you look at the copilot comment on the PR and the finding on the trail

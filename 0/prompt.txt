@@ -1,0 +1,344 @@
+we are installing entire-cli with scoops/brew and custom script via curl. Can we send metrics to posthog to track every time entire-cli is installed and which installation method is done? how?
+
+---
+
+<task-notification>
+<task-id>aca585490d3a8f372</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-exploring-entire/b47061b7-2deb-4547-8a3d-98eb83319bce/tasks/aca585490d3a8f372.output</output-file>
+<status>completed</status>
+<summary>Agent "Find telemetry/posthog/install infra" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have a complete picture. Here is my report.
+
+---
+
+# Telemetry / Analytics + Install Infrastructure Report
+
+## 1. Hidden command `__send_analytics`
+
+Defined in `cmd/entire/cli/root.go:200-209` (`newSendAnalyticsCmd`). It is `Hidden: true`, takes exactly one arg (a JSON payload), and simply calls `telemetry.SendEvent(args[0])`.
+
+The real work lives in **`cmd/entire/cli/telemetry/detached.go`** — this is your primary reuse target.
+
+Backend: **PostHog** (Go SDK `github.com/posthog/posthog-go`, imported at `detached.go:14`).
+- API key + endpoint are package vars stamped at build time (`detached.go:19-24`): defaults `PostHogAPIKey = "phc_development_key"`, `PostHogEndpoint = "https://eu.i.posthog.com"`. Overridden by goreleaser ldflags (see item 6).
+- `SendEvent` (`detached.go:170-213`) creates the client with `DisableGeoIP: true` and a `silentLogger`, then `client.Enqueue(posthog.Capture{...})` with `DistinctId`, `Event`, `Properties`, `Timestamp`. Notably the key/endpoint are read from package vars, NOT passed via argv, deliberately to keep them out of `ps` listings (`detached.go:27-28`).
+
+Event schema — three event types share the `EventPayload` struct (`detached.go:29-34`: `event`, `distinct_id`, `properties`, `timestamp`):
+
+- **`cli_command_executed`** — `BuildEventPayload` (`detached.go:46-87`). Properties: `command` (cmd path), `agent` (or `"auto"`), `isEntireEnabled`, `cli_version`, `os` (`runtime.GOOS`), `arch` (`runtime.GOARCH`), optional `flags` (comma-joined flag NAMES only, no values — privacy), and `git_version` added inside `SendEvent` best-effort (`detached.go:193-198`).
+- **`cli_plugin_executed`** — `BuildPluginEventPayload` (`detached.go:124-149`). Properties: `command`, `plugin`, `isEntireEnabled`, `cli_version`, `os`, `arch`.
+- **`checkpoint_policy_blocked`** — `cmd/entire/cli/telemetry/checkpoint_policy.go:39-70`. Properties: `hook`, `hook_type`, `reason`, `outcome`, `cli_version`, `os`, `arch`, optional `agent`/`checkpoint_version`/`checkpoint_min_version`.
+
+The send is dispatched via `spawnDetachedAnalytics` (`detached.go:92-94`) → `execx.SpawnDetached("", "__send_analytics", payloadJSON)`, so the network call is a detached child that never blocks the CLI.
+
+Trackers (call the above): `TrackCommandDetached` (`detached.go:98-120`), `TrackPluginDetached` (`detached.go:153-166`), `TrackCheckpointPolicyBlocked` (`checkpoint_policy.go:76-89`). All three early-return if `ENTIRE_TELEMETRY_OPTOUT` env var is set.
+
+## 2. Hidden command `curl-bash-post-install`
+
+Defined in `cmd/entire/cli/setup.go:2048-2061` (`newCurlBashPostInstallCmd`). `Hidden: true`, short desc "Post-install tasks for curl|bash installer". It currently does exactly one thing: calls `promptShellCompletion(w)` (`setup.go:2105`) to offer adding shell completion to the user's rc file (zsh/bash/fish, via `shellCompletionTarget` at `setup.go:2071`). It is invoked as the last step of the curl installer — `scripts/install.sh:336`: `"$install_path" curl-bash-post-install`. This is the natural hook point for install tracking on the curl path.
+
+## 3. PostHog integration / references
+
+Only one integration, all in the `telemetry` package (item 1). No other `posthog`/`capture`/`phc_`/`distinct_id` usages exist outside `cmd/entire/cli/telemetry/`. Build wiring in `.goreleaser.yaml` (item 6). No separate analytics vendor.
+
+## 4. Telemetry opt-in / opt-out setting
+
+Stored as `Telemetry *bool` on `EntireSettings` in `cmd/entire/cli/settings/settings.go:85-87`. Tri-state by design: `nil` = not asked (prompt), `true` = opted in, `false` = opted out. JSON key `telemetry` (merged in `settings.go:971` via `mergeRawBoolPtr`).
+
+Consumption / gate (`cmd/entire/cli/root.go:65-86`, `PersistentPostRun`): loads settings, and only fires `telemetry.TrackCommandDetached(...)` when `telemetryEnabled != nil &amp;&amp; *telemetryEnabled` (`root.go:81-85`). Hidden commands are skipped by walking the parent chain (`root.go:66-71`). Plugin tracking gate at `cmd/entire/cli/plugin.go:85`.
+
+Two-layer opt-out: (a) the persisted `settings.Telemetry` bool checked at the call site, AND (b) the `ENTIRE_TELEMETRY_OPTOUT` env var checked inside every `Track*` function (`detached.go:100`, `detached.go:154`, `checkpoint_policy.go:77`).
+
+Consent capture: `promptTelemetryConsent` (`cmd/entire/cli/setup.go:2184-2222`) — the "Help improve Entire CLI?" confirm during setup. Honors `--telemetry=false` flag (`setup.go:2186`) and `ENTIRE_TELEMETRY_OPTOUT` (`setup.go:2198`). Flag defined at `setup.go:792` and `setup.go:935` (`--telemetry`, default true). Also set non-interactively at `setup.go:1297-1306` and `setup.go:1902-1904`.
+
+Note: `settings.Telemetry` is checked only at the root call site (`root.go:81`); it is NOT bridged into the `ENTIRE_TELEMETRY_OPTOUT` env var. So a new install-tracking path that runs outside `PersistentPostRun` (e.g. inside `curl-bash-post-install`) must consult `settings.Telemetry` itself — it won't be gated automatically.
+
+## 5. Install method / distribution channel detection
+
+- **Release channel** (stable vs nightly): `cmd/entire/cli/versioncheck/versioncheck.go` — consts `installChannelStable`/`installChannelNightly` (`:34-35`), `releaseChannel(version)` (`:339-343`) infers channel from whether the version string looks like a nightly. Upgrade hint at `:408` hardcodes `curl -fsSL https://entire.io/install.sh | bash -s -- --channel nightly`.
+- **No install-method / package-manager detection exists yet** (no brew/scoop/install.sh source detection in Go). This is explicitly a planned feature, not built. See `docs/install-provenance-plan.md` (item 6/plan below).
+- No build ldflag for distribution/install channel — ldflags only stamp version, commit, PostHog key/endpoint, and `experimental.Visible`.
+
+## 6. Curl script + brew/scoop packaging
+
+- **Curl installer**: `scripts/install.sh`. Repo `entireio/cli`, default install dir `~/.local/bin`, `--channel stable|nightly` (`:5-7`, `:158-185`). Detects os/arch, downloads `entire_${os}_${arch}.tar.gz` + `checksums.txt` from GitHub releases, verifies sha256, installs `entire` and `git-remote-entire`, then runs `entire curl-bash-post-install` (`:336`). Windows is rejected with a pointer to scoop (`:64`).
+- **goreleaser**: `.goreleaser.yaml` (prod) and `.goreleaser.nonprod.yaml`. ldflags at `.goreleaser.yaml:23-33` stamp `versioninfo.Version/Commit`, **`telemetry.PostHogAPIKey={{.Env.POSTHOG_API_KEY}}`** and **`telemetry.PostHogEndpoint={{.Env.POSTHOG_ENDPOINT}}`** (`:27-28`), and `experimental.Visible`.
+  - **Scoop**: `scoops:` block (`.goreleaser.yaml:107-122`) → bucket `entireio/scoop-bucket`, manifest named `entire`.
+  - **Homebrew**: `homebrew_casks:` (`.goreleaser.yaml:124-167`) → tap `entireio/homebrew-tap`, casks `entire` and `entire@nightly` (mutually conflicting), binaries `entire` + `git-remote-entire`, auto-generates shell completions. These are casks, not formulae. No `post_install`/`caveats` hook writing provenance currently.
+- **Plan doc**: `docs/install-provenance-plan.md` describes the intended future approach — an installer-written `install.json` provenance file with fields `manager` (`install.sh`/`brew`/`scoop`), `channel` (`stable`/`nightly`), `package`, `installed_at`; CLI reads it read-only and infers heuristically when absent. This is the design context for your install-tracking work but is NOT yet implemented.
+
+## 7. Anonymous machine-id / install-id
+
+Anonymous **machine ID** via `github.com/denisbrodbeck/machineid` — `machineid.ProtectedID("entire-cli")` used as the PostHog `distinct_id` in all three event builders (`detached.go:52`, `detached.go:129`, `checkpoint_policy.go:40`). It is an HMAC-derived per-machine ID, stable across runs, not tied to identity. There is **no separate install-id** and **no anonymous install-id generation** anywhere — the machine ID is the only stable identifier. If install-tracking needs per-install (not per-machine) granularity, that would be net-new.
+
+---
+
+### Reuse summary for adding install tracking to PostHog
+- Emit through the existing `telemetry` package: add a `BuildInstallEventPayload` + `TrackInstallDetached` mirroring `detached.go`, reusing `EventPayload`, `spawnDetachedAnalytics`, `machineid.ProtectedID`, and the `ENTIRE_TELEMETRY_OPTOUT` guard.
+- Natural trigger point on the curl path: extend `newCurlBashPostInstallCmd` (`setup.go:2048`). For brew/scoop, there is no Go entry point today — provenance-file approach from `docs/install-provenance-plan.md` would be needed, or a cask/scoop post_install hook invoking a new hidden command.
+- Gate on `settings.Telemetry` explicitly in any new path — it is only auto-checked in `root.go`'s `PersistentPostRun`, and install-time may run before consent is captured (`Telemetry == nil`).
+- Distribution channel is derivable today only via `versioncheck.releaseChannel`; install-method is not detected anywhere yet.</result>
+<usage><subagent_tokens>45250</subagent_tokens><tool_uses>18</tool_uses><duration_ms>108515</duration_ms></usage>
+</task-notification>
+
+---
+
+lets brainstorm the desing but I like model A. send it as soon as it is installed
+
+---
+
+disclosure, yeah, add it.
+channel, derive from version
+
+---
+
+rock and roll!
+
+---
+
+1
+
+---
+
+<task-notification>
+<task-id>a96b1ce25c840a2f7</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-exploring-entire/b47061b7-2deb-4547-8a3d-98eb83319bce/tasks/a96b1ce25c840a2f7.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement Task 1: export ReleaseChannel" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Task 1 Complete
+
+**Status:** DONE
+
+**Commit Hash:** `8cd177095`
+
+**Test Summary:** All tests pass (go test ./cmd/entire/cli/versioncheck/ ✓); new TestReleaseChannel validates both stable and nightly channel detection.
+
+**Implementation Details:**
+- Exported `ReleaseChannel(version string) string` function for reuse by telemetry package
+- Updated two internal call sites in `updateCommand` (lines 397, 407)
+- Added `TestReleaseChannel` with `t.Parallel()` following repo conventions
+- Code passes `go vet` and `go fmt` validation
+
+**No concerns.** Full report written to `/Users/gtrrz-victor/wks/cli/exploring-entire/.superpowers/sdd/2026-08-05-install-tracking-posthog/task-1-report.md`.</result>
+<usage><subagent_tokens>65173</subagent_tokens><tool_uses>25</tool_uses><duration_ms>135539</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a9c604339aadebb02</task-id>
+<tool-use-id>toolu_01TNqxetqoz1qrdXS3BRPTRL</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-exploring-entire/b47061b7-2deb-4547-8a3d-98eb83319bce/tasks/a9c604339aadebb02.output</output-file>
+<status>completed</status>
+<summary>Agent "Review Task 1" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>No dangling lowercase `releaseChannel` references anywhere in the repo — rename is complete.
+
+**(1) Spec compliance: ✅**
+
+- `ReleaseChannel(version string) string` exported exactly as specified, returns `installChannelStable`/`installChannelNightly` (which stringify to `"stable"`/`"nightly"`) — matches brief's Interfaces section verbatim.
+- Both internal call sites in `updateCommand` (lines ~397, ~407 pre-diff) updated to `ReleaseChannel(...)`; grep confirms zero remaining lowercase `releaseChannel` references repo-wide.
+- No inline string literals — both branches use `installChannelNightly`/`installChannelStable` constants, no duplication of the `isNightly` check.
+- Test `TestReleaseChannel` added exactly as specified in the brief, calls `t.Parallel()`.
+- Diff is scoped to exactly the two files brief named (`versioncheck.go`, `versioncheck_test.go`), single commit, commit message matches brief's suggested message. No scope creep.
+
+**(2) Task quality: Approved**
+
+- Praise: clean minimal diff, doc comment added on the exported function (`// ReleaseChannel reports whether the given version is a stable or nightly build.`) is a nice touch beyond the letter of the brief but well within its spirit (exported functions should be documented — satisfies golangci `revive`/`stylecheck` exported-doc rules).
+- No Critical/Important/Minor findings. Report accurately reflects the diff (line numbers, call sites, commit hash all check out).
+- Minor observation (not a finding, just noted): the report claims `mise run lint` couldn't be run due to the known stale-binary shadow issue (documented in project memory as `project_lint_binary_shadow.md`) and substituted `go vet`/`go fmt`. Given the change is a pure rename plus a trivial test, this is low-risk, but worth flagging to the implementer that the correct workaround (per repo memory) is to invoke the mise-installed golangci-lint binary directly rather than skipping lint entirely — not a defect in this diff, just a process note for future tasks.
+
+Files reviewed:
+- `/Users/gtrrz-victor/wks/cli/exploring-entire/.superpowers/sdd/2026-08-05-install-tracking-posthog/task-1-brief.md`
+- `/Users/gtrrz-victor/wks/cli/exploring-entire/.superpowers/sdd/2026-08-05-install-tracking-posthog/task-1-report.md`
+- `/Users/gtrrz-victor/wks/cli/exploring-entire/.superpowers/sdd/2026-08-05-install-tracking-posthog/review-76dff6a81..8cd177095.diff`
+- `/Users/gtrrz-victor/wks/cli/exploring-entire/cmd/entire/cli/versioncheck/versioncheck.go`
+- `/Users/gtrrz-victor/wks/cli/exploring-entire/cmd/entire/cli/versioncheck/versioncheck_test.go`</result>
+<usage><subagent_tokens>65827</subagent_tokens><tool_uses>4</tool_uses><duration_ms>24145</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a788285f02bfc6f4f</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-exploring-entire/b47061b7-2deb-4547-8a3d-98eb83319bce/tasks/a788285f02bfc6f4f.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement Task 2: install payload + tracker" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Status: DONE
+Commit: 5ae96860e ("feat: add cli_installed telemetry event builder and tracker", on branch `install-tracking-posthog`, parent `8cd177095` = Task 1)
+Test summary: `TestBuildInstallEventPayload` and `TestTrackInstallDetachedRespectsOptOut` both PASS; full `telemetry` package suite PASS; `go build ./cmd/entire/cli/telemetry/` clean (no import cycle); lint clean (0 issues) via mise-installed golangci-lint v2.11.3 binary directly (PATH shadow is stale v1.64.8).
+
+Concerns: none. Full report at `/Users/gtrrz-victor/wks/cli/exploring-entire/.superpowers/sdd/2026-08-05-install-tracking-posthog/task-2-report.md`.</result>
+<usage><subagent_tokens>76306</subagent_tokens><tool_uses>19</tool_uses><duration_ms>112581</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aa81a050ba73af517</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-exploring-entire/b47061b7-2deb-4547-8a3d-98eb83319bce/tasks/aa81a050ba73af517.output</output-file>
+<status>completed</status>
+<summary>Agent "Review Task 2" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Everything checks out. This is a tightly-scoped diff that matches the brief verbatim and the neighboring pattern in `detached.go`.
+
+## Spec Compliance: ✅
+
+- **Reuse, no second client**: Both functions reuse `EventPayload`, `spawnDetachedAnalytics`, `machineid.ProtectedID("entire-cli")`. No new PostHog client instantiated (`detached.go:218-256`).
+- **Opt-out gate**: `TrackInstallDetached` (`detached.go:243-245`) checks `ENTIRE_TELEMETRY_OPTOUT` first, exactly matching `TrackCommandDetached`/`TrackPluginDetached`'s early-return pattern.
+- **distinct_id**: `machineid.ProtectedID("entire-cli")`, nil-safe fallback (`detached.go:219-222`), matches existing builders.
+- **Event name**: exactly `"cli_installed"` (`detached.go:233`).
+- **Channel**: derived via `versioncheck.ReleaseChannel(version)`, which returns exactly `"stable"`/`"nightly"` (verified in `versioncheck.go:34-35,340-345`).
+- **Properties**: exactly 5 keys — `method`, `channel`, `cli_version`, `os`, `arch` (`detached.go:224-230`). No extra fields, no method allowlist/validation.
+- **Best-effort**: nil payload short-circuits; `json.Marshal` error silently swallowed; never panics or blocks (mirrors `TrackPluginDetached`).
+- **No import cycle**: `versioncheck` import added cleanly; report confirms `go build` exit 0.
+
+One deviation from the literal "every test function calls t.Parallel()" instruction: `TestTrackInstallDetachedRespectsOptOut` has no `t.Parallel()`. This is correct per the project's own documented exception in CLAUDE.md — `t.Setenv` cannot coexist with `t.Parallel()` (panics). The brief's own test snippet (verbatim, brief lines 44-48) omits it for the same reason, and the implementer copied it exactly. Not a real compliance gap.
+
+## Task Quality: Approved
+
+- Diff is a pure additive append (`detached.go:216-256`, `detached_test.go` two new tests) — no unrelated edits, no touching of `interface{}`/`posthog.Ptr` pre-existing code as instructed.
+- New code's shape (guard → build → nil-check → marshal → spawn) is structurally identical to `TrackPluginDetached` immediately above it — good consistency, not reinventing a pattern.
+- Doc comments follow the file's existing convention (`// FuncName does X. Exported for testing...`).
+- Test for the builder checks every property key plus `Event`/`DistinctID`; test for the tracker checks opt-out doesn't panic — matches brief exactly, no gold-plating.
+- Report is honest and complete: shows failing-first, passing-after, full package suite, clean build, correct v2 lint binary usage (per project's known stale-shadow issue), and commit hash matches diff.
+
+No critical, important, or minor findings. Nothing to flag beyond the note above about `t.Parallel()`, which is a correct, documented exception rather than a defect.</result>
+<usage><subagent_tokens>74337</subagent_tokens><tool_uses>8</tool_uses><duration_ms>46965</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>abeb49eaa45b73658</task-id>
+<tool-use-id>toolu_01QdHjfBiF2srBHHpJg2Ni3d</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-exploring-entire/b47061b7-2deb-4547-8a3d-98eb83319bce/tasks/abeb49eaa45b73658.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement Task 3: __track-install command" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Status: DONE
+Commit: `4317772554d76dc46bac1d9085af3a76a7bdf885` (branch `install-tracking-posthog`)
+Tests: `go test ./cmd/entire/cli/ -run TestTrackInstallCmd` — both `TestTrackInstallCmd_RequiresMethod` and `TestTrackInstallCmd_Hidden` PASS; full `./cmd/entire/cli/...` suite also green.
+Concerns: brief's snippet `_ = cmd.MarkFlagRequired("method")` fails this repo's errcheck lint (blank-assignment still flagged) — replaced with the existing `markRequired(cmd, "method")` helper from `corecmd.go` (same behavior, already used identically elsewhere). Lint run with the real mise v2.11.3 binary directly (`.../mise/installs/golangci-lint/2.11.3/.../golangci-lint`), not the PATH-shadowing v1.64.8 — 0 issues. Full report at `/Users/gtrrz-victor/wks/cli/exploring-entire/.superpowers/sdd/2026-08-05-install-tracking-posthog/task-3-report.md`.</result>
+<usage><subagent_tokens>82396</subagent_tokens><tool_uses>33</tool_uses><duration_ms>472718</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a5b2d8a35d95f8942</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-exploring-entire/b47061b7-2deb-4547-8a3d-98eb83319bce/tasks/a5b2d8a35d95f8942.output</output-file>
+<status>completed</status>
+<summary>Agent "Review Task 3" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Confirmed: `markRequired` (corecmd.go:623) calls `cmd.MarkFlagRequired(name)` and panics only on a wiring-time typo, which can't happen here since `"method"` is a real flag defined on the same command two lines above. It's the established repo pattern (already used in repo.go, project.go, grant.go x2), not a behavior-changing workaround — it marks the flag required identically to `MarkFlagRequired`, just with panic-on-typo instead of a silently-ignored error. This deviation is sound.
+
+I reviewed the diff directly (no re-run of tests, per instructions).
+
+## Spec Compliance: ✅
+
+- `root.go:203-217` (per diff hunk): `newTrackInstallCmd()` — `Use: "__track-install"`, `Hidden: true`, required `--method` flag. Matches spec exactly.
+- `RunE` body does exactly one thing: `telemetry.TrackInstallDetached(method, versioninfo.Version)` then `return nil`. No extra logic, no logging, no validation beyond the required-flag check. Matches "RunE calls ... and returns nil. No other logic."
+- Registration: `cmd.AddCommand(newTrackInstallCmd())` inserted immediately after `cmd.AddCommand(newSendAnalyticsCmd())` in the "Hidden infrastructure" block (root.go, near line 166 per brief). Correct placement.
+- Non-interactive: no prompts, forms, or stdin reads anywhere in the new code — pure flag parsing + function call.
+- Tests: `TestTrackInstallCmd_RequiresMethod` and `TestTrackInstallCmd_Hidden` both call `t.Parallel()`, both present in `root_test.go`, both assert the exact required behaviors from the brief.
+- Deviation (`markRequired` vs `_ = cmd.MarkFlagRequired(...)`): verified equivalent and idiomatic — not a scope or behavior change, just a lint-clean substitution using an existing repo helper.
+
+All four global constraints and both brief-mandated tests are satisfied. No scope creep — diff touches only the two files named in the brief, 34 lines total.
+
+## Task Quality: Approved
+
+- **Correctness**: command wiring, flag, and RunE are minimal and correct.
+- **Style/consistency**: reusing `markRequired` instead of introducing a second copy of the ignore-error pattern is the better call — it matches existing call sites (`repo.go:150`, `project.go:89`, `grant.go:260,412`) and avoids a lint workaround/duplication that `mise run dup` or a reviewer would likely flag later.
+- **Tests**: both tests are meaningful (one exercises the actual `Execute()` path to confirm cobra enforces the required flag, the other checks the `Hidden` field directly) and are appropriately narrow — no over-testing of cobra internals.
+- **Documentation**: doc comment on `newTrackInstallCmd` explains purpose and "not for direct user use," consistent with sibling `newSendAnalyticsCmd`.
+- **Process**: report is transparent about the lint failure encountered, the fix applied, and the golangci-lint v1/v2 binary-shadow issue (consistent with known repo gotcha in user memory) — good diagnostic hygiene, not just a bare "done" claim.
+
+No critical, important, or minor findings. Nothing to request changes on.</result>
+<usage><subagent_tokens>67722</subagent_tokens><tool_uses>5</tool_uses><duration_ms>23030</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a2c9c0b368745d0b9</task-id>
+<tool-use-id>toolu_0158aUFCTKfruuUAA4fnRw2R</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-exploring-entire/b47061b7-2deb-4547-8a3d-98eb83319bce/tasks/a2c9c0b368745d0b9.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement Task 4: fire from curl path" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Status: complete.
+
+Commit hash: `46b1d061f0d2702487fba15c06f8432fa635c5f9` — "feat: fire cli_installed from curl-bash-post-install"
+
+Build clean, no matching tests (acceptable per brief), lint 0 issues (golangci-lint v2.11.3, direct binary — mise shim shadows a stale v1).
+
+Concerns: none. Both `telemetry` and `versioninfo` imports were actually missing from `setup.go` (brief assumed they were likely already present) — added them. Full report at `/Users/gtrrz-victor/wks/cli/exploring-entire/.superpowers/sdd/2026-08-05-install-tracking-posthog/task-4-report.md`; edited file `/Users/gtrrz-victor/wks/cli/exploring-entire/cmd/entire/cli/setup.go`.</result>
+<usage><subagent_tokens>71340</subagent_tokens><tool_uses>20</tool_uses><duration_ms>145095</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>abd4771f09e0bb27f</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-exploring-entire/b47061b7-2deb-4547-8a3d-98eb83319bce/tasks/abd4771f09e0bb27f.output</output-file>
+<status>completed</status>
+<summary>Agent "Review Task 4" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Signature and symbols check out: `telemetry.TrackInstallDetached(method, version string)` and `versioninfo.Version` both exist as used.
+
+**(1) Spec compliance: ✅**
+
+- Call inserted before `promptShellCompletion(w)`, inside `newCurlBashPostInstallCmd`'s `RunE` — correct insertion point.
+- Method string is exactly `"install.sh"`.
+- Best-effort placement is correct: `TrackInstallDetached` is a plain statement with no return value checked, so it can't gate or short-circuit; `promptShellCompletion`'s error handling and `return nil` are untouched and still execute in original order.
+- Imports: `telemetry` and `versioninfo` added once each, correctly alphabetized (`strategy` → `telemetry` → `vercelconfig` → `versioninfo`), no duplication, no unrelated import churn.
+- Diff is exactly the 4 lines described (2 import lines + comment + call), matching the report's stated scope. No scope creep — no other files touched, no test files added (per brief, not required).
+
+**(2) Task quality: Approved**
+
+- Report accurately matches the diff (report's earlier claim that the file needed both imports was correctly verified via grep rather than assumed, per the brief's caveat).
+- Build/lint evidence in the report is credible and correctly worked around the known stale-shim lint issue (matches `project_lint_binary_shadow.md` memory), using the real pinned v2.11.3 binary with `--new-from-rev=HEAD`, reporting 0 issues.
+- No new test added, consistent with brief's explicit instruction ("No new test required for this task").
+- Comment above the call (`// Record the install (curl|bash path). Best-effort, detached, opt-out aware.`) is accurate and useful, matches the brief's suggested wording.
+- Minor stylistic note only (not a defect): the call is placed after `w := cmd.OutOrStdout()` rather than as the literal first statement; report explains this reasoning and it has zero functional effect since `w` is unused by the tracker call and `promptShellCompletion(w)` still runs immediately after. Not a finding.
+
+No outstanding issues. Verdict: **APPROVE**.</result>
+<usage><subagent_tokens>65252</subagent_tokens><tool_uses>5</tool_uses><duration_ms>21495</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aaefa4de96a0eb332</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-exploring-entire/b47061b7-2deb-4547-8a3d-98eb83319bce/tasks/aaefa4de96a0eb332.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement Task 5: goreleaser wiring" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>The `.goreleaser.yaml` edits are staged and verified (goreleaser check passes, yq confirms values), but `git commit` fails at the signing step — the 1Password SSH-signing agent (`op-ssh-sign`) errors with `failed to fill whole buffer`. `ssh-add -l` shows no identities loaded and `SSH_AUTH_SOCK` points to the default launchd listener, not 1Password's socket, so this looks like it needs an interactive 1Password unlock/Touch ID approval that isn't available in this session — not something I can bypass (repo policy: never skip signing without explicit request).
+
+The change itself is complete and staged (`git status` shows `modified: .goreleaser.yaml`, staged). I did not write the report file or commit yet since the commit step is blocked.
+
+Status: BLOCKED on commit signing (1Password SSH agent unavailable/unapproved in this session)
+Commit hash: none yet — changes staged only
+Summary: `goreleaser check` PASSED; yq confirms `scoops[0].post_install` and both `homebrew_casks[].hooks.post.install` parsed exactly as specified in the brief.
+Concerns:
+1. Need you to either unlock/approve 1Password for SSH signing in this session, or run the commit yourself:
+   ```
+   git commit -m "feat: fire cli_installed from brew cask and scoop installers"
+   ```
+2. I have not yet written `task-5-report.md` — will do so once the commit succeeds and I have a hash to include, unless you'd like it written now with "commit pending."
+
+Files touched: `/Users/gtrrz-victor/wks/cli/exploring-entire/.goreleaser.yaml` (staged, not committed).</result>
+<usage><subagent_tokens>68962</subagent_tokens><tool_uses>15</tool_uses><duration_ms>446466</duration_ms></usage>
+</task-notification>

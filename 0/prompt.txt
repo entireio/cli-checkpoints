@@ -1,1 +1,109 @@
 /simplify
+
+---
+
+<task-notification>
+<task-id>a0ee36d5de7c7c404</task-id>
+<tool-use-id>toolu_018KR84s1cV64VjQK1BdhBC3</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments-2/31338833-f9a5-4114-a91a-d0fa621c0c36/tasks/a0ee36d5de7c7c404.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review of recent plugin changes" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Simplification Analysis
+
+### Core purpose
+Install `entire-&lt;name&gt;` plugins from a curated index, a git URL, or a local path — bounding every read of remote-controlled data and making the choice of what gets installed deterministic.
+
+---
+
+### Worth changing
+
+**1. `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/plugin_gitremote.go:38-65` — the new const block swallowed `runGitQuiet`'s doc comment.**
+There is no blank line between line 48 and line 49, so lines 38-53 are one contiguous comment block that godoc attaches to `const (` at :54. `runGitQuiet` (:67) now has **no doc comment at all**, and the const block is documented by a paragraph about ssh batch mode and `LC_ALL`. Fix: blank line after :48. Cost: +1 line, restores docs on both.
+
+While there: line 41 (`Output() (not Run()) so stderr lands in the ExitError for error messages.`) is false as of this diff — `cmd.Stderr` is set and `ExitError.Stderr` is empty (the code says so itself at :103-104). Delete it. Same stale claim again at **`plugin_gitremote.go:302-303`** ("Output() (not Run()) so stderr is captured into the ExitError"). −3 lines.
+
+**2. `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/plugin_deps.go:368-391` — same orphaning, also introduced here.**
+`reinstallCommand` was inserted immediately after `checkManagedBinaryIntegrity`'s 12-line doc comment with no blank line, so :368-384 is one block attached to `reinstallCommand`, and `checkManagedBinaryIntegrity` (:393) is undocumented. Fix: move `reinstallCommand` above :368. Zero net lines.
+
+**3. `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/plugin_index.go:106-111` — `HasRepoURL` is dead in production.**
+Verified: the only remaining callers are `plugin_index_test.go:62` and `:65`. `FindByRepoURL` replaced its one real use at `plugin_group.go:239`. A six-line wrapper plus doc kept alive by two test assertions. Delete it; the tests read fine as `idx.FindByRepoURL(...) != nil`. −6 lines.
+
+**4. `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/plugin_fetch.go:527-593` — the two tar passes duplicate 12 lines of setup verbatim.**
+`tarEntryNames` (:528-538) and `extractFromTarGz` (:568-578) are byte-identical through `tr := tar.NewReader(gz)`, including both `defer`s and both error strings. The two-pass decision is right (a tar stream can't seek); the duplicated plumbing isn't. Extract:
+
+```go
+func openTarGz(archivePath string) (*tar.Reader, func(), error)
+```
+
+returning the reader and a combined closer. Each function drops from 12 setup lines to 4. **−10 lines, one of two `defer` pairs gone.**
+
+**5. `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/plugin_fetch.go:611-622` — `extractFromZip` walks `zr.File` twice and defers inside a loop.**
+Zip is random-access, so the second loop only exists to re-find `want`. Replace :611-622 with:
+
+```go
+i := slices.IndexFunc(zr.File, func(f *zip.File) bool {
+    return !f.FileInfo().IsDir() &amp;&amp; path.Clean(filepath.ToSlash(f.Name)) == want
+})
+```
+
+then open `zr.File[i]` directly. **−5 lines, removes the `defer rc.Close()` inside a `for`, and removes the unreachable tail error at :622** (once `want != ""` the entry provably exists, since `want` came from that same slice).
+
+**6. `plugin_fetch.go:565, :592, :609, :622` — `"archive %s contains no %s entry"` four times.**
+After #5 it's three; a one-line helper makes it one. Minor, but it's the same sentence constructed twice per function.
+
+**7. `/Users/soph/Work/entire/devenv/cli_experiments_2/docs/architecture/external-commands.md:75` — stale sentence contradicting the paragraph four lines above.**
+Line 75 still reads "Bare absolute paths are rejected because `file://` expresses the same thing unambiguously." Lines 71-73 of the same diff now say `file://` is rejected too. Delete the clause.
+
+---
+
+### Matter of taste
+
+**8. `plugin_gitremote.go:83-107` — the pipe machinery.** It is close to minimal *for a pipe*, but the shape isn't forced. `exec.Cmd` spawns a copier goroutine for any non-`*os.File` `Stdout`, so a ~8-line writer that errors past the cap lets the whole block collapse to:
+
+```go
+cmd.Stdout, cmd.Stderr = &amp;stdout, &amp;stderr
+if err := cmd.Run(); err != nil { ... }
+```
+
+Function body 25 lines → ~9; the 4-branch `switch`, the two identical `fmt.Errorf("git %s: %w", args[0], err)` returns at :90/:93, and the Start-before-Wait-after-ReadAll ordering constraint all disappear. Net LOC is roughly a wash once you count the writer type — call it even, better shape. (It also removes the case where an oversize response leaves `cmd.Wait()` blocked on a full pipe until the 2-minute timeout, but that's the correctness reviewer's territory.)
+
+**9. `plugin_gitremote.go:110-119` — `stderrDetail` has exactly one caller.** It replaced `stderrSuffix`, which had six. Inlined at :105 it's 5 lines against a 10-line helper. Also `stderr.String()` beats `stderr.Bytes()` → `string(raw)`.
+
+**10. The three size constants earn their keep — the *argument* at five call sites doesn't.** `maxGitRefsOutput` (16 MiB), `maxPluginMetadataSize` (64 KiB) and `maxGitNoOutput` (4 KiB) are three genuinely different scales with three different rationales; collapsing them would be worse. But all five `maxGitNoOutput` sites (`plugin_gitremote.go:304,:309`, `plugin_index.go:240,:259,:262`) discard the output entirely — every one is `if _, err := runGitQuiet(ctx, maxGitNoOutput, ...)`. A 4-line `runGitDiscard(ctx, args...) error` wrapper cleans all five to `if err := runGitDiscard(ctx, ...)`.
+
+**11. `plugin_group.go:71-77` — `installSource.Ref` is always exactly the input argument.** All three branches return `Ref: arg` unmodified, so the doc at :74-75 ("Ref is the repository URL, the filesystem path, or the catalog name, according to Kind") promises a normalization that never happens. Returning `(installArgKind, error)` and letting the caller keep `args[0]` deletes the type and 7 lines. Weakly against: the pairing reads well at `:750`. Also note `installFromURL` is never *compared* in production — only assigned at :114 and asserted in tests; the real branches are `installFromPath` (:166) and `installFromIndex` (:215), with URL as the fallthrough. Either drop the struct or fix the `Ref` doc.
+
+**12. `plugin_group.go:106` — the leading-`-` guard is in the right place.** Verified: without it, `-foo` reaches the index branch and `validatePluginName` rejects it anyway, but `-x/foo` reaches the *path* branch, which has no other guard. It's not a redundant third copy of `validatePluginRepoURL:211` either — that one is still load-bearing for URLs arriving from `index.json` and stored manifests. Keep as-is.
+
+**13. `plugin_fetch.go:510-524` — `preferredArchiveEntry`'s comparison.** `best == "" || depth &lt; bestDepth || (depth == bestDepth &amp;&amp; clean &lt; best)` carries a `bestDepth = 0` sentinel that is meaningless until `best != ""` — the classic flag-plus-sentinel shape. Stating the rule once as a comparator is clearer at the same length:
+
+```go
+return slices.MinFunc(candidates, func(a, b string) int {
+    return cmp.Or(strings.Count(a, "/")-strings.Count(b, "/"), strings.Compare(a, b))
+})
+```
+
+**14. Four copies of "read one past the cap", not three.** `readFileLimited` (`plugin_manifest.go:56-63`), `runGitQuiet` (`plugin_gitremote.go:95-101`), `writeExecutableLimited` (`plugin_fetch.go:678-688`), `fetchAndVerify` (`plugin_fetch.go:435-448`). Only the first two share a shape (read-into-memory); the other two are copy-to-disk with cleanup. One helper across all four would be worse. A `readAllLimited(r io.Reader, limit int64, what string) ([]byte, error)` covering the first two saves ~6 lines and lets `readFileLimited` shrink to open + defer + delegate. Note that adopting #8 removes `runGitQuiet` from this set, so #8 and #14 are alternatives.
+
+**15. `plugin_group.go:294` vs `:239` — two idioms for one condition.** `:239` gates on `idxErr == nil`, `:294` gates on `idx == nil`. `SyncPluginIndex` returns `(nil, err)` or `(idx, nil)`, so they're the same test. Pick one.
+
+---
+
+### Clean categories
+
+- **`depStatus` (`plugin_deps.go:194-205`)** — no field is derivable from another. `Manifest != nil` does *not* imply `Satisfied` (installed-but-too-old returns both), and `Warning` is independent of both. Nothing to cut.
+- **`RemoteInstallResult.ReplacedFrom` (`plugin_install_remote.go:53-59`)** — must be captured at `:158-163`, before `SavePluginManifest` at `:228` overwrites the source of truth. Genuinely not derivable at the point of use (`plugin_group.go:278`). The neighbouring `FindInstalledPlugin(name)` at `:147` and `LoadPluginManifest(name)` at `:158` look like a double lookup but read different things (bin/ entry vs pkg/ manifest) — not redundant.
+- **Comment volume** — overwhelmingly decision- and security-rationale, which is what you asked me to leave alone. The only genuine offenders are the two *orphaned* blocks (#1, #2) and the two *stale* ones (#1, #7). One soft note: two of the five paragraphs in `parseInstallSource`'s 22-line preamble (`plugin_group.go:84-95`) are changelog rather than rationale — "they were two functions… and they drifted" and "Parsing once… stops the argument being classified twice" describe the refactor, not the code. The drift bug itself (the `git@` vs any-SSH-username divergence) is worth keeping.
+
+---
+
+### Bottom line
+
+| | |
+|---|---|
+| Realistic LOC reduction from "worth changing" | ~30 lines (≈3% of the diff), plus one defer-in-loop and one unreachable branch |
+| Complexity added by this diff | **Medium** — mostly justified; the caps, the two-pass selection, and the single-parse install source all pay for themselves |
+| Recommended action | **Proceed with #1-#7.** #1 and #2 are the highest value per keystroke: two functions in this range silently lost their doc comments to comment-block fusion, and one of the fused paragraphs is now factually wrong. |</result>
+<usage><subagent_tokens>138760</subagent_tokens><tool_uses>22</tool_uses><duration_ms>295243</duration_ms></usage>
+</task-notification>

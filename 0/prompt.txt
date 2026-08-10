@@ -1,0 +1,67 @@
+/review https://github.com/entireio/cli/pull/1930
+
+---
+
+<task-notification>
+<task-id>a663896af451dad17</task-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-pr-reviews/3b1dccb2-09b9-44af-b608-89e0c465faa2/tasks/a663896af451dad17.output</output-file>
+<status>completed</status>
+<summary>Agent "/code-review https://github.com/entireio/cli/pull…" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Based on my analysis of this small, focused PR, here are the findings.
+
+```json
+[
+  {
+    "file": "cmd/entire/cli/agent_group.go",
+    "line": 117,
+    "summary": "`add` and `remove` use the broad `DiscoverAndRegisterAlways`, which scans all of $PATH and executes the `info` subcommand of every `entire-agent-*` binary, even though the exact target name is known.",
+    "failure_scenario": "`entire agent add claude-code` (a built-in) or `entire agent remove zed` now shells out to every third-party `entire-agent-*` executable on $PATH just to register the one that was named — arbitrary-code-execution surface plus a shared 10s scan budget on every add/remove. The codebase already provides `external.DiscoverAndRegisterNamedAlways(ctx, types.AgentName(name))`, whose doc says it is 'for explicit, one-invocation selections without executing unrelated plugins'; it short-circuits instantly for built-ins (agent.Get hits) and execs only the single matching binary."
+  },
+  {
+    "file": "cmd/entire/cli/agent_group.go",
+    "line": 117,
+    "summary": "External-discovery errors are silently swallowed on the `add` path because `DiscoverAndRegisterAlways` returns nothing, so a genuine plugin failure is reported to the user as a generic 'wrong agent name'.",
+    "failure_scenario": "`entire agent add zed` where the `entire-agent-zed` binary exists but its `info` call errors or times out: discovery logs a debug line and returns void, `agent.Get(\"zed\")` then fails, and the user sees `printWrongAgentError` (\"Unknown agent\") — masking the real cause. `DiscoverAndRegisterNamedAlways` returns the discovery error, which `add`/`remove` could surface instead."
+  },
+  {
+    "file": "cmd/entire/cli/agent_group_test.go",
+    "line": 86,
+    "summary": "The new test permanently pollutes the process-global agent registry with `ext-agentgroup-test`, whose factory points at a temp binary deleted at test cleanup.",
+    "failure_scenario": "After `TestAgentGroup_DiscoversExternalAgents` runs, `agent.Register` has stored a wrapped external agent that outlives the test; the temp dir (and binary) are removed by `t.TempDir`/`t.Setenv` cleanup, so any later test in package `cli` that enumerates agents via `agent.List()`/`StringList()` (e.g. `TestPrintMissingAgentError`, `TestPrintWrongAgentError`, `TestRunAgentList_*`) sees a phantom agent backed by a nonexistent binary. It happens to stay self-consistent today, but the leaked global state is a latent flake source and there is no reset seam."
+  }
+]
+```
+
+Notes for the caller: this is a clean, well-reasoned PR. The `add` path does correctly auto-persist `external_agents=true` for external agents (setup.go:1886-1889), so installed external hooks will still resolve at commit time via the gated git-hook discovery — no bug there. The non-parallel test is correctly justified (uses `t.Setenv` on PATH). The strongest actionable point is #1/#2 (same root cause): prefer `DiscoverAndRegisterNamedAlways` for the single-name `add`/`remove` commands rather than the full-PATH `DiscoverAndRegisterAlways`; keep the broad scan only for `list`. The PR author chose `Always` to mirror `entire enable`, but `enable --agent` shares the same pre-existing inefficiency.</result>
+<usage><subagent_tokens>86665</subagent_tokens><tool_uses>18</tool_uses><duration_ms>206059</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a663896af451dad17</task-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-pr-reviews/3b1dccb2-09b9-44af-b608-89e0c465faa2/tasks/a663896af451dad17.output</output-file>
+<status>completed</status>
+<summary>Agent "/code-review https://github.com/entireio/cli/pull…" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Fixed the two substantive findings. Summary of what changed in `cmd/entire/cli/agent_group.go`:
+
+**Findings 1 &amp; 2 (same root cause) — fixed.** `add` and `remove` now call `external.DiscoverAndRegisterNamedAlways(ctx, types.AgentName(name))` instead of the broad `DiscoverAndRegisterAlways`. This:
+- Executes only the single named `entire-agent-&lt;name&gt;` binary rather than shelling out to every `entire-agent-*` plugin on `$PATH` for a targeted command (and short-circuits instantly for built-ins, where `agent.Get` already succeeds).
+- Surfaces the plugin's real load/timeout error (`loading external agent %q: ...`) instead of masking it behind the generic "unknown agent" message. `SilenceUsage` is set so the usage blob isn't dumped for a prerequisite failure.
+- Preserves existing UX for a bogus name: lookup returns `ErrNotFound` → `nil`, then `agent.Get` fails → `printWrongAgentError` as before.
+
+`list` deliberately keeps the broad `DiscoverAndRegisterAlways` since it must enumerate every plugin.
+
+**Finding 3 (test-isolation) — not changed, by design.** The global-registry leak comes from `runAgentList` running discovery (correct production behavior for a single-process CLI), and the pre-existing `TestRunAgentList_*` tests already trigger it. It stays self-consistent and benign; cleanly fixing it would require adding an `Unregister`/reset seam to the `agent` package purely for tests (the cli-package test can't reach the internal `registry` var), which isn't warranted for a low-severity, non-failing leak.
+
+Verification:
+- `go build ./cmd/entire/cli/` — clean
+- `mise run fmt` — applied
+- golangci-lint 2.11.3 (mise binary, direct) on `./cmd/entire/cli/...` — 0 issues
+- `go test ./cmd/entire/cli/ -run 'TestAgentGroup_DiscoversExternalAgents|TestRunAgentList|TestAgentGroupBareCommand'` — PASS
+
+Note: I did not run the full `mise run test:ci` (unit + integration + e2e canary) — worth running before you commit/push per the project checklist.</result>
+<usage><subagent_tokens>98240</subagent_tokens><tool_uses>27</tool_uses><duration_ms>547889</duration_ms></usage>
+</task-notification>

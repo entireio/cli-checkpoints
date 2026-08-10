@@ -272,3 +272,175 @@ The hot-path change is **essentially efficiency-clean**. The resolver is 2 `os.S
 `ClaudeCodeAgent.ExtractAllModifiedFiles` (`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/agent/claudecode/transcript.go:479-491`) documents that "the common no-subagent case is short-circuited by the `subagentsDir == ""` guard" — but **that guard is unreachable from both callers**. `lifecycle.go:847` and `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/strategy/manual_commit_hooks.go:1948` both pass a `filepath.Join` result, which is never empty. So **every turn end pays a second full `ParseFromBytes` of the entire main transcript** — including sessions that never spawned a subagent, where `ExtractSpawnedAgentIDs` then returns nothing. Measured cost: ~5 ms/MB (231 MB/s), so ~5 ms for a 1 MB transcript and ~90 ms for a 20 MB long session, on every turn end. The diff's new `SubagentsDir()` plus the existing `fileExists` make a one-stat guard (`if !fileExists(subagentsDir) { subagentsDir = "" }`) a two-line fix that activates the documented short-circuit. Caveat to validate before doing it: confirm Claude Code creates `&lt;sessionID&gt;/subagents/` only once a subagent actually runs, and note `manual_commit_hooks.go:1948` re-derives the same path inline and can't import the `cli` helper (`cli` imports `strategy`), so the helper would need to move to a shared package to fix both call sites.</result>
 <usage><subagent_tokens>121278</subagent_tokens><tool_uses>44</tool_uses><duration_ms>1988450</duration_ms></usage>
 </task-notification>
+
+---
+
+<task-notification>
+<task-id>a6cc331c19b530600</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments-2/f12d4d56-00f1-45df-a94c-6a3cf2714244/tasks/a6cc331c19b530600.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review of PR2 diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Tree restored clean. Here are my findings.
+
+## Verification performed
+
+I applied the proposed restructure to `lifecycle.go` (single pre-switch guard, `nestedInvocation`/`logNestedInvocationSkip` deleted, both now-dead cache fallbacks removed), then reverted. Result: `go test ./cmd/entire/cli/agent/pi/...` **passes**, and `golangci-lint run ./cmd/entire/cli/agent/pi/...` with the repo config reports **0 issues**. I also ran `dupl` at threshold 75 with `--tests=true` over the package: **0 issues**.
+
+---
+
+## Answers to the six questions
+
+### 1. Is a term of `nestedInvocation` redundant? — Yes: `payload.SessionFile == ""` is inert. Collapse to `sessionID == ""`.
+
+`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/agent/pi/lifecycle.go:166-168`
+
+Directional check (I ran `extractSessionIDFromPath` over edge inputs):
+
+- `SessionFile == ""` does **not** imply `sessionID == ""` — an explicit `payload.SessionID` survives. So that term alone is not a valid predicate; **keep `sessionID == ""`, not the other one.**
+- `sessionID == ""` implies `SessionFile == ""` for every input Pi can produce. The basename fallback means any real path yields a non-empty ID (`/tmp/live.jsonl` → `"live"`, `/tmp/` → `"tmp"`, `/` → `"/"`). The only counterexamples are pathological names the extension cannot emit: `x_.jsonl` → `""`, `.jsonl` → `""`, `_` → `""` (verified by running the function).
+
+**Recommendation: collapse to `sessionID == ""` and delete `nestedInvocation` entirely** — a named function wrapping one `== ""` comparison over a struct it barely reads doesn't earn its name, and after the collapse the predicate is identical to the check `HookNameSessionStart` already does inline. Nothing is lost: explicit `session_id` is still honoured (test 3 stays green — verified). In the pathological-filename case the two-term version actually *falls through to the cache fallback*, i.e. into the exact behaviour the guard exists to distrust, so collapsing is strictly more consistent, not a loosening.
+
+Cost of keeping it: a 2-term predicate + a function + a 21-line comment whose central claim (see #4) exists only to justify the inert term.
+
+### 2. Should all three call sites use the same predicate, and is one pre-switch guard safe? — Yes to the same predicate; yes to one guard, but it must be a positive list, not a blanket check.
+
+A blanket `if sessionID == ""` before the switch is **not safe**. `entire_extension.ts:136-138` fires `session_shutdown` with `{ type: "session_shutdown" }` and nothing else — no `cwd`, no `session_file`, no `session_id`. So `sessionID` is `""` for *every* shutdown, including the user's own, and a blanket guard would skip `clearCachedSessionID` and fail the existing `TestParseHookEvent_SessionShutdown_ClearsCache` (`lifecycle_test.go:123-152`).
+
+The safe single-guard form, which I verified passes tests and lint:
+
+```go
+// A Pi subagent is a nested `pi --no-session` process that auto-discovers this
+// same project-local extension, so it fires these hooks with no session of its
+// own; the session-ID cache is one per-repo file, so resolving such a payload
+// against it hands the child its parent's ID. See docs/architecture/agent-guide.md.
+// session_shutdown is exempt: it carries no session identity at all and must
+// still clear the cache.
+switch hookName {
+case HookNameSessionStart, HookNameBeforeAgentStart, HookNameAgentEnd:
+    if sessionID == "" {
+        logging.Debug(ctx, "pi: skipping hook for sessionless (nested) Pi invocation",
+            slog.String("hook", hookName))
+        return nil, nil //nolint:nilnil // no session to track = no lifecycle event
+    }
+}
+```
+
+Concrete cost of the current shape: 44 added lines in `lifecycle.go` (21-line comment + 3-line predicate + 4-line helper + 14 lines across three in-branch guards + blanks) versus 12 for the above — **−32 lines**, three `//nolint:nilnil` directives with three differently-worded justifications collapse to one, and the reader stops having to diff three guards to notice they mean the same thing.
+
+Side note relevant to the design: this is also why the TypeScript guard is **not** redundant with the Go guard. Because `session_shutdown` must stay exempt, the TS early-return is the only thing preventing a nested child's shutdown from reaching `clearCachedSessionID`. Worth keeping both; the diff already says "Two guards" in the docs.
+
+### 3. `logNestedInvocationSkip` — inline it.
+
+`lifecycle.go:170-173`. Four lines of declaration to save one line at each of three call sites: net **+1 line** plus a name and a jump for the reader, even at three uses. After #2 it has exactly **one** caller, which makes it unambiguously pure overhead. Inline the two-line `logging.Debug` call.
+
+### 4. The 21-line doc comment — 4 lines are load-bearing, ~10 duplicate the docs, and 3 are factually inverted.
+
+`lifecycle.go:145-165`.
+
+**Keep (compressed to ~4 lines):**
+- the mechanism (nested `pi --no-session` auto-discovers the project-local extension and fires these hooks) — genuinely non-obvious;
+- why the cache is the hazard (single per-repo file → child gets parent's ID);
+- "Nothing is lost for agent_end: `captureTranscript` returns `""` without a session file" — unique to this comment and the actual justification for dropping the event rather than emitting one with a cached ID.
+
+**Restate briefly or drop:**
+- lines 155-157, the symptom narrative ("overwrote the parent's last prompt with the subagent's internal task text and opened a new turn mid-flight, so the checkpoint's title and turn-scoped windows described the subagent") — commit-message material; one clause suffices, and the docs already carry it.
+- line 165, "An explicit payload session_id is always honoured" — becomes self-evident once the predicate is `sessionID == ""`.
+
+**Delete (inverted claim):** lines 159-161, "Requiring a session file keeps the legitimate fallback — a session file whose name carries no parseable ID." That case does not reach the cache: `extractSessionIDFromPath` falls back to the basename, so the ID is non-empty and the guard never consults `SessionFile`. This sentence is the sole justification offered for the inert second term.
+
+**Duplication with `docs/architecture/agent-guide.md:741-751`: substantial.** The same four sentences now appear in **four** places in this diff — `lifecycle.go:145-165` (21 lines), `entire_extension.ts:14-22` (9), `nested_session_test.go:9-18` (10), `agent-guide.md:741-751` (11) — **51 lines of prose for a 2-line TS guard and a 1-line predicate**, all four needing to be kept in sync. Recommendation: `agent-guide.md` is canonical (repo convention already treats it as the Pi reference); reduce the Go comment to ~4 lines, the TS comment to ~3, and the test header to ~2, each pointing at the doc. Saves ~35 lines and three sync obligations. Note the one thing that exists *only* in the TS comment and the docs and must survive: "Entire's hook subprocesses inherit this marker, so the CLI must never treat it as a skip signal."
+
+### 5. `nested_session_test.go` — yes, fold the three functions into the existing table. `dupl` does **not** trip (verified).
+
+- **`dupl`:** confirmed empirically — 0 issues at threshold 75 with tests included. Test 3 is well under 75 tokens; test 2's overlap with test 1's setup and with test 3 is ~30-40 tokens. No lint risk.
+- **Duplicated setup:** test 1 (`:20-25`) and test 2 (`:68-73`) share six identical lines (`t.TempDir`/`t.Chdir`/`ctx`/`&amp;PiAgent{}` + a `session_start` seed differing only in the UUID); test 3 (`:99-102`) does the same thing in two lines with a different style (`t.Chdir(t.TempDir())`, inline `context.Background()`), inconsistently.
+- **Inert setup:** test 2's `session_start` seed (`:75-78`, 4 lines) does nothing. `/tmp/live.jsonl` resolves to `"live"` from the basename, so the cache is never read — and `cacheSessionID` then *overwrites* the seeded `"abc-123"` with `"live"`. Six lines that mislead the reader into thinking the assertion depends on the cache.
+- **Misnamed:** `TestParseHookEvent_CacheFallbackStillAppliesWithSessionFile` (`:64-93`) exercises no cache fallback; its own body comment at `:88-89` admits it ("the ID comes from the file name itself rather than the cache"), and the assertion is the weak `ev.SessionID != ""`.
+- **Overlap:** test 2 and test 3 both largely re-cover the existing `TestParseHookEvent_BeforeAgentStart` (`lifecycle_test.go:29-46`), which already asserts a full `TurnStart` for a `session_file` payload. Their unique content is one input string each.
+- **Simpler form:** add a `wantSessionID` column to test 1's existing table (`""` = expect no event) and make tests 2 and 3 two more rows. **104 lines → ~35**, three serial (non-parallel, `t.Chdir`) test functions → one, and it *strengthens* test 2: with the parent cache seeded once for the whole table, asserting `wantSessionID == "live"` actually discriminates against the cached `"parent-id"`, which `!= ""` never did.
+
+### 6. The TypeScript guard — the code is already minimal; the comment is 4.5× oversized.
+
+`entire_extension.ts:23-24`. Two lines is the floor; there is no shorter idiomatic form. One nit: `=== "1"` couples the reader to the writer's literal for no benefit, since this file is the only writer — `if (process.env.ENTIRE_PI_NESTED) return;` is the more usual env-marker idiom and is robust to any truthy value a future spawner might set.
+
+The 9-line comment (`:14-22`) is not proportionate: lines 14-19 restate `agent-guide.md:741-751` verbatim in substance. Keep only line 19's one-liner intent plus lines 21-22 (the "hook subprocesses inherit it, so the CLI must NOT treat it as a skip signal" warning — the genuinely surprising constraint, and load-bearing). ~3 lines.
+
+---
+
+## One follow-up worth a decision (not a bug)
+
+The guard makes both pre-existing cache fallbacks unreachable: `lifecycle.go:215-219` (`before_agent_start`) collapses to a bare `cacheSessionID(ctx, sessionID)`, and `lifecycle.go:237-239` (`agent_end`) is fully dead. The diff leaves both in, so a reader must reason about a fallback that can never fire — and `readCachedSessionID` then has **no production caller at all** (grep confirms only `lifecycle.go:216,238` and tests), making the per-repo active-session file write-then-clear only. `agent-guide.md:737` still advertises that cache as the mechanism that "bridge[s] races between `session_start` and `before_agent_start`/`agent_end`", which the new guard supersedes. Note `unused` will not flag it, because the tests still call it. Either delete the two dead branches (8 lines, verified test- and lint-clean) — with the ~35-line cache read path as a larger follow-up — or state explicitly in the comment why the fallback is retained.</result>
+<usage><subagent_tokens>114339</subagent_tokens><tool_uses>29</tool_uses><duration_ms>465626</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aed499a0b9e4c8896</task-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments-2/f12d4d56-00f1-45df-a94c-6a3cf2714244/tasks/aed499a0b9e4c8896.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review of PR2 diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Verified everything independently. Here is the reuse review.
+
+## REUSE findings
+
+### 1. The guard is repeated per-case; the sibling agent hoists it once — `cmd/entire/cli/agent/pi/lifecycle.go:195`, `:209`, `:233`
+
+Three copies of the same skip block inside the `switch`:
+
+```go
+if nestedInvocation(payload, sessionID) {
+    logNestedInvocationSkip(ctx, hookName)
+    return nil, nil //nolint:nilnil // nested/sessionless Pi = no lifecycle event
+}
+```
+
+**Existing convention to use instead:** `cmd/entire/cli/agent/copilotcli/lifecycle.go:92-96` solves the identical problem (Copilot fires per-turn/session hooks for subagent turns; they must not spin up a top-level Entire session) with **one** guard placed *before* the switch, carrying an explicit exemption for the hook that must still run:
+
+```go
+if hookName != HookNameSubagentStop &amp;&amp; isSubagentSessionID(env.SessionID) {
+    logging.Debug(ctx, "copilot-cli: skipping lifecycle event for subagent session", ...)
+    return nil, nil //nolint:nilnil
+}
+```
+
+Introduced in commit `b2f193be6f` ("copilot: don't create phantom sessions for subagent turns"). I enumerated every `//nolint:nilnil` in all nine `agent/*/lifecycle.go` files: copilotcli:95 is the **only** other subagent/nested skip in the codebase — every other `nil, nil` is "unknown hook", "pass-through hook", or "no model info". So copilotcli is the precedent, and pi diverges from it structurally.
+
+**Duplication cost:** 12 lines and 3 `nolint` directives where copilotcli needs 4 lines and 1. It also forces the `logNestedInvocationSkip` wrapper into existence (see #3). A fourth pi hook added later must remember to paste a fourth copy — the hoisted form is correct by construction. Pi's equivalent exemption is `hookName != HookNameSessionShutdown`, since that case must still reach `clearCachedSessionID`.
+
+### 2. The new predicate is not reused at one of its own three sites — `cmd/entire/cli/agent/pi/lifecycle.go:195`
+
+`nestedInvocation` (`:166`) is introduced as *the* named predicate for "sessionless/nested Pi", but the `session_start` case spells it by hand as `if sessionID == ""` and then points at `nestedInvocation` in a comment ("See nestedInvocation"). The other two sites call the function.
+
+**Use instead:** call `nestedInvocation(payload, sessionID)` at `:195` too (or fold it into the single hoisted guard from #1).
+
+**Cost:** one concept with two spellings. Any future change to what counts as nested updates 2 of 3 sites, and the comment already has to bridge the gap manually.
+
+### 3. Test assertion hardcodes a template string where the adjacent line uses a Go const — `cmd/entire/cli/agent/pi/hooks_test.go:46` (minor)
+
+Line 46 asserts `strings.Contains(body, "process.env.ENTIRE_PI_NESTED")` as a bare literal. Eight lines above, `hooks_test.go:38` asserts the same *kind* of thing via the Go const `entireMarker` (declared `pi/hooks.go:32`).
+
+**Convention to use instead:** every load-bearing string shared between the embedded template and Go is declared as a const in `hooks.go` — `entireMarker` (`pi/hooks.go:32`), `entireCmdPlaceholder` (`pi/hooks.go:36`), mirrored in `opencode/hooks.go:24` and `opencode/plugin.go:9`. The pi package already declares its own env-var names this way: `piSessionDirEnvVar = "ENTIRE_TEST_PI_SESSION_DIR"` (`pi/pi.go:36`), `piHomeEnvVar` (`pi/pi.go:31`). Adding `const piNestedEnvVar = "ENTIRE_PI_NESTED"` next to `entireMarker` and using it at `:46` matches both.
+
+**Honest calibration:** low value. The name never enters Go behaviorally (the TS sets and reads it; the Go side is explicitly forbidden from reading it), and a rename in either place *fails* the test rather than silently passing, so there is no drift hazard — only inconsistency with the line above it. The name `ENTIRE_PI_NESTED` itself does **not** violate any convention: there is no central `ENTIRE_*` registry, roughly half of production `ENTIRE_*` names are inline literals, and the one dedicated registry (`cmd/entire/cli/provenance/env.go`) is scoped by its own package doc to markers Entire sets on child agents *that a Go hook reads* — which this is not.
+
+### 4. Tests: no shared helper is being bypassed, but the file split diverges from the precedent
+
+**Not a finding:** pi has no `ParseHookEvent` test driver and no session-cache test helper, and `agent/testutil` only holds `ReadRawHooks`/`GetKeys` and the fake-stream harness. Pi's package convention is hand-written JSON via `strings.NewReader` plus plain `if` assertions (zero testify usage across all seven pi test files), which `nested_session_test.go` follows correctly. Do **not** switch it to `require` — that is copilotcli's style, not pi's.
+
+**Two real reuse points:**
+
+- **File placement — `cmd/entire/cli/agent/pi/nested_session_test.go:1`.** `lifecycle_test.go` is the home of all eight existing `TestParseHookEvent_*` tests, and copilotcli keeps its exactly-analogous subagent-skip tests in `copilotcli/lifecycle_test.go:366` alongside its other ParseHookEvent tests rather than in a new file. Cost: ParseHookEvent coverage is now split across two files, so "what does ParseHookEvent do for case X" requires knowing to check both.
+- **Repeated cache-priming preamble — `nested_session_test.go:21-33` and `:69-78`.** The `t.TempDir()` + `t.Chdir()` + `ParseHookEvent(HookNameSessionStart, {"session_file":"/tmp/2026-05-09T12-00-00-000Z_&lt;id&gt;.jsonl"})` + `readCachedSessionID` assert sequence is now written three times, counting the pre-existing `lifecycle_test.go:126-139`. A `t.Helper()`-marked `newPiEnvWithCachedSession(t, id) (context.Context, *PiAgent)` would remove ~14 lines and centralize the session-file naming pattern. Below dupl's 75-token gate, so lint will not flag it.
+
+## Explicit non-findings
+
+- **`nestedInvocation` does not re-implement anything.** I checked `shouldSkipForwardedHook` (`cmd/entire/cli/hook_guard.go:25`) — it is unexported, in package `cli`, runs on the *normalized* `*agent.Event` after parse, and keys on transcript-path ownership; it cannot express "sessionless payload" and runs too late to suppress pi's `cacheSessionID`/`captureTranscript` side effects. `interactive.isAgentSubprocessEnv` (`interactive/interactive.go:81`) is private and TTY-prompting-scoped. `cmd/entire/cli/agent/spawn/spawn.go` sets no env and is documented as "intentionally env-contract-agnostic". `agent.ReadAndParseHookInput` (`agent/event.go:174`) has no empty-payload skip. The only sibling predicate is copilotcli's `isSubagentSessionID` (`copilotcli/lifecycle.go:21`), which keys on a Copilot-specific `toolu_` id prefix and is not reusable. In-agent placement is correct.
+- **`logNestedInvocationSkip` does not duplicate an existing helper.** There is no shared skip-logging helper; every skip log in the repo is an inline `logging.Debug`. Small named `logXxx` wrappers are an established local pattern with comparable call-site counts: `logCellClientFallback` (2), `logFileChanges` (1), `logInvalidGitTreePath` (5), `logFallback` (7) vs `logNestedInvocationSkip` (3). Its only issue is that it exists to service the duplicated call sites in #1 — hoisting the guard removes the need for it.
+- **The TypeScript guard has nothing to reuse.** `ENTIRE_PI_NESTED` is the only env var set or read inside any embedded template; `opencode/entire_plugin.ts` touches `process.env` zero times.</result>
+<usage><subagent_tokens>145044</subagent_tokens><tool_uses>45</tool_uses><duration_ms>711533</duration_ms></usage>
+</task-notification>

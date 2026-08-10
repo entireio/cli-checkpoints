@@ -1,0 +1,274 @@
+1935 mentions that the logs are now captured, are they really? like in the shadow branch but in actual checkpoints?
+
+---
+
+did you update pr description and also the trail description
+
+---
+
+can you run simplify on each of the 3 PRs
+
+---
+
+<task-notification>
+<task-id>ad2ea9e15f0b96f86</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments-2/f12d4d56-00f1-45df-a94c-6a3cf2714244/tasks/ad2ea9e15f0b96f86.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review of PR1 diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have what I need. Findings below.
+
+## Verdict
+
+The diff's *concept* is right (name the layout, probe both variants) but the *placement* is wrong, and demonstrably so: it put the helper in the one package that 4 of the 5 existing copies of this same layout cannot import. The Claude-specific-layout-in-generic-layer issue is real but pre-existing and baked into the interface signature — acceptable for this fix, follow-up to move behind the agent interface.
+
+---
+
+### Finding 1 — `SubagentsDir`/`ResolveAgentTranscriptPath` landed in package `cli`, which 4 of the 5 sites holding this same literal cannot import
+
+**File:** `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/transcript.go:112` and `:127`
+
+The diff converted exactly one call site (`lifecycle.go:847`). `filepath.Join(dir, sessionID, "subagents")` still appears verbatim in four other non-test places:
+
+- `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/strategy/manual_commit_hooks.go:1948`
+- `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/review/manifest.go:446` (in a private `reviewSubagentsDir` helper — a 5-line duplicate of the new function)
+- `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/agentimport/claude.go:42`
+- `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/agentimport/factory.go:45`
+
+None of the four import `cli`; `strategy` structurally *can't* (cli imports strategy). All four already import `cmd/entire/cli/agent`.
+
+**Maintenance cost:** the next layout change is still a 5-site edit, and 4 of those sites cannot call the new canonical helper — whoever does the de-dup must relocate it first. Meanwhile the helper's doc comment ("This is where Claude Code writes them today") reads as a single source of truth that isn't one. The `review/manifest.go` case is the sharpest illustration: `reviewSubagentsDir(st)` is computed locally purely to be passed into `agent.CalculateTokenUsage(...)` two lines later.
+
+**Deeper alternative (in scope for this fix):** move both functions to package `agent` (e.g. `cmd/entire/cli/agent/subagents.go`), next to `agent.CalculateTokenUsage` in `agent/token_usage.go:13` — which already takes `subagentsDir` and is already the shared framework-side helper called from both `cli/lifecycle.go` and `review/manifest.go`. Pure move plus 4 call-site substitutions, no interface change, no cycle.
+
+---
+
+### Finding 2 — Claude Code's layout is now a named, documented API in the agent-agnostic layer, applied to every agent
+
+**File:** `cmd/entire/cli/transcript.go:108-114`, consumed at `cmd/entire/cli/lifecycle.go:847` and `:1149`
+
+`SubagentAwareExtractor` has three implementors, and the dispatcher hands all of them a Claude-shaped path:
+- `cmd/entire/cli/agent/claudecode/lifecycle.go:25`
+- `cmd/entire/cli/agent/factoryaidroid/lifecycle.go:22` (blindly `filepath.Join(subagentsDir, "agent-&lt;id&gt;.jsonl")` at `factoryaidroid/transcript.go:397,454`)
+- `cmd/entire/cli/agent/external/capabilities.go:171` — a third-party binary handed `--subagents-dir` (`external/external.go:401`, `docs/architecture/external-agent-protocol.md:396-420`) with **no protocol channel to declare where it actually stores subagent transcripts**
+
+`handleLifecycleSubagentEnd` additionally runs `ResolveAgentTranscriptPath` for Cursor and Copilot CLI, which emit SubagentEnd but don't implement the interface at all — they get Claude-shaped path probes under their own session dirs.
+
+This contradicts `docs/architecture/agent-guide.md:11` ("agents are passive data providers... It only answers questions") and the `GetSessionDir`/`ResolveSessionFile` precedent at `cmd/entire/cli/agent/agent.go:65-78`.
+
+**However:** the interface signature itself already declares this — `agent.go:427` takes `subagentsDir string` and documents it as "specifies where subagent transcripts are stored." Caller-owns-layout is the pre-existing contract, not something this diff invented. **This is acceptable for a focused bug fix; moving it behind the agent interface is a follow-up.** The diff makes the problem *marginally worse only in placement* (it entrenches the knowledge on the wrong side of the import cycle — see Finding 1) and *better in legibility* (one documented resolver instead of a bare literal).
+
+**Deeper alternative (follow-up):** add `SubagentsDir(transcriptDir, sessionID) string` — or better, `ResolveSubagentTranscript(transcriptDir, sessionID, agentID) string` — to `SubagentAwareExtractor`, with a framework default for external agents plus a new `subagents-dir` protocol subcommand. Claude then owns nested+legacy, Droid owns its own, and all five duplicate sites collapse to `ag.SubagentsDir(...)`.
+
+---
+
+### Finding 3 — Two functions now give two different answers to "where do subagent transcripts live"
+
+**File:** `cmd/entire/cli/transcript.go:112` (nested only) vs `:127` (nested, then legacy)
+
+`SubagentsDir` feeds the TurnEnd directory scan (`lifecycle.go:847`); `ResolveAgentTranscriptPath` feeds the SubagentEnd single-file lookup (`lifecycle.go:1149`). Only the second knows there are two layouts.
+
+**Maintenance cost:** the two-layout fact is half-encoded, which is exactly how the original bug hid — TurnEnd already assumed nested while SubagentEnd assumed the flat sibling, and nobody noticed the disagreement. A third layout change now requires knowing which of the two functions carries the candidate list, and the two can silently disagree per session vintage.
+
+**Deeper alternative:** the root cause is `ExtractAllModifiedFiles(…, subagentsDir string)` accepting exactly one directory, so "current + legacy candidates" is inexpressible. The honest fix is to hand the extractor a resolver, or let the agent resolve internally (Finding 2). Until then, state the asymmetry in `SubagentsDir`'s doc comment so it reads as deliberate rather than an oversight.
+
+---
+
+### Finding 4 — `AgentTranscriptPath` stays exported with zero remaining external callers
+
+**File:** `cmd/entire/cli/transcript.go:104`
+
+After this diff its only callers are `transcript.go:132`/`:133` and its own test. The "prefer `ResolveAgentTranscriptPath`" warning is comment-only.
+
+**Maintenance cost:** the wrong-by-default builder remains exactly as discoverable as the safe one. The next caller needing a subagent path can autocomplete `AgentTranscriptPath`, get a plausible-looking path with no existence check, and reintroduce this precise bug — with no compiler, lint, or test signal.
+
+**Deeper alternative:** unexport it (`agentTranscriptPath`), or inline the `fmt.Sprintf` into the resolver, so `ResolveAgentTranscriptPath` is the only public entry point. One-line change, zero external breakage.</result>
+<usage><subagent_tokens>116188</subagent_tokens><tool_uses>26</tool_uses><duration_ms>249036</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a0fee8e41353788e1</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments-2/f12d4d56-00f1-45df-a94c-6a3cf2714244/tasks/a0fee8e41353788e1.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review of PR1 diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Simplification findings
+
+All line numbers are post-change; paths absolute.
+
+---
+
+**1. `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/transcript.go:99-106` — `AgentTranscriptPath` is now internal-only; the diff leaves it exported plus a new "don't use me" doc block.**
+
+Repo-wide grep (`*.go` + `*.md`): the only callers are `transcript.go:132-133` (inside `ResolveAgentTranscriptPath`) and `transcript_test.go:94`. The one other match, `cmd/entire/cli/agent/cursor/types.go:189`, is an unrelated struct field of the same name. No production code outside `ResolveAgentTranscriptPath` calls it.
+
+Cost: an exported symbol, a 4-line doc comment that exists purely to warn callers who no longer exist ("Prefer ResolveAgentTranscriptPath, which handles both layouts"), and a 30-line table test (`transcript_test.go:71-100`) kept alive for a single `filepath.Join`.
+
+Simpler form: fold it into the resolver and delete the export, its doc block, and `TestAgentTranscriptPath` (both joins are already asserted end-to-end by `TestResolveAgentTranscriptPath`'s nested/legacy subtests):
+
+```go
+func ResolveAgentTranscriptPath(transcriptDir, sessionID, agentID string) string {
+	if agentID == "" {
+		return ""
+	}
+	name := "agent-" + agentID + ".jsonl"
+	if p := filepath.Join(SubagentsDir(transcriptDir, sessionID), name); fileExists(p) {
+		return p
+	}
+	if p := filepath.Join(transcriptDir, name); fileExists(p) {
+		return p
+	}
+	return ""
+}
+```
+Net ≈ −40 lines. If you'd rather keep the helper, at least unexport it — nothing outside package `cli` uses it (same is true of the new `SubagentsDir`; `cli` is imported only by `cmd/entire/main.go`, and `strategy`/`review`/`agentimport`, which hand-roll the same join, can't import `cli` back).
+
+---
+
+**2. `transcript.go:131-140` — `[]string` of candidates built, named, then ranged over exactly once.**
+
+Cost: a slice allocation and a named intermediate for a fixed 2-element list; the reader has to hold the slice in their head to see the precedence.
+
+Simpler form: the two `if` statements shown above (equivalent, 2 lines shorter, no allocation). If you want to keep the loop shape, at minimum inline the literal: `for _, candidate := range []string{nested, legacy} {`.
+
+---
+
+**3. `transcript.go:116-126`, `cmd/entire/cli/integration_test/subagent_transcript_layout_test.go:16-23`, `docs/architecture/claude-hooks-integration.md:178-186` — the same rationale paragraph is written three times.**
+
+All three say: legacy-only resolution yielded `""` for modern sessions → task checkpoint had no subagent transcript → extraction fell back to the main transcript, where the subagent's Write/Edit calls don't appear. That's 20 doc lines in `transcript.go` for 15 lines of trivial code, plus 8 comment lines above the first test, plus the doc.
+
+Simpler form: keep the full paragraph in exactly one place — the `ResolveAgentTranscriptPath` doc comment is the right home since it's next to the precedence it justifies. Trim `SubagentsDir` to its one factual line ("Claude Code writes subagent transcripts here today; older versions wrote `agent-&lt;id&gt;.jsonl` directly into transcriptDir"), and cut the test-file paragraph to one line ("both layouts must resolve; see ResolveAgentTranscriptPath"). The load-bearing facts (which layout wins, why the fallback exists) survive in one copy.
+
+---
+
+**4. `subagent_transcript_layout_test.go:24-103` — the two tests are near-copies; collapse them into one table-driven test. Definite recommendation: yes, collapse.**
+
+Verified about `dupl`: it will *not* force this. `dupl` isn't in `.golangci.yaml`'s `enable` list at all (CI runs the action with no extra args, so `mise run lint` never runs it), and I ran it explicitly with `run.build-tags: [integration]` at threshold 75 **and** 50 — 18 and 39 hits in that package respectively, none in this file. So this is a maintainability call, not a lint gate.
+
+It's still worth doing, because the duplication is not the interesting part of either test. Everything except the transcript-placement line is identical: `NewFeatureBranchEnv` → `NewSession` → `CreateTranscript` → `SimulateUserPromptSubmit` → `SimulatePreTask` → `WriteFile` → `SimulatePostTask(PostTaskInput{...})` → the same 1-line `wantPath` expression. Concrete cost: any harness signature change (e.g. a new `PostTaskInput` field) needs two edits, and the copies have *already* diverged — the legacy copy (line 100) drops the `strings.Contains(content, ...)` assertion, so it only checks that *something* was stored under that name.
+
+Simpler form: one test with a `write func(t *testing.T, s *Session, subagentID string)` table field, two rows (`writeNestedSubagentTranscript`, `writeLegacySubagentTranscript`), subtests calling `t.Parallel()` with their own `env` (matches how the file already isolates state). Both rows then get the stronger content assertion for free. ≈88 lines → ≈45, and the differing directory layouts stay obvious because they're the only thing the table varies.
+
+---
+
+**5. `subagent_transcript_layout_test.go:163-178` — `Files().ForEach` walk with two captured variables, where go-git has a direct lookup.**
+
+`(*object.Tree).File(path)` exists in the pinned go-git (`v6.0.0-alpha.5`, `plumbing/object/tree.go:89`) and returns `ErrFileNotFound` (`tree.go:30`). The neighbouring `verifyShadowCheckpointStorage` needs a walk because it does prefix matching — this new code copied the walk without needing it.
+
+Simpler form (16 lines → 8, and no `found`/`content` closure state):
+```go
+f, err := shadowTree.File(path)
+if errors.Is(err, object.ErrFileNotFound) {
+	return "", false
+}
+if err != nil {
+	t.Fatalf("lookup %s: %v", path, err)
+}
+content, err := f.Contents()
+...
+return content, true
+```
+
+**5b. `subagent_transcript_layout_test.go:144-161` — third copy of the open-repo → resolve-branch → commit → tree boilerplate in this package.**
+
+Identical shape already lives at `cmd/entire/cli/integration_test/subagent_checkpoints_test.go:298-321` (same package, so directly shareable) and `cmd/entire/cli/integration_test/codex_shadow_sanitize_test.go:59-76`. Simpler form: one `shadowTree(t *testing.T, env *TestEnv) *object.Tree` helper; `readShadowFile` drops to ~10 lines and `verifyShadowCheckpointStorage` loses ~20. (Side benefit: the new copy uses `git.PlainOpen` directly, which CLAUDE.md forbids outside `gitrepo`; a shared helper fixes that in one place, as `codex_shadow_sanitize_test.go` already does with `gitrepo.OpenPath`.)
+
+---
+
+**6. `subagent_transcript_layout_test.go:117-121` — the `.meta.json` sidecar write cannot affect the test.**
+
+Grep for `meta.json` across `cmd/` and `internal/`: nothing in the CLI reads `agent-&lt;id&gt;.meta.json` — the only non-test hits are this test and the comment at `transcript.go:110`. The resolver builds an exact path, so a decoy sibling can't change the outcome either.
+
+Cost: 5 lines of setup plus a hand-built JSON literal, all inert; a reader has to check whether the sidecar is load-bearing (it isn't).
+
+Simpler form: delete lines 117-121. If you want the fact recorded, one comment does it: `// Claude Code also writes an agent-&lt;id&gt;.meta.json sidecar here; nothing in the CLI reads it.`
+
+---
+
+**7. `subagent_transcript_layout_test.go:108-122` — `writeSubagentTranscript` is a single-call-site helper whose parameters are always the same constants, and it's asymmetric with the legacy case.**
+
+Both `subagentID` and `editedPath` have exactly one caller passing literals (`"docs/red.md"`); `unparam` doesn't fire (I ran it: zero `unparam` issues in this package), but the generality is unused. Meanwhile the legacy layout gets no helper at all — its path is built inline at line 79 — so the two paths under test are written in two different styles. Line 111 also re-derives `&lt;dir&gt;/&lt;sessionID&gt;/subagents` by hand, a join that now has a name (`SubagentsDir`) and that `hooks_test.go:166` also hand-rolls.
+
+Simpler form: under finding 4's table, both become symmetric 3-6 line funcs taking `(t, session, subagentID)` with the edited path as a package-level const; drop `editedPath` as a parameter.
+
+---
+
+**8. `cmd/entire/cli/transcript_test.go:102-110` — `TestSubagentsDir` duplicates coverage the resolver test already provides.**
+
+`TestResolveAgentTranscriptPath/current nested layout` (lines 133-142) builds `filepath.Join(dir, sessionID, "subagents", "agent-"+agentID+".jsonl")` by hand and asserts the resolver returns exactly that — so the layout is already pinned end-to-end. `TestSubagentsDir` re-asserts the same `filepath.Join` against itself, which can only fail if the join is reordered (already caught) .
+
+Cost: 9 lines and one more test name to read.
+
+Simpler form: delete it.
+
+---
+
+**9. `cmd/entire/cli/lifecycle.go:1148` — single-use local (nit).**
+
+`transcriptDir` is used on exactly one line (grep confirms only 1148/1149 in the whole file). Inline it: `subagentTranscriptPath := ResolveAgentTranscriptPath(filepath.Dir(event.SessionRef), event.SessionID, event.SubagentID)`.
+
+---
+
+**10. `subagent_transcript_layout_test.go:126-138` — `writeTranscriptFile` re-implements `Session.CreateTranscript` (low priority).**
+
+`cmd/entire/cli/integration_test/hooks.go:278-294` does the same five builder calls (`AddUserMessage` → `AddToolUse("mcp__acp__Write", path, content)` → `AddToolResult` → `AddAssistantMessage` → `WriteToFile`); the only difference is the destination path. Too short for `dupl`, and the fix touches the shared harness, so it's a judgement call: a `Session.WriteTranscriptTo(path, changes)` (or a free `newTranscript(path, prompt, changes)`) in `hooks.go` would serve both and this helper disappears.
+
+---
+
+### Checked, not findings
+
+- The five subtests in `TestResolveAgentTranscriptPath` are a clean matrix (nested-only, legacy-only, both, neither, empty agentID) — no pair is redundant; "prefers nested over legacy" is a different setup from "current nested layout", not a superset of it.
+- `readShadowFile`'s `(string, bool)` return: both returns are used (the legacy caller discards the string, which is fine, and disappears under finding 4).
+- The new tests do not duplicate `cmd/entire/cli/integration_test/hooks_test.go:127` (`TestHookRunner_SimulateStop_SubagentOnlyChanges`) — that one exercises the TurnEnd/Stop path and asserts `StepCount`; these exercise SubagentEnd and assert the stored blob.
+- `mcp__acp__Write` as the tool name matches the house convention in this test package (`hooks.go:283` and ~20 other sites), so it's not gratuitous variation.
+- No dead code left behind in `lifecycle.go`: `fileExists` still has another caller (`lifecycle.go:749`).</result>
+<usage><subagent_tokens>139946</subagent_tokens><tool_uses>33</tool_uses><duration_ms>1907682</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>af79197bf79707060</task-id>
+<tool-use-id>toolu_01HDe6dtE7buZxTPM6RoQepj</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments-2/f12d4d56-00f1-45df-a94c-6a3cf2714244/tasks/af79197bf79707060.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review of PR1 diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Verdict
+
+The hot-path change is **essentially efficiency-clean**. The resolver is 2 `os.Stat`s worst case with the common case checked first, no walk/glob/read is added by the resolution itself, and the `SubagentsDir()` refactor is bit-for-bit the same computation. There is one genuine latency addition (intended by the fix, but worth knowing its magnitude), one micro-nit, one test-only item, and one pre-existing waste sitting directly in the diff's blast radius.
+
+## Findings
+
+### 1. Newly activated read + full redaction of the subagent transcript on every SubagentStop (intended cost, but measure it)
+- **File/line:** `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/lifecycle.go:1149` (consumed at `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/checkpoint/persistent.go:550` and `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/checkpoint/ephemeral.go:444`)
+- **Concrete waste:** Before the fix, `subagentTranscriptPath` was `""` for every modern Claude Code session, so the store's `os.ReadFile` + `redact.JSONLBytes` branch was dead code. It is now live on every subagent completion. I benchmarked the repo's own redaction bench: `BenchmarkRedactJSONLBytes/Fixture/ClaudeFull2` runs at **4.07 MB/s, 287 ms for a 1.17 MB transcript** (M4 Max, 48 MB allocated, 447k allocs). `redact.JSONLBytes` also makes two full copies of the content (`string(b)` in, `[]byte(redacted)` out). Unlike the main transcript, the subagent blob has **no chunking and no size cap**. Additionally the same file is now read and JSON-parsed **twice** in one hook process: once by `ExtractModifiedFilesFromOffset` (lifecycle.go:1171) and again by the store's `os.ReadFile`.
+- **Honest net:** this partly *pays for itself* — extraction now scans the small subagent transcript instead of the whole main transcript from offset 0. I measured full-transcript parse at **231 MB/s** (5 ms/MB), so the extraction saving is ~5 ms/MB of main transcript while the redaction add is ~250 ms/MB of subagent transcript. Net is a modest regression dominated by redaction throughput.
+- **Cheaper alternative:** none that preserves the fix's intent — you cannot store the transcript without redacting it. Worth doing anyway: (a) add a size guard so a pathological multi-MB subagent transcript can't add seconds to the hook (mirroring the main transcript's cap), and (b) if you want the duplicate read/parse gone, thread the already-read bytes through `TaskStepContext` instead of a path. I verified this is **once per subagent**, not per checkpoint: the incremental path (`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/hooks_claudecode_posttodo.go:120`) sets neither `SubagentTranscriptPath` nor `AgentID`, so there is no O(n²) re-redaction of a growing transcript.
+
+### 2. Nit: both candidates are built eagerly, so the legacy path is constructed even when the nested one hits
+- **File/line:** `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/transcript.go:131-134`
+- **Concrete waste:** The slice itself is **not** a heap allocation — escape analysis confirms `transcript.go:131:24: []string{...} does not escape`, and `SubagentsDir`/`fileExists` both inline. But the second element runs a `fmt.Sprintf` (which boxes `agentID` to the heap: `transcript.go:105:68: agentID escapes to heap`) plus a `filepath.Join` unconditionally, and it is discarded in the common modern-layout case. Cost is nanoseconds, once per subagent completion.
+- **Cheaper alternative:** check the nested path and return early, then build the legacy path only on miss; and `"agent-" + agentID + ".jsonl"` instead of `fmt.Sprintf` avoids the interface boxing and format parse. Purely cosmetic at this call frequency — mention it only if you're already touching the function.
+
+### 3. Test helper does a full recursive tree walk with a blob fetch per file, duplicating a cheaper existing helper
+- **File/line:** `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/integration_test/subagent_transcript_layout_test.go:141-179`
+- **Concrete waste:** `shadowTree.Files().ForEach` calls `GetBlob(...)` for **every** file in the shadow tree (go-git v6 `FileIter.Next`, `plumbing/object/file.go:101`) and never early-exits after the match (no `plumbing.ErrStop`), so it keeps fetching blobs past the hit. It also `git.PlainOpen`s the repo and **never closes it**, retaining dotgit/packfile handles for the test's lifetime — every other helper in the package does `defer repo.Close()`.
+- **Cheaper alternative:** the identical helper already exists: `env.ReadFileFromBranch(env.GetShadowBranchName(), path)` at `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/integration_test/testenv.go:902` — it uses `gitrepo.OpenPath` (also the repo's mandated open path per CLAUDE.md), `defer repo.Close()`, and a direct `tree.File(path)` lookup that fetches exactly one blob. Deleting `readShadowFile` in favour of it removes ~38 lines. Real-world magnitude here is milliseconds (the test tree is small), so this is hygiene plus a free win, not a hot spot.
+
+## Explicitly checked and clean
+
+- **`ResolveAgentTranscriptPath` stat count/ordering:** optimal. Modern layout first means modern sessions pay the **same one** stat the old code paid (just on a path that now exists); legacy sessions pay one extra ENOENT stat, which is free. Two stats is well within the "a stat or two is fine" budget.
+- **No new walk/glob/read from the resolution itself.** `filepath.Join` + `os.Stat` only.
+- **`handleLifecycleTurnEnd` (lifecycle.go:847):** `SubagentsDir(...)` is byte-identical to the inline `filepath.Join` it replaced, computed exactly once per turn end, inlined by the compiler. Frequency and cost unchanged.
+- **Integration tests:** no sleeps anywhere in the new file or in `hooks.go`. Per-test `NewFeatureBranchEnv` is the package norm and is required here — the two tests assert *mutually exclusive* on-disk layouts and both call `t.Parallel()`, so sharing a repo would serialize them for no gain. The hook binary is prebuilt in `TestMain`, so there's no per-test compile. The unused `agent-&lt;id&gt;.meta.json` sidecar write is a ~90-byte fixture-realism cost; not worth changing.
+
+## Adjacent pre-existing waste (not introduced by this diff, but the diff makes the fix trivial)
+
+`ClaudeCodeAgent.ExtractAllModifiedFiles` (`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/agent/claudecode/transcript.go:479-491`) documents that "the common no-subagent case is short-circuited by the `subagentsDir == ""` guard" — but **that guard is unreachable from both callers**. `lifecycle.go:847` and `/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/strategy/manual_commit_hooks.go:1948` both pass a `filepath.Join` result, which is never empty. So **every turn end pays a second full `ParseFromBytes` of the entire main transcript** — including sessions that never spawned a subagent, where `ExtractSpawnedAgentIDs` then returns nothing. Measured cost: ~5 ms/MB (231 MB/s), so ~5 ms for a 1 MB transcript and ~90 ms for a 20 MB long session, on every turn end. The diff's new `SubagentsDir()` plus the existing `fileExists` make a one-stat guard (`if !fileExists(subagentsDir) { subagentsDir = "" }`) a two-line fix that activates the documented short-circuit. Caveat to validate before doing it: confirm Claude Code creates `&lt;sessionID&gt;/subagents/` only once a subagent actually runs, and note `manual_commit_hooks.go:1948` re-derives the same path inline and can't import the `cli` helper (`cli` imports `strategy`), so the helper would need to move to a shared package to fix both call sites.</result>
+<usage><subagent_tokens>121278</subagent_tokens><tool_uses>44</tool_uses><duration_ms>1988450</duration_ms></usage>
+</task-notification>

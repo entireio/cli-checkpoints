@@ -1,0 +1,25 @@
+You are fixing two related bugs in the Entire CLI's semantic search fan-out (this worktree is the `cli` repo off latest main). The root cause is already fully diagnosed and I have a validated proof-of-fix in PROOF-FIX.diff at the repo root — your job is to turn it into a clean, tested, review-ready PR, not to re-investigate. Read PROOF-FIX.diff first.
+
+BACKGROUND (confirmed, with evidence)
+`entire search --all-repos` (or `repo:*`) fans out to all regional query-serve cells in parallel and merges results (cmd/entire/cli/search_v4.go + cell_fanout.go). Two bugs:
+
+BUG 2 (the real defect) — cmd/entire/cli/search/search.go, func CellV4: the per-cell response body is read with `io.ReadAll(io.LimitReader(resp.Body, 1<<20))` — a hard 1 MiB cap. The busiest cell (us-east-2, largest corpus) returns 2+ MB on high-hit queries (e.g. "transcript", "backfill", "indexer" — result rows carry full transcript text). The LimitReader SILENTLY TRUNCATES at exactly 1,048,576 bytes, so json.Unmarshal fails, CellV4 returns "unexpected response from search service", that cell is classified failed, and the CLI prints "search failed in N of M regions; results may be incomplete" — silently dropping that whole region's results. Proven: the truncated body is invalid JSON breaking at char ≈1<<20, cut mid-transcript. It is query-VOLUME-dependent (big responses truncate; small ones decode fine), NOT region health, NOT version skew (all 4 cells run the identical image), NOT latency (30s per-cell budget, cells respond in 1-4s).
+
+BUG 3 (why it was undiagnosable) — cmd/entire/cli/search_v4.go, classifySemanticCells + mergeSemanticV4Responses: the CLI captures each failing cell's label AND error, but the user-facing warning only prints a COUNT ("1 of 4 regions"), and the detail goes to logging.Debug — which the `search` command discards because it never calls logging.Init (logger is nil → slog.Default() at INFO → Debug dropped). So the operator cannot tell which region failed or why.
+
+MY VALIDATED FIX (in PROOF-FIX.diff) — I made both changes locally, built, and confirmed:
+- Bug 2: raise the cap 1<<20 → 64<<20 (64 MiB). All previously-failing queries (transcript/backfill/indexer/embedding/cohere/consumer) went from "search failed in 1 of 4 regions" → clean with full results; controls unaffected.
+- Bug 3: include each failed cell's `label: error` in the warning (and I confirmed this is what surfaced "aws-us-east-2: unexpected response from search service" that pinned Bug 2). Existing test `search_v4_test.go` (asserts warning contains "1 of 2 regions") still passes since the prefix is preserved.
+
+WHAT I WANT YOU TO DECIDE/IMPROVE (don't just copy the diff blindly)
+1. Bug 2: is a raised fixed cap (64 MiB) the right call, or should CellV4 STREAM-decode via `json.NewDecoder(resp.Body)` (no magic number, no full-buffer)? Weigh: streaming removes the truncation class entirely and avoids buffering multi-MB in memory, but loses the "on decode error, show the raw body" behavior (parseSearchResponse currently dumps string(body) on failure) and the non-200 error path also reads the body. Pick the cleaner design and justify it. If you keep a cap, justify the number and make sure it's comfortably above real payloads. Consider a DoS/runaway guard either way.
+2. Bug 3: my one-liner (append `label: err` to the warning) works but the raw error can be a full multi-MB body dump (parseSearchResponse puts string(body) in the error). Make the surfaced per-region error SANE — e.g. truncate/summarize the error so the warning is readable (region + a short reason), not a 2 MB blob in the user's terminal. Preserve the machine-readable Response.Warnings contract.
+3. Tests: add/extend unit tests — a cell response just over the old 1 MiB cap decodes fully now (regression test for Bug 2); the partial-failure warning names the region + a concise reason (Bug 3). Keep the existing "1 of N regions" assertion green.
+
+CONSTRAINTS
+- Use `entire graph search` / `entire graph neighbors` and `entire graph commit HEAD` over reading whole files where it helps; the relevant code is small (search.go CellV4/parseSearchResponse, search_v4.go classifySemanticCells/mergeSemanticV4Responses, cell_fanout.go).
+- Run gofmt, `go vet ./...`, and the search tests green before opening the PR.
+- Open a PR (draft is fine) titled about the 1 MiB response cap truncating large-region search results + surfacing per-region fan-out errors. Reference that it fixes silent incomplete cross-region results. Do NOT merge.
+- Delete PROOF-FIX.diff before committing (it's a scratch handoff artifact, not part of the change).
+
+Report back with the PR link and your design decision on streaming-vs-cap.

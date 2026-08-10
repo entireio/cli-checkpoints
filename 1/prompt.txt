@@ -1,0 +1,357 @@
+can you take a look at this user feedback: 
+
+1. The Entire CLI often doesn't realise that a Codex session is done. I understand that's a limitation due to how Codex's hooks work. Currently, I find it quite tedious to clean up the sessions manually (entire status + entire session stop <id>). It'd be nice to have a entire session stop --older-than=3d or something along these lines to make the cleanup much easier.
+
+Can you get an overview and then I'd like to chat about it, mostly I'm wondering what the exact issue is with this.
+
+---
+
+can you check if this changed in regards to what hooks are available in the codex sources: /Users/soph/Work/entire/research/codex
+
+---
+
+ok, can you start a new branch and start working on the fixes in meaningful commits, test codex exec in the end
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>a5aa703682aefcbd3</task-id>
+<tool-use-id>toolu_015HkqiGcmBBbCb6Ek6Jkpcm</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/a78beaef-a2ab-4cad-9900-f4d3c3b51959/tasks/a5aa703682aefcbd3.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I've verified each candidate against the actual tree (including import-cycle reachability). Three real reuse findings, plus a few things I checked and cleared.
+
+## Findings
+
+### 1. `cmd/entire/cli/session/state.go:528` — third literal copy of the "session already finalized" rule
+**Summary:** `if s.Phase == PhaseEnded || s.EndedAt != nil` re-states a predicate the codebase already declares canonical elsewhere.
+
+The identical expression already exists at:
+- `cmd/entire/cli/sessions.go:291` inside `filterActiveSessions` (inverted), whose doc comment at `sessions.go:282-284` literally states the rule *and* warns it "matches the logic in status.go's `writeActiveSessions` for consistency"
+- `cmd/entire/cli/sessions.go:739` (`sessions stop` already-stopped check)
+- and a **narrower, already-diverged** spelling at `cmd/entire/cli/status.go:438` and `status.go:831`, which test only `EndedAt == nil`
+
+**Cost:** four sites, no enforcement of the sync the comment claims. `status.go` has already drifted: a state with `Phase == PhaseEnded` but nil `EndedAt` counts as active there and as ended for `OwnerExited`. Every future refinement of "finalized" has to find all four.
+
+**What to call instead:** there is no existing function reachable from here — `filterActiveSessions` lives in package `cli`, which imports `session`, so `session` cannot call it. The fix is to hoist the predicate to `func (s *State) IsEnded() bool` in `session/state.go` beside `OwnerExited`, then call it from `OwnerExited`, `sessions.go:291`, and `sessions.go:739`. `strategy.SessionState = session.State` is an alias (`strategy/manual_commit_types.go:26`), so the method is available on `*strategy.SessionState` at the `sessions.go` sites with no new import and no cycle.
+
+### 2. `cmd/entire/cli/agent/codex/lifecycle.go:132` and `codex/types.go:52` — new session-end parse duplicates the session-start parse, and sibling agents already solved it
+**Summary:** `parseSessionEnd` + `sessionEndRaw` are near-clones of `parseSessionStart` + `sessionStartRaw` in the same package.
+
+`sessionEndRaw`'s fields are a strict subset of `sessionStartRaw` (`session_id`, `transcript_path`, `cwd`, `hook_event_name`) with `reason` swapped for `source` — and `Reason`, `HookEventName`, and `Source` are never read anywhere in the package (verified by grep). `parseSessionEnd` differs from `parseSessionStart` only in `Type`, plus start setting `Model` and end setting `CWD`.
+
+**Cost:** codex now carries three near-identical `agent.ReadAndParseHookInput` → `&amp;agent.Event{...}` functions; its own `AGENT.md` (added in this diff) names `SubagentStart`/`SubagentStop` as the likely next additions, which would make five. Each new one duplicates the transcript-deref and timestamp logic again.
+
+**What to call instead:** the exact remedy already exists twice in this codebase — `parseSessionInfoEvent(stdin io.Reader, eventType agent.EventType)` with a single `sessionInfoRaw`, at `cmd/entire/cli/agent/geminicli/lifecycle.go:149` and `cmd/entire/cli/agent/factoryaidroid/lifecycle.go:171` ("SessionStart, SessionEnd, and PreCompact differ only in the event type"). Rename `sessionStartRaw` → `sessionInfoRaw`, delete `sessionEndRaw`, add a codex `parseSessionInfoEvent`. Both mechanics check out: `agent.ReadAndParseHookInput` uses plain `json.Unmarshal` (`agent/event.go:180`, no `DisallowUnknownFields`), so one struct parses both payloads; and `Event.CWD` is consumed only by `normalizeToolUsePaths` for ToolUse events (`lifecycle.go:406-408`), so populating it on SessionStart too is inert.
+
+### 3. `cmd/entire/cli/logging/logger.go:155` — `EnsureInitialized` codifies an idiom written by hand at 11 sites, and adopts none of them
+**Summary:** nothing equivalent pre-exists in the `logging` package (confirmed: it is only `logger.go` + `context.go`, exporting `SetLogLevelGetter`/`Init`/`Close`), but the new function's body is verbatim the idiom already spelled out at:
+
+`clean.go:70`, `checkpoint_resume.go:65`, `resume.go:86`, `resume.go:176`, `reset.go:32`, `rewind.go:71`, `explain.go:309`, `import_cmd.go:66`, `trail_context_cache.go:413`, `setup.go:934`, `investigate/cmd.go:340`.
+
+**Cost:** two spellings of "route logs to the file for this command" now coexist; the next change to that dance (e.g. the level-getter wiring) has to be made in 12 places. It also has a live consequence: 10 of those sites pair `Init` with `logging.SetLogLevelGetter(GetLogLevel)` immediately before (e.g. `clean.go:69`, `setup.go:933`), which `EnsureInitialized` does not do — so the sweep's logging from `entire status`/`entire doctor` ignores `log_level` in `settings.local.json` and only honors `ENTIRE_LOG_LEVEL`.
+
+**What to call instead:** replace the `Init`/`Close` pair at those sites with `defer logging.EnsureInitialized(ctx)()`. It is behavior-preserving there — all are cobra `RunE` entry points where `logger == nil`, so the new no-op guard never fires. Keep the `SetLogLevelGetter(GetLogLevel)` line at each site, or better, call it once from an `init()`/root setup in package `cli` so `EnsureInitialized` becomes a true single entry point (`logging` cannot import `cli`, so the getter itself can't move into the helper).
+
+## Checked and cleared (no finding)
+
+- **`stuck(...)` closure, `doctor.go:232`** — no pre-existing constructor exists; after this change the only `&amp;stuckSession{` literal in the tree is the one inside the closure. The change *removes* duplication (it collapsed two identical 7-field literals into one). No action.
+- **Per-event hook timeout in codex `hooks.go`** — `claudecode` does have the analogous shape (`localDevSessionEndTimeoutSecs` at `claudecode/hooks.go:63`, threaded through `addHookToMatcher(..., timeoutSecs int)` at `:563`), but each agent's hooks config has its own matcher type (`ClaudeHookMatcher`, `FactoryHookMatcher`, codex `MatcherGroup`, `CursorHookEntry`), so nothing is callable across packages. Parallel structure, not duplicated code.
+- **`agent.SessionEndBudgeter` / `AsSessionEndBudgeter`** — no prior timeout/budget capability existed in the `agent` package (only an unrelated 2s probe in `hook_command.go:240`), and the accessor correctly reuses the established `builtinCapability[T]` helper in `capabilities.go`.
+- **`processStart` / `sessionEndCondenseDeadline` (`lifecycle.go:1099`, `:1108`)** — no existing process-start-time or hook-deadline helper anywhere in the tree; all other deadline uses are ad-hoc `context.WithTimeout` calls. Genuinely new.
+- **`derefString`, `agent.ReadAndParseHookInput`, `agent.WrapProductionSilentHookCommandForOS`** — all correctly reused rather than reimplemented.</result>
+<usage><subagent_tokens>134988</subagent_tokens><tool_uses>26</tool_uses><duration_ms>241305</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a257a2129b6200fdd</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/a78beaef-a2ab-4cad-9900-f4d3c3b51959/tasks/a257a2129b6200fdd.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Simplification review
+
+### 1. `cmd/entire/cli/lifecycle.go:1095–1156`, `session_finalize.go:57` — the session-end budget is threaded as a 5th parameter + zero-time sentinel + standalone helper; a ctx-carried deadline does the same job with three fewer parts
+
+`processStart` → `sessionEndCondenseDeadline(ag)` → `condenseDeadline time.Time` param → `IsZero()` branch. `endSessionNow` has two call sites, and one of them passes `time.Time{}` purely to satisfy the signature.
+
+Cost: every future caller of `endSessionNow` must know about a parameter that is meaningless to it, and the "zero time means no deadline" convention is a second sentinel language on top of `ctx`, which already has exactly this concept.
+
+Simpler form — keep the deadline in the context, and make the "never bound the mark-ended write" rule explicit *inside* `endSessionNow` instead of at the call sites:
+
+```go
+// lifecycle.go
+func withSessionEndBudget(ctx context.Context, ag agent.Agent) (context.Context, context.CancelFunc) {
+    b, ok := agent.AsSessionEndBudgeter(ag)
+    if !ok || b.SessionEndBudget() &lt;= 0 {
+        return ctx, func() {}
+    }
+    return context.WithDeadline(ctx, processStart.Add(b.SessionEndBudget()))
+}
+
+// handleLifecycleSessionEnd
+ctx, cancel := withSessionEndBudget(ctx, ag)
+defer cancel()
+if _, err := endSessionNow(ctx, event, event.SessionID, nil); err != nil { ... }
+
+// endSessionNow — signature unchanged from main
+ended, err = markSessionEnded(context.WithoutCancel(ctx), event, sessionID, guard) // always completes
+if err != nil || !ended { return ended, err }
+if ctx.Err() != nil {                      // budget already spent
+    logging.Info(logCtx, "skipping eager condense: session-end budget already spent", ...)
+    return true, nil
+}
+```
+
+That deletes the 5th parameter, both call-site sentinels, and `sessionEndCondenseDeadline`. Tradeoff to weigh honestly: `context.WithoutCancel` also decouples the sweep's mark-ended write from caller cancellation — which the diff's own doc says is the desired invariant ("must always complete so the session cannot be left un-finalized"), but it is a behaviour change on the `entire status`/`doctor` path, so it should be a deliberate choice rather than a side effect.
+
+**Not flagged** (load-bearing, don't change): `agent.SessionEndBudgeter` + `AsSessionEndBudgeter` themselves. That interface/`As*`-helper pair is this codebase's uniform extension mechanism (~18 identical pairs in `capabilities.go`), and a per-agent knob genuinely *is* needed — a global 2.5s condense cap would break Claude Code. `processStart` is also load-bearing: the cap is measured by Codex from spawn, so `time.Now()` at condense time would overshoot it.
+
+**Worth a decision, not a nit:** the diff's own comments say condensation doesn't poll ctx, and that being killed mid-condense is safe (`FullyCondensed` stays false, PostCommit retries). The only part of this machinery that reliably bounds anything is the `remaining &lt;= 0` early-skip; the `WithDeadline` mostly just SIGKILLs git subprocesses ~500ms before Codex would have. If the team accepts that, deleting the whole capability (interface, helper, codex method, const, test) is the largest available simplification here. If it stays, at least collapse it as above.
+
+### 2. `cmd/entire/cli/agent/codex/hooks.go:57–140, 204–231, 271–275` — five events × three functions of copy-paste; the diff adds 12 more lines of it and a `timeoutSec` param threaded through three helpers
+
+`InstallHooks` now repeats parse/force-remove/build-command/sync/marshal five times (~45 lines), `UninstallHooks` repeats parse/remove/marshal five times (~25 lines), `AreHooksInstalled` five times. The new `timeoutSec` parameter on `syncHookCommand`/`hookCommandExists`/`addHook` means `defaultHookTimeoutSec` is now spelled out at 4 of 5 call sites just so 1 can differ.
+
+Cost: adding or removing a Codex event is a 12-line, 3-function edit with three chances to forget one (the diff itself is that edit); the per-event timeout lives in the call site rather than with the event.
+
+Table-driven form:
+
+```go
+type managedHook struct {
+    event   string // hooks.json key
+    name    string // `entire hooks codex &lt;name&gt;`
+    timeout int
+    wrap    func(cmd string, windows bool) string
+}
+
+var managedHooks = []managedHook{
+    {"SessionStart", HookNameSessionStart, defaultHookTimeoutSec, func(c string, w bool) string {
+        return agent.WrapProductionJSONWarningHookCommandForOS(c, agent.WarningFormatSingleLine, w)
+    }},
+    // Codex clamps SessionEnd to SESSION_END_MAX_TIMEOUT_SEC and warns at every startup otherwise.
+    {"SessionEnd", HookNameSessionEnd, SessionEndTimeoutSec, agent.WrapProductionSilentHookCommandForOS},
+    {"UserPromptSubmit", HookNameUserPromptSubmit, defaultHookTimeoutSec, agent.WrapProductionSilentHookCommandForOS},
+    {"Stop", HookNameStop, defaultHookTimeoutSec, agent.WrapProductionSilentHookCommandForOS},
+    {"PostToolUse", HookNamePostToolUse, defaultHookTimeoutSec, agent.WrapProductionSilentHookCommandForOS},
+}
+```
+
+```go
+// InstallHooks
+updated := make([][]MatcherGroup, len(managedHooks))
+for i, h := range managedHooks {
+    var groups []MatcherGroup
+    if err := parseHookType(rawHooks, h.event, &amp;groups); err != nil { return 0, err }
+    if force { groups = removeEntireHooks(groups) }
+    cmd := cmdPrefix + h.name
+    if !localDev { cmd = h.wrap(cmd, useWindowsProductionHooks) }
+    if next, changed := syncHookCommand(groups, cmd, h.timeout); changed {
+        groups = next
+        count++
+    }
+    updated[i] = groups
+}
+if count == 0 { return 0, nil }
+for i, h := range managedHooks { marshalHookType(rawHooks, h.event, updated[i]) }
+
+// UninstallHooks — replaces ~25 lines
+for _, h := range managedHooks {
+    var groups []MatcherGroup
+    if err := parseHookType(rawHooks, h.event, &amp;groups); err != nil { return err }
+    marshalHookType(rawHooks, h.event, removeEntireHooks(groups))
+}
+```
+
+`AreHooksInstalled` can loop the same table if it unmarshals into `map[string]json.RawMessage` (or gains a `func (HookEvents) byEvent(string) []MatcherGroup`). Bonus: `require.Equal(t, 5, count)` in six tests becomes `len(managedHooks)`, and `defaultHookTimeoutSec` gets a home next to the events instead of sitting between two helpers at line 317.
+
+Honest caveat: this shape is repo-wide precedent — `claudecode/hooks.go` repeats the same way for six events — so the diff is extending an existing pattern, not inventing one. But this is the file the diff is already rewriting, and codex is now the agent with a *per-event* timeout, which is exactly what the flat form can't express well.
+
+### 3. `cmd/entire/cli/session_finalize.go:27–32, 45–47` — the lazy `closeLogging func()` + nil-check + wrapped `defer` collapses to a pre-check
+
+Four separate constructs (declaration, deferred nil-check closure, in-loop nil test, 9-line comment) exist only to answer "is there at least one candidate?".
+
+Cost: the loop body now interleaves logging lifecycle with finalize logic, and the invariant "initialize exactly once, but not on the empty path" is spread across three places.
+
+Simpler, and it also short-circuits the common (zero-candidate) case entirely:
+
+```go
+// Both callers are plain commands (`entire status`, `entire doctor`) that never
+// initialize logging, so the lines below would land on the user's terminal via
+// slog.Default(). Only initialize when there is real work — Init creates
+// .entire/logs/, which must not happen on every status invocation.
+if !slices.ContainsFunc(states, (*session.State).OwnerExited) {
+    return 0
+}
+defer logging.EnsureInitialized(ctx)()
+```
+
+Cost of the change: at most one extra `OwnerExited()` call per state preceding the first candidate; in the common case (no candidates) it is exactly the same number of calls the loop makes today.
+
+While here: the function's doc comment at line 12 still says "finalizes every **ACTIVE** session in states" — the whole point of this diff is that it now covers IDLE too.
+
+### 4. `cmd/entire/cli/session_finalize_test.go:83–121` — `TestFinalizeExitedSessions_IdleSession` is a 40-line clone of `TestFinalizeExitedSessions` differing only in `Phase`
+
+The existing test already builds a multi-state fixture (`exited`, `noOwner`), saves them in a loop, and asserts per-session outcomes. The new test repeats the repo setup (`setupAttachTestRepo` uses `t.Chdir`, so these run serially), the store construction, the `List`, the count assertion and the ended-state assertions.
+
+Cost: two copies of the sweep's end-to-end assertions drift apart; a second serial `t.Chdir` repo setup for one changed field.
+
+Simpler: add a third fixture to the existing test and bump the expectation.
+
+```go
+idleExited := &amp;session.State{
+    SessionID: "idle-exited-session",
+    Phase:     session.PhaseIdle,   // agent finished its last turn, then quit
+    StartedAt: time.Now(),
+    Owner:     &amp;proclive.Identity{PID: os.Getpid(), Start: "bogus-start-fingerprint"},
+}
+for _, s := range []*session.State{exited, idleExited, noOwner} { ... }
+if n := finalizeExitedSessions(ctx, states); n != 2 { ... }
+```
+…then assert the ended shape over `[]string{"exited-session", "idle-exited-session"}` in a small loop.
+
+### 5. `cmd/entire/cli/session/owner_live_test.go:12–64` — four near-identical functions that are one 2×2 matrix (phase × liveness)
+
+The diff added `DeadOwnerIdleIsTrue`/`LiveOwnerIdleIsFalse` alongside the existing `…ActiveIsTrue`/`…ActiveIsFalse`; the bodies differ only in `Phase`.
+
+Cost: adding a third non-ended phase means writing two more copies.
+
+Simpler:
+
+```go
+func TestOwnerExited_DeadOwnerNonEndedPhases(t *testing.T) {
+    t.Parallel()
+    dead := &amp;proclive.Identity{PID: os.Getpid(), Start: "bogus-start-fingerprint"}
+    for _, phase := range []Phase{PhaseActive, PhaseIdle} {
+        s := &amp;State{Phase: phase, Owner: dead}
+        if s.OwnerLiveness() != proclive.LivenessDead {
+            t.Fatalf("OwnerLiveness(%s) = %v, want dead", phase, s.OwnerLiveness())
+        }
+        if !s.OwnerExited() {
+            t.Errorf("OwnerExited(%s, dead owner) = false, want true", phase)
+        }
+    }
+}
+// …and the mirrored live-owner test with a single ResolveOwner()/t.Skip.
+```
+
+Two functions instead of four, and the phase list is where the new IDLE behaviour is actually asserted.
+
+### 6. `cmd/entire/cli/logging/logger.go:162–164` — unreachable error branch in `EnsureInitialized`
+
+`Init` returns a non-nil error only when `sessionID != ""` fails validation; `EnsureInitialized` passes `""`, so every other path returns `nil` (falling back to stderr internally). The `if err := Init(ctx, ""); err != nil { return func(){} }` arm can never fire.
+
+Cost: implies a failure mode that doesn't exist, and the two distinct `return func(){}` no-ops read as two different outcomes.
+
+```go
+_ = Init(ctx, "") //nolint:errcheck // only errors on a non-empty invalid session ID; we pass none
+return Close
+```
+(`Close` is correct even on the stderr-fallback path — it handles a nil `logFile`.)
+
+### 7. `cmd/entire/cli/agent/codex/hooks_test.go:184–232` — a 6th and 7th copy of the read-file/unmarshal preamble
+
+```go
+data, err := os.ReadFile(filepath.Join(tempDir, ".codex", HooksFileName))
+require.NoError(t, err)
+var hooksFile HooksFile
+require.NoError(t, json.Unmarshal(data, &amp;hooksFile))
+```
+now appears seven times in the file. A one-line helper next to the new `entireHookTimeout` helper removes all of them:
+
+```go
+func readHooksFile(t *testing.T, repoRoot string) HooksFile {
+    t.Helper()
+    data, err := os.ReadFile(filepath.Join(repoRoot, ".codex", HooksFileName))
+    require.NoError(t, err)
+    var f HooksFile
+    require.NoError(t, json.Unmarshal(data, &amp;f))
+    return f
+}
+```
+
+---
+
+### Deliberately not flagged
+
+- **`doctor.go` `stuck := func(reason string)` closure** — this is the diff *removing* duplication (two inline `&amp;stuckSession{...}` literals became one). Good change.
+- **`doctor_classify_live_test.go` build tag `//go:build linux || darwin`** — load-bearing: `proclive` returns `LivenessUnknown` elsewhere, so the tests would be vacuous on Windows. The two tests in it share ~8 lines but follow `doctor_test.go`'s established one-function-per-case shape exactly; table-driving just these two would make the file inconsistent with its neighbour. Low value.
+- **`codex/lifecycle_test.go` `SessionEnd` / `SessionEndNullTranscript` pair** — mirrors the existing `SessionStart` / `SessionStartNullTranscript` pair in the same file. Consistent; leave it.
+- **`agent.SessionEndBudgeter`, `AsSessionEndBudgeter`, the `_ agent.SessionEndBudgeter = (*CodexAgent)(nil)` assertion** — idiomatic for this codebase (18 sibling capability pairs, and the compile-time assertion block already exists in `codex/lifecycle.go`). The complexity worth attacking is the *plumbing* in finding 1, not the capability declaration.
+- **`sessionEndRaw.HookEventName` / `.Reason` unused fields** — documented as deliberate (schema fidelity / future enum widening) and cost nothing.</result>
+<usage><subagent_tokens>145064</subagent_tokens><tool_uses>27</tool_uses><duration_ms>308968</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aa2a029909e4f7d5d</task-id>
+<tool-use-id>toolu_01GMy11KbyjZb4oF8VmU4Hrk</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/a78beaef-a2ab-4cad-9900-f4d3c3b51959/tasks/aa2a029909e4f7d5d.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Tree is clean (temp benchmark removed). Here are the results.
+
+## Finding 1 — `entire status` can now block on N synchronous condensations, unbounded
+
+**File:** `cmd/entire/cli/session_finalize.go:57` (the `time.Time{}` passed as `condenseDeadline`), reached from `cmd/entire/cli/status.go:431` (text) and `cmd/entire/cli/status.go:823` (`--json`, i.e. also the MCP `entire_status` tool).
+
+**Summary:** widening `OwnerExited()` to IDLE multiplies the sweep's candidate set, and each candidate triggers a full, deadline-free `CondenseAndMarkFullyCondensed` inside `entire status`.
+
+**Concrete cost (measured on this machine, darwin/arm64 M4 Max):**
+
+| what | measured |
+|---|---|
+| `entire status` end-to-end, 0–20 sessions | **40–44 ms** (`BenchmarkStatusCommand`) |
+| one condense (2-line transcript) | **119 ms** (`BenchmarkPostCommit/SingleSession_Idle`) |
+| redaction alone, real Claude fixture | **277 ms / 1.17 MB → 4.22 MB/s** (`BenchmarkRedactJSONLBytes/Fixture/ClaudeFull2`) |
+
+So one swept session costs ~120 ms floor, and a realistic 5–10 MB transcript adds another 1.2–2.4 s of redaction on top. That is **3× to 60× the entire cost of the command it is embedded in**, per session, serially, with no cap on N.
+
+The candidate set is the part the diff changes, and it changes it a lot in exactly the direction that matters: a session is `ACTIVE` only between TurnStart and TurnEnd, so the old gate only caught agents killed *mid-turn*. `IDLE` is the resting state — every agent quit at the prompt. The diff's own comment says so ("gating on ACTIVE alone missed the common case"). Non-ended states linger for `StaleSessionThreshold` = 7 days, so the first `entire status` after upgrade sweeps up to a week's backlog in one go, and the user sees the first status line print and then a frozen terminal (the "Finalized N exited session(s)" line prints *after* the work).
+
+`--json` is worse: nothing prints at all until it finishes, and that path is what the MCP `entire_status` tool calls (`mcp.go:231`), so an agent's tool call inherits the same multi-second stall.
+
+**Cheaper alternative** — the machinery is already in this diff and deliberately declined:
+
+1. Pass a real deadline instead of `time.Time{}`. `endSessionNow` now takes `condenseDeadline` precisely for this; the sweep opts out with the comment "not inside an agent's bounded shutdown". But `entire status` has its own implicit budget — a user's patience — and the diff already argues a curtailed condense is safe (`FullyCondensed` stays false, PostCommit retries). A ~1 s budget covering *the whole sweep* would bound the worst case.
+2. Better: split the work by caller. The thing that makes these sessions user-visible-wrong is that they show as active — and that is fixed by `markSessionEnded` alone, one atomic state-file rename. `status` should mark-ended only; leave the condense to `doctor` (already interactive and expected to be slow) and PostCommit (which retries anyway). `status` gains nothing from doing it eagerly.
+3. At minimum, cap the number of condenses per `status` invocation (1–2) so the backlog drains across invocations instead of in one stall.
+
+---
+
+## Measured and **not** worth flagging
+
+I checked each of the specific items you called out and quantified them; none is a real cost.
+
+**`OwnerExited()` call counts per `entire status` invocation** (you asked for the numbers):
+
+- Text path: **2 per surviving session**, 3 for a swept one — `finalizeExitedSessions` pre-filter (`session_finalize.go:35`), the render-loop `case st.OwnerExited()` (`status.go:544`), plus the re-check inside the guard closure (`session_finalize.go:56`) for candidates only. `writeActiveSessions` is called exactly once (`runStatus`/`runStatusDetailed` are mutually exclusive).
+- JSON path: **2 per session**, 3 when the agent-dedup upgrade fires — sweep + `sessionStatusLabel` (`status.go:874`, called at `:850` and again at `:842`).
+- `doctor`: **2 per session** — sweep + `classifySession` (`doctor.go:248`), which now runs before the phase switch instead of only inside the ACTIVE branch.
+
+**Per-call cost:** `proclive.Check` caches nothing, but on darwin it is 9.4 µs alive / 8.4 µs dead — 7.5 µs `unix.SysctlKinfoProc` + 0.9 µs `os.Hostname`; `bootID()` is a 2.3 ns no-op on darwin. Zero syscalls when `Owner == nil`, when `PhaseEnded`/`EndedAt` is set, or (after one `os.Hostname`) on a host mismatch. **At 20 live sessions that is 40 checks ≈ 0.38 ms against a 40 ms command — 0.9%.** The IDLE-only delta is a fraction of that. Not worth deduplicating.
+
+(On Linux a Check is 3 file reads — `/proc/sys/kernel/hostname`, `/proc/sys/kernel/random/boot_id`, `/proc/&lt;pid&gt;/stat` — and `bootID` is re-read every call despite being immutable per process. That is pre-existing, still µs-scale, and I would not change it for this diff.)
+
+**Is `entire status` a hot path?** No. Only two callers: the `status` cobra command and the MCP `entire_status` tool. No hook, no git hook, no shell-prompt integration anywhere in the repo or docs. That is why Finding 1 is about a multi-second stall and not about microseconds.
+
+**`var processStart = time.Now()` (`lifecycle.go:1099`):** one `time.Now()` (~30 ns) at package init of a package that already pulls in go-git, huh and bubbletea. Free.
+
+**`logging.EnsureInitialized` (`session_finalize.go:46`):** no lock-ordering hazard — the `RLock` is released before `Init` takes the write lock, so there is no upgrade and no deadlock. It is not called per session: the `closeLogging == nil` guard makes it fire at most once per sweep. Its cost (`paths.WorktreeRoot` — cached — plus `MkdirAll` + `OpenFile`, ~100 µs) is invisible next to the 119 ms+ condense it precedes.
+
+**Closures:** `stuck := func(reason string)` in `doctor.go:242` captures three small values and does not escape; the guard `func(s *session.State) bool` in the sweep loop captures nothing, so Go allocates it statically. Neither is a long-lived object over a large scope.
+
+**Codex hook changes:** `hookCommandExists` gaining a timeout comparison adds no I/O (in-memory field compare), and causes at most a one-time rewrite of a stale hook entry. `AreHooksInstalled` gaining the `SessionEnd` check adds one in-memory slice check on a file that was already being read; it is only reached from `config.go:93` and `setup.go`, not from any per-turn path.</result>
+<usage><subagent_tokens>152180</subagent_tokens><tool_uses>32</tool_uses><duration_ms>358401</duration_ms></usage>
+</task-notification>

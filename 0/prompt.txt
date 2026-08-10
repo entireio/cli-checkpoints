@@ -860,3 +860,74 @@ Minor, same file line 27: "0 of 30 sampled real checkpoints carried one" — a p
 **No dead code found**, and the two `//TODO: why do we not use here subagents dir?` removals are a net improvement — keep those.</result>
 <usage><subagent_tokens>122035</subagent_tokens><tool_uses>26</tool_uses><duration_ms>706229</duration_ms></usage>
 </task-notification>
+
+---
+
+<task-notification>
+<task-id>a5a499fe22eff7a41</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments-2/f12d4d56-00f1-45df-a94c-6a3cf2714244/tasks/a5a499fe22eff7a41.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review of PR3 diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Verdict
+
+The diff is **efficiency-positive on the hot path**. The one thing worth changing is a new write amplification vector in `aggregateTokenUsage`, and there's a straight reuse win that also makes it slightly cheaper.
+
+All numbers below are measured on this machine (M4 Max, warm page cache) against real transcripts from `~/.claude/projects/-Users-soph-Work-entire-devenv-cli-experiments-2/` — a 6.9 MB / 2789-line main transcript with 16 subagent transcripts totalling 9.6 MB. Temporary benchmark files were deleted; tree is clean.
+
+---
+
+### 1. Confirmed: keeping `subagentsDir=""` is the cheap path — re-reading would have cost ~80 ms per condensing session per commit
+
+`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/strategy/manual_commit_condensation.go:1133` and `:1176` — the `//TODO: why do we not use here subagents dir?` is replaced with a rationale comment and the empty `subagentsDir` is retained. Measured cost of the alternative, on `claudecode.CalculateTotalTokenUsage` with `startLine=2700`:
+
+| call | time | bytes | allocs |
+|---|---|---|---|
+| `subagentsDir=""` (what the diff keeps) | **2.9 ms** | 454 KB | 1,275 |
+| `subagentsDir=&lt;real dir&gt;` (the rejected path) | **81–87 ms** | 37.9 MB | 67,715 |
+
+Breakdown of the extra ~80 ms: the second full `transcript.ParseFromBytes` of the whole 6.9 MB main transcript plus `ExtractSpawnedAgentIDs` costs 38 ms / 19.9 MB / 45k allocs (`cmd/entire/cli/agent/claudecode/transcript.go:418-422`), and opening + parsing the 16 subagent JSONL files from line 0 costs a further ~57 ms / 24 MB / 31k allocs (`transcript.go:428-446`, one `os.Open` + full parse per spawned agent ID, no offset, no cache). That is ~29x the no-subagent cost, and it would land once per condensing session per `git commit` — against the documented condensation budget of 30–50 ms/session (`docs/architecture/commit-hook-perf-analysis.md:99`), i.e. it would have roughly **tripled** post-commit condensation for subagent-heavy sessions, and the perf doc's 100-session case (6.5 s PostCommit) scales with it. Reusing the already-computed `state.CheckpointTokenUsage.SubagentTokens` costs one struct copy. Clear win; the added comments are the right place for it.
+
+### 2. `cmd/entire/cli/checkpoint/persistent.go:1035` — recursion is depth-bounded only incidentally, and it newly amplifies a bad metadata blob into a huge written blob
+
+Recursion depth: real data is depth 1 (`transcript.go:429` builds a flat `subagentUsage` with no nesting), so per-call cost is trivial:
+
+| variant | time | bytes | allocs |
+|---|---|---|---|
+| pre-diff (scalars only) | 172 ns | 48 B | 1 |
+| post-diff, with subagents | 209 ns | 96 B | 2 |
+| post-diff, no subagents | 70 ns | 48 B | 1 |
+
+So: **+1 alloc / +48 B only when subagent tokens exist, zero extra allocation otherwise** (the recursive call hits the `a == nil &amp;&amp; b == nil` early return). Not measurable.
+
+On the untrusted-input question: `entries` in `reaggregateFromEntries` comes from `flattenExisting` → `FlattenTree` over the *existing* checkpoint subtree (`persistent.go:178-187`, `:227`), so for a multi-session checkpoint the per-session `metadata.json` blobs can have been authored elsewhere and fetched with `entire/checkpoints/v1`. The chain depth is therefore attacker/corruption-influenced. It is *not* a stack-overflow risk: `encoding/json` caps nesting at 10000 (measured — depth 9999 decodes, depth 10001 fails with `exceeded max depth`), and 10k tiny frames is nothing against Go's growable stack. Worst case for the recursion itself is 719 µs / 480 KB / 10,001 allocs per call.
+
+The real cost is downstream and is new with this diff: the nested chain is now **propagated into the root summary and re-marshalled** with `jsonutil.MarshalIndentWithNewline` (`persistent.go:855`), whose output is O(depth²) because of indentation. Measured: a 200 KB session `metadata.json` carrying a 9999-deep `subagent_tokens` chain aggregates into a **701,379,980-byte** root `metadata.json` blob — written into the v1 tree and then pushed. Pre-diff this was impossible because the nested total was dropped.
+
+Cheaper alternative: cap the depth the way the repo already does — `reviewTokenMaxDepth = 16` with `reviewTokensFromTokenUsageAtDepth` (`cmd/entire/cli/review/manifest.go:25-29`, `:453`). Costs one `int` parameter, bounds both the recursion and the blob size, and keeps legitimate depth-1 data untouched.
+
+### 3. `cmd/entire/cli/checkpoint/persistent.go:1016-1044` — `aggregateTokenUsage` + `subagentTokensOf` are now a verbatim duplicate of `types.AddTokenUsage`
+
+`agent.TokenUsage` is a type alias of `types.TokenUsage` (`cmd/entire/cli/agent/types.go:53`), and `types.AddTokenUsage` (`cmd/entire/cli/agent/types/token_usage.go:23-47`) already does exactly what the post-diff `aggregateTokenUsage` does: nil-if-both-nil, sum the five scalars, recurse into `SubagentTokens`, no mutation. The diff re-derives it.
+
+Concrete waste: the new `subagentTokensOf(a)` / `subagentTokensOf(b)` calls at `:1035` re-do the `a != nil` / `b != nil` checks the two branches above already performed — two extra calls and two redundant nil tests per recursion level. `AddTokenUsage` captures `aSub`/`bSub` inside the existing branches instead. Cheaper alternative: delete `aggregateTokenUsage` and `subagentTokensOf` (30 lines), call `types.AddTokenUsage` at `:959`. Same semantics, strictly fewer branches, one implementation to keep the depth story consistent with (see finding 2), and it removes a `dupl`-shaped near-clone pair.
+
+### 4. Call frequency — the new recursion is unmeasurable where it runs
+
+`aggregateTokenUsage` is called from exactly one non-test site: `reaggregateFromEntries` (`persistent.go:959`), **once per session** in a `for i := range sessionCount` loop, and `reaggregateFromEntries` itself runs **once per checkpoint write** from `writeCheckpointSummary` (`:801`, reached via `writeStandardCheckpointEntries:686`). Not per blob. `sessionCount` is 1–3 in practice. Each loop iteration already pays `readMetadataFromBlob` — a go-git object lookup + zlib inflate + `json.Decode` of a multi-KB blob, tens of microseconds — so the added ~37 ns / 48 B is well under 0.1% of one iteration. No measurable change.
+
+### 5. `cmd/entire/cli/strategy/manual_commit_condensation.go:312` / `:798` — `withCheckpointSubagentTokens` is as cheap as it can be
+
+One call site, straight-line inside `CondenseSession`, not in a loop; `CondenseSession` runs once per condensing session per commit. Both guard clauses return the input pointer untouched with zero allocation, so the no-subagent case (the common one) costs two nil checks. The fill path does one 48-byte struct copy and **aliases** `checkpointUsage.SubagentTokens` rather than deep-copying it, so there is no second allocation for the nested value. No repeated work, no recomputation, nothing re-read. Nothing to improve here.
+
+### 6. Tests — proportionate, nothing gratuitous
+
+- `cmd/entire/cli/strategy/condensation_subagent_tokens_test.go`: 0.18 s + 0.20 s = **0.38 s added to a 40.4 s package (~0.9%)**. Both tests use the shared `setupGitRepo` helper (`phase_wiring_test.go:178`) rather than rolling their own init, and neither repeats setup within a test. They can't be `t.Parallel()` because of `t.Chdir`, so that 0.38 s is wall-clock — acceptable at 0.9%. The real git work is load-bearing: the bug was that the committed root `metadata.json` blob said `null`, so the assertion has to read the blob off the metadata branch (`readCheckpointSummary`); a lighter fixture couldn't prove it. The second test's extra `SaveStep` + `CondenseSessionByID` + second `CondenseSession` is the minimum needed to reach a second checkpoint window with a snapshotted baseline.
+- `cmd/entire/cli/checkpoint/aggregate_token_usage_test.go`: pure function, 5 parallel subtests, no I/O — microseconds. Free.
+
+### Net
+
+Hot-path effect: **strictly better** (avoids ~80 ms per condensing session per commit, at the cost of ~48 bytes). The two changes I'd make are non-hot-path: add the `reviewTokenMaxDepth`-style depth cap to bound the new blob amplification, and collapse `aggregateTokenUsage`/`subagentTokensOf` into the existing `types.AddTokenUsage`.</result>
+<usage><subagent_tokens>131057</subagent_tokens><tool_uses>40</tool_uses><duration_ms>743359</duration_ms></usage>
+</task-notification>

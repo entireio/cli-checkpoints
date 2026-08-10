@@ -355,3 +355,58 @@ I checked each of the specific items you called out and quantified them; none is
 **Codex hook changes:** `hookCommandExists` gaining a timeout comparison adds no I/O (in-memory field compare), and causes at most a one-time rewrite of a stale hook entry. `AreHooksInstalled` gaining the `SessionEnd` check adds one in-memory slice check on a file that was already being read; it is only reached from `config.go:93` and `setup.go`, not from any per-turn path.</result>
 <usage><subagent_tokens>152180</subagent_tokens><tool_uses>32</tool_uses><duration_ms>358401</duration_ms></usage>
 </task-notification>
+
+---
+
+<task-notification>
+<task-id>a23639e2097c6a186</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/a78beaef-a2ab-4cad-9900-f4d3c3b51959/tasks/a23639e2097c6a186.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Findings — altitude only
+
+### 1. WRONG — `cmd/entire/cli/logging/logger.go:155` (+ call site `cmd/entire/cli/session_finalize.go:46`)
+**`EnsureInitialized` moves global-logger ownership from the command layer down into a sweep helper, creating a second init idiom that structurally can't do what the first one does.**
+
+Every other place in this repo that needs file-backed logging from a plain command does the same two-line ritual in `RunE`, guarded by a git-repo check: `logging.SetLogLevelGetter(GetLogLevel)` then `logging.Init(ctx, "")` + `defer logging.Close()` — 12 call sites (`clean.go:69`, `reset.go:31`, `setup.go:933`, `investigate/cmd.go:339`, `explain.go:308`, `rewind.go:70`, `import_cmd.go:65`, `resume.go:85/175`, `trail_context_cache.go:412`, `checkpoint_resume.go:64`, `hooks_git_cmd.go:137`). `EnsureInitialized` can only do half of it: `logging` cannot import `cli`, so it can never call `SetLogLevelGetter`. `status.go` and `doctor.go` never set it either, so `logLevelGetter` is nil when the sweep initializes — the sweep's own logs silently ignore `log_level` in `.entire/settings.json`. The one knob you'd reach for to debug "why did `entire status` condense my session" is the one that doesn't work on this path.
+
+Cost later: a second competing idiom in a package that already had one, with implicit lifetime ownership ("returns an inert closer if someone else owns it"). The next helper that wants to log from a command has a precedent to self-initialize, and you end up with several deep call sites racing to own one global file handle and one global session ID.
+
+Deeper/simpler alternative, in preference order:
+- **Fix the fallback, not the call sites.** The hazard the doc comment names — "`log()` falls back to `slog.Default()`, which prints internal structured lines straight onto the user's terminal" (`logger.go:266-269`) — is a policy decision of the `logging` package. Make the uninitialized fallback `io.Discard` (or stderr only when `ENTIRE_LOG_LEVEL` is set). That retires this whole class in one place and retroactively fixes every command that forgot to call `Init`, instead of adding a 13th patch.
+- Failing that, do it at command level in `status.go`/`doctor.go` with the standard two-liner. The stated objection (creating `.entire/logs/` on every `entire status`) is real but is the *command's* concern to gate — `setup.go:925-932` already documents exactly this "place `Init` after every check that can reject the invocation" reasoning, at the right layer.
+
+### 2. WRONG — `cmd/entire/cli/lifecycle.go:1141` (with `processStart` at :1099 and `sessionEndCondenseDeadline` at :1105)
+**The host budget is attached to one callee's parameter list instead of to the process's context, so it opts *in* one step rather than opting *out* the one step that must not be cancelled.**
+
+The budget is a property of *this hook process* ("Codex gave us 3s from the moment it spawned us"), and Go's carrier for that is the context. Today it's a 5th positional `time.Time` on `endSessionNow`, forcing an unrelated caller (`session_finalize.go:58`) to pass `time.Time{}`, plus a new package-level `processStart` global in the `cli` package.
+
+Two concrete future costs:
+- **New session-end work escapes the budget by default.** `handleLifecycleSessionEnd` will grow (transcript finalize, sidecar image capture, telemetry). Anything added there is unbudgeted, and will be the thing that gets the process tree killed — the next author has to know to re-derive the deadline and thread it. "Everything is bounded except one explicit exemption" fails safe; "nothing is bounded except one explicit inclusion" fails open.
+- **`markSessionEnded`'s must-complete invariant isn't actually protected** — it's just not-bounded-by-*this*-deadline. Any future caller with a genuinely cancellable ctx (a TUI with ctrl-C, a `--timeout` flag) cancels it anyway. The invariant belongs to `markSessionEnded`, not to its callers' discipline.
+
+Deeper alternative: set the deadline once in `hook_registry.go` (~:167-190), where `ag`, `hookName` and the decorated `ctx` are all already in hand — the same spot that already installs the perf span and the agent-scoped logging context — and have `markSessionEnded` wrap with `context.WithoutCancel(ctx)` internally. That deletes the parameter, the `time.Time{}`, and `sessionEndCondenseDeadline`, and generalizes to every step in the budgeted process.
+
+On the reviewer's framing ("a deadline the callee cannot honour"): the best-effort bound itself is **defensible** — it strictly dominates doing nothing (worst case is today's behaviour: killed at 3s), and skipping the eager condense outright would forfeit the #591 zombie-ENDED protection whenever 2.5s *would* have sufficed. If you want the genuinely deeper design, the repo already has the pattern: `execx.SpawnDetached` (`telemetry/detached.go:93`, the hidden `__send_analytics` command) puts the child in a new session, which escapes Codex's process-tree kill. Handing the condense to a detached child is the honest answer to "this work isn't latency-sensitive and shouldn't die with us" — but it brings its own concurrency questions against PostCommit, so deferring it is a reasonable call, not a finding.
+
+### 3. WRONG (low) — `cmd/entire/cli/agent/capabilities.go:199-205`
+**The "built-in only" justification for `AsSessionEndBudgeter` describes an enforcement the external-agent execution model makes impossible.**
+
+The comment says an external agent "that needs one enforces it itself rather than declaring it through the plugin protocol." But external agents only supply `parse-hook` (`external/external.go:233`); the lifecycle handling — `endSessionNow`, the condense — runs in the *entire* process, not the plugin's. A plugin for a Codex-like host literally cannot enforce a budget on work it doesn't run.
+
+Cost: the rationale is stated as a design principle, so the next person adding a budgeted external agent will trust it, discover it's false, and then have to decide whether to widen `DeclaredCaps` (a protocol change) under time pressure. Either add `session_end_budget` to `DeclaredCaps` now (one field; `declaredCapability[…]` already handles the gating), or change the comment to say the honest thing: "no external agent needs this yet; widen `DeclaredCaps` when one does."
+
+---
+
+## Considered and judged DEFENSIBLE (not findings)
+
+- **`agent.SessionEndBudgeter` as an interface with one implementor.** This is the repo's established mechanism, not over-abstraction: `SidecarImageProvider` (Cursor only), `TranscriptSanitizer` (Codex only), `ModelExtractor` (Pi only), `RestoredSessionPathResolver` (Codex only) are all single-implementor built-in capabilities, and `capabilities.go:15-33` documents the bar explicitly (built-in-only capabilities skip the `DeclaredCaps` gate and resolve by type assertion via `builtinCapability`). The alternative — `if ag.Name() == "codex"` in `lifecycle.go` — is the thing this review is supposed to catch, and the change correctly avoids it. Widening to a hook-name-keyed `HookBudgeter` later costs nothing (no external protocol to version).
+- **Per-event timeouts staying inside `codex/hooks.go`.** There is no shared hooks.json layer to hoist into — each agent's config schema differs (claudecode uses named matchers, codex uses null matchers), and `claudecode/hooks.go:181-192` already threads a per-event timeout through its own `addHookToMatcher(…, timeoutSecs)` for exactly the same reason. Codex is catching up to an existing per-agent pattern, not inventing a local one.
+- **Making the timeout part of `hookCommandExists`'s match** (`codex/hooks.go:309`). Codex-local is correct: it's the upgrade path for a config *Codex* clamps and warns about. (Claude Code has the same latent staleness with `localDevSessionEndTimeoutSecs`, but that's pre-existing and unaffected.)
+- **Broadening `OwnerExited`** (`session/state.go:527`). This is a *narrowing* of the function's responsibility, not a widening of a hack: the predicate now means what its name says (owner dead ∧ not already finalized) instead of conflating liveness with phase. It is not substituting for the missing hook — the real fix (Codex `SessionEnd`) ships in the same branch — and the safety net is still needed for pre-0.146 Codex, SIGKILL, and reboot. It also can't strand resumable work: `resume` operates on *stopped* sessions (`resume_picker.go`), so finalizing an idle-dead session makes it more resumable, not less.
+- **No codex special-casing added to shared code.** Grep of non-codex packages turns up only pre-existing `checkCodexHookTrust` in `doctor.go`; the new work routes entirely through the capability lookup.
+- **The `stuck(reason)` closure in `doctor.go:232`.** Local dedup of a 6-field literal, and hoisting the dead-owner check above the phase switch correctly mirrors `OwnerExited`'s now phase-independent semantics.</result>
+<usage><subagent_tokens>139491</subagent_tokens><tool_uses>35</tool_uses><duration_ms>469015</duration_ms></usage>
+</task-notification>

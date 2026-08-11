@@ -1,0 +1,577 @@
+rebase this branch on origin/main.  then, make it so login goes to auth.entire.io  - that has recently been fixed (in the entiredb repo) to auto-select a user's region.  less need for the --server flag, hopefully!  can this already work, or do we need to make modifications server-side? (that would be in the entire-core component of entiredb).  go and have alook, trace the code, then report back.
+
+---
+
+<task-notification>
+<task-id>aaaf21da0918ffd3b</task-id>
+<tool-use-id>toolu_01CuAUWDXj6tuXwYmTGYWqWm</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-paul-src-entireio-cli/8fb17963-4dfe-4ed1-9e6c-786c1b219fa0/tasks/aaaf21da0918ffd3b.output</output-file>
+<status>completed</status>
+<summary>Agent "Trace CLI login auth-host flow" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Here is the full trace.
+
+---
+
+# 1. Where the auth host comes from
+
+**Single source, single consumer.** `DefaultAuthBaseURL` is referenced in exactly one place in non-test code:
+
+- `/Users/paul/.claude/worktrees/cli/glittery-gliding-pretzel/cmd/entire/cli/api/base_url.go:20` — `DefaultAuthBaseURL = "https://us.auth.entire.io"`
+- `/Users/paul/.claude/worktrees/cli/glittery-gliding-pretzel/cmd/entire/cli/login.go:106` — the `--server` flag default.
+
+```go
+cmd.Flags().StringVar(&amp;server, "server", api.DefaultAuthBaseURL,
+    "login server to authenticate against (rarely needed; the default serves all standard accounts)")
+```
+
+`entire login` and `entire auth login` are literally the same command object registered twice: `/Users/paul/.claude/worktrees/cli/glittery-gliding-pretzel/cmd/entire/cli/root.go:138` (top-level) and `/Users/paul/.claude/worktrees/cli/glittery-gliding-pretzel/cmd/entire/cli/auth.go:120` (`auth` subtree). Same default, same semantics.
+
+Flow from flag to wire:
+
+1. `login.go:83` `parseLoginServer(server)` → `login.go:119-144`. Validates scheme is http/https, rejects userinfo/path/query/fragment, then returns `api.NormalizeOriginURL(raw)` (`base_url.go:105-130`: lowercase scheme+host, strip default port, drop path).
+2. `login.go:87` `requireSecureLoginServer` (`login.go:149-158`) → `api.RequireSecureURL` (`base_url.go:77-88`), unless `--insecure-http-auth`.
+3. `login.go:90` `auth.NewClient(loginServer, nil, insecureHTTPAuth)` — the only caller of `auth.NewClient` in the repo.
+4. `/Users/paul/.claude/worktrees/cli/glittery-gliding-pretzel/cmd/entire/cli/auth/client.go:59-93` sets `issuer := api.NormalizeOriginURL(server)` and stuffs it into **both** `deviceflow.Client.BaseURL` and `authcode.Client.BaseURL`, with scope `"cli offline_access"` (client.go:69).
+
+**The endpoint paths are hardcoded constants, not discovered** — `/Users/paul/.claude/worktrees/cli/glittery-gliding-pretzel/cmd/entire/cli/auth/provider.go:12-18`:
+
+```go
+oauthClientID       = httputil.OAuthClientID   // "entire-cli"
+oauthDeviceCodePath = "/device_authorization"
+oauthAuthorizePath  = "/authorize"
+oauthTokenPath      = "/oauth/token"
+oauthSTSPath        = "/oauth/token"
+```
+
+## Per-surface breakdown
+
+| Surface | URL built as | Location |
+|---|---|---|
+| OIDC discovery (`/.well-known/openid-configuration`) | **never fetched** | see §2 |
+| Authorize URL (browser/PKCE) | `--server` + `/authorize` | `authcode.go:385-412` via `client.go:88` |
+| PKCE loopback redirect | `http://127.0.0.1:&lt;ephemeral&gt;/callback` — *not* derived from the auth host at all | `authcode.go:59,67,338,347` |
+| Token endpoint (code exchange) | `--server` + `/oauth/token` | `authcode.go:578` → `postForm` `authcode.go:618-640` |
+| Device authorization | `--server` + `/device_authorization` | `deviceflow.go:254`, `client.go:78` |
+| Device token poll | `--server` + `/oauth/token` | `deviceflow.go:392`, `client.go:79` |
+| Refresh (`grant_type=refresh_token`) | **persisted `context.CoreURL`** + `/oauth/token` | `auth/refresh.go:123-132` |
+| RFC 8693 exchange (tokenmanager) | **persisted `context.CoreURL`** + `/oauth/token` | `auth/refresh.go:126-127` (`STSPath`) |
+| RFC 8693 jurisdiction exchange (`entire auth token --jurisdiction`) | *templated* `https://{juris}.auth.&lt;family&gt;` + `/oauth/token` | `auth/cell_data_api.go:519-534`, `httputil/oauth.go:99` |
+| Saved context (`contexts.json`) | **token's `iss` claim** — not `--server` | `auth/contexts.go:64` |
+| Keyring slot | `"entire-core:" + iss` | `auth/contexts.go:76`, `tokenstore.go:42,49-51` |
+
+### What gets persisted where
+
+`persistLogin` (`login.go:322-336`) hands the raw token to `auth.RecordLoginContext` (`/Users/paul/.claude/worktrees/cli/glittery-gliding-pretzel/cmd/entire/cli/auth/contexts.go:59-136`). The host written to disk is derived from the **JWT's `iss` claim**, not the `--server` value:
+
+```go
+coreURL := claims.Issuer                                  // contexts.go:64
+keychainService := tokenstore.CoreKeyringService(coreURL) // contexts.go:76  -&gt; "entire-core:https://…"
+next := &amp;contexts.Context{Name: name, CoreURL: coreURL, …} // contexts.go:114-119
+```
+
+The context *name* is the issuer's host (`contexts.go:231-236`, `contextNameForCoreURL`) — so today users get a context literally named `us.auth.entire.io`, and after a change it would be `auth.entire.io` only if the server's `iss` changes too.
+
+---
+
+# 2. Discovery vs hardcoded paths; issuer/aud validation
+
+**No discovery document is ever fetched.** Grepping the whole repo and the `github.com/entireio/auth-go v0.5.2` module (`go.mod:15`) for `well-known/openid-configuration` returns zero non-test hits. `provider.go:5-11` says the paths were "confirmed against us.auth.entire.io's /.well-known/openid-configuration" — i.e. they were copied by hand once, at authoring time. The CLI's only well-known fetches are Entire-proprietary: `/.well-known/entire-cluster.json` (`clusterdiscovery/discovery.go`) and `/.well-known/entire-api.json` (`clusterdiscovery/api_discovery.go:20`), which list *trusted core URLs*, not OAuth endpoints.
+
+Consequence: a different issuer host works only if it serves the identical four paths at the identical origin. `oauthhttp.ResolveURL` (`/Users/paul/go/pkg/mod/github.com/entireio/auth-go@v0.5.2/internal/oauthhttp/url.go:36-67`) hard-rejects any absolute/scheme-relative path, so a config-supplied endpoint on another host is impossible by design.
+
+### Issuer validation — this is the load-bearing check
+
+`login.go:367-409`, called from `persistLogin` at `login.go:323`:
+
+```go
+// iss check: the token must claim to come from the issuer we sent
+// the device-code request to.
+if issErr := issMatches(claims.Issuer, issuerURL); issErr != nil {
+    return issErr
+}
+…
+func issMatches(claimed, expected string) error {
+    normClaimed := api.OriginOnly(claimed)
+    normExpected := api.OriginOnly(expected)
+    if normClaimed != normExpected {
+        return fmt.Errorf("iss mismatch: token claims %q, expected %q", normClaimed, normExpected)
+    }
+    return nil
+}
+```
+
+`issuerURL` here is `client.BaseURL()` (`login.go:199`, `login.go:229`/`316`), which is the `--server` value verbatim (`auth/client.go:138`). **So `iss` must equal the host the CLI dialled, origin-normalised. This is the check that a redirect-based region split would trip.**
+
+Also enforced at login: `iss` non-empty (`login.go:375`), `handle`/`sub` non-empty (`login.go:378`), `exp` not already past (`login.go:391`), token must be a parseable signed JWT (`login.go:369-374`).
+
+### `aud` validation
+
+Not checked at login. It is checked in two later places:
+
+- `auth/env_token.go:64-100` `CoreURLFromEnvToken` — for `ENTIRE_TOKEN` only. Note its doc at `env_token.go:39-41`: *"Login and sa-session JWTs carry aud=&lt;home-region URL&gt;, so we read aud, not iss (iss may be a different regional core)."* That is an explicit statement that `iss` and the home-region `aud` can already diverge — but `login.go:385` does not tolerate that for the interactive flow.
+- `tokenmanager` shortcut `coreTokenAudienceIncludes` (`tokenmanager.go:634-646`): if the login JWT's `aud` already contains the resource origin, no exchange is performed.
+
+### Context eligibility (the second host comparison)
+
+`clusterdiscovery/resolve.go:255-267` → `contexts.ContextsForIssuer` (`/Users/paul/.claude/worktrees/cli/glittery-gliding-pretzel/internal/entireclient/contexts/contexts.go:106-118`) is an **exact string compare** modulo trailing slash:
+
+```go
+want := trimURL(issuer)
+for _, c := range f.Contexts {
+    if trimURL(c.CoreURL) == want { out = append(out, c) }
+}
+```
+
+So a context whose `CoreURL` is `https://auth.entire.io` is eligible for a cluster/API host only if that host's well-known lists `https://auth.entire.io` in its trusted `core_urls`. Otherwise `selectContext` (`resolve.go:241-243`) returns the "no eligible context / run entire login" hint and every data-API and git operation fails.
+
+---
+
+# 3. `--server` semantics, and refresh
+
+**Semantics** (`login.go:106-107`, doc block `login.go:113-118`): a bare http(s) **origin** naming the OAuth authorization server. It becomes, per that comment, "the OAuth issuer, the token-exchange target, and the keyring key". Path/query/fragment/userinfo are rejected rather than trimmed (`login.go:131-142`). It affects only the login command — no other command has it, and the retired env override `ENTIRE_AUTH_BASE_URL` hard-fails every command if set (`base_url.go:38-43`).
+
+**Refresh re-uses the persisted host, never the compiled-in default.** `newContextTokenManager` (`auth/refresh.go:116-137`):
+
+```go
+mgr, err := tokenmanager.New(tokenmanager.Config{
+    Issuer:      strings.TrimRight(c.CoreURL, "/"),   // from contexts.json
+    ClientID:    oauthClientID,
+    STSPath:     oauthSTSPath,      // "/oauth/token"
+    RefreshPath: oauthTokenPath,    // "/oauth/token"
+    Store:       contextTokenStore{service: c.KeychainService, handle: c.Handle},
+    …
+})
+```
+
+`refresh.go:110-113` states the intent: "Keying Issuer on c.CoreURL is the whole point: store reads, the refresh grant, and the STS exchange all target that context's core." Control-plane routing does the same (`auth/control_plane.go:97-103`). So once a login is recorded, the CLI is pinned to whatever `iss` the server put in the token — changing `DefaultAuthBaseURL` does not retarget existing logins, and existing keyring entries stay under `entire-core:https://us.auth.entire.io`.
+
+---
+
+# 4. Redirect behaviour, path by path
+
+All OAuth calls go through `oauthhttp.HTTPClient` (`/Users/paul/go/pkg/mod/github.com/entireio/auth-go@v0.5.2/internal/oauthhttp/httpclient.go:18-23`), which sets **no `CheckRedirect`** → Go's default: follow up to 10 hops.
+
+| Path | Redirect outcome |
+|---|---|
+| Discovery fetch | N/A — never happens |
+| Authorize URL in browser | Fine. The browser follows the 302 itself; `openBrowser` (`login.go:511-553`) just shells out to `open`/`xdg-open`. The loopback `redirect_uri` is unaffected (`authcode.go:347`). |
+| POST `/device_authorization`, POST `/oauth/token` (code exchange, device poll, refresh, STS) | **Depends on the status code.** |
+
+Go's `redirectBehavior` (`/Users/paul/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.darwin-arm64/src/net/http/client.go:507-538`):
+
+- **301 / 302 / 303 on a POST → silently rewritten to GET with the body dropped.** The token endpoint would receive a bodyless GET and answer `invalid_request`/405. This is a real break for every one of the four POST paths.
+- **307 / 308 → method and body preserved**, provided `GetBody != nil`:
+  ```go
+  case 307, 308:
+      redirectMethod = reqMethod
+      shouldRedirect = true
+      includeBody = true
+      if ireq.GetBody == nil &amp;&amp; ireq.outgoingLength() != 0 {
+          shouldRedirect = false   // returns the 307 to the caller instead
+      }
+  ```
+  Every POST here uses `strings.NewReader(form.Encode())` with `http.NewRequestWithContext` (`authcode.go:624`, `deviceflow.go:440`, `refresh/refresh.go:193`, `sts/sts.go:232`, `httputil/oauth.go:98-99`), and net/http populates `GetBody` automatically for `*strings.Reader`. So **307/308 would re-POST correctly.**
+
+Two additional notes:
+
+- The `Authorization: Basic` header in `httputil.PostOAuthToken` (`httputil/oauth.go:107`) survives a redirect from `auth.entire.io` → `us.auth.entire.io`, because Go only strips auth headers when the destination is *not* a subdomain of the origin (`client.go:1005-1030`, `shouldCopyHeaderOnRedirect` / `isDomainOrSubdomain`). `us.auth.entire.io` *is* a subdomain of `auth.entire.io`, so it is preserved. A sibling redirect (`auth.entire.io` → `eu.auth.entire.io` is still a subdomain — fine; but `entire.io` → `us.auth.entire.io` would also be fine, while `auth.entire.io` → `auth-eu.example` would drop it).
+- `api.Client` (`/Users/paul/.claude/worktrees/cli/glittery-gliding-pretzel/cmd/entire/cli/api/client.go:63,72-80`) hard-**rejects** any cross-host redirect — so the clusters listing / control-plane / cell calls would error out rather than follow a regional redirect. Same for `resolveCellAPIBaseURL`'s `GET /api/v1/clusters` if it were served by a redirecting apex, though that one uses a plain client (`cell_data_api.go:348-359`).
+
+**But the redirect question is largely moot for login**, because even a perfect 307 chain still ends with a token minted by the regional core. If that token carries `iss = https://us.auth.entire.io` while the CLI asked for `https://auth.entire.io`, `login.go:385` rejects the login outright with `iss mismatch`.
+
+---
+
+# 5. Can the default just change to `auth.entire.io`?
+
+**Not unconditionally.** The one-line change works only if `auth.entire.io` behaves as a *real issuer* rather than a redirector. Concretely, the server side must satisfy all of:
+
+1. **Serve `/authorize`, `/device_authorization`, `/oauth/token` at `auth.entire.io` itself** — either directly or via 307/308 (never 301/302/303, which strip the POST body). The CLI never reads a discovery doc, so it cannot learn a different endpoint host (`provider.go:12-18`, `oauthhttp/url.go:61-65`).
+2. **Mint tokens with `iss = https://auth.entire.io`**, matching the dialled origin — otherwise `login.go:385` fails the login before anything is saved.
+3. **Serve the whole refresh + RFC 8693 lifetime at `auth.entire.io`**, since `contexts.json.CoreURL` is `iss` (`contexts.go:64`) and every later refresh/exchange targets it (`refresh.go:124-127`).
+4. **Advertise `https://auth.entire.io` in every cluster's `/.well-known/entire-cluster.json` and API host's `/.well-known/entire-api.json` `core_urls`**, or exact-match eligibility fails (`contexts.go:113`, `resolve.go:255-267`).
+5. Decide the fate of the jurisdiction templates: `jurisdictionCoreURL` (`cell_data_api.go:519-534`) still builds `https://{jurisdiction}.auth.entire.io` for `entire auth token --jurisdiction` / cell routing. That regional form is not going away, so `auth.entire.io` and `us.auth.entire.io` must coexist as valid issuers.
+
+## Code locations that would need touching
+
+**Required:**
+
+- `/Users/paul/.claude/worktrees/cli/glittery-gliding-pretzel/cmd/entire/cli/api/base_url.go:20` — the constant itself.
+- `/Users/paul/.claude/worktrees/cli/glittery-gliding-pretzel/cmd/entire/cli/login_validate_test.go:136` — pins `"https://us.auth.entire.io"` as the "default form" case; :138 and :142 also use the host (cosmetic).
+
+**Required if the server cannot mint `iss = https://auth.entire.io`** (i.e. if it genuinely 30x-redirects to a regional core):
+
+- `/Users/paul/.claude/worktrees/cli/glittery-gliding-pretzel/cmd/entire/cli/login.go:385` and `login.go:399-409` (`issMatches`) — would need to accept an `iss` that differs from the requested origin. This is a deliberate security check ("A mismatch means either the AS is misconfigured or someone's playing games", `login.go:382-384`); relaxing it needs a replacement rule (e.g. accept an `iss` that is a subdomain of the requested host, or one listed in the requested host's trusted-issuer document).
+- `/Users/paul/.claude/worktrees/cli/glittery-gliding-pretzel/cmd/entire/cli/login.go:282` — the `Logging in to: %s` line prints the requested host, which would then be misleading.
+
+**Documentation / cosmetics:**
+
+- `/Users/paul/.claude/worktrees/cli/glittery-gliding-pretzel/README.md:270-271` — "the default is the production us.auth.entire.io".
+- `/Users/paul/.claude/worktrees/cli/glittery-gliding-pretzel/docs/architecture/upstream-host-resolution.md:21` — the Core row naming `us.auth.entire.io`.
+- `/Users/paul/.claude/worktrees/cli/glittery-gliding-pretzel/cmd/entire/cli/auth/provider.go:7` — the comment claiming the endpoints were verified against `us.auth.entire.io`'s discovery doc.
+
+**Explicitly *not* needing changes** (they already follow the persisted host, so they inherit whatever `iss` the new server issues): `auth/refresh.go:116-137`, `auth/control_plane.go:97-103`, `auth/contexts.go:59-136`, `auth/client.go:59-93`, `auth/provider.go` paths.
+
+**Migration gap worth flagging:** existing users keep `CoreURL: https://us.auth.entire.io` in `contexts.json` and keyring slots under `entire-core:https://us.auth.entire.io` (`contexts.go:76`, `tokenstore.go:42,49-51`). There is no rename/migration path in the repo — a user who re-runs `entire login` after the default flips gets a *second* context named `auth.entire.io` alongside the old `us.auth.entire.io` one (`pickContextName`, `contexts.go:145-165`, keys on `CoreURL` + handle). If both hosts appear in a cluster's `core_urls`, `selectContext` (`resolve.go:241-248`) then reports "multiple login contexts can authenticate against …; choose one with `entire auth use &lt;context&gt;`" for users whose active context is neither.</result>
+<usage><subagent_tokens>120675</subagent_tokens><tool_uses>55</tool_uses><duration_ms>314780</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>afa717b2886afe0a3</task-id>
+<tool-use-id>toolu_01UvAUatDbQns4GMQHGDRmGM</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-paul-src-entireio-cli/8fb17963-4dfe-4ed1-9e6c-786c1b219fa0/tasks/afa717b2886afe0a3.output</output-file>
+<status>completed</status>
+<summary>Agent "Trace entire-core region auto-select" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Summary
+
+**Bottom line: no.** A CLI cannot complete an OIDC login starting at `https://auth.entire.io` with what's committed here. The recent "region auto-select" fix is a **browser-only, BFF-mediated jurisdiction *hint* handback** — it is not a redirect on `/authorize`, and the apex/global core mounts **zero** OIDC endpoints (no discovery, no `/authorize`, no token endpoint, no JWKS, no userinfo, no revoke, no device flow).
+
+---
+
+## 1. Where entire-core lives, and the two modes
+
+`entire-core` = `core/api` (HTTP surface) + `core/authn` (+ `core/authn/oidcop`, the zitadel `pkg/op` OIDC provider), wired by `internal/entirecore`, binary at `cmd/entire-core`.
+
+Mode dispatch: `/Users/paul/src/entirehq/entiredb/core/api/server.go:1102-1117`
+```go
+func (s *Server) routes() {
+	switch s.mode {
+	case "global":
+		s.registerGlobalRoutes()
+	...
+	default:
+		// "regional", plus the empty mode tests construct servers with.
+		s.registerRegionalRoutes()
+	}
+}
+```
+
+**Regional** (`us.auth.entire.io`, `eu.auth.entire.io`, …) mounts the whole IdP — `/Users/paul/src/entirehq/entiredb/core/api/server.go:1280-1326`:
+- `GET /.well-known/jwks.json` (1280), `GET /keys` (1281)
+- `GET /.well-known/openid-configuration` (1285), `GET /.well-known/oauth-authorization-server` (1290)
+- `GET /authorize` (1291), `GET /authorize/callback` (1296), `POST /device_authorization` (1297)
+- `POST /oauth/token` (1320), `GET|POST /userinfo` (1323-1324), `POST /oauth/introspect` (1325), `POST /revoke` (1326)
+- `GET /cli/login` interstitial (1352), `GET /cli/auth` device-approval page (1347)
+
+**Global** (the apex router) mounts only — `/Users/paul/src/entirehq/entiredb/core/api/server.go:1365-1393`:
+```go
+func (s *Server) registerGlobalRoutes() {
+	s.registerCommonRoutes()                      // /healthz, /api/info, /.well-known/entire-federation
+	s.mux.HandleFunc("GET /{$}", s.handleGlobalRoot)
+	s.mux.HandleFunc("GET /favicon.svg", ...)
+	s.mux.HandleFunc("GET /entire-lockup-light.svg", ...)
+	s.mux.HandleFunc("GET /global-landing.js", ...)
+	s.mux.HandleFunc("GET /api/auth/{provider}/login", s.handleRouterProviderLogin)
+	s.mux.HandleFunc("GET /api/auth/{provider}/callback", s.handleProviderGlobalCallback)
+	s.mux.HandleFunc("GET /api/authz/debug-bounce", s.handleGlobalDebugBounce)
+	s.mux.HandleFunc("GET /api/auth/resolve-jurisdiction", s.handleGlobalResolveJurisdiction)
+	// No control plane, no JWKS, no device flow, no internal API.
+}
+```
+Pinned by test: `/Users/paul/src/entirehq/entiredb/core/endtoend/topology_test.go:38-48` asserts `GET /.well-known/jwks.json` is **absent** in global mode. There is no `"/"` catch-all in global (the comment at server.go:1369-1373 says the staticFS catch-all is deliberately not mounted), so any unlisted path — including `/.well-known/openid-configuration`, `/authorize`, `/oauth/token` — is a bare **404 from ServeMux**. No `httputil.ReverseProxy` exists anywhere in the repo (grep: zero non-test hits).
+
+Global mode's own dep builder confirms it isn't an IdP: `/Users/paul/src/entirehq/entiredb/internal/entirecore/serve_mode_global.go:88-91` — *"Global is a thin router: identity lookup -&gt; redirect to home region. No JWT, no JWKS, no regional."*
+
+**Host mapping caveat:** the host→mode map lives in fleet config, not this repo. `docs/entire-core/oauth-flow.md:13` says Global = `auth.partial.to` (staging) ⇒ `auth.entire.io` prod, but that doc is stale elsewhere (it claims global mints JWTs and serves JWKS, contradicted by topology_test.go:47). Meanwhile `internal/entirecore/config.go:457-459` documents the RP return_to allowlist as *"e.g. `auth.entire.io` prod, `auth.partial.to` staging"*, and `core/api/global_debug_bounce_test.go:38` uses `https://auth.entire.io/auth/core/resolve-callback` — i.e. the **BFF** also answers on `auth.entire.io`. Most consistent reading: `auth.entire.io` is a shared front door path-split between the entire.io BFF (`/auth/*`) and entire-core-global (`/api/auth/*`, `/healthz`, `/`). Either way, **nothing entire-core serves on that host is an OIDC endpoint.** `deploy/*.yaml` carries only regional `core_url`s (`deploy/aws-us-east-2.yaml:3`, `deploy/aws-eu-central-1.yaml:3`, `deploy/aws-ap-south-1.yaml:3`, `deploy/aws-ap-southeast-2.yaml:3`) — there is no global entry.
+
+---
+
+## 2. The recent fix — what it actually is
+
+Two commits, both Aug 6 2026:
+
+**`9a85ebc24` — "core: geo-route new users in resolve-jurisdiction instead of the region picker (#3080)"**
+&gt; A new user hitting the RP resolve-jurisdiction flow is now handed a Cloudflare-geo best guess (Cf-Ipcountry / Cf-Ipcontinent, clamped to JurisdictionAuthHosts, fallback us) straight back to the BFF, instead of being routed to the /region-picker page. Known users still route by their recorded home […]
+
+Touched: `core/api/global_debug_bounce_test.go`, `core/api/jurisdiction_handoff_e2e_test.go`, `core/api/server.go` (+44/-26), `core/authn/geo.go` (new, 137 lines), `core/authn/geo_test.go`.
+
+**`5a2a57d4d` — "Merge trail: core: delete the region picker — geo-route every new-user path at global"**
+&gt; With resolve-jurisdiction geo-routing new users, the region-picker page's only remaining audience was the direct global login (unreachable in prod: the global root 302s to the BFF) and the orphaned /api/auth/switch-region route. Geo-route those too and delete the whole picker surface […] Router.HandleCallback now just reports home jurisdiction (or empty for new users); the global callback completes every flow via BFF handback or login-start bounce […]
+
+Deleted `core/api/static/region-picker.html/.js`, `core/authn/region_picker.go`, `ROUTER_STATE_SECRET`, `PickerState` HMAC signing, etc. (−2059 lines).
+
+### Mechanism (all browser 302s, no OIDC involved)
+
+1. The BFF (`entire.io` / `auth.entire.io`, different repo) sends the browser to global `GET /api/auth/resolve-jurisdiction?return_to=…&amp;state=…` — `/Users/paul/src/entirehq/entiredb/core/api/jurisdiction_handoff.go:67`. `return_to` must be on an **exact-host** allowlist (subdomains rejected, `jurisdiction_handoff.go:19-42`, test `jurisdiction_handoff_test.go:21`). Unconfigured ⇒ 404 (`jurisdiction_handoff.go:69-72`).
+2. Global redirects to a **zero-scope GitHub OAuth** identify (`jurisdiction_handoff.go:113-121`, `authn.AuthModeRouting`).
+3. GitHub calls back to `GET /api/auth/{provider}/callback` → `handleProviderGlobalCallback`, `/Users/paul/src/entirehq/entiredb/core/api/server.go:2439`. It resolves home jurisdiction and computes the geo guess — `server.go:2477-2489`:
+```go
+homeJurisdiction, err := s.routerCaps.Router.HandleCallback(r.Context(), model.HandleProvider(providerID), profile.ProviderUserID, profile.Login)
+...
+if homeJurisdiction != "" &amp;&amp; s.cookie != nil { ... s.cookie.Set(w, homeJurisdiction) }
+geoJurisdiction := authn.GeoSuggestJurisdiction(
+	r.Header.Get("Cf-Ipcountry"), r.Header.Get("Cf-Ipcontinent"), s.jurisdictionAuthHosts)
+redirectURL := s.resolveGlobalCallbackRedirect(r.Context(), homeJurisdiction, geoJurisdiction, action)
+```
+4. `resolveGlobalCallbackRedirect` — `/Users/paul/src/entirehq/entiredb/core/api/server.go:2925-2953` — appends `?state=&lt;rp-state&gt;&amp;jurisdiction=&lt;us|eu|in|au&gt;` to the RP's `return_to` (`buildHandoffRedirect`, `jurisdiction_handoff.go:48-59`) and 302s the browser back to the BFF. The BFF then runs PKCE `/authorize` against that region itself.
+5. Fallbacks never point at a region: `server.go:2964-2975` bounces to `ENTIRE_LOGIN_START_URL` (`loginStartBounceURL`, `server.go:3009-3021`; `loginStartWithJurisdiction`, `server.go:3028-3040`); a dead end renders the inline auth error page (`server.go:2490-2497`).
+
+**Coverage: `/authorize` is not covered either.** The auto-select covers *nothing* on the OIDC surface — not discovery, not `/authorize`, not token, not revocation, not userinfo. The only outputs are (a) a `jurisdiction` query param handed to an allowlisted RP, and (b) a `home_region` cookie (`server.go:2482-2486`, `core/authn/home_jurisdiction_cookie.go`).
+
+---
+
+## 3. Answer to the key question
+
+**A CLI starting at `https://auth.entire.io` fails at step one.** `GET https://auth.entire.io/.well-known/openid-configuration` has no route in `registerGlobalRoutes` (`server.go:1365-1393`) → 404. Same for `/authorize`, `/oauth/token`, `/revoke`, `/userinfo`, `/.well-known/jwks.json`, `/device_authorization`, `/cli/login`.
+
+The auto-select is not even "browser `/authorize` only" — it is a *separate, RP-gated jurisdiction-discovery endpoint*, usable only by a host on `JURISDICTION_HANDOFF_RETURN_TO_HOSTS`. A loopback `http://127.0.0.1:PORT/callback` can never satisfy `validateReturnTo` (`jurisdiction_handoff.go:19-42`).
+
+**What does work today, against a regional host:** full loopback PKCE-S256 for the `entire-cli` public client. `code_challenge_method=S256` (`core/authn/oidcop/provider.go:99` `CodeMethodS256: true`), refresh_token grant (`provider.go:100`), RFC 8693 token-exchange auto-advertised (`provider.go:101-105`), pinned by `core/api/oauth_metadata_test.go:67-72`. The token endpoint's origin guard explicitly lets cookie-less clients through — `/Users/paul/src/entirehq/entiredb/core/api/oauth_origin_guard.go:142-150`:
+&gt; A request carrying neither cookie is a plain OAuth exchange — its credential is the auth code + PKCE […] so its origin is irrelevant.
+
+And a foreign-homed user logging in at a *wrong* regional host is **no longer redirected home** — they get a full local session there: `/Users/paul/src/entirehq/entiredb/core/api/foreign_juris_login_test.go:19-33` asserts `Location == /authorize/callback?id=…` and explicitly `assert.False(strings.HasPrefix(..., "https://eu.auth.example/authorize"))`; comment at `core/api/server.go:2569-2576`. So today's `--server https://us.auth.entire.io` default yields a **US-issued token for an EU-homed user**, and `cmd/entire-core/cli/cross_region_hint.go:32-57` exists precisely because such a token is rejected by other regions ("it only accepts tokens minted by its own region").
+
+---
+
+## 4. Issuer and audience
+
+Both are the **regional** host, never the apex.
+
+- `/Users/paul/src/entirehq/entiredb/internal/entirecore/config.go:879` — `func (c Config) IssuerClaim() string { return c.AuthBaseURL }` (docstring at 875-878: *"the `iss` value entire-core writes on every JWT it issues — login, sa_session, repo_access, ops_access, api_access, and system"*).
+- `/Users/paul/src/entirehq/entiredb/internal/entirecore/serve_mode_regional.go:395-396` — `iss := cfg.IssuerClaim(); deps.jwtIssuer = authn.NewJWTIssuer(deps.keyStore, authn.LoginTokenTTL, iss, iss)` (iss == aud).
+- `serve_mode_regional.go:572` — `LoginAud: cfg.AuthBaseURL`; `serve_mode_regional.go:402` — verifier `WithAudiences([]string{cfg.AuthBaseURL})`.
+- `serve_mode_regional.go:574` — `oidcop.NewProvider(cfg.AuthBaseURL, oidcStorage)`; `core/authn/oidcop/provider.go:88-91`: *"The issuer string MUST equal the iss claim entire-core writes on JWTs"*, and `provider.go:135` uses `op.StaticIssuer(issuer)`.
+- `ENTIRE_CORE_AUTH_BASE_URL` must be https and is the regional host (`internal/entirecore/config.go:290-293`, `serve_mode_regional.go:493-495`).
+
+**Discovery endpoint URLs:** because the provider uses `op.StaticIssuer`, `discoveryDocument` (`core/api/server.go:1498-1512`) emits absolute endpoint URLs rooted at `AuthBaseURL` regardless of the request `Host` — pinned by `core/api/oauth_metadata_test.go:51-52,108-120` (issuer == the configured `AuthBaseURL`, not the request host). So **if** the apex ever served discovery, it would have to be a bespoke document; today there is no code path that emits an apex-issuer or region-pointing discovery doc.
+
+RFC 9207 `iss` *is* appended to the outbound auth-code redirect so a client can learn which region minted the code — `core/api/server.go:1292-1296` + `core/api/authorize_callback.go:9-46`. `client/clilogin/loopback.go:61-79` documents consuming it for keychain keying / refresh routing. That is the only region-signal a CLI gets today, and it only appears *after* a successful `/authorize` at some region.
+
+---
+
+## 5. How region is determined
+
+Two inputs only, both in `handleProviderGlobalCallback`:
+
+1. **Existing user → recorded home jurisdiction**, by GitHub *provider user ID* looked up in the global identity store: `core/authn/router.go:41-58` (`Router.HandleCallback` → `identity.ResolveHandleByProviderID`). Requires the user to have just completed a zero-scope GitHub OAuth round-trip in a **browser**. Not email domain, not IP, not a bearer token.
+2. **New user (no home) → Cloudflare geo IP**: `core/authn/geo.go:120-152` `GeoSuggestJurisdiction(country, continent, live)`. Resolution order (geo.go:107-118): country code that doubles as a live jurisdiction slug (`IN`→`in`, `AU`→`au`) → continent via `continentToJurisdiction` (geo.go:23-30: NA/SA→us, EU/AF→eu, AS→in, OC→au), with the country-derived continent used whenever the `cf-ipcontinent` header is absent *or* unmappable → `geoFallbackJurisdiction = "us"` (geo.go:101). Headers are trusted because they arrive via Cloudflare→NLB→Envoy (geo.go:11-16). Returns `""` only if even `us` isn't live → auth error page.
+
+A `home_region` cookie exists (`core/authn/home_jurisdiction_cookie.go`, set at `server.go:2482-2486`) but it is a browser cookie and only *written* on this path — the callback deliberately does not short-circuit on it (`server.go:2459-2463` just counts `CookieAutoRedirectSkipped`).
+
+**No-account user:** geo guess only; the account is *not* created at global (`5a2a57d4d`: *"handleRegionPickerSubmit no longer creates the account"* / *"The picker's job is now: verify signed state, validate region, hand back to the BFF […] No writes"*). The regional core creates it on its own `/authorize` callback, waitlist-gated (`server.go:2966-2968`).
+
+---
+
+## 6. What's still missing server-side to drop `--server`
+
+For a CLI to default to `https://auth.entire.io`, entire-core would need **all** of the following, none of which exists:
+
+1. **No discovery at the apex.** `GET /.well-known/openid-configuration` and `/.well-known/oauth-authorization-server` are registered only in `registerSessionAuthRoutes` — `core/api/server.go:1285,1290` — which global never calls (`server.go:1365`, and `1254-1257`: *"Global mode does not call this"*). Nothing emits a per-region-rewritten discovery doc; `discoveryDocument` is hard-anchored to the static issuer (`server.go:1499`, `core/authn/oidcop/provider.go:135`).
+2. **No `/authorize` at the apex, and no 302-to-region for it.** `core/api/server.go:1291` is regional-only. `resolveGlobalCallbackRedirect` (`server.go:2925-2976`) can produce exactly two shapes — an allowlisted-RP handback and a BFF login-start bounce — and `5a2a57d4d` made "never emit a region `/api/auth/login` URL" an explicit invariant. There is no code that reconstructs an inbound `/authorize` query onto `&lt;region&gt;.auth.entire.io/authorize`.
+3. **No token / revocation / userinfo / introspection at the apex.** `server.go:1320,1323-1326`, regional-only. Cross-region would also need CORS/origin-guard review (`core/api/oauth_origin_guard.go:136`).
+4. **No JWKS at the apex** — `server.go:1280` regional-only; `core/endtoend/topology_test.go:47` pins it absent. A client that trusted an apex issuer would have no keys.
+5. **Apex would have to be a distinct issuer, or tokens would fail `iss` string-comparison.** `core/authn/oidcop/provider.go:88-91` requires issuer == `iss` claim, and `internal/entirecore/config.go:879` fixes that to the regional `AuthBaseURL`. Tokens minted after an apex-initiated flow would carry `iss=https://us.auth.entire.io` — a client that started discovery at the apex must be prepared for that (or the fix must be an apex→region redirect *before* discovery, RFC 8414-style, rather than an apex issuer).
+6. **The one region-select endpoint that does exist is unusable by a CLI.** `GET /api/auth/resolve-jurisdiction` requires an exact-host allowlisted `return_to` (`core/api/jurisdiction_handoff.go:19-42`; config `internal/entirecore/config.go:456-461`) — loopback redirect URIs are structurally rejected (`jurisdiction_handoff_test.go:18-23`). It is also 404 unless `JURISDICTION_HANDOFF_RETURN_TO_HOSTS` is set (`jurisdiction_handoff.go:69-72`).
+7. **No device flow at the apex either** — `POST /api/auth/{provider}/device` and `POST /device_authorization` live in `registerLoginRoutes` / `registerSessionAuthRoutes` (`server.go:1246`, `1297`), not global. So the device-code fallback is equally unavailable at the apex. Note the regional device path *does* have a wrong-region 409 with a `device_auth_url` pointing home (`core/api/foreign_jurisdiction.go:71-100`) — that's the closest existing CLI-shaped region redirect, and it's regional-to-regional, not apex.
+8. **The apex bare root 302s away.** `handleGlobalRoot` (`core/api/server.go:2858-2868`) redirects to the `ENTIRE_LOGIN_START_URL` origin — a CLI hitting the apex root lands on the marketing/BFF site.
+
+**One thing that *does* work at the apex:** `GET /api/info` is mode-agnostic (`server.go:1121`, `1127`) and returns `jurisdiction_hosts` + `jurisdiction_auth_hosts` in **every** mode (`server.go:1415-1419`). A CLI could fetch `https://auth.entire.io/api/info` to enumerate the live regional auth hosts — but nothing there tells it *which* region is the caller's, and global's branch deliberately omits `auth_url` (`server.go:1406-1407`).</result>
+<usage><subagent_tokens>133263</subagent_tokens><tool_uses>61</tool_uses><duration_ms>658472</duration_ms></usage>
+</task-notification>
+
+---
+
+set 2 subagents (Opus 5) on the entire-core and CLI tasks.  ask me for any decisions up front first.  We don't need any discovery - the entire-core-global deployment should dispatch to a regional login endpoint based on Cloudflare geo IP headers.  The CLI can be hardcoded to https://auth.entire.io too.
+
+---
+
+<task-notification>
+<task-id>a12dc28e5e727ecd6</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-paul-src-entireio-cli/8fb17963-4dfe-4ed1-9e6c-786c1b219fa0/tasks/a12dc28e5e727ecd6.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement apex login dispatch (entire-core)" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Done. Committed on `paul/apex-authorize-dispatch` in `/Users/paul/src/entirehq/entiredb-wt-apex-authorize` (not pushed).
+
+## What I built
+
+**New file `core/api/global_oidc_dispatch.go`** — both handlers, plus the shared URL builder and fallback helper:
+
+- `handleGlobalAuthorize` (`global_oidc_dispatch.go:83`) — validates `client_id` is present (`:88`) and the query is ≤ 4KB (`:92`, cap at `:37` so an unauthenticated caller can't use the dispatcher as a write amplifier against `oauth_states`), then stashes the **entire raw query** in a new `cli_authorize` global-OAuth-state action and kicks off the zero-scope identify via `provider.AuthCodeURL(state, authn.AuthModeRouting)` (`:127`) — the same state-stashing pattern as `handleGlobalResolveJurisdiction` (`jurisdiction_handoff.go:104-126`), including its resolve-provider-before-writing-state ordering. Every failure below "malformed" routes to `dispatchAuthorizeByGeo` (`:145`) instead of an error page.
+- `jurisdictionAuthorizeURL` (`:46`) — splices `rawQuery` in **byte-for-byte** rather than round-tripping `url.Values`; a re-encode can legitimately change parameter order or `+`/`%20`, and the regional IdP validates `code_challenge`/`state`/`redirect_uri` against exactly what the CLI generated.
+- `handleGlobalDeviceAuthorization` (`:183`) — pure `GeoSuggestJurisdiction`, **307** (`:200`), reason documented at `:179`. No live jurisdiction → RFC 8628-shaped JSON error with 503 (`:191`).
+
+**Wiring:**
+- Routes registered in `registerGlobalRoutes` only: `core/api/server.go:1427-1429`.
+- New `AuthorizeQuery` field on `globalOAuthAction`: `core/api/debug_bounce.go:201`.
+- Post-identify branch in `resolveGlobalCallbackRedirect`: `core/api/server.go:3009-3023` — home wins, falls to geo when home is absent *or* has no auth host (config drift), `""` only when no jurisdiction is live at all.
+- Callback soft-fail hooked into all three identify-leg failures: `core/api/server.go:2501-2529`.
+
+## The cookie short-circuit decision: **not taken**
+
+`handleProviderGlobalCallback`'s no-op at `server.go:2496-2500` only *counts* the skip because by then the GitHub hop already happened — the real decision is at flow start, and the reason it isn't taken is stated at `docs/superpowers/specs/2026-04-13-topology-flip-design.md:154`:
+
+&gt; **The cookie is not an auto-routing authority.** Global always performs zero-scope OAuth to identify the user before routing... This is the only safe model on shared browsers — a stale `.partial.to` cookie set by a previous user must never be enough to route a brand-new user's signup into the wrong jurisdiction.
+
+It is domain-compatible (`COOKIE_DOMAIN` is shared global↔regional, `serve_mode_global.go:139`), so the short-circuit would *work* — it's just wrong. Routing an unknown user by a previous user's cookie places their account and PII in the wrong jurisdiction, which is a data-residency decision, not a UX one. The cost of declining is one GitHub hop that GitHub auto-approves. I emit the same `CookieAutoRedirectSkipped` metric from the new handler (`global_oidc_dispatch.go:98`) so the metric keeps covering every entry point, and `TestHandleGlobalAuthorize_DoesNotShortCircuitOnHomeRegionCookie` mints a genuinely valid cookie with the server's own secret so it fails for the right reason if anyone adds the shortcut.
+
+## Tests
+
+`core/api/global_oidc_dispatch_test.go` (no DB): URL building, jurisdiction selection incl. home-beats-geo and the config-drift fallback, per-parameter query preservation, cookie non-short-circuit, geo fallback table (DE→eu, US→us, none→us, AU-with-no-au-region→us), malformed rejection, 307 semantics (asserts a real Go client replays the POST **body** to a stand-in regional core), device geo table, and `TestRoutes_RegionalMode_KeepsItsOwnOIDCEndpoints` which proves regional still routes to its own IdP.
+`core/api/global_oidc_dispatch_e2e_test.go` (DB-backed, CI only): known user → home, new user → geo, exchange failure → geo instead of the error page.
+`core/endtoend/topology_test.go:45-57` — added the two new present routes and pinned `/oauth/token`, `/authorize/callback`, `/.well-known/openid-configuration` as still absent in global; added both paths to regional so the dispatchers can't silently displace the IdP.
+
+Also added `docs/adrs/20260811-apex-oidc-dispatch.md` (repo guidance requires an ADR for a new cross-component protocol).
+
+## Verification (real output)
+
+```
+$ mise run lint:go
+golangci-lint has version 2.11.2 built with go1.26.1 from e8f62197 on 2026-03-07T21:27:51Z
+0 issues.
+
+$ mise run lint          # (excerpt)
+[lint:go] 0 issues.
+[lint:antithesis-tags] 0 issues.
+[lint:gofmt] [lint:gofix] [lint:gomod] [lint:migrations] ok
+[lint:shellcheck] ERROR task failed        # PRE-EXISTING, see below
+
+$ go vet ./core/api/ ./core/endtoend/       # clean
+$ go test ./core/api/ -run '...' -count=1
+ok  	entire.io/core/api	0.081s
+$ go test ./core/endtoend/ -run 'TestTopologyFlip_RouteMatrix' -count=1
+ok  	entire.io/core/endtoend	0.042s
+
+$ git log --oneline -3
+b5beebabc core/api: dispatch CLI OIDC logins from the apex to a regional core
+c534ffbbc Merge trail: core/coreapi: retire project region gates (COR-1165)
+f4d7caec5 core/authn: send the acceptance email at signup when the waitlist is off (COR-1233) (#3132)
+
+$ git status --short
+(clean)
+```
+
+`lint:shellcheck` fails on SC2312 in `.buildkite/scripts/setup-toolchain.sh:133` and `.buildkite/scripts/lib.sh:59-62` — files this branch does not touch (`git status` clean of them; last change `61dcc194e`), so it's origin/main state, likely a local shellcheck version drift from CI. `mise run fmt` doesn't exist here; `lint:gofmt`/`lint:gofix` cover it and changed nothing (`git status` was identical before and after).
+
+## Still needed
+
+- **Fleet**: `auth.entire.io` must point at the global deployment, and its `JURISDICTION_AUTH_HOSTS` must list every live jurisdiction — that map is the sole routing input for both endpoints, and a missing entry silently degrades a known user to geo.
+- **Per-jurisdiction `entire-cli` client**: loopback any-port matching is code-level (`core/authn/oauth_client.go:138,198`), so it works anywhere, but each regional core needs the `entire-cli` public client registered or the dispatched `/authorize` 400s there. Worth confirming beyond `us` before the CLI hardcodes the apex.
+- **CLI side** (github.com/entireio/cli): switch to the hardcoded host and make sure it reads RFC 9207 `iss` off the loopback callback to pick the `/oauth/token` host — the dispatch is useless without that.
+- **Not covered**: a user who clicks *Cancel* on GitHub still gets the plain 400 at `server.go:2481` (that branch runs before state is consumed, so the action is unknown). Deliberate — it's a user decision, not a failure to route around.
+- DB-backed e2e tests and `core/authn` were not run locally (no CockroachDB; `dial tcp 127.0.0.1:26257: connection refused`) per repo policy — CI runs them.</result>
+<usage><subagent_tokens>194596</subagent_tokens><tool_uses>90</tool_uses><duration_ms>1498476</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aba48bbd7481d38d9</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-paul-src-entireio-cli/8fb17963-4dfe-4ed1-9e6c-786c1b219fa0/tasks/aba48bbd7481d38d9.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement CLI apex login default" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Done. Both repos are committed, nothing pushed.
+
+## ⚠️ Blocking release dependency
+
+**auth-go v0.5.2 lacked the required hooks**, so I had to change it. The CLI's `go.mod:144` now carries a **temporary local replace**:
+
+```
+replace github.com/entireio/auth-go =&gt; /Users/paul/.claude/worktrees/auth-go/regional-token-endpoint
+```
+
+**The auth-go change must be released (v0.5.3+) and this replace dropped before the CLI commit can merge.** CI will fail on the absolute path.
+
+## What auth-go was missing (verified at file:line)
+
+- `authcode/authcode.go:424-451` (`handleCallback`) read only `state`, `error`, `error_description`, `code` — the RFC 9207 `iss` param was silently discarded, so the CLI could not learn the region.
+- `authcode/authcode.go:578` (`Exchange`) posted to `c.postForm(ctx, c.TokenPath, …)` resolved against `Client.BaseURL` — no per-flow retarget. `Flow.verifier`/`state`/`client` are unexported, so a caller cannot rebuild the flow against another host.
+- `deviceflow/deviceflow.go:241-277` (`StartDeviceAuth`) discarded `resp.Request.URL`; `PollDeviceAuth` (`:392`) was pinned to `BaseURL`. Note `ReadAndDecodeJSON(…, true)` decodes the device response **strictly**, so a server-sent `iss` field would be a breaking change — hence the redirect-origin approach rather than a wire field.
+
+### auth-go changes (`/Users/paul/.claude/worktrees/auth-go/regional-token-endpoint`, branch `paul/regional-token-endpoint`, commit `c43c075`)
+
+| Addition | File |
+|---|---|
+| `Flow.Issuer() string` — RFC 9207 `iss`, carried on `callbackResult`, recorded by `Wait` via `record()` (no cross-goroutine field write) | `authcode/authcode.go:268-296, 449, 528-560` |
+| `Flow.SetTokenBaseURL(string) error` — per-flow token-endpoint retarget, validated by `oauthhttp.ValidateOriginURL` | `authcode/authcode.go:298-322` |
+| `DeviceCode.ResponseOrigin` — origin that served the response after redirects | `deviceflow/deviceflow.go:50-63, 289, 296-306` |
+| `Client.TokenBaseURL` — token-endpoint-only override | `deviceflow/deviceflow.go:106-120, 425-432` |
+
+Both are documented as **unvalidated for trust** — that is deliberately the embedder's job. Tests: `authcode/regional_test.go`, `deviceflow/regional_test.go`. CHANGELOG updated.
+
+## CLI changes (commit `0998e86447`)
+
+- **`cmd/entire/cli/api/base_url.go:28`** — `DefaultAuthBaseURL` → `https://auth.entire.io`.
+- **`cmd/entire/cli/login.go:458-500`** — `issMatches` now accepts the dialled origin **or a strict subdomain of it over https on the same port** (`isDelegatedIssuer`). The leading-dot suffix check is what makes it a delegation rule: `auth.entire.io.evil.com`, `xauth.entire.io`, `entire.io`, `api.entire.io`, `:8443` mismatches and plaintext downgrades are all rejected.
+- **`cmd/entire/cli/login.go:519-535`** — `adoptIssuer` gates the retarget with the *same* rule, so the host that receives the authorization/device code and the host in the token's `iss` are held to one policy.
+- **`cmd/entire/cli/login.go:180-192`** (device) and **`:338-350`** (browser) — wire the handoff.
+- **`cmd/entire/cli/auth/client.go:108-124, 159-179`** — `BrowserAuthFlow.Issuer()/UseTokenIssuer`, `Client.UseTokenIssuer`. The device-side shim applies a *stricter* transport rule than the dialled server: `--insecure-http-auth` (and the automatic loopback exemption) does not extend to a host named at runtime — plaintext only survives on loopback.
+- **`cmd/entire/cli/login.go:379-391`** — `loginCompleteLine` prints `✓ Login complete (signed in at https://us.auth.entire.io).` when the issuer differs from the dialled host.
+- Docs: `docs/architecture/upstream-host-resolution.md:21, 32-59` (new "the apex dispatches, a region issues" section), `README.md:270`, `cmd/entire/cli/auth/provider.go:5-18`, `login_validate_test.go:136-139`.
+
+**Verified the persisted-context path needs no change**: `RecordLoginContext` derives `coreURL` from `claims.Issuer` (`auth/contexts.go:64`) and `newContextTokenManager` keys `Issuer` on `c.CoreURL` (`auth/refresh.go:126`) — both already follow the token, not the dialled host.
+
+## Tests
+
+New: `cmd/entire/cli/login_issuer_test.go` (table-driven `issMatches`/`adoptIssuer` incl. every evil case; retarget + hostile-issuer rejection for both flows, asserting the code never leaves the machine) and `cmd/entire/cli/auth/client_dispatch_test.go` (httptest apex 307→regional for device, loopback callback with `iss` → regional exchange for browser; the apex 404s everything it shouldn't serve, so a missed handoff fails loudly).
+
+## Pasted output
+
+```
+$ mise run lint
+[lint:mise] Finished in 11.0ms
+[lint:go] golangci-lint has version 2.11.3 built with go1.26.1 from 6008b81b on 2026-03-10T10:25:44Z
+[lint:gomod] Finished in 136.7ms
+[lint:gofmt] Finished in 365.8ms
+[lint:shellcheck] Finished in 561.2ms
+[lint:go] 0 issues.
+Finished in 2.01s
+
+$ git diff        # after lint (--fix can edit silently)
+(no output)
+
+$ go test ./cmd/entire/cli/ ./cmd/entire/cli/auth/ ./cmd/entire/cli/api/ -count=1
+ok  	github.com/entireio/cli/cmd/entire/cli	44.883s
+ok  	github.com/entireio/cli/cmd/entire/cli/auth	0.356s
+ok  	github.com/entireio/cli/cmd/entire/cli/api	0.033s
+
+$ go test -tags=integration ./cmd/entire/cli/integration_test -run 'TestLogin|TestAuth' -count=1
+ok  	github.com/entireio/cli/cmd/entire/cli/integration_test	2.895s
+
+$ go run ./cmd/entire login --help | grep server
+      --server string   login server to authenticate against (rarely needed; the default serves all standard accounts) (default "https://auth.entire.io")
+
+$ git log --oneline -3          # cli
+0998e86447 feat(login): default to the auth.entire.io apex and follow its regional handoff
+49269ddf2c Merge pull request #1942 from entireio/soph/cross-repo-explain-via-api
+b2df7db38b Merge trail: Add --compact JSON output mode to entire search (ENT-1527)
+
+$ git status --short            # cli
+(clean)
+```
+
+```
+$ go test ./authcode/ ./deviceflow/ -count=1      # auth-go
+ok  	github.com/entireio/auth-go/authcode	0.064s
+ok  	github.com/entireio/auth-go/deviceflow	7.046s
+
+$ golangci-lint run ./...                          # auth-go
+0 issues.
+
+$ git log --oneline -2          # auth-go
+c43c075 feat(authcode,deviceflow): support region-dispatching authorization servers
+bb62b5d tokenmanager: add ForceRefresh for reactive 401 re-mints (#19)
+
+$ git status --short            # auth-go
+(clean)
+```
+
+## Risks / what only the server deploy can confirm
+
+1. **The replace directive.** Blocks merge. Release auth-go, bump the CLI's require, drop the replace.
+2. **`auth-go`'s `mise run lint` fails on govulncheck** — `GO-2026-5856` (crypto/tls, fixed in go1.26.5; auth-go pins `go 1.26.4` in `go.mod`/`mise.toml`). **Pre-existing and unrelated to my change**; golangci-lint itself is clean. Needs a separate toolchain bump.
+3. **Device-flow region discovery rests on `resp.Request.URL`**, i.e. on the apex actually 307-ing (307/308 preserve the POST body; a 302 would have Go re-issue as GET and break the flow). Only the real deploy proves the redirect code. If the server instead returns the region in the JSON body, `ReadAndDecodeJSON(…, strict=true)` will **reject the whole response** — worth a heads-up to whoever builds the apex.
+4. **Browser flow depends on the region emitting RFC 9207 `iss`** on the loopback redirect. Verified present in entiredb (`core/api/server.go:1292-1296`, `core/api/authorize_callback.go:9-46`) but not exercised end-to-end against a live apex. If `iss` were absent the CLI would exchange at the apex and get a 404 — noisy, not silent.
+5. **The subdomain rule assumes regions are always strictly below the apex.** If a jurisdiction ever lands on a host that isn't (e.g. `auth.entire.eu`), `issMatches` rejects it and login fails closed. Correct default, but it's a coupling worth knowing about.</result>
+<usage><subagent_tokens>203075</subagent_tokens><tool_uses>126</tool_uses><duration_ms>1545286</duration_ms></usage>
+</task-notification>
+
+---
+
+Create the 3 PRs, we'll wait with a version bump for the minute, we can point at a specific auth-go commit SHA for now.

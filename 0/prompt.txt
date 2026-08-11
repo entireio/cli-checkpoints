@@ -57,3 +57,65 @@ Two pre-existing tests fixed the same way as Task 2's doctor test — their fixt
 <result>The gate's output is buffered until completion. Waiting for the background task/monitor notifications.</result>
 <usage><subagent_tokens>527343</subagent_tokens><tool_uses>61</tool_uses><duration_ms>888592</duration_ms></usage>
 </task-notification>
+
+---
+
+<task-notification>
+<task-id>a4826b01c37385dc0</task-id>
+<tool-use-id>toolu_0163BhrPJ433MZt1yibbomgp</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli/8dd9c23d-5883-4b35-86f9-65c24083886d/tasks/a4826b01c37385dc0.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement RR Task 2: read threading" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>**Status: DONE.** Commit `1c1a5aae5` on `fix/checkpoint-read-remotes` (one commit, not pushed). Branch now: `c7544301b` → `a46be03ca` → `4ff71ad74` → `1c1a5aae5`.
+
+## Gate outcome
+
+`mise run check` run **synchronously**: fully green, exit 0 (fmt + lint + unit + integration + Vogon canary; "ALL 4 TESTS PASSED", `Finished in 206.74s`). The earlier backgrounded run also completed green (exit 0) — same result, both attempts consistent.
+
+## Stack check
+
+`cmd/entire/cli/integration_test/refs_queue_semantics_test.go` (PR #1638's stack) has **NOT merged into main**: absent from the worktree and from `origin/main` after a fresh fetch (tip `49269ddf2`, which is still our merge-base — main hasn't moved since the branch started). No reconciliation needed.
+
+## Discovery semantics implemented (Step 1)
+
+`ListCheckpointRefsOnRemote`: dedicated `checkpoint_remote` path byte-identical (single resolved URL). Otherwise it now ls-remotes **every** read candidate for `refs/entire/checkpoints/*` and **merges the listings** — union, deduped by ref name (merge-not-first-non-empty rationale encoded in the doc comment: pre-#1893 refs landed on whichever remote the hook fired for, so disjoint legacy refs are realistic). Per candidate: URL resolved token-aware and worktree-pinned via `FetchURLOptions{WorktreeRoot, LeadReadRemote}` (rule 7's option now has a second live consumer), falling back to the bare name; a candidate failing logs debug and continues; **all** failing → `(nil, nil)` (best-effort — the first-error rule is for data fetches, not discovery); empty chain → `(nil, nil)`. The single `checkpointRefListTimeout` budget spans the whole union. Unit tests: disjoint-union+dedupe pin, candidate-failure-doesn't-block + all-fail-(nil,nil), remoteless no-op, plus existing worktree-pinning/canceled-ctx tests unchanged.
+
+## Integration matrix (Step 2) — all 6 scenarios covered, all pass
+
+New `integration_test/checkpoint_read_remotes_test.go` (build tag `integration`, `ForEachBackend` except where noted, `execx.NonInteractive` via the harness):
+
+1. **Configured read-back** — checkpoint pushed to elected `upstream` through the real gate, origin present+empty, all local checkpoint state wiped → `checkpoint explain --checkpoint` finds it; git-refs additionally re-wipes and asserts `checkpoint list` (discovery) surfaces it.
+2. **Legacy origin** — data lands on origin under the default election, election then moves to upstream → explain falls back to the legacy tier; git-branch asserts the local primary is **not** recreated; git-refs asserts discovery unions origin's refs in.
+3. **Upstream-only repo** — sole non-origin remote elected; read-back works.
+4. **Cross-machine discovery** (git-refs only, by design) — fresh `CloneFrom(origin)` with zero local checkpoint state and **no dedicated checkpoint_remote**: `checkpoint list` discovers, `explain` hydrates. I verified this assertion is non-vacuous: the list display requires the ID in `store.List`'s output, which in a pristine clone can only come from the new discovery (local refs empty, asserted).
+5. **Remoteless repo** — wiped checkpoint in a repo with no remotes → explain fails with "not found" (absence classification preserved end-to-end).
+6. **Confinement end-to-end** — election moved to upstream, then upstream's URL pointed at a nonexistent path; reads still succeed via the legacy tier and the local primary stays untouched (git-branch assertion).
+
+Nothing the harness couldn't express; no scenarios dropped. Notably, the Task-3-flagged *stale-local + origin-only* interaction did **not** surface: the matrix wipes local state (the missing-local shape), where the tracking-ref fallback fires correctly. The stale-local variant remains served only through resume's `getMetadataTree` remote-tracking tier, as documented.
+
+## Carry-over compliance
+
+1. `resume.go` remote-tracking-tier comment reworded to "the read candidates' tracking refs for Primary, first hit wins — pure read, both tiers legal". ✓
+2. `TestPromoteRemoteTrackingPrimary_FailOpenChainNeverPromotes` — election fails (`checkpoint_push_remote: "gone"`), chain fail-opens to `["origin"]` (asserted in-fixture), stale origin tracking ref present → no promote. This kills the `candidates[0]` mutation the spec reviewer found surviving. ✓
+3. `TestResumeFromCurrentBranch_FastForwardsStaleLocalMetadata` — positive assertion added: post-resume local metadata hash must equal the descendant (tracking-ref) hash, so a silent promote no-op can no longer pass vacuously. ✓
+
+## Docs (Step 3)
+
+- **CLAUDE.md**: new "Checkpoint reads follow the election" bullet (chain, fail-open, per-operation semantics, elected-only writers, discovery without dedicated store, absence evidence); also removed the now-false "read paths cannot see" clause from the write-side bullet.
+- **sessions-and-checkpoints.md**: "Reads follow the election" paragraph added as the write-side section's sibling; the two stale read-back clauses removed.
+- **ref-checkpoint-backend.md**: discovery section rewritten around "Where enumeration looks" — merged-listing semantics, shadow-avoidance rationale, best-effort failure behavior; known-limitations bullet updated.
+- **`strategy/checkpoint_sync_remote.go`** resolver doc: the false "cannot be read back from the same clone" sentence rewritten to "reads follow the election" with a `CheckpointReadRemotes` pointer; the silent-no-op tracking-tier rationale kept fully intact. Also fixed the stale discovery comment at explain.go's wiring site.
+
+## Files changed (commit `1c1a5aae5`)
+
+`CLAUDE.md`, `cmd/entire/cli/git_operations.go`, `cmd/entire/cli/git_operations_test.go`, `cmd/entire/cli/explain.go`, `cmd/entire/cli/resume.go`, `cmd/entire/cli/resume_test.go`, `cmd/entire/cli/resume_read_candidates_test.go`, `cmd/entire/cli/strategy/checkpoint_sync_remote.go`, `cmd/entire/cli/integration_test/checkpoint_read_remotes_test.go` (new), `docs/architecture/ref-checkpoint-backend.md`, `docs/architecture/sessions-and-checkpoints.md`.
+
+## Concerns
+
+- **Discovery cost**: without a dedicated store, `checkpoint list`/branch explain now runs up to two ls-remotes instead of zero in the default setup — bounded by the existing 5s budget across the union and gated by `WithRemoteListDiscovery`, but it's a new network touch on a previously local-only default path (this is Unit 3's entire point; flagging the UX latency for awareness).
+- **`ScenarioNotFound` wording coupling**: the remoteless integration test asserts on "not found" in explain's error output — a wording change there would need a test tweak (kept loose deliberately).
+- **attach.go hint** (carried from Task 3, still open): with elected≠origin and no dedicated store it names origin's URL via `CheckpointFetchTarget`; unchanged per instructions, candidate for a follow-up.
+- The stale-local + origin-only-data residual (Task 3 report) remains the accepted trade-off; the matrix confirms the missing-local shapes all work.</result>
+<usage><subagent_tokens>510624</subagent_tokens><tool_uses>63</tool_uses><duration_ms>1205127</duration_ms></usage>
+</task-notification>

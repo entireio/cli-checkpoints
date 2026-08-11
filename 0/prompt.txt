@@ -1,0 +1,467 @@
+<system_instruction>
+You are working inside Conductor, a Mac app that lets the user run many coding agents in parallel.
+Your work should take place in the /Users/evisdrenova/conductor/workspaces/cli/krakow directory (unless otherwise directed), which has been set up for you to work in.
+Each workspace has a .context directory (gitignored) where you can save files to collaborate with other agents.
+The target branch for this workspace is origin/main. Use this for actions like diffing (`git diff origin/main...`) or creating PRs (`gh pr create --base main`).
+
+Do not rename the current branch unless the user explicitly tells you to do so.
+
+By default, the user will only see the last message that you send before stopping. Include all essential information in the last message. The intermediate messages will be collapsed and accessible by the user but not displayed by default.
+
+If the user asks you to work on several unrelated tasks, you can suggest they start new workspaces.
+Sometimes the user might send you a message they meant to send in a different workspace or a different chat. If something doesn't make sense in the context of your work, just ask. 
+If the user asks for help with Conductor, you can ask them to go to "Help -> Send Feedback" to get in touch with our team.
+</system_instruction>
+
+
+<system_instruction>
+The user has attached these files. Read them before proceeding.
+- .context/attachments/MNYmQD/pasted_text_2026-08-08_17-33-33.txt (6.3 KB)
+</system_instruction>
+
+
+
+here is another chat i had going on with another agent that im porting here:: 
+
+.context/attachments/MNYmQD/pasted_text_2026-08-08_17-33-33.txt
+
+---
+
+whereis this PR
+
+---
+
+okay pull the latest CLI repo and let's start working on this.
+
+---
+
+<task-notification>
+<task-id>afd65fc95392571ca</task-id>
+<tool-use-id>toolu_01W6mhtegoYep1Df2nZSeTdL</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-evisdrenova-conductor-workspaces-cli-krakow/0e4f6109-876a-41e4-ac8d-a76650c33368/tasks/afd65fc95392571ca.output</output-file>
+<status>completed</status>
+<summary>Agent "Map search command flow" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>`entire search` command flow — findings
+
+## 1. Command wiring — `cmd/entire/cli/search_cmd.go`
+
+**Two command instances share one `RunE`:** `newSearchCmd()` (search_cmd.go:27, top-level `entire search`, `Hidden: true`) and `newCheckpointSearchCmd()` (cmd/entire/cli/checkpoint_group.go:50) which just calls `newSearchCmd()` and unhides it. Any envelope change lands on both.
+
+**Flags** (search_cmd.go:315-326):
+- `--json` (315), `--compact` (316), `--code` (317), `--case-sensitive` (318)
+- `--limit` (319, default `resultsPerPage` = 10, defined at cmd/entire/cli/search_tui.go:112)
+- `--page` (320, 1-based), `--author` (321), `--date` (322), `--branch` (323)
+- `--repo` StringSlice (324, repeatable/comma-separated), `--all-repos` (325), plus `addInsecureHTTPAuthFlag` (326)
+- `--compact` implies `--json` at search_cmd.go:80; `--compact` + `--code` is rejected at :78.
+
+**RunE flow** (search_cmd.go:68-312):
+1. :72-81 flag validation; :83-146 the `--code` branch (entirely separate path → `runCodeSearch` :137, envelope at `writeCodeSearchJSON` :774).
+2. :152-169 inline filter parsing (`search.ParseSearchInput`), merge `--repo` + inline `repo:` via `search.AppendUnique`, `search.ValidateRepoFilters`.
+3. :185-187 fast-fail when no query and non-interactive.
+4. :190-210 open repo, read `origin`, `search.ParseGitHubRemote` → owner/repoName.
+5. **Client/API call construction:** :215 `searcher := newSemanticSearcher(insecureHTTPAuth)` (cmd/entire/cli/search_v4.go:36) and :217-228 builds `search.Config`.
+6. :254-257 — **important**: the requested `--limit`/`--page` are saved (`requestedLimit`, `requestedPage`) and the fetch is forced to `search.DefaultLimit` (100), page 0. Pagination is client-side.
+7. **Results fetched:** :259 `resp, err := searcher(ctx, searchCfg)` → cmd/entire/cli/search_v4.go:85 `(*semanticSearchV4Session).search` → fan-out `search.CellV4` (cmd/entire/cli/search/search.go:646) per cell → merged by `mergeSemanticV4Responses` (search_v4.go:502). Warnings printed to stderr at :263-265.
+8. **JSON marshal branch:** :268-273
+   - compact → `writeSearchCompactJSON(w, resp, requestedLimit, requestedPage)` (defined :1050)
+   - full → `writeSearchJSON(w, resp, requestedLimit, requestedPage)` (defined :975)
+   - Both call `paginateSearchResults` (:948) then `jsonutil.MarshalIndentWithNewline(out, "", "  ")` (:993 / :1096).
+9. Non-JSON paths: accessible static table :278-285; TUI :288-311 (TUI never emits JSON — no `json.Marshal`/`jsonutil` in search_tui.go).
+
+**Full JSON envelope** — anonymous struct, search_cmd.go:978-992:
+```go
+out := struct {
+	Results    []search.Result    `json:"results"`
+	Total      int                `json:"total"`
+	Page       int                `json:"page"`
+	TotalPages int                `json:"total_pages"`
+	Limit      int                `json:"limit"`
+	Counts     *search.TypeCounts `json:"counts,omitempty"`
+}{
+	Results:    pageResults,
+	Total:      total,
+	Page:       page,
+	TotalPages: totalPages,
+	Limit:      limit,
+	Counts:     resp.Counts,
+}
+```
+
+**Compact JSON envelope** — anonymous struct, search_cmd.go:1081-1095 (identical except `Results []compactSearchHit`):
+```go
+out := struct {
+	Results    []compactSearchHit `json:"results"`
+	Total      int                `json:"total"`
+	Page       int                `json:"page"`
+	TotalPages int                `json:"total_pages"`
+	Limit      int                `json:"limit"`
+	Counts     *search.TypeCounts `json:"counts,omitempty"`
+}{...}
+```
+Both are anonymous structs declared inline — adding `search_id` means editing both literal declarations (and the `--code` envelope at :775-782 if you want parity there).
+
+**Compact per-hit type** — search_cmd.go:1007-1026:
+```go
+type compactSearchHit struct {
+	ID           string   `json:"id"`
+	Type         string   `json:"type"`
+	Repo         string   `json:"repo,omitempty"`
+	Branch       string   `json:"branch,omitempty"`
+	Author       string   `json:"author,omitempty"`
+	Date         string   `json:"date,omitempty"`
+	Title        string   `json:"title"`
+	FilesTouched []string `json:"filesTouched,omitempty"`
+	Description     string  `json:"description,omitempty"`
+	CheckpointCount int     `json:"checkpointCount,omitempty"`
+	Score           float64 `json:"score"`
+	Snippet   string `json:"snippet,omitempty"`
+	MatchType string `json:"matchType,omitempty"`
+}
+```
+Populated in the loop at search_cmd.go:1054-1079 — this is the single natural place to compute per-result `rank` (currently no rank field; rank = page-relative index `i`, or `(page-1)*limit + i` for absolute). `compactTitleMaxLen = 200` at :1003; `truncateOneLine` lives at cmd/entire/cli/trail_review_cmd.go:1657; `compactSnippet` (dedupe of snippet vs title) at :1036.
+
+## 2. Result types — `cmd/entire/cli/search/search.go`
+
+Package files: `search.go` (724 lines), `github.go` (`ParseGitHubRemote`), tests `search_test.go`, `search_v4_test.go`, `scope_test.go`. No other production files.
+
+Ranking metadata (search.go:57-65):
+```go
+type Meta struct {
+	MatchType string   `json:"matchType"`
+	Score     float64  `json:"score"`
+	Tier      *int     `json:"tier,omitempty"`
+	Snippet   string   `json:"snippet,omitempty"`
+	Summary   string   `json:"summary,omitempty"`
+	BM25Score *float64 `json:"bm25Score,omitempty"`
+	ANNScore  *float64 `json:"annScore,omitempty"`
+}
+```
+
+`Result` (search.go:118-131) has all-`json:"-"` fields plus custom `MarshalJSON`/`UnmarshalJSON` (:141, :169) over the wire shape `resultJSON{Type "type", Data "data", Meta "searchMeta"}` (:134-138). So a full-JSON result serializes as `{"type":…,"data":{…},"searchMeta":{…}}` — **adding a per-result field to full JSON means touching `resultJSON`/`MarshalJSON`, not just the envelope.**
+
+Typed payloads: `CheckpointResult` (:68-81 — id, prompt, commitMessage, commitSubject, commitSha, branch, org, repo, author, authorUsername, createdAt, filesTouched), `CommitResult` (:84-99), `SessionResult` (:102-114). Types `repo`/`pr` have no struct — decoded into `rawFields` (:130, :201-206) and read via `rawString`.
+
+Accessors used by compact: `ResultOrg` :246, `ResultRepo` :263, `ResultBranch` :288, `ResultCreatedAt` :304, `ResultAuthor` :316, `ResultID` :345, `ResultTitle` :357, `ResultDescription` :385, `ResultCheckpointCount` :391. Note `ResultID` returns checkpoint ID / commit SHA / sessionID / raw `id` — that's the `result_id` for the impression set.
+
+Envelope-level response type (search.go:420-433):
+```go
+type Response struct {
+	Results  []Result    `json:"results"`
+	Total    int         `json:"total"`
+	Page     int         `json:"page"`
+	Error    string      `json:"error,omitempty"`
+	Timing   *Timing     `json:"timing,omitempty"`
+	Reranked *bool       `json:"reranked,omitempty"`
+	Counts   *TypeCounts `json:"counts,omitempty"`
+	Warnings []string    `json:"-"`
+}
+```
+`TypeCounts` :400-406 (repos/checkpoints/commits/prs/sessions); `Timing` :409-417. Note `Timing`/`Reranked`/`Error` are decoded from the server but **never emitted** by either CLI envelope — only `Counts` is forwarded.
+
+## 3. Does the server response carry a request/search id?
+
+No. Grep for `requestId|request_id|searchId|search_id|queryId|query_hash|traceId|X-Request` across `cmd/entire/cli/search`, `search_cmd.go`, `search_v4.go`, `cmd/entire/cli/api`, `internal/coreapi` returns zero hits. `Response` (search.go:420) is decoded with plain `json.Unmarshal` (search.go:715), so any server-side id field is silently dropped. Also, the CLI fans out across cells and merges N cell responses into one (search_v4.go:502), so even a per-cell server id would not be a single search identity — **the search_id must be minted client-side**, once per `RunE` invocation (best spot: right after `resp, err := searcher(...)` at search_cmd.go:259, or before, so it can also be passed into the request if you ever want server correlation).
+
+## 4. Where the `explain` hint lives today
+
+Nowhere in the JSON output. There is no `explain` field in `compactSearchHit` or either envelope. The hint exists only as prose:
+- Command long help: search_cmd.go:59-61 (`Fetch full detail for a single result with 'entire checkpoint explain &lt;id&gt;'`).
+- Doc comment on `writeSearchCompactJSON`: search_cmd.go:1047-1049.
+- The generated search skill markdown: cmd/entire/cli/setup_search_skill.go:114, :146, :172 (three copies, one per agent flavor) — `Explain the top one or two hits with \`entire checkpoint explain &lt;id&gt;\``, plus the caveat at :115/:147/:173 that repo/pr/other-repo hits can't be explained.
+- Unrelated hint sites for reference: cmd/entire/cli/attribution.go:1179, cmd/entire/cli/review_context.go:143, cmd/entire/cli/resume.go:763.
+
+So ENT-1528's "ready-made explain hint" is entirely new output; note the skill text already says `explain` cannot read repo/pr rows, so a per-result hint should be omitted for `type: repo|pr` to stay consistent.
+
+## 5. Existing ULID generation
+
+- Dependency: `github.com/oklog/ulid/v2 v2.1.2` — go.mod:28.
+- Generator: `cmd/entire/cli/checkpoint/id/id.go:182` `func GenerateULID() (CheckpointID, error)` — `ulid.New(ulid.Now(), rand.Reader)` (crypto/rand), returns `CheckpointID(u.String())`. Related: `MaxIDLength = ulid.EncodedSize` (:72), `ulidPattern` (:39), `isULID`/`ParseStrict` (:85), `ulid.Time` (:243).
+- Only other use: `cmd/entire/cli/search/search.go:600` — `ulid.Parse(repo)` to accept a repo ULID as a `--repo` filter.
+- Caveat: `GenerateULID` returns the domain type `id.CheckpointID`, so for a search ID you'd either call `ulid.New(ulid.Now(), rand.Reader).String()` directly or add a neutral helper rather than reusing the checkpoint-typed one.
+
+## 6. Existing tests for search JSON output
+
+**Pattern everywhere: `strings.Contains` assertions against the pretty-printed buffer (indented `"key": value` substrings). No golden files, no struct round-trip assertions on the envelope.**
+
+`cmd/entire/cli/search_cmd_test.go` (relevant tests):
+- :88 `REDACTED` — asserts `"limit": 10`, `"total_pages": 1`.
+- :111 `TestWriteSearchCompactJSON_TrimsResults` — the canonical field-list assertion (`"id"`, `"type"`, `"repo"`, `"branch"`, `"author"`, `"date"`, `"score"`, `"title"`, `"snippet"`, `"matchType"`, `"total_pages"`), plus a negative assert that the full prompt is absent.
+- :154 `REDACTED` — builds a `search.Response` by `json.Unmarshal`ing a raw wire string (useful template for repo/pr rows).
+- :197 `TestWriteSearchCompactJSON_DropsSnippetDuplicatingTitle`, :253 `TestWriteSearchCompactJSON_TruncatesLongPromptTitle`.
+- :284 `TestSearchCmd_CompactWithCodeRejected`; :492 `TestWriteCodeSearchJSON`; :1041 `TestWriteCodeSearchJSON_RepoFilteredEmpty`.
+- Shared fixture `testResults()` is in **cmd/entire/cli/search_tui_test.go:16** (two checkpoint results with `Meta{MatchType, Score, Snippet}`).
+- Test constants at search_cmd_test.go:17-23.
+
+`cmd/entire/cli/search/search_test.go`: `TestSearch_ResultJSONRoundTrip` :412 and `TestSearch_ResultAccessors` :312 — these guard the `resultJSON` wire shape; `TestCellV4_*` (:135-:307) use `httptest` servers returning wire JSON.
+`cmd/entire/cli/search/search_v4_test.go`: `TestCellV4_URLConstruction` :17, `_UnfilteredOmitsRepo` :68, `_ResponseDecodesLikeV3` :93, `_ErrorForwarded` :128, `_RouteNotFoundIsErrCellUnavailable` :147.
+`cmd/entire/cli/search_v4_test.go`: 17 `TestMergeSemanticV4Responses_*` tests (:84-:534) covering tier ordering, dedup, totals/counts — these construct `[]cellCallResult[*search.Response]` directly.
+
+## Notes for the impression-set logging piece
+
+- There is **no analytics/telemetry event pipeline** in the CLI for this. `cmd/entire/cli/telemetry/` is only `checkpoint_policy.go` + `detached.go` (checkpoint-policy specific). The general facility is `cmd/entire/cli/logging` (slog wrapper: `Debug/Info/Warn/Error(ctx, msg, attrs...)` at logging/logger.go:213-231).
+- Critical constraint documented twice in the search path: `logging.Init` is **not** called by the search command (grep shows Init only in clean.go, resume.go, hooks_git_cmd.go, attach.go, reset.go, setup.go, trail_context_cache.go). Comments at search_v4.go:118-121 and :513-517 state that a `Warn` on a command that never ran `logging.Init` prints straight to stderr via slog's default handler — so an impression-set log must use `logging.Debug` or a dedicated sink, otherwise it will corrupt `--json` consumers' stderr expectations.
+- `query_hash` has no existing helper — the query is only carried as `search.Config.Query` (search.go:441), set at search_cmd.go:220 and possibly replaced by `search.WildcardQuery` ("*") at :232 when only filters are given.</result>
+<usage><subagent_tokens>86086</subagent_tokens><tool_uses>24</tool_uses><duration_ms>151519</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>af1c700ca27e7296a</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-evisdrenova-conductor-workspaces-cli-krakow/0e4f6109-876a-41e4-ac8d-a76650c33368/tasks/af1c700ca27e7296a.output</output-file>
+<status>completed</status>
+<summary>Agent "Map analytics send path" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Findings below. All paths absolute.
+
+## 1. The hidden `__send_analytics` command
+
+- **Registered**: `/Users/evisdrenova/conductor/workspaces/cli/krakow/cmd/entire/cli/root.go:166` (`cmd.AddCommand(newSendAnalyticsCmd())`)
+- **Defined**: `/Users/evisdrenova/conductor/workspaces/cli/krakow/cmd/entire/cli/root.go:198-210` — `Use: "__send_analytics"`, `Hidden: true`, `Args: cobra.ExactArgs(1)`, body is just `telemetry.SendEvent(args[0])`.
+- **Payload format**: a single argv positional containing JSON-marshalled `telemetry.EventPayload` (`/Users/evisdrenova/conductor/workspaces/cli/krakow/cmd/entire/cli/telemetry/detached.go:29-34`):
+  ```go
+  type EventPayload struct {
+      Event      string         `json:"event"`
+      DistinctID string         `json:"distinct_id"`
+      Properties map[string]any `json:"properties"`
+      Timestamp  time.Time      `json:"timestamp"`
+  }
+  ```
+  API key/endpoint are deliberately NOT in the payload (would leak via `ps`); the child reads package vars `telemetry.PostHogAPIKey` / `PostHogEndpoint` (`detached.go:19-24`), injected at release build time via ldflags in `/Users/evisdrenova/conductor/workspaces/cli/krakow/.goreleaser.yaml:27-28`.
+- **Fire-and-forget spawn**: yes. `spawnDetachedAnalytics` (`detached.go:92-94`) calls `execx.SpawnDetached("", "__send_analytics", payloadJSON)`. `SpawnDetached` (`/Users/evisdrenova/conductor/workspaces/cli/krakow/cmd/entire/cli/execx/spawn_detached.go:22-49`) re-execs `os.Executable()`, detaches from TTY, cwd = `os.TempDir()` when dir is empty, discards stdout/stderr, `Process.Release()`. **Important: it is a hard no-op under `testing.Testing()`** (spawn_detached.go:23), so unit tests must assert on `Build*Payload` functions, not on the spawn.
+- **Receiving side**: `telemetry.SendEvent(payloadJSON string)` (`detached.go:170-213`) unmarshals, creates `posthog.NewWithConfig(PostHogAPIKey, posthog.Config{Endpoint, Logger: silentLogger{}, DisableGeoIP: true})`, adds a best-effort `git_version` property, and `client.Enqueue(posthog.Capture{...})`.
+- `__send_analytics` is excluded from the checkpoint-policy warning path at `/Users/evisdrenova/conductor/workspaces/cli/krakow/cmd/entire/cli/checkpoint_policy_warning.go:28`.
+
+## 2. Analytics package/API
+
+Package: `/Users/evisdrenova/conductor/workspaces/cli/krakow/cmd/entire/cli/telemetry/` — only two files (`detached.go`, `checkpoint_policy.go`). Client is PostHog (`github.com/posthog/posthog-go`).
+
+**Pattern to copy**: each event gets (a) a `Build&lt;X&gt;Payload(...) *EventPayload` exported for testing, returning `nil` on failure, and (b) a `Track&lt;X&gt;(...)` that checks `ENTIRE_TELEMETRY_OPTOUT`, builds, marshals, and calls `spawnDetachedAnalytics`. Verbatim signatures of the emit functions:
+
+```go
+func TrackCommandDetached(cmd *cobra.Command, agent string, isEntireEnabled bool, version string)          // detached.go:98
+func TrackPluginDetached(pluginName string, isEntireEnabled bool, version string)                          // detached.go:153
+func TrackCheckpointPolicyBlocked(event CheckpointPolicyBlockedEvent, version string)                      // checkpoint_policy.go:76
+func BuildEventPayload(cmd *cobra.Command, agent string, isEntireEnabled bool, version string) *EventPayload            // detached.go:46
+func BuildPluginEventPayload(pluginName string, isEntireEnabled bool, version string) *EventPayload                     // detached.go:124
+func BuildCheckpointPolicyBlockedPayload(event CheckpointPolicyBlockedEvent, version string) *EventPayload              // checkpoint_policy.go:39
+func SendEvent(payloadJSON string)                                                                          // detached.go:170
+func spawnDetachedAnalytics(payloadJSON string)   // unexported — new events live in this package         // detached.go:92
+```
+
+**Existing event names** (3 total): `cli_command_executed` (detached.go:82), `cli_plugin_executed` (detached.go:144), `checkpoint_policy_blocked` (checkpoint_policy.go:65).
+
+**Property maps** are `map[string]any` built inline. Common baseline props: `command`, `agent`, `isEntireEnabled`, `cli_version`, `os` (`runtime.GOOS`), `arch` (`runtime.GOARCH`), optional `flags` (comma-joined flag **names** only, never values — detached.go:58-61,77-79), plus `git_version` added in the child. `checkpoint_policy_blocked` uses snake_case props (`hook`, `hook_type`, `reason`, `outcome`, `cli_version`, `os`, `arch`, optional `agent`, `checkpoint_version`, `checkpoint_min_version`) with string constants at checkpoint_policy.go:13-22. Note the two conventions coexist — snake_case is the newer one, match that for your search events.
+
+**Opt-in/opt-out check** (two layers, both required):
+1. Env kill switch inside each `Track*`: `os.Getenv("ENTIRE_TELEMETRY_OPTOUT") != ""` → return. (detached.go:100, detached.go:154, checkpoint_policy.go:77)
+2. Settings opt-in, checked **at the call site, not inside the telemetry package**: `settings.Telemetry *bool` (`/Users/evisdrenova/conductor/workspaces/cli/krakow/cmd/entire/cli/settings/settings.go:85-87`, merged at settings.go:971 from `.entire/settings.json` / `settings.local.json`). Canonical guard shape at `/Users/evisdrenova/conductor/workspaces/cli/krakow/cmd/entire/cli/checkpoint_policy_telemetry.go:13-19`:
+   ```go
+   s, err := LoadEntireSettings(ctx)
+   if err != nil || s.Telemetry == nil || !*s.Telemetry { return }
+   telemetry.TrackCheckpointPolicyBlocked(event, versioninfo.Version)
+   ```
+   Consent prompt / `--telemetry=false` flag: `/Users/evisdrenova/conductor/workspaces/cli/krakow/cmd/entire/cli/setup.go:46` (`flagTelemetry`), `setup.go:2225` (`promptTelemetryConsent`), `setup.go:1337`, `setup.go:1943`.
+
+**Three concrete emission call sites**:
+- `/Users/evisdrenova/conductor/workspaces/cli/krakow/cmd/entire/cli/root.go:85` — generic per-command event, fired from the root `PersistentPostRun` (root.go:65-87). It **skips any command whose Hidden flag is set anywhere on the parent chain** (root.go:66-72).
+- `/Users/evisdrenova/conductor/workspaces/cli/krakow/cmd/entire/cli/plugin.go:85` — `maybeTrackPluginInvocation`, gated on `IsOfficialPlugin` allowlist plus the settings check.
+- `/Users/evisdrenova/conductor/workspaces/cli/krakow/cmd/entire/cli/hook_registry.go:240` (and 252, 273, 284) and `/Users/evisdrenova/conductor/workspaces/cli/krakow/cmd/entire/cli/hooks_git_cmd.go:97,117` — both route through the `emitCheckpointPolicyBlocked` wrapper in `checkpoint_policy_telemetry.go`.
+
+## 3. Hashing / privacy conventions
+
+There is **no query-hashing or path-hashing helper today** — you will be introducing `query_hash` as a new convention. What exists:
+- `machineid.ProtectedID("entire-cli")` — the only hash in the telemetry path (HMAC-SHA256 of the machine ID keyed by the app ID, hex). Called at `detached.go:52`, `detached.go:129`, `checkpoint_policy.go:40`. Documented in `/Users/evisdrenova/conductor/workspaces/cli/krakow/docs/security-and-privacy.md:386` as "a hashed machine identifier … not a user identity".
+- Privacy posture is otherwise **omission, not hashing**: flag names without values (detached.go:58-61), plugin names only from a hardcoded allowlist (`/Users/evisdrenova/conductor/workspaces/cli/krakow/docs/architecture/external-commands.md:235`), no repo names/paths sent at all today.
+- Unrelated hashing that is *not* a privacy convention: `crypto/sha256` in `/Users/evisdrenova/conductor/workspaces/cli/krakow/cmd/entire/cli/plugin_fetch.go:8` (release checksum verification). The `/Users/evisdrenova/conductor/workspaces/cli/krakow/redact/` package handles transcript PII redaction (used at `cmd/entire/cli/attach.go:346`) — pattern-based scrubbing, not hashing.
+
+Practical note: raw repo/org names are currently never in any event, so if `query_hash` is meant to be per-user-stable but non-reversible, `machineid.ProtectedID`-style HMAC keyed by a stable secret is the closest existing precedent; a plain `sha256(query)` is reversible for short queries and has no precedent in this repo.
+
+## 4. Search / explain analytics today
+
+**None.** `grep` for `telemetry|analytics|Track` across `search_cmd.go`, `search_v4.go`, `search/search.go`, `explain.go` returns zero telemetry hits (only unrelated uses of the word "track" in comments). Two structural gotchas:
+
+- `entire search` is declared `Hidden: true` at `/Users/evisdrenova/conductor/workspaces/cli/krakow/cmd/entire/cli/search_cmd.go:66-67`, so it gets **no** `cli_command_executed` event via the root PostRun. The canonical alias `entire checkpoint search` un-hides the same command object (`/Users/evisdrenova/conductor/workspaces/cli/krakow/cmd/entire/cli/checkpoint_group.go:49-56`, `cmd.Hidden = false`), so only the `checkpoint search` path is tracked today. Your impression event should be emitted explicitly from the run path, not rely on the PostRun.
+- `entire checkpoint explain` is defined at `/Users/evisdrenova/conductor/workspaces/cli/krakow/cmd/entire/cli/explain.go:225` (`newExplainCmd`), `Use: "explain [checkpoint-id | commit-sha]"` (explain.go:245), positional arg captured at explain.go:310-331 (`positional := args[0]`), registered at `checkpoint_group.go:41`. That positional is your click-attribution key.
+
+Relevant search data shapes for your event fields:
+- `search.Meta` (`/Users/evisdrenova/conductor/workspaces/cli/krakow/cmd/entire/cli/search/search.go:56-65`) already carries `MatchType string`, `Score float64`, `Tier *int`, `BM25Score`, `ANNScore` — direct sources for `match_type` and `score`.
+- `func (r *Result) ResultID() string` (`search/search.go:345`) is the canonical `result_id` (checkpoint `ID`, commit `CommitSHA`, session `SessionID`, else raw `"id"`).
+- Rank is positional — results are sorted in `search_cmd.go:684-685` and `search_v4.go:409-419`; the compact JSON emitter `writeSearchCompactJSON` (`search_cmd.go:1050`) is the natural place to capture rank/id/score/match_type per hit in one loop.
+- `search.Response` (`search/search.go:420-434`) has **no** server-supplied request/search ID — you'll need to mint `search_id` client-side.
+
+## 5. Session / context identifiers in events
+
+- **`distinct_id`** is the only identity field: `machineid.ProtectedID("entire-cli")` (detached.go:52,129, checkpoint_policy.go:40). No user ID, no session ID, no repo ID is attached to any event today.
+- Context props are all coarse and non-identifying: `command`, `agent`, `isEntireEnabled`, `cli_version`, `os`, `arch`, `git_version`, `flags`.
+- There is no telemetry-side session concept. Agent session IDs exist elsewhere in the CLI (`session.SessionStateDirName = "entire-sessions"` at `/Users/evisdrenova/conductor/workspaces/cli/krakow/cmd/entire/cli/session/state.go:26-27`, per-session state files under the git common dir) but are never sent to PostHog.
+- **Precedent for the cross-invocation state you need** (impression → later click): `/Users/evisdrenova/conductor/workspaces/cli/krakow/cmd/entire/cli/trail_context_cache.go` writes JSON cache/marker files under the git common dir — `filepath.Join(commonDir, session.SessionStateDirName, sessionID+".trail-scope.json")` (line 160) and `filepath.Join(commonDir, "entire", "trail-refresh-spawn")` (lines 367-374), with `flock` for concurrency and TTL-based expiry constants at lines 29-33. That is the closest existing model for persisting "recently served search results" so `explain` can compute `seconds_since_impression`.</result>
+<usage><subagent_tokens>61573</subagent_tokens><tool_uses>38</tool_uses><duration_ms>164086</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ab4fb583875b9682f</task-id>
+<tool-use-id>toolu_01A6ZxACG17X3Hb1bf6xKSV5</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-evisdrenova-conductor-workspaces-cli-krakow/0e4f6109-876a-41e4-ac8d-a76650c33368/tasks/ab4fb583875b9682f.output</output-file>
+<status>completed</status>
+<summary>Agent "Map session state and explain resolution" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have what I need. Here are the findings.
+
+---
+
+## 1. Session state storage
+
+**Directory:** `&lt;git-common-dir&gt;/entire-sessions/` (i.e. `.git/entire-sessions/`, shared across worktrees because it uses the *common* dir, not the worktree gitdir).
+
+- `cmd/entire/cli/session/state.go:27` — `SessionStateDirName = "entire-sessions"`
+- `cmd/entire/cli/session/state.go:31` — `StaleSessionThreshold = 7 * 24 * time.Hour` (Load/List auto-delete stale files)
+- `cmd/entire/cli/session/state.go:558` — `func NewStateStore(ctx context.Context) (*StateStore, error)` → `stateDir = filepath.Join(commonDir, SessionStateDirName)` (:564)
+- `cmd/entire/cli/session/state.go:570` — `func NewStateStoreWithDir(stateDir string) *StateStore`
+- `cmd/entire/cli/strategy/session_state.go:67` — `func getSessionStateDir(ctx context.Context) (string, error)`
+
+**Naming/keying:** one file per session, `&lt;session-id&gt;.json` (`state.go:592` read, `:646` write; atomic via unique temp + rename, `:650`). Session ID is validated against path traversal (`validation.ValidateSessionID`, `state.go:579/624`) and writes are additionally scoped through `os.Root`. Sibling files in the same dir use `&lt;session-id&gt;.&lt;suffix&gt;` conventions:
+- `&lt;id&gt;.agent` (agent-type hint) — `strategy/session_state.go:360` `StoreAgentTypeHint`, `:426` `LoadAgentTypeHint`
+- `&lt;id&gt;.trail-scope.json` — `trail_context_cache.go:160`
+- `review-pending.json` (non-session-keyed marker) — `review/marker_fallback.go:33,57`
+- `staleEndedSessionWarnFile` (mtime-based rate limit) — `strategy/manual_commit_hooks.go:834-844`
+
+**How a non-hook command discovers the "current" session — the exact helpers:**
+
+```go
+// cmd/entire/cli/strategy/session_state.go:179
+func FindMostRecentSessionInCurrentWorktree(ctx context.Context) string
+
+// cmd/entire/cli/strategy/session_state.go:161  (same, but falls back to other worktrees)
+func FindMostRecentSession(ctx context.Context) string
+
+// cmd/entire/cli/strategy/session_state.go:187
+func sessionStatesForCurrentWorktree(ctx context.Context, states []*SessionState) []*SessionState
+
+// cmd/entire/cli/strategy/session_state.go:201
+func mostRecentSessionID(states []*SessionState) string   // by LastInteractionTime, then StartedAt
+
+// cmd/entire/cli/strategy/session_state.go:144
+func ListSessionStates(ctx context.Context) ([]*SessionState, error)
+```
+
+Filtering is by `State.WorktreePath == paths.WorktreeRoot(ctx)` (`session_state.go:188-197`; field defined `session/state.go:120`).
+
+**This is heuristic, not authoritative.** `LastInteractionTime` is only updated on TurnStart/TurnEnd/SessionStop/Compaction (`session/state.go:199-202`) — not per tool call — so with two concurrent agents in the same worktree, "most recent" can attribute to the wrong session. Existing precedent for accepting that heuristic in non-hook commands:
+- `cmd/entire/cli/session_current.go:42` (`entire session current`)
+- `cmd/entire/cli/session_tokens.go:125-127`
+- `cmd/entire/cli/hooks_git_cmd.go:140`
+
+---
+
+## 2. Precedent for ephemeral cross-invocation state
+
+Strong precedents, ranked by closeness to your use case:
+
+| What | Path | Code | TTL/recency |
+|---|---|---|---|
+| **Trail-refresh spawn throttle** (closest small-marker analogue) | `&lt;common-dir&gt;/entire/trail-refresh-spawn` (+ `.lock`) | `trail_context_cache.go:366-390` `func trailRefreshRecentlySpawned(commonDir string, now time.Time) bool` | RFC3339Nano timestamp in file; window = `trailRefreshSpawnThrottle` (`:339`), flock-serialized read-modify-write |
+| **Clone-local preferences** (structured JSON w/ TTL fields) | `&lt;common-dir&gt;/entire/preferences.json` | `settings/settings.go:35` `ClonePreferencesFile`, `:655` `ClonePreferencesPath`, `:664` `LoadClonePreferences`, `:673` `ModifyClonePreferences(ctx, fn func(*ClonePreferences) error) error` | `TrailsEnabledCheckedAt` + `trailEnablementCacheTTL = time.Hour` (`trail_context_cache.go:30`), expiry check `:74 trailEnablementCacheExpired`; separate 5-min failure backoff `:31` |
+| **Append-only bounded JSONL queue under `.git/`** (closest to "last-N tuples") | `&lt;common-dir&gt;/entire-checkpoint-push-queue.jsonl` (+ `.lock`) | `checkpoint/pushqueue.go:24-25`, `:42 NewPushQueue`, `:62 Enqueue`, `:94 Drain`, `:117 Peek`, `:131 Remove`, `:163 rewriteLocked`, `:230 writeFileAtomicInDir` | flock + atomic rewrite; entries removed on drain rather than time-expired |
+| **Per-session sidecar hint** | `&lt;common-dir&gt;/entire-sessions/&lt;id&gt;.trail-scope.json` | `trail_context_cache.go:115 saveTrailEnablementScopeHint`, `:133 loadTrailEnablementScopeHint`, `:152 trailEnablementScopeHintPath` | none (lifetime = session) |
+| **Pending-review marker** | `&lt;common-dir&gt;/entire-sessions/review-pending.json` | `review/marker_fallback.go:66 WritePendingReviewMarker`, `:86 ReadPendingReviewMarker`, `:106 ClearPendingReviewMarker` | none |
+| **Stale-session warn rate limit** (mtime-as-TTL) | `&lt;common-dir&gt;/entire-sessions/&lt;staleEndedSessionWarnFile&gt;` | `strategy/manual_commit_hooks.go:829-845` | `staleEndedSessionWarnInterval` via `os.Lstat` ModTime |
+| Other `.git/` state dirs | `entire-review/manifests` (`review/manifest.go:773`), `investigate` (`investigate/state.go:104`, `manifest.go:99`), `entire-session-locks` (`strategy/session_state.go:732`), `entire-shadow-locks` (`checkpoint/shadow_ref.go:125`) | | |
+
+**User-level XDG cache** (not repo-local): `internal/entireclient/userdirs/userdirs.go:40` — `$XDG_CACHE_HOME/entire` else `~/.cache/entire`; used for API discovery cache. Plugin data uses `$XDG_DATA_HOME/entire/plugins` (`plugin_store.go:55-90`).
+
+**Worktree-visible `.entire/`:** `paths/paths.go:17-19` (`.entire`, `.entire/tmp`, `.entire/metadata`) and `logging/logger.go:41` (`.entire/logs`). These live *in the worktree*, so writing impressions there risks polluting the user's working tree/diff — `.git/entire/` or `.git/entire-sessions/` is the established pattern for uncommitted, clone-local state. Note `entire clean` currently only documents removing `.git/entire-sessions/` (`clean.go:26,30`) — a new file outside that dir wouldn't be cleaned.
+
+---
+
+## 3. `entire checkpoint explain` id resolution
+
+Command wiring: `cmd/entire/cli/explain.go:225` `func newExplainCmd() *cobra.Command`; `Use: "explain [checkpoint-id | commit-sha]"` (:245), max 1 positional (:304-309), RunE at :310.
+
+Four resolution paths:
+
+**(a) Cross-repo / API path (added by PR #1942, merge `49269ddf2`, feat commit `346b7fb5b`):**
+- Routed at `explain.go:355-380` when `--repo` is set and `explainRepoTargetsCurrentRepo` is false.
+- `explain_repo.go:153` `func runCrossRepoExplain(ctx context.Context, w, errW io.Writer, opts crossRepoExplainOptions) error`
+- **Resolution point: `explain_repo.go:163`** — `cid, err := id.NewCheckpointID(opts.target)`. **No prefixes, no commit hashes** — full 12-hex or 26-char ULID only (error text at :165). Guarded upstream at `explain.go:469-471`.
+- **Success point: `explain_repo.go:181-189`** — `summary, err := reader.Read(ctx, cid)`, then a `summary == nil` check. This is the single best hook for "resolved in the cross-repo path". Reader impl: `checkpoint_api_reader.go:117` `func (r *apiCheckpointReader) Read(ctx context.Context, checkpointID id.CheckpointID) (*checkpoint.CheckpointSummary, error)` → `loadDetail` (:327).
+
+**(b) Export path (`--json` / `--transcript` / `--raw-transcript` + `--session-index`):** routed `explain.go:387-399` → `explain_export.go:61 runExplainExport` → **`explain_export.go:97` `func resolveExplainCheckpointID(ctx context.Context, errW io.Writer, opts explainExportOptions) (id.CheckpointID, *explainCheckpointLookup, error)`**. This is the clean, single resolution funnel for export modes; returns the full ID exactly once.
+
+**(c) Prose auto path (positional):** `explain.go:403 runExplain` → :531 → `explain.go:574` `func runExplainAuto(...)` → `explain.go:702` `func runExplainCheckpointWithLookup(ctx, w, errW, checkpointIDPrefix string, ...) error`.
+- **Best hook point: `explain.go:758-759`**, the `case 1: fullCheckpointID = matches[0]` arm of the switch on `matchCheckpointPrefixWithRemoteFallback` results (call at :725). Everything downstream (`loadCheckpointForExplain` :798, `--generate`, `--raw-transcript`, render :870) has a fully-resolved `id.CheckpointID` in hand and the target definitively matched.
+- Prefix matching: `explain_export.go:247` `func matchCheckpointPrefixWithRemoteFallback(ctx context.Context, errW io.Writer, lookup *explainCheckpointLookup, prefix string) ([]id.CheckpointID, *explainCheckpointLookup)` and `:319 matchCheckpointPrefix`. So **yes, prefixes are accepted** on local paths.
+- Ambiguity: `&gt;1` match → `explain.go:764-766`; `0` matches → temp/ephemeral checkpoint attempt (`explain.go:742-756`, `explainTemporaryCheckpoint` :1634, keyed by *git SHA prefix*), then `explainTargetNotFoundError` (:757).
+
+**(d) Commit-hash fallback:** `explain.go:611-645` — after a checkpoint miss, `resolveCommitUnambiguous` (:184) then `trailers.ParseCheckpoint(commit.Message)` (:626) yields `cpID`, and it re-enters `runExplainCheckpointWithLookup` at :640. Export equivalent: `explain_export.go:176 resolveCheckpointFromCommitRef`, trailer parse at :200. **So explain accepts commit SHAs/refs too**, which resolve into a checkpoint ID via the `Entire-Checkpoint` trailer.
+
+**Recommendation:** for the click event you need two hooks, not one — `explain.go:758` (covers prose positional, `--checkpoint`, and the commit-trailer re-entry, since (d) recurses through the same function) plus `explain_repo.go:181` (cross-repo). If you also want `--json` clicks, add `explain_export.go:122` (`case 1: return matches[0]`). Note that hooking at `:758` fires for *both* the user-typed prefix and the trailer-derived ID on path (d); you'd want to correlate the **original user-supplied** target against impressions, which is only available in `runExplainAuto` (`target` param, :574) — consider capturing there and correlating at :758.
+
+**`checkpoint/id` classification (`cmd/entire/cli/checkpoint/id/id.go`):**
+- `:31` `Pattern = "[0-9a-f]{12}"` (legacy); `:39` `ulidPattern` (26 Crockford base32); `:46` `CheckpointPattern` = either.
+- `:103` `func KindOf(s string) Kind` → `KindLegacy` (`:95`, exact 12-hex regex), `KindULID` (`:97`, via `ulid.ParseStrict` + canonical round-trip, `:84 isULID`), else `KindUnknown` (`:93`). `:115 (id CheckpointID) Kind()` delegates.
+- `:144` `func NewCheckpointID(s string) (CheckpointID, error)` — validates via `:193 Validate`; **rejects prefixes**. Used by the cross-repo path.
+- `:59` `func CouldBePrefix(s string) bool` — cheap shape gate (1-12 hex, or 1-26 base32 starting 0-7), `prefixShapeRegex` `:53`. Useful if you want to skip impression lookup for obviously-not-an-ID targets.
+- `:72` `MaxIDLength = ulid.EncodedSize` (26) — used in `explain.go:658` to short-circuit non-ID targets.
+
+---
+
+## 4. Context and repo root
+
+Both get `ctx` from cobra: `cmd.Context()` — `explain.go:312/318/365/388/403`, `search_cmd.go:69`. Root context originates at `cmd/entire/main.go:26` (`context.WithCancel(context.Background())`) and is threaded via `rootCmd.ExecuteContextC(ctx)` (`main.go:87`).
+
+Repo root:
+- `paths.WorktreeRoot(ctx) (string, error)` — `paths/paths.go:67`, cached per-cwd (`:56-64`, invalidate via `:102 ClearWorktreeRootCache`).
+- explain calls it at `explain.go:318` purely as a gate before logging init.
+- search does **not** call `WorktreeRoot` directly, but it hard-requires a git repo: `strategy.OpenRepository(ctx)` at `search_cmd.go:190-196` (fails with "Not a git repository"), then `origin` remote at :198-210. `--code` path derives the slug via `currentRepoSlugWithForge(ctx)` (`recap.go:281`).
+- The git common dir (where you'd write) comes from `session.GetGitCommonDir(ctx)` — `session/state.go:790`, cached, with `:778 ClearGitCommonDirCache`.
+
+So both commands can reach `.git/entire*/` without extra plumbing.
+
+---
+
+## 5. Concurrency / agent-session identification
+
+**There is no `ENTIRE_SESSION_ID`.** Full env-var inventory confirms it: the only session-ish vars are `ENTIRE_REVIEW_SESSION` and `ENTIRE_INVESTIGATE_SESSION`, defined in `cmd/entire/cli/provenance/env.go:22,28`. Those are set by `entire review` / `entire investigate` on the **agent process they spawn** (package doc, `provenance/env.go:1-11`), read by the UserPromptSubmit hook to tag session Kind — they are *not* set for ordinary agent sessions, and `agentlaunch` deliberately strips them before spawning fix agents (`agentlaunch/launch.go:44-46`, `provenance/env.go:70 IsEntry`).
+
+**How hooks get the session id:** from the agent's **hook JSON payload on stdin**, not env. See `cmd/entire/cli/hooks.go:14` (`SessionID string \`json:"session_id"\``), parsed at `hooks.go:26` via `agent.ReadAndParseHookInput[T]`; lifecycle consumes `event.SessionID` throughout `lifecycle.go` (e.g. :163, :169 `"no session_id in %s event"`, :577).
+
+**Does it propagate to shells?** No. Claude Code (and the other agents) do not export the session id into the environment of Bash-tool subprocesses, and this repo does nothing to add it. The only env vars this CLI injects into child processes are `ENTIRE_REPO_ROOT` (`plugin.go:173`, `agent/external/external.go:448`) and `ENTIRE_CLI_VERSION`. So when Claude Code runs `entire search` in a Bash tool call, **the subprocess has no session identifier available from the environment**.
+
+**Practical implication for correlation:** the only available "current session" signal for `entire search` / `entire checkpoint explain` is the filesystem heuristic in §1 (`FindMostRecentSessionInCurrentWorktree`, `strategy/session_state.go:179`), scoped by `WorktreePath`. Its resolution is turn-level (`LastInteractionTime` updates only at TurnStart/TurnEnd), so two agents in one worktree will collide. Two mitigations visible in the codebase's own patterns:
+- Key impressions by worktree + a self-generated `search_id`, and correlate explain→search purely on `result_id ∈ recent impressions` with a short recency window, treating session id as best-effort metadata rather than the join key.
+- If you do need per-session isolation, follow the `&lt;session-id&gt;.&lt;suffix&gt;` sidecar convention (`trail_context_cache.go:152-160`) and accept the same heuristic the rest of the non-hook commands already accept.
+
+**Locking:** if impressions are written from concurrent processes, use `internal/flock` the way `trailRefreshRecentlySpawned` (`trail_context_cache.go:375`) and `PushQueue` (`checkpoint/pushqueue.go:56`) do; plain atomic-rename (`jsonutil.WriteFileAtomic`, used at `trail_context_cache.go:127`) is fine only for last-writer-wins single values.
+
+**Telemetry emission point** for the click event: `cmd/entire/cli/telemetry/detached.go:29` `type EventPayload`, `:46 BuildEventPayload`, `:98 TrackCommandDetached`, `:170 SendEvent` (PostHog, spawned detached via `execx.SpawnDetached("", "__send_analytics", ...)` at `:92`). Opt-out honored via `ENTIRE_TELEMETRY_OPTOUT`. There is currently **no** `search_id` / impression / click concept anywhere in the codebase, and `search.Response` (`search/search.go:420-433`) carries no server-side search id — you'd need to mint one client-side (or add it to the wire format). Per-result ids are available as `CheckpointResult.ID` (`search/search.go:69`) and surfaced in compact JSON as `compactSearchHit.ID` (`search_cmd.go:1008`).</result>
+<usage><subagent_tokens>120015</subagent_tokens><tool_uses>60</tool_uses><duration_ms>238648</duration_ms></usage>
+</task-notification>
+
+---
+
+update your memory to always save plans to their corresponding linear tickets instead. 
+
+-dont save antyhing to .git/entire folders
+- we don't need impressions or seconds since impression
+- we want to be as privacy conscious as we can be
+
+the goal is that we want to be able to see which results the agent called explain on so we can see if the results we're returning are relevant. similar to what we would do in the web. we don't need to overcomplicate this either. ideally this is a simple and straightforward implementation that we can then query either through datadog or ideally posthog (via a dashboard & mcp) later to improve our results.
+
+---
+
+<task-notification>
+<task-id>bxmxqu3am</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-evisdrenova-conductor-workspaces-cli-krakow/0e4f6109-876a-41e4-ac8d-a76650c33368/tasks/bxmxqu3am.output</output-file>
+<status>completed</status>
+<summary>Background command "Run full CI test suite (unit + integration + canary)" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+okay let's pull the latest CLI repo here and rebase on it and then revisit oour approach and ensure that it's still valid. and then let's open up a PR for this

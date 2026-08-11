@@ -1,0 +1,43 @@
+Entire Trail review comment
+ID: 019ff13e-2d28-7eb3-a400-dd541794f44a
+URL: https://entire.io/gh/entireio/cli/trails/1008/migrate-trail-commands-to-entire-api
+Severity: medium
+Context: cmd/entire/cli/trail_review_cmd.go:534
+Selected context:
+```
+client.SetTrailRoute(found.ID, trailNumberPath(host, owner, repo, found.Number))
+```
+`resolveTrailReviewTarget` now routes ID-keyed review/finding requests to the entire-api cell via `SetTrailRoute`, but `trailReviewCommentsPath` and `trailReviewStatePath` still build query strings with the legacy snake_case keys (`include_dismissed`, `limit`, `offset`) instead of the camelCase/cursor convention used elsewhere in this migration (e.g. `trailListPageQuery`'s `pageSize`/`pageToken`, and the `TrailsEnabled` backend-aware query fix in this same branch). If entire-api's findings endpoint expects the same camelCase convention, `entire trail finding list`, `entire trail resume`, and `runner_gather`'s trail-context gathering would silently drop the dismissed-filter and could loop forever in `fetchAllTrailReviewComments` if the server ignores `offset` and keeps returning `hasMore=true`.
+
+---
+
+Entire Trail review comment
+ID: 019ff158-2c88-76de-9a31-0668edbd250f
+URL: https://entire.io/gh/entireio/cli/trails/1008/migrate-trail-commands-to-entire-api
+Severity: medium
+Two normalizers in this PR; only the SSE one protects free-form data
+
+`normalizeTrailEventValue` (`trail_watch_cmd.go`) deliberately exempts the free-form key so event data is not re-cased:
+
+```go
+if key == "payload" {
+    out[key] = child
+    continue
+}
+```
+
+`normalizeTrailJSONValue` here has no equivalent guard — it re-cases every key at every depth, on both the read path (`decodeNormalizedTrailJSON`, used by ~13 UnmarshalJSON methods across trail/review/thread types) and the write path (`legacyTrailRequestBody`, which every request body on the **default** backend passes through).
+
+Verified against this head (512908dc6):
+
+```
+read   {"id":"t1","context":{"my_custom_key":1},"labels":{"team_a":true}}
+    -> {"id":"t1","context":{"myCustomKey":1},"labels":{"teamA":true}}
+
+write  {"metadata":{"userDefinedKey":1,"already_snake":2}}
+    -> {"metadata":{"user_defined_key":1,"already_snake":2}}
+```
+
+**Latent, not live:** no trail type currently declares a `map[string]any`; the only free-form field is `TrailApproval.Author` (`json.RawMessage`), and re-casing an author object is harmless. So nothing is corrupted today. Filing it because the same PR already recognises the hazard in the sibling normalizer, so the fix is known and cheap, and the first free-form field to land here (metadata, labels, annotations, a stored context blob) would be silently mangled in both directions with no test catching it.
+
+Suggested fix: give `normalizeTrailJSONValue` the same treatment — either exempt known free-form keys as the SSE path does, or narrow re-casing to a schema key allowlist instead of walking arbitrary depth. A shared helper for both normalizers would also resolve the divergence noted separately (`snakeToLowerCamel` lacks `trailEventCamelKey`’s `reviewSessionId -> reviewId` remap, so `review_session_id` normalizes differently depending on which path handles it).

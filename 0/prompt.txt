@@ -1137,3 +1137,88 @@ Not worth doing: folding this into `subagent_transcript_layout_test.go`'s existi
 **Doc-structure note:** `codex/AGENT.md` replaces the "No subagent hooks" gap with a **16-line description of a capability that now works**, filed under a heading called "Gaps &amp; Limitations". The identity/transcript detail belongs in the payload/capability section above; the Gaps entry should shrink to one line or disappear.</result>
 <usage><subagent_tokens>141772</subagent_tokens><tool_uses>45</tool_uses><duration_ms>408753</duration_ms></usage>
 </task-notification>
+
+---
+
+<task-notification>
+<task-id>a53e79d7760e6792b</task-id>
+<tool-use-id>toolu_01GcVwLbpMAoewrS1curgUFa</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments-2/f12d4d56-00f1-45df-a94c-6a3cf2714244/tasks/a53e79d7760e6792b.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review of codex diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Efficiency review complete. Findings ordered by magnitude, all numbers measured on this machine (warm binary, 164 real Codex rollouts in `~/.codex/sessions`).
+
+## 1. The real cost: newly-live subagent-transcript redaction is uncapped, unchunked, and unsanitized
+
+`/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/checkpoint/ephemeral.go:445-446` (and the git-refs twin at `persistent.go:551-553`)
+
+This block was effectively dead for every agent except Claude Code, because `subagentTranscriptPath` always resolved to `""`. Codex declaring `agent_transcript_path` (and `cursor/lifecycle.go:227` forwarding it) makes it live.
+
+Measured end-to-end, real `entire hooks codex subagent-stop` subprocess, trivial repo so the status walk is ~free:
+
+| `agent_transcript_path` | hook wall time |
+|---|---|
+| `null` (old Codex behaviour) | **0.19s** |
+| real 3.3MB Codex rollout | **1.44s** |
+
+So the read + `redact.JSONLBytes` adds **~1.25s to a single hook**. Rollout sizes across 164 real rollouts: median 481KB, p90 2.8MB, max 9.3MB. `redact.JSONLBytes` measured at 645/442/356/219 ms-per-MB for 0.3/0.5/1.0/9.3MB inputs → median ≈ 220ms, p90 ≈ 700ms, 9.3MB ≈ 2.0s.
+
+Three compounding issues:
+
+- **No cap or chunking.** The *main* transcript 30 lines above (`ephemeral.go:411-418`) goes through `agent.ChunkTranscript` (50MB cap, `agent/chunking.go:16`). The subagent transcript is read whole and redacted whole with no guard, so cost scales linearly forever (~220ms/MB → 50MB ≈ 11s).
+- **No sanitize-first**, which CLAUDE.md flags as load-bearing for exactly this cost. `SanitizeTranscriptForAgentType` (`persistent.go:1017`) is applied to main transcripts at `persistent.go:1051` and `:1066`, but to the subagent transcript on neither backend. Codex rollouts carry base64 `encrypted_content`: measured up to **20.8% of file bytes** (687KB of base64 in a 3.3MB rollout). On that exact file: `redact.JSONLBytes(raw)` = **1.31s** vs `SanitizePortableTranscript` (27ms, 3.3MB→2.6MB) + `redact.JSONLBytes` = **668ms**. A 48% saving — the hook goes 1.44s → ~0.80s.
+- **Cheaper alternative is a one-field change.** `strategy.TaskStepContext.AgentType` is already set at `lifecycle.go:1280` and simply isn't forwarded into `checkpoint.TaskStep` at `manual_commit_git.go:256-270` (`WriteEphemeralTaskOptions` has no agent field). Or skip the plumbing entirely: the same function already calls `agent.DetectAgentTypeFromContent` at `ephemeral.go:413`.
+
+## 2. Guaranteed-futile full parse of the parent rollout, now newly live for Codex
+
+`cmd/entire/cli/lifecycle.go:1251`
+
+`parseTranscriptForCheckpointUUID(event.SessionRef)` parses the whole parent transcript into `[]transcript.Line`; `FindCheckpointUUID` then looks for `line.Type == transcript.TypeUser` carrying a matching `tool_result`. Codex rollouts have no `user` lines — measured type histogram of a real rollout: `response_item: 4371, event_msg: 3034, turn_context: 62, compacted: 4, session_meta: 1`. Measured `ParseFromFileAtLine`: 3.3MB → 17.6ms / 2402 `Line` structs; 9.3MB → 45.3ms / 7472 structs, **`userLines = 0` both times**. Codex also has no `tool_use_id` at all (the diff maps `agent_id` into `ToolUseID`), so there is nothing to match even in principle.
+
+Modest in absolute terms but 100% waste, newly paid per Codex subagent task. Cheaper: make it a capability (only Claude Code implements the tool_result-UUID convention) rather than an unconditional call. Pre-existing code, but this diff is what makes a second agent hit it.
+
+## 3. Two new subprocesses per delegated task, each with a full go-git worktree walk
+
+`cmd/entire/cli/lifecycle.go:1131` → `CapturePreTaskState` → `getUntrackedFilesForState` (`state.go:494`) → `gitrepo.Status` (`state.go:437`).
+
+Measured on this repo (1408 tracked, 39k worktree files, correctly laid-out `.gitignore`): `gitrepo.Status` = **64-67ms**, repo open 1.4ms. `git status --porcelain` on the same tree = 19ms, so go-git is ~3.5x; in the documented pathological ignore-layout case this same call was 5.25s.
+
+Per delegated subagent task the diff adds, where before there was zero:
+
+- `subagent-start`: ~40ms in a trivial repo, **~105-110ms here** (40ms process start + `git rev-parse` spawn from `paths.WorktreeRoot` (cache is cold in a fresh process) + settings reads + `initHookLogging`/`FindMostRecentSession` + 65ms status walk + one small JSON write). `handleLifecycleSubagentStart` does nothing else — it is as cheap as capturing an untracked baseline can be.
+- `subagent-stop`: **~190ms** baseline plus finding 1's redaction. It also pays a *second* `gitrepo.Status` (`DetectFileChanges`, `lifecycle.go:1221`) and a third repo open + policy ref read, because `hookWritesCheckpointData` (`hook_registry.go:303`) includes `SubagentEnd` (correctly not `SubagentStart`).
+
+Net: 2 status walks + 3 repo opens across 2 processes. This is inherent rather than gratuitous — the baseline genuinely needs a walk, and `gitrepo.WithStatusCache` buys nothing across process boundaries. The only cheaper shape is reusing the session's pre-prompt untracked list, which SubagentEnd *already* falls back to at `lifecycle.go:1215-1220`; that trades attribution precision for ~65ms. Worth naming in the PR as a chosen cost.
+
+## 4. `declaredSubagentTranscript` — answering the specific question: it *replaces* stats, net reduction
+
+`cmd/entire/cli/lifecycle.go:1146`
+
+- Codex/Cursor (declared path exists): **1 stat instead of 2** — `ResolveAgentTranscriptPath` is skipped entirely, and it stats two candidates (`transcript.go:119` nested `subagents/`, `:122` legacy sibling). Net −1.
+- Claude Code and all others (declared empty): a `TrimSpace("")` plus an empty compare, then the same 2 stats. Net ±0.
+- Only the pathological case (declared but missing) costs 3 stats + a `logging.Warn`. Net +1.
+
+Magnitude either way is single-digit microseconds against a ~40ms process start. **Not additive — immaterial and slightly favourable.**
+
+## 5. Small win the diff earns
+
+`cmd/entire/cli/lifecycle.go:1197-1199` — `ExtractModifiedFilesFromOffset` now scans the subagent's own rollout rather than the parent's. Codex's impl (`codex/transcript.go:126`) streams with `bufio` and normally sees the smaller of the two files. Tens of ms saved; dwarfed by finding 1.
+
+## 6. Installer loop and new parse functions — efficiency-neutral
+
+- `codex/hooks.go`: the two new events add 2 `json.Unmarshal`s of in-memory `json.RawMessage` and 2 marshals into the same map. `UseWindowsProductionHooks` is computed **once** at `hooks.go:97` and reused for all six commands — no per-command probe. One file read, one write, unchanged. Runs at `enable`, never on a hook path.
+- `AreHooksInstalled` (`hooks.go:280-287`) now requires both new events, so every already-enabled repo reports drift once and gets one reinstall; converges immediately. Call sites are `config.go:93` and `setup.go:1584/2518` — status/setup only.
+- `codex/lifecycle.go:100-146`: one stdin read + one `json.Unmarshal` each. No repeated I/O, no redundant computation. `subagentStopRaw` decodes `LastAssistantMessage`, `CWD`, `HookEventName`, `PermissionMode`, `TurnID`, `StopHookActive` into never-read fields — encoding/json must scan those values regardless, so dropping them saves only the assignment. Noise. `derefString` returns the string header without copying.
+
+## 7. Integration test and harness — lean, nothing gratuitous
+
+`codex_subagent_test.go` measured at **0.79s** wall (2.26s package including binary build), uses `t.Parallel()`, spawns 2 subprocesses, writes 5 tiny files, and uses `NewFeatureBranchEnv` like its neighbours. It hand-writes the session state JSON instead of driving a `session-start` hook — that avoids a third subprocess and is the cheaper choice. The `hooks.go` additions are two `map[string]any` + `json.Marshal` builders matching the existing simulators.
+
+## Bottom line
+
+The diff is not efficiency-neutral. Findings 4-7 are neutral-to-favourable, and finding 3 is an inherent cost of the feature. But **finding 1 is a genuine regression in hook latency**: Codex and Cursor subagent-stop hooks now spend 0.2s (median rollout) to 2s+ (p90-to-max) in an unsanitized, uncapped `redact.JSONLBytes` pass that no prior code path exercised, with a measured ~48% saving available from a one-line sanitize-before-redact and a size guard that the adjacent main-transcript path already has.
+
+Verification artifacts (scratch benchmark files, test repo) were removed; `git status` is clean.</result>
+<usage><subagent_tokens>161778</subagent_tokens><tool_uses>66</tool_uses><duration_ms>564090</duration_ms></usage>
+</task-notification>

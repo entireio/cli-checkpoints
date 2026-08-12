@@ -1,0 +1,237 @@
+now actually reading the only change in CLAUDE.md: I think the caching might be obsolete now too? can we run some tests on that?
+
+---
+
+I feel 28% on 430ms is not nothing, true but a cache always has the risk of being stale and given that I feel it might be worth it to throw it out again
+
+---
+
+<task-notification>
+<task-id>bkby2m131</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-clear-cloud-548a/ac065b40-422f-4c60-bd54-24f1e1606b6d/tasks/bkby2m131.output</output-file>
+<status>completed</status>
+<summary>Background command "Run test:ci after cache removal" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>ac3bea22aee4ce681</task-id>
+<tool-use-id>toolu_01Hrdm6uj2vUUoNF7dLWD2eH</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-clear-cloud-548a/ac065b40-422f-4c60-bd54-24f1e1606b6d/tasks/ac3bea22aee4ce681.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review of the diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Diff read, current tree inspected, and the leftover-symbol sweep is clean: `WithStatusCache`, `statusCache`, `statusCacheSafe` have **zero hits** across all file types (`.go`, `.md`, `.yaml`, `.toml`). `go build ./cmd/...` passes and `git check-ignore -v e2e/artifacts/foo` confirms the reverted root rule prunes. The deletion itself is tidy. What's left is duplicated/stale prose around it.
+
+## Findings
+
+**1. `.golangci.yaml:117` — stale perf lore, third copy of the same rationale**
+The forbidigo message still reads `"go-git Worktree.Status() walks ignored subtrees (seconds in this repo) - use gitrepo.Status(ctx, repo)"`. "Walks ignored subtrees" and "seconds in this repo" are exactly the claims this diff deleted from `.gitignore`, `e2e/.gitignore`, `CLAUDE.md`, and `status.go` — and the go-git bump (which adds the `Scope`-based ignore walk and deprecates `ReadPatterns`) is what made them false. The diff updated three copies of this rationale and missed the fourth.
+- **Cost:** the lint message is what a developer reads at the exact moment they hit the rule, and it now teaches the pre-bump model. Four places must move together on the next measurement.
+- **Simpler:** `msg: "Worktree.Status() walks the worktree - use gitrepo.Status(ctx, repo)"`. Drop the magnitude claim; keep numbers in exactly one place (CLAUDE.md).
+
+**2. `cmd/entire/cli/gitrepo/status.go:12` — doc comment duplicates CLAUDE.md and already disagrees with it**
+Lines 12-15 restate `CLAUDE.md:516-519`, but with a different subset of the numbers: the code says "around 120ms on a 20k-file tree", CLAUDE.md says "~12ms on a 1.5k-file tree and ~120ms on a 20k-file one". Seven lines of comment over six lines of body.
+- **Cost:** two copies of one measurement, already out of sync at birth; both rot on the next hardware or repo-size change.
+- **Simpler:** keep only the instruction in code — the forbidigo sentence plus "Read it once per hook and pass the result down rather than calling this repeatedly." — and let CLAUDE.md own the cost profile.
+
+**3. `CLAUDE.md:520` — tombstone for machinery that no longer exists**
+Lines 520-524 ("There is deliberately no memoization: a context-scoped cache previously saved one walk per TurnStart hook (~28% of that hook on a 20k-file repo), but it had to be kept out of any window that writes tracked files or stages anything…") spend 5 lines describing the deleted design, including its staleness precondition — which is now advice about nothing.
+- **Cost:** the precondition clause is the part most likely to be read as a live constraint on hook ordering; a reader must hold a design that isn't in the tree.
+- **Simpler:** one sentence. `Do not memoize it: a context-scoped cache was tried and removed (4c3a6d343) — the write-free window it required cost more to maintain than the walk saved.` The rest is already in the commit message.
+
+**4. `cmd/entire/cli/gitrepo/status.go:16` — the `ctx` parameter is now purely decorative**
+Nothing in the body reads it, and there is no plausible future consumer *inside this function*: go-git v6 exposes only `Status()` and `StatusWithOptions(StatusOptions{Strategy})` — `StatusOptions` has one field and no context. The stated reason is also only half true: the package's other exported entry points are `OpenCurrent(ctx)` (which genuinely uses its ctx) and `OpenPath(repoRoot string)` (which takes none), so "symmetry with the other gitrepo entry points" doesn't describe the package.
+- **Cost:** line 17's `_ = ctx` is a line of code whose only job is to silence `unparam` (configured `check-exported: true`) — a linter that is, post-deletion, correct. Six call sites and two docs carry an argument that means nothing.
+- **Simpler:** `func Status(repo *git.Repository) (git.Status, error)`, deleting the param, the `_ = ctx`, and its comment. Call-site cost is 6 mechanical arg deletions, all with `ctx` still in scope: `cmd/entire/cli/review_target.go:88`, `cmd/entire/cli/rewind.go:1089`, `cmd/entire/cli/state.go:273`, `cmd/entire/cli/state.go:437`, `cmd/entire/cli/strategy/common.go:1187`, `cmd/entire/cli/strategy/manual_commit_hooks.go:2505` — plus `.golangci.yaml:117` and CLAUDE.md:513/520 text.
+- **Judgment call, not a must-fix:** the repo has 8 other `_ = ctx // Reserved for future use` sites, so keeping it is defensible convention. But then match that convention's wording — "reserved for future use" is honest; "for symmetry" is not.
+
+**5. `cmd/entire/cli/lifecycle.go:561` — comment kept at its pre-cache length after its reason shrank** (minor)
+Five lines guarding one `EnsureSetup` call. The reason is genuinely weaker now (snapshot freshness, not a cache-correctness invariant), and the first line, "Strategy setup runs before the first worktree-status read below," only restates the code order the reader can see.
+- **Cost:** the ordering constraint's real weight is no longer legible from its comment's size.
+- **Simpler:** two lines — `EnsureEntireGitignore can append to the tracked .entire/.gitignore, so run it before CapturePrePromptState: the snapshot should describe the tree the agent starts from.`
+
+**6. `cmd/entire/cli/explain_repo.go:50` — analogy that only worked as a pair** (minor)
+"Context-scoped like checkpoint's remote-list discovery" previously named two comparanda; with `WithStatusCache` deleted it points at one distant, unnamed mechanism in another package and says nothing about `crossRepoReadKey`. The diff spent an edit preserving half a comparison.
+- **Cost:** a cross-package prose dependency carrying no information.
+- **Simpler:** drop the clause — `Context-scoped so the renderers can adjust their guidance without an extra positional parameter through every formatCheckpointOutput call site.`
+
+## Explicitly not a problem
+
+**The `Status` wrapper still earns its existence.** With the cache gone the body is `repo.Worktree()` + `worktree.Status()`, but it keeps two real jobs: it is the single `//nolint:forbidigo` choke point enforcing `.golangci.yaml:116`, and it absorbs the `repo.Worktree()` error branch that would otherwise repeat at all 6 call sites. Keep it — the forbidigo choke point alone justifies it, and that is worth stating in its doc comment (finding 2's replacement text does).</result>
+<usage><subagent_tokens>94797</subagent_tokens><tool_uses>21</tool_uses><duration_ms>195513</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>af770e8feaa2fec56</task-id>
+<tool-use-id>toolu_01VLVASqgEDuGQ7SVcRobrcG</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-clear-cloud-548a/ac065b40-422f-4c60-bd54-24f1e1606b6d/tasks/af770e8feaa2fec56.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review of the diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Verdict
+
+The diff adds essentially no new code — one `_ = ctx` line and rewritten doc comments — so there are **no new re-implementations of existing helpers**. What I did find is residue of the deleted helper (references the diff missed) plus one genuine pre-existing duplication that this diff makes newly load-bearing.
+
+### Findings
+
+**1. `cmd/entire/cli/strategy/manual_commit_hooks.go:2502`**
+- summary: Comment still documents the deleted `gitrepo.WithStatusCache` as the mechanism sharing this status read with TurnStart.
+- cost: The diff updated three copies of this rationale (`CLAUDE.md`, `gitrepo/status.go`, `explain_repo.go:49`) but left the fourth. It now asserts a sharing guarantee that no longer exists, so the next reader will assume this walk is free.
+- use instead: Delete the sharing claim; the accurate cost statement now lives once in `Status`'s doc at `cmd/entire/cli/gitrepo/status.go:12-15`. Exact text to drop: `// Shared with the turn-start pre-prompt capture via the context status cache, so the expensive go-git worktree walk runs once per hook rather than once per caller.`
+
+**2. `.golangci.yaml:117`**
+- summary: The `forbidigo` message is a third copy of the perf rationale and still states the reverted claim.
+- cost: It says `Worktree.Status() walks ignored subtrees (seconds in this repo)` — the premise this diff reverts (`e2e/artifacts/` back in the root `.gitignore`) and contradicts (`~120ms on a 20k-file tree`). Two divergent numbers for the same fact in the same tree.
+- use instead: Keep the message to the rule (`use gitrepo.Status(ctx, repo)`) and let `cmd/entire/cli/gitrepo/status.go:12-15` be the single place that states the cost.
+
+**3. `cmd/entire/cli/state.go:430` (`getUntrackedFilesForState`)**
+- summary: Re-implements the untracked-file extraction that `DetectFileChanges` already does, including its own repo open and worktree walk.
+- cost: Identical loop and identical filter (`st.Worktree == git.Untracked` + `shouldIgnoreSessionTrackingPath`). Previously the two shared one walk through the context cache; with the cache gone each is a separate full walk, so the duplication became a duplicated *cost*, not just duplicated code. Three call sites (`state.go:116`, `state.go:494`).
+- use instead: `DetectFileChanges(ctx, nil)` (`cmd/entire/cli/state.go:266`) — with `previouslyUntracked == nil` its `.New` is exactly this list. Only difference to preserve: `DetectFileChanges` leaves `New` nil where this returns `[]string{}`, and nil-vs-empty is load-bearing for `PrePromptState.PreUntrackedFiles`.
+
+**4. `cmd/entire/cli/gitrepo/status.go:12` (new doc) vs. its own call sites**
+- summary: The new comment prescribes "read it once per hook and pass the result down," but nothing in the diff provides the plumbing, and TurnStart still reads status twice.
+- cost: On TurnStart, `CapturePrePromptState` → `getUntrackedFilesForState` (`state.go:116`) and `InitializeSession` → `calculatePromptAttributionAtStart` (`manual_commit_hooks.go:2505`) each do a full walk. That doubles the read the diff itself calls the most expensive on the hook path, on the one hook `lifecycle.go:520-528` documents as latency-critical. Advice with no carrier will not be followed.
+- use instead: Pass the already-computed `git.Status` from the pre-prompt read into `calculatePromptAttributionAtStart` (and give `DetectFileChanges`/`getUntrackedFilesForState` a status-accepting variant). Honest caveat: this crosses the `cli` → `strategy` package boundary via `InitializeSession`'s signature, so it is real work — but without it the new comment is aspirational.
+
+### Explicitly not findings (checked)
+
+- **`gitrepo.Status` redundancy vs. the porcelain paths**: not redundant. `checkpoint/ephemeral.go:1250` (`git status --porcelain -z -uall`) yields changed/deleted path sets and discards the XY codes; `review/scope.go:236` yields a count via `gitexec.Run`. Six callers of `gitrepo.Status` need the `git.Status` map's `Staging`/`Worktree` codes. A shared porcelain→`git.Status` parser in `gitrepo` would let all three use the fast CLI read, but that is a separate refactor, not something this diff should carry.
+- **Lost test coverage**: none. Both deleted files tested only the removed mechanism (`WithStatusCache`, `statusCacheSafe`); the remaining `Status` is a 4-line wrapper covered transitively by its six callers' tests.
+- **Orphaned test helper**: `initRepoWithFile` (`cmd/entire/cli/gitrepo/repository_test.go:262`) is still used 17 times by `repository_test.go`, so deleting `status_test.go` orphaned nothing. It cannot be replaced by `testutil.InitRepo` — `cmd/entire/cli/testutil/testutil.go:14` imports `gitrepo`, so that would be an import cycle.
+- **`_ = ctx` convention**: both forms are established here. `_ = ctx` in the body appears in `investigate/manifest.go:114,147,199,289`, `investigate/state.go:130,156`, `session/state.go:621,680`; `_ context.Context` in the signature appears in `config.go:68`, `explain_summary_provider.go:142,232`. No convention violation, and go-git v6 (including the bumped pseudo-version) has no context-taking status API — only `Status()` and `StatusWithOptions(StatusOptions)` — so the param genuinely cannot be used.
+- **`.gitignore` revert**: `e2e/artifacts/` now exists exactly once across all six `.gitignore` files; no duplicate rule left behind.
+- **Dangling symbol references**: `WithStatusCache` / `statusCacheSafe` have zero remaining references in `.go`, `.md`, or `.yaml` (finding 1 is prose only).</result>
+<usage><subagent_tokens>105861</subagent_tokens><tool_uses>26</tool_uses><duration_ms>238458</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aacfa016348051fe9</task-id>
+<tool-use-id>toolu_01NejS1XorUFVAJSgrjbADD1</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-clear-cloud-548a/ac065b40-422f-4c60-bd54-24f1e1606b6d/tasks/aacfa016348051fe9.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review of the diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Investigation complete. All checks done; I edited nothing.
+
+## Verdict
+
+**The altitude is right on the two substantive calls** (pseudo-version pin, deleting `e2e/.gitignore`) — evidence below. Four findings, all small and documentation-shaped; none is a correctness issue.
+
+### Where the altitude is right (checked, not assumed)
+
+**1. The pseudo-version pin is forced, not a choice, and has precedent.** `go list -m -versions` confirms `v6.0.0-alpha.5` is go-git's newest tag, so no released version contains #2309 — the alternatives are a fork or a vendored patch, both worse. Precedent is direct: `go.mod:20-21` already require `go-git/x/plugin/objectsigner/auto` and `.../program` at pseudo-versions and have since 2026-06-24. Nothing in the pipeline assumes tags: no `vendor/`, no `replace` directives, no SBOM/`govulncheck`/`osv-scanner` anywhere, `.goreleaser.yaml`/`.goreleaser.nonprod.yaml` have no `sboms:` or gomod-proof keys, no workflow or script hardcodes a go-git version, and `license-check.yml` (runs on every PR and push to main) has been green with the two `objectsigner` pseudo-versions for ~7 weeks — empirical proof the license gate tolerates them.
+
+**2. `go.mod`'s `require` is sufficient enforcement of the floor.** MVS treats it as a minimum, there is no `replace` and no vendor dir, so no ordinary build or `go mod tidy` can drop below it. Dependabot cannot downgrade, and semver ordering puts the pseudo-version *above* `alpha.5`, so it will sit still until `alpha.6` ships and then propose exactly the right exit. The only hole is developer-local: `go.work`/`go.work.sum` are gitignored (`.gitignore:25-26`), so a local workspace `use`/`replace` pointing at a go-git checkout silently restores the slow walk and CI never sees it — plausible here given the repo owner's go-git maintainer work, but the failure is perf-only and local, so a CI guard would be over-built. Finding #1 below is the proportionate fix.
+
+**3. Deleting `e2e/.gitignore` outright is the right depth.** One root list is the house style — the root `.gitignore` already carries `cmd/entire/entire`, `docs/plans`, `docs/reviews`, `docs/requirements`, `.claude/worktrees/`. The only other nested `.gitignore`s in the repo (`.claude/`, `.entire/`, `.gemini/`, `.opencode/`, `docs/generated/`) are each owned by the tool that generates that directory. `e2e/.gitignore` was neither; it existed solely for the go-git constraint. Keeping it as an empty husk would leave two places to look for e2e ignores plus a "why is this here" artifact.
+
+**4. `gitrepo.Status` is justified infrastructure, not a one-user mechanism.** It has 6 call sites across 5 files (`review_target.go:88`, `rewind.go:1089`, `state.go:273`, `state.go:437`, `strategy/manual_commit_hooks.go:2505`, `strategy/common.go:1187`), and it is the sanctioned target named verbatim in the forbidigo message at `.golangci.yaml:117`. No stale references to `WithStatusCache`/`statusCacheSafe` survive anywhere in the tree.
+
+## Findings
+
+**1. `go.mod`, line 19 — the floor's reason and exit condition exist only in a commit message.**
+- Cost: the constraint is invisible at the point where it will be changed. Dependabot's `go-dependencies` group bundles minor/patch bumps into one PR (`.github/dependabot.yml`), so the eventual `alpha.6` bump arrives as a grouped patch a reviewer merges without ever seeing why the pin exists. If a version conflict is ever resolved by dropping to `alpha.5`, the commit's own measurement says `Status()` goes 23.3ms → 1.279s on this repo — the original hook-timeout regression — with no test or CI signal.
+- Deeper fix: an inline comment on the require line, which `go mod tidy` preserves: `// floor: go-git#2309 (per-directory ignore Scope); the root e2e/artifacts/ rule depends on it — drop to a plain tag once alpha.6 ships`. The repo already has exactly this convention one file over: `.github/dependabot.yml:21-25` encodes the betterleaks pin's reason, upstream issue, and un-pin condition machine-visibly where a future bumper looks. The go-git floor is the mirror-image constraint and bypasses it.
+
+**2. `CLAUDE.md`, lines 516-524 — three measured numbers in a doc loaded every session, none of them load-bearing.**
+- Cost: the previous numbers (5.25s vs 0.013s) *earned* their place — they were the reason for a counterintuitive `.gitignore` layout a reader would otherwise undo. The replacements justify nothing a reader must do: "read it once per hook and pass the result down" holds identically at 12ms and at 120ms, so `~12ms / ~120ms` are hardware- and tree-shaped facts that rot with no behavioural consequence. `~28% of that hook on a 20k-file repo` is worse: it measures a deleted optimization, so it is archaeology that costs context on every single session.
+- Deeper fix: keep the scale-shaped rule and a one-clause prohibition — "deliberately not memoized: a context-scoped cache was tried and removed (see `git log` on `gitrepo/status.go`)" — and drop the three figures. Keeping *some* don't-re-add note is right, since a bare removal invites a future agent to re-add the cache; but the full measured rationale already lives in commit `4c3a6d343`, which preserves it without a per-session cost.
+
+**3. `cmd/entire/cli/gitrepo/status.go`, line 17 — `_ = ctx` is justified by the weakest available reason, and inaccurately.**
+- Cost: "symmetry with the other gitrepo entry points" is not true of the package — of the two other exported entry points, only `OpenCurrent` takes a ctx; `OpenPath(repoRoot string)` does not. So the comment points a future reader at a symmetry that isn't there, and invites someone to "clean up" the parameter.
+- Deeper fix: keeping `ctx` is correct — state the load-bearing reason instead. The forbidigo message at `.golangci.yaml:117` prescribes `gitrepo.Status(ctx, repo)` by name, so the signature is part of the lint-enforced contract, and ctx is where cancellation or a perf span would attach. Also worth matching the established local idiom: the other 11 sites in the repo (`investigate/manifest.go`, `session/state.go`, …) all write `_ = ctx // Reserved for future use`, which would make the line unremarkable. Lint is clean either way — I ran `golangci-lint run ./cmd/entire/cli/gitrepo/...`: 0 issues.
+
+**4. Nit — `.gitignore`, lines 50-51: double blank line.** The workaround commit's comment block wasn't fully unwound; the revert restored the rule but left two blank lines before `# E2E test artifacts`. Cosmetic only.</result>
+<usage><subagent_tokens>105149</subagent_tokens><tool_uses>21</tool_uses><duration_ms>294637</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ada55ccaa8bc6d158</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-clear-cloud-548a/ac065b40-422f-4c60-bd54-24f1e1606b6d/tasks/ada55ccaa8bc6d158.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review of the diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Context first (measured, because it resizes the question)
+
+I benchmarked `gitrepo.Status` on this worktree (7,303 files, clean tree) via a throwaway module with a `replace` on go-git:
+
+| | this worktree | 3,000-dir tree ignored by a **root-level** `e2e/artifacts/` rule |
+|---|---|---|
+| go-git `alpha.5` (before) | **765 ms** / call | **1.10 s** |
+| go-git pseudo-version (after) | **34 ms** warm, 82 ms cold-process | **1.25 ms** |
+
+Commit (a) is a ~22× per-call win: the pseudo-version replaces `gitignore.ReadPatterns` with a lazily-read `gitignore.Scope` threaded through the walk (`worktree_status.go` → `w.ignoreScope()`), which both removes the second internal traversal and makes a root-level nested rule prune correctly. So the `.gitignore` move-back is sound, and the duplicate-walk cost being discussed is **~34 ms here, not ~700 ms** (the diff's own doc says ~120 ms on a 20k-file tree). For comparison, native `git ls-files --others --exclude-standard` on the same tree is **10 ms including process spawn**, and one `gitrepo.OpenPath` is 1.5–4.8 ms.
+
+## Findings
+
+**1. Two full worktree walks on TurnStart; no third.**
+- files/lines: `cmd/entire/cli/state.go:437` and `cmd/entire/cli/strategy/manual_commit_hooks.go:2505`
+- summary: exactly two `gitrepo.Status` calls are reached per user-prompt-submit hook, from two sibling call chains that never share the value.
+- cost: ~34 ms of duplicated walk here / ~120 ms on a 20k-file tree, plus a duplicate repo open. Chains from `handleLifecycleTurnStart` (`cmd/entire/cli/lifecycle.go:531`):
+  - `lifecycle.go:575` → `CapturePrePromptState` (`state.go:98`) → `getUntrackedFilesForState` (`state.go:430`) → `openRepository` + `gitrepo.Status` (`state.go:437`)
+  - `lifecycle.go:608` → `(*ManualCommitStrategy).InitializeSession` (`manual_commit_hooks.go:2274`) → `MutateSessionState` callback → `calculatePromptAttributionAtStart` (`manual_commit_hooks.go:2443`) → `gitrepo.Status` (`manual_commit_hooks.go:2505`)
+  - I verified there is no third: `gitrepo.Status` has only 6 call sites repo-wide (`rewind.go:1089`, `review_target.go:88`, `state.go:273` `DetectFileChanges`, `state.go:437`, `manual_commit_hooks.go:2505`, `strategy/common.go:1187` `checkCanRewindWithWarning`) and only the middle two are on TurnStart. `state.go:273` is TurnEnd/SubagentEnd; `common.go:1187` is the rewind command, not the hook path — the task brief's pointer at "common.go:1187" is `checkCanRewindWithWarning`, not prompt attribution. `EnsureSetup`, `resolveSessionAgentType`, `initializeSession`, `emitContextInjection`, and the `hook_registry.go` policy gate read no status (TurnStart isn't in `hookWritesCheckpointData`, `hook_registry.go:299`).
+- cheaper alternative: see the threading assessment below; the cheapest is finding 4.
+
+**2. Stale comment now asserts an optimization that no longer exists.**
+- file/line: `cmd/entire/cli/strategy/manual_commit_hooks.go:2502-2504`
+- summary: "Shared with the turn-start pre-prompt capture via the context status cache, so the expensive go-git worktree walk runs once per hook rather than once per caller" — the cache is gone; this walk is now a second one.
+- cost: no runtime cost, but this is the *only* place in the code where a reader would learn the walk is duplicated, and it now tells them the opposite. The diff updated `gitrepo/status.go`, `CLAUDE.md`, `lifecycle.go` and `explain_repo.go` comments but missed this one.
+- alternative: rewrite to state the current fact ("a second full worktree walk in this hook; see the pre-prompt capture in cli/state.go"). One comment, zero risk. This should be fixed regardless of whether anything else here is.
+
+**3. `calculatePromptAttributionAtStart` is computed twice when reconcile fires.**
+- file/lines: `cmd/entire/cli/strategy/manual_commit_hooks.go:2345` and `:2353`
+- summary: on the reconcile branch the whole attribution computation re-runs only to change which base tree it compares against.
+- cost: a third Status walk (+34 ms) **plus** a second `os.ReadFile` + `binary.IsBinary` pass over every changed file (`manual_commit_hooks.go:2516-2540`, uncapped by size). Nothing writes to the worktree between the two calls — `migrateShadowBranchIfNeeded` only touches refs and `state` — so the walk and the `changedFiles` content map are provably identical; only `baseTree`/`lastCheckpointTree` differ. Rare trigger (user reset to the last condensed checkpoint), but on a dirty tree the file-read half can dominate the walk.
+- alternative: split `calculatePromptAttributionAtStart` into `collectChangedFileContents(ctx, repo) (map[string]string, error)` and a pure `attributionFrom(baseTree, lastCheckpointTree, changedFiles, n)`, then have the reconcile path reuse the first result. Entirely local to `manual_commit_hooks.go`, ~1 function split, 3 in-file call sites, no signature crosses a package. Lowest-risk of the three real fixes.
+
+**4. The pre-prompt capture pays for a full status walk to learn only "which files are untracked".**
+- file/line: `cmd/entire/cli/state.go:430-451` (`getUntrackedFilesForState`), reached from `state.go:116`
+- summary: it discards everything in the `git.Status` map except `st.Worktree == git.Untracked`.
+- cost: the entire 34 ms walk (and one repo open) for a set that native git produces in 10 ms including spawn. Chain: `handleLifecycleTurnStart` → `CapturePrePromptState` → `getUntrackedFilesForState`.
+- alternative: `git ls-files --others --exclude-standard` (or `git status --porcelain -z -uall`) run at the worktree root. **Zero signature changes, one function body**, and the codebase already establishes the pattern twice for exactly this reason: `getStagedFiles` (`manual_commit_hooks.go:2550-2557`: "much faster than go-git's `worktree.Status()` which scans the entire working tree") and `collectChangedFiles` (`cmd/entire/cli/checkpoint/ephemeral.go:1238`, "modified tracked + untracked non-ignored … git CLI … go-git's `worktree.Status()` does not respect global gitignore"). This is the best cost/invasiveness ratio on the list: it removes one of the two walks outright without any cache and without any threading. Caveat to cover with a test, not to assert: `ls-files --others` also honors `core.excludesfile`, which go-git's walk does *not* (per the `ephemeral.go` comment) — so the untracked set may legitimately shrink for users with a global gitignore, which is a behavior change (arguably a fix) that needs a deliberate decision.
+
+**5. Three independent repository opens per TurnStart hook.**
+- files/lines: `cmd/entire/cli/strategy/common.go:97` (`EnsureSetup`), `cmd/entire/cli/state.go:431` (`getUntrackedFilesForState`), `cmd/entire/cli/strategy/manual_commit_hooks.go:2277` (`InitializeSession`)
+- summary: each re-runs `openPathWithAlternates` — dotgit/common-dir resolution, alternates-rewrite FS wrapping, config parse, reftable detection.
+- cost: ~4.8 ms cold + ~1.5 ms × 2 ≈ 8 ms per hook. No subprocess (reftable detection reads config, doesn't spawn git), so this is small next to a walk.
+- alternative: open once in `handleLifecycleTurnStart` and pass `*git.Repository` down. Same threading churn as finding 6 below for ~8 ms — **not worth it on its own**; only worth folding in if the status threading happens anyway.
+
+**6. Nit: `_ = ctx` body statement in the reduced `Status`.**
+- file/line: `cmd/entire/cli/gitrepo/status.go:20`
+- summary: `_ = ctx // accepted for symmetry` exists to satisfy `unparam` (enabled with `check-exported: true`, `.golangci.yaml:69,134`).
+- cost: none; noise.
+- alternative: declare `func Status(_ context.Context, repo *git.Repository)` — same signature symmetry, no body statement, and it matches in-repo precedent (`GetStrategy(_ context.Context)` at `cmd/entire/cli/config.go:68`, `getLastPrompt(_ context.Context, …)` at `manual_commit_hooks.go:2585`). One-line change.
+
+## How invasive is threading a `git.Status` through? (question 3)
+
+Cheaper than it looks, because **there is no `Strategy` interface** — `grep '^type .* interface'` across `cmd/entire/cli/strategy/*.go` returns nothing, and `GetStrategy` (`cmd/entire/cli/config.go:68`) returns the concrete `*strategy.ManualCommitStrategy`. So `InitializeSession` is a concrete method with **one** production caller. (Note: `CLAUDE.md` still describes a `Strategy` interface in `strategy.go` — that doc is stale, independent of this diff.)
+
+The `cli → strategy` boundary is **not** awkward: `git.Status` is an exported go-git type already imported by both packages (`cmd/entire/cli/state.go:23`, and `strategy` throughout), and the dependency direction is the existing one. No new abstraction, no new import edge.
+
+Signatures to change: 4, across 2 packages.
+1. `getUntrackedFilesForState(ctx)` → take a `git.Status` (`state.go:430`). 2 prod callers — but `CapturePreTaskState` (`state.go:494`) is on the ToolUse path and needs its own read, so keep a thin reading wrapper.
+2. `CapturePrePromptState(ctx, ag, sessionID, sessionRef)` → + `status git.Status` (`state.go:98`). 1 prod + 3 test callers.
+3. `(*ManualCommitStrategy).InitializeSession(...)` → + `status git.Status` (`manual_commit_hooks.go:2274`). 1 prod caller + **~41 test call sites across 8 files** (`phase_wiring_test.go` alone has 18; also `manual_commit_staging_test.go`, `agent_resolution_test.go`, `phase_prepare_commit_msg_test.go`, `manual_commit_test.go`, `owner_wiring_test.go`, `manual_commit_concurrent_test.go`, `session_adopt_test.go`).
+4. `calculatePromptAttributionAtStart(ctx, repo, state)` → + `status git.Status` (`manual_commit_hooks.go:2443`). 3 in-file callers.
+
+Realistic verdict: ~4 signatures and ~45 call-site edits, of which ~90% is mechanical test churn, to save ~34 ms (~120 ms on a large tree). The churn can be cut to near zero by accepting a nil `git.Status` and having the callee fall back to `gitrepo.Status(ctx, repo)` — but that reintroduces a "did someone pass me a stale snapshot?" contract at every hop, which is the same class of hazard the cache was deleted to remove, just spread across four signatures instead of one context value.
+
+**Recommendation, in order:** finding 2 (comment, must fix), then finding 4 (native git for the untracked snapshot — removes one walk with zero threading and two in-repo precedents), then finding 3 (local split, removes the reconcile duplicate). Full `git.Status` threading (findings 1/5) is the option I'd *not* take: it buys the same ~34 ms that finding 4 buys for one function body, at 45 call sites and a new stale-snapshot contract.</result>
+<usage><subagent_tokens>151583</subagent_tokens><tool_uses>50</tool_uses><duration_ms>437992</duration_ms></usage>
+</task-notification>

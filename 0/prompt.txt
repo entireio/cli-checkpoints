@@ -1,0 +1,93 @@
+Please go thru the open findings, eval them all, and lets talk about what to do after we gather all those learnings
+
+---
+
+logged in
+
+---
+
+tell fix-findings to fix #2 and #3
+
+---
+
+#2 and #3 are resolved. Check i
+
+---
+
+Yes, but, once you handed it to fix-findings I want to talk about it before start fixing it
+
+---
+
+<cross-session-message from="uds:/tmp/cc-socks/31069.sock" from-name="fix-findings" from-mode="prompting">
+Got the context for finding #1, holding as instructed — no edits until your explicit "go ahead".
+
+My understanding of the finding: TestRunAgentList_ExternalFlagListsAvailablePlugin's "default path doesn't scan $PATH" assertion is illusory because absence-from-output is guaranteed by the IsExternal filter (agent_group.go:97), not by the absence of a scan. A reintroduced unconditional DiscoverAndRegisterAlways on the default path would still pass. Suggested fix: make the mock #!/bin/sh script append to an $ENTIRE_TEST_EXEC_LOG, then assert the log is empty after the default call and non-empty after --external (author measured 0 vs 2 execs).
+
+One note for the discussion: the exec-log env var would need to be threaded through writeExternalAgentBinaryEx (shared by other tests), so I'll scope it carefully to avoid disturbing the installed/available tests. Ready when you are.
+</cross-session-message>
+
+---
+
+1. yes
+2. ok
+
+---
+
+<cross-session-message from="uds:/tmp/cc-socks/31069.sock" from-name="fix-findings" from-mode="prompting">
+Finding #1 done. Changes:
+
+1. cmd/entire/cli/setup_test.go — writeExternalAgentBinaryEx (shared by writeExternalAgentBinary): added one guarded line at the top of the generated #!/bin/sh mock, `[ -n "$ENTIRE_TEST_EXEC_LOG" ] && echo "$1" >> "$ENTIRE_TEST_EXEC_LOG"`, with a comment. No-op for existing tests since they never set the env var.
+
+2. cmd/entire/cli/agent_group_test.go — new test TestRunAgentList_DefaultPathDoesNotScanPath: writes an external plugin on $PATH, sets ENTIRE_TEST_EXEC_LOG to a tempfile, asserts the exec log is EMPTY after the default (externalOnly=false) call and NON-EMPTY after the --external call. Uses t.Cleanup(agent.SnapshotForTesting()) and t.Setenv per existing patterns. Added path/filepath import.
+
+3. cmd/entire/cli/agent_group_test.go — tightened the doc comment on the existing TestRunAgentList_ExternalFlagListsAvailablePlugin to state its default-absence check is filter-driven and that the new test owns the no-scan guarantee. Left its assertions untouched.
+
+No production code changed; no new $PATH scan on the default path.
+
+Verification:
+- mise run fmt applied; golangci-lint 2.11.3 — 0 issues on agent_group_test.go + setup_test.go.
+- go test ./cmd/entire/cli/ -run TestRunAgentList — all pass incl. the new test (default=0 execs, --external non-empty).
+- Full package go test ./cmd/entire/cli/ -count=1 — ok (48s), so the shared-helper change didn't disturb the installed/available/setup tests.
+
+Not committed/pushed yet — let me know if you want me to ship it. Ready for you to verify and resolve #1.
+</cross-session-message>
+
+---
+
+Let's talk about the funtionality at highlevel. We are making this over complex... It should be quite simple implement this thing... entire agent list should list built in agents and mark those are installed, that's it. and for those external ones, knowing that exec on them is quite costly, let's reduce to 0 if possible any call to them. Knowing this:
+- I want to see what external agents are available and which of those are already installed. 
+
+Would it be simpler to display built-in and external agents when using --external ? in terms of the logic we have around like, displaying hint to install any if non is installed?
+
+---
+
+is there any way to easy check if any agent is installed?
+
+---
+
+lets do a on the other sessions while we speak a bit more about persisting installed agents
+
+---
+
+<cross-session-message from="uds:/tmp/cc-socks/31069.sock" from-name="fix-findings" from-mode="prompting">
+Superset refactor done (edited forward, not reverted). Not committed. Diff summary:
+
+agent_group.go — runAgentList:
+- Filter: `external.IsExternal(ag) != externalOnly` → `!externalOnly && external.IsExternal(ag)` (skip externals only on default; --external includes everything).
+- Header: plain "Agents:" in both modes; dropped "External agents:".
+- Dropped the `listed` counter and the "No external agent plugins found on your PATH." branch.
+- Empty-state (`if !hasSomeInstalled`): default → "No built-in agents installed. Use 'entire agent add <name>' ...", --external → "No agents installed. Use 'entire agent add <name>' ...".
+- Footer: default only → "Run 'entire agent list --external' to also list external plugins on your PATH." No footer under --external.
+- Discovery unchanged: still `if externalOnly { external.DiscoverAndRegisterAlways(ctx) }` — 0-scan default guarantee intact.
+
+agent_group_test.go:
+- Kept TestRunAgentList_DefaultPathDoesNotScanPath (exec-log guard) unchanged — still passes.
+- Kept ExternalFlagListsAvailablePlugin / ...MarksInstalled — still pass under superset.
+- Removed the three a418c8e2c wording tests (ExternalHeaderAndReciprocalFooter, ExternalEmptyStateNonePlugins, ExternalEmptyStateNoneInstalled).
+- Added TestRunAgentList_ExternalIsSuperset: under --external, output contains BOTH the external plugin and a built-in (agent.StringList()[0]).
+- Added TestRunAgentList_EmptyStateWording: fresh repo, default empty-state says "No built-in agents installed."; --external says "No agents installed." (and not the built-in-scoped wording).
+
+setup_test.go: exec-log line from #1 retained (still used by the no-scan guard).
+
+Verification: mise run fmt applied; golangci-lint 2.11.3 → 0 issues; go test ./cmd/entire/cli/ -run TestRunAgentList all pass; full package go test -count=1 → ok (48s). Diffstat: agent_group.go +? -?, net 34-line block; test files updated. Ready for your review — holding on commit.
+</cross-session-message>

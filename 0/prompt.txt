@@ -1,0 +1,399 @@
+Can you review https://entire.io/gh/entireio/cli/trails/1034
+
+---
+
+can you push the review findings to the trail
+
+---
+
+can you explain to me the general impact of this, why did we had the contexts before, why could you argue they are not needed and why not
+
+---
+
+ok, let's do an alternative approach fresh of main that drops auto-selection and keep holding multiple login
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>a529338c855de7cb5</task-id>
+<tool-use-id>toolu_01FRMCvviyQbES7tq1jgEtEz</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-quiet-field-0c15/60622398-2550-4a6f-b585-4bc7aeb7c9b4/tasks/a529338c855de7cb5.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review of login-selection diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Verified against the live code, with escape analysis and a benchmark. Here is the result.
+
+## Verdict: no efficiency regressions. The diff makes the hot path strictly cheaper.
+
+The premise in the task brief is inverted: `eligibleContexts` is **not** newly eager — it was *previously* unconditional and is now error-path-only.
+
+### The one material change (an improvement, not a finding)
+
+`internal/entireclient/clusterdiscovery/resolve.go:235-245` — `selectContext` success path is now allocation-free and O(len(coreURLs)) instead of allocating and O(len(coreURLs) × len(contexts)).
+
+Old code (`git show HEAD:.../resolve.go`) computed `eligible := eligibleContexts(f, coreURLs)` on line 1 of the function, *before* the active-context check, then linear-scanned that slice to see whether the active context was in it. New code early-returns on `f.Find` + `contextEligible`, and `eligibleContexts` is only evaluated as an argument on line 244, which is reached only after the success path has already returned.
+
+Benchmarked (replica of both bodies, Apple M4 Max, go1.26.5), success path only:
+
+| contexts | old | new |
+| --- | --- | --- |
+| 1 | 42.5 ns, 16 B, 2 allocs | 6.5 ns, 0 B, 0 allocs |
+| 3 | 83.4 ns, 48 B, 2 allocs | 6.5 ns, 0 B, 0 allocs |
+
+New cost is flat in the number of saved logins; old grew with it. The 2 saved allocs are the `out` slices in `ContextsForIssuer` and `eligibleContexts` (the `seen` map does not escape, per `-gcflags=-m`). On the `git-remote-entire` path this is per `git fetch`/`git push`, so the absolute win is noise against the network round trip — but it is a win, and it removes the only allocation in the function apart from the pre-existing `debugf` variadic spill.
+
+### Each item you asked me to check, disposed of
+
+- **`eligibleContexts` eager on the success path?** No. `resolve.go:244` is unreachable from the success path. On the error path it is eagerly evaluated as an argument, and `unusableActiveContextError` uses it only for `len(eligible) &gt; 0` in two of three branches — but you cannot answer that predicate without the scan, and the branch that is true needs the names. So there is no wasted work to remove, and it is a terminal error path regardless.
+
+- **`contextEligible`'s closure:** allocation-free, confirmed not by reasoning but by the compiler: `-gcflags='-m -m'` reports `inlining call to slices.ContainsFunc`, `inlining call to slices.IndexFunc`, `inlining call to contextEligible.func1` at `resolve.go:256`. No "func literal escapes to heap" line. The closure is compiled out entirely; the benchmark's 0 allocs/op corroborates it. Nothing to optimize.
+
+- **`trustedLoginServers` map+slice:** confirmed error-path-only. Its sole caller is `renderLoginInstruction` (`discovery.go:176`), whose only callers are `renderLoginHint` (`discovery.go:164`) and `unusableActiveContextError` (`resolve.go:301`) — both only on `selectContext`'s error return. Cost is irrelevant; do not touch it.
+
+- **Repeated `strings.TrimRight` of the same value:** yes, three places — `current.CoreURL` is trimmed in both `contextEligible` (:252) and `describeActiveContext` (:314); each `coreURL` is trimmed in both `contextEligible` (:257) and `trustedLoginServers` (:191). All of these co-occur only on error paths, and `TrimRight`/`TrimSpace` return substrings of the input with zero allocation. Immaterial — hoisting would add a parameter for no measurable gain.
+
+- **Long-lived closures capturing a large scope:** none added. The only closure in the diff is the inlined-away `ContainsFunc` predicate, which does not outlive its call. `resolveClusterAuth`'s `debugf = func(string, ...any) {}` no-op is untouched by the diff.
+
+- **New blocking work at startup or on a hot path:** none. No new I/O, network calls, `init()`, or package-level vars. `cmd/entire/cli/auth/control_plane.go`, `cmd/entire/cli/auth/data_api.go`, `cmd/git-remote-entire/main.go`, and `internal/entireclient/clusterdiscovery/api_discovery.go` are **comment-only** (verified: zero non-comment changed lines in each). All executable change is confined to `resolve.go` and `discovery.go`.
+
+- **`sort.Strings` → `slices.Sort` (`resolve.go:327`):** zero perf delta — `sort.Strings` in go1.26 is literally `func Strings(x []string) { slices.Sort(x) }`. Pure idiom cleanup, and on an error path anyway.
+
+Nothing to fix. If you want a nit for the record: `contextEligible` is 137 cost units and so not inlinable (budget 80), which is why the success path is 6.5 ns rather than ~3 ns. That is not worth restructuring for on a path gated by a network fetch.</result>
+<usage><subagent_tokens>103807</subagent_tokens><tool_uses>15</tool_uses><duration_ms>170512</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aa14e715e10e45f75</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-quiet-field-0c15/60622398-2550-4a6f-b585-4bc7aeb7c9b4/tasks/aa14e715e10e45f75.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review of login-selection diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have everything I need. Here are the verified findings.
+
+## Finding 1 (real) — `contextEligible` is the third copy of the trailing-slash-insensitive issuer comparison
+
+**File:** `/Users/soph/.herdr/worktrees/cli/worktree-quiet-field-0c15/internal/entireclient/clusterdiscovery/resolve.go`
+**Line:** 251 (`contextEligible`), with a second copy of the same primitive at line 314 (`describeActiveContext`) and a third at `discovery.go:191` (`trustedLoginServers`)
+
+**Summary:** New `contextEligible` re-implements the core-URL comparison that `contexts.trimURL` / `(*File).ContextsForIssuer` already owns — and that `coreTrusted` in `cmd/git-remote-entire/main.go:438` already copies verbatim.
+
+**What is duplicated.** `coreTrusted` (main.go:438-445) and `contextEligible` (resolve.go:251-259) are the same function modulo the parameter type and one guard:
+
+```go
+// cmd/git-remote-entire/main.go:438
+want := strings.TrimRight(coreURL, "/")
+for _, t := range trusted { if strings.TrimRight(t, "/") == want { return true } }
+
+// resolve.go:251 (new)
+want := strings.TrimRight(c.CoreURL, "/")
+return slices.ContainsFunc(coreURLs, func(coreURL string) bool { return strings.TrimRight(coreURL, "/") == want })
+```
+
+Both carry a doc comment naming the other implementations ("to match how core URLs are compared everywhere else (contexts.ContextsForIssuer, auth.sameIssuer)") — the comment is the tell that the semantics are meant to be shared but aren't. There are now four hand-rolled sites for one rule: `contexts.trimURL` (contexts.go:120), `auth.sameIssuer` (cmd/entire/cli/auth/contexts.go:168), `coreTrusted`, `contextEligible`. At ~8 lines each they sit well under `dupl`'s 75-token threshold, so CI will never flag the drift.
+
+**Concrete cost, inside one function.** `selectContext` (resolve.go:235) now answers "is this context eligible?" through *two different implementations*: `contextEligible` for the accept decision, and `eligibleContexts` → `f.ContextsForIssuer` (i.e. `contexts.trimURL`) for the list of candidates offered in the error. They already disagree on one input: `contextEligible` bails on an empty `CoreURL`, `ContextsForIssuer` does not (`trimURL("") == trimURL("")` matches). So for a context with a blank `CoreURL` against `coreURLs = [""]` — exactly the case the new `TestResolve_ContextWithoutCoreURLIsNeverEligible` covers — the accept path says "not eligible" while the offer path lists that same context, producing: *"…does not accept your active login "blank". These saved logins can authenticate it: blank. Switch with `entire auth use &lt;context&gt;`"* — telling the user to switch to the context they are already on. The new test only asserts `require.Error`, so it passes. Any future change to `trimURL` (lowercasing a host, trimming whitespace) widens that gap silently.
+
+**Exact helper to use instead.** `contexts.trimURL` is the owner but is unexported. Export one comparison from `internal/entireclient/contexts` — e.g. `func SameIssuer(a, b string) bool { return trimURL(a) == trimURL(b) }` — and call it from `contextEligible`:
+
+```go
+return slices.ContainsFunc(coreURLs, func(u string) bool { return contexts.SameIssuer(u, c.CoreURL) })
+```
+
+Reachability verified: `clusterdiscovery` already imports `contexts` (resolve.go:11, api_discovery.go:9), so this is a no-new-edge change. `cmd/git-remote-entire` already imports `clusterdiscovery` (main.go:40), so `coreTrusted` can be deleted in favour of the same helper (or of an exported `clusterdiscovery.CoreTrusted`), and `auth.sameIssuer` can become a call to it too.
+
+**Alternative that removes the helper entirely** (and the two-implementations hazard): drop `contextEligible` and test membership in `eligibleContexts(f, coreURLs)`, which `selectContext` computes on every failure path anyway — this is what the pre-diff code did. The blank-`CoreURL` guard then belongs in `eligibleContexts` (or `ContextsForIssuer`), where it also fixes the offer list rather than only the accept path.
+
+**Same primitive, same fix, line 314:** `describeActiveContext` opens with a fourth `strings.TrimRight(current.CoreURL, "/")`. It should use the exported comparison's normalizer (`contexts.TrimURL` if you export the trim rather than the predicate). Note `auth.contextReauthError` (cmd/entire/cli/auth/refresh.go:159-170) already renders the identical `%q (%s)` name-plus-trimmed-core clause for a context, but it is **not** reachable — `auth` imports `clusterdiscovery` (control_plane.go:11, data_api.go:12) — so that one is a convention to match, not a helper to call.
+
+## Candidates checked and ruled out (verified, not assumed)
+
+- **`auth.sameIssuer` as the shared home** — not viable. Unexported, and `cmd/entire/cli/auth` imports `clusterdiscovery`, so the edge would be a cycle. Same for `coreTrusted`: `cmd/git-remote-entire` is `package main` and can never be imported. `contexts` is the only reachable home.
+- **Order-preserving `[]string` dedupe in `trustedLoginServers` (discovery.go:187)** — clean, no existing helper to call. `uniqueStrings` (cmd/entire/cli/experts_cmd.go:589) is structurally identical but **unexported**, and `package cli` transitively depends on `clusterdiscovery` (`go list -deps ./cmd/entire/cli` confirms), so it is doubly unreachable. `dedupeStrings` (cmd/entire/cli/review/picker.go:1333) is also unexported. `cmd/entire/cli/stringutil` contains only `CollapseWhitespace` / `TruncateRunes` / `CapitalizeFirst` — no dedupe. There is no `internal/` slices-or-strings util package (`internal/` = coreapi, entireclient, procsignal, remotehelper, testdirs). One reverse-direction opportunity worth taking while you are exporting things: `cmd/git-remote-entire/main.go:425` joins `cluster.CoreURLs` raw (untrimmed, undeduped) in the ENTIRE_TOKEN error, so exporting `trustedLoginServers` would make the two "servers this resource trusts" messages consistent.
+- **`api.NormalizeOriginURL` (cmd/entire/cli/api/base_url.go:105) for core-URL comparison** — exported, but **not equivalent**: it drops path/query/fragment, so two distinct issuers differing only by path (`https://core.example.com/auth`) would compare equal. It exists for token-audience parity with auth-go's tokenmanager. Correctly not used here.
+- **Sorting/joining names for a user message (`contextNames`, resolve.go:322)** — no reachable helper exists; the repo does this inline everywhere (remote_topology.go:78-82, checkpoint/remote/util.go:537-541) and nothing operates on `[]*contexts.Context`. This is a straight extraction of the deleted `ambiguousContextError`'s body, not a duplication.
+- **Multi-line user-facing message building** — no shared helper or convention beyond what the package already had. The diff's switch of `renderLoginHint` from `strings.Builder` to `fmt.Sprintf` leaves discovery.go internally consistent; `unusableActiveContextError`'s concatenated `Sprintf`s are a local style choice with nothing to reuse.
+
+Nothing else in the diff re-implements existing code on this axis.</result>
+<usage><subagent_tokens>134468</subagent_tokens><tool_uses>35</tool_uses><duration_ms>312357</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a4f18cef540425f2f</task-id>
+<tool-use-id>toolu_014BhAnUWtRdaxGGEBDaEv24</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-quiet-field-0c15/60622398-2550-4a6f-b585-4bc7aeb7c9b4/tasks/a4f18cef540425f2f.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review of login-selection diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Simplification review — `soph/explicit-login-selection`
+
+Seven findings, all verified against the code (plus three "checked and clean" notes at the end).
+
+---
+
+### 1. `internal/entireclient/clusterdiscovery/resolve.go:295-302` — the `errors.New(Sprintf + Sprintf + literal)` construction is unnecessary; a variable does the same job
+
+The two error branches interleave `fmt.Sprintf` calls with `+` and a bare literal, so the rendered message can't be read in one place. The comment (lines 289-292) says this shape exists to keep revive's `error-strings` rule from forcing the message onto one lowercase line.
+
+I verified with `golangci-lint` against this repo's config what actually fires:
+
+- `errors.New("ends with a period.")` / `fmt.Errorf("... .\n...")` → **flagged** (`error-strings`). So the rule is real.
+- `errors.New(fmt.Sprintf(...))` → **flagged**, but by a *different* rule: `errorf: should replace errors.New(fmt.Sprintf(...)) with fmt.Errorf(...)`. That is what the `+` concatenation is dodging.
+- `msg := fmt.Sprintf(&lt;one format string with \n and periods&gt;, ...); return errors.New(msg)` → **clean**. No revive, no staticcheck S1028, no perfsprint.
+
+Simpler form, one format string per branch:
+
+```go
+msg := fmt.Sprintf("%s does not accept your active login%s.\nThese saved logins can authenticate it: %s\nSwitch with `entire auth use &lt;context&gt;`, then re-run your command.",
+    subject, describeActiveContext(current), strings.Join(contextNames(eligible), ", "))
+return errors.New(msg)
+```
+
+Cost of leaving it: a novel idiom — `grep` shows `errors.New(fmt.Sprintf` appears **nowhere else in the repo** except these two new lines. The neighbouring `renderLoginHint` (discovery.go:164) already uses the single-`Sprintf`-plus-`\n` shape, so the diff invents a second convention two files apart. The 4-line comment defending the shape can go too.
+
+---
+
+### 2. `resolve.go:306-318` — `describeActiveContext`'s nil branch doesn't serve the case its comment claims, and silently produces a false sentence in the case it does serve
+
+The comment says the `""` return exists "so one message template covers both the wrong-federation and no-active-context cases." That is not what happens: the no-active-context case is branch 3 (`resolve.go:303`), which calls `renderLoginHint` and never touches `describeActiveContext`.
+
+`describeActiveContext(nil)` is reachable by exactly one path — branch 1 (`len(eligible) &gt; 0`) with a **dangling** `current_context`, which `TestResolve_DanglingCurrentContextIsNotAnIdentity` (resolve_test.go:163) exercises. It renders:
+
+```
+cluster aws-eu-central-1.entire.io does not accept your active login.
+These saved logins can authenticate it: prod-eu
+Switch with `entire auth use &lt;context&gt;`, then re-run your command.
+```
+
+There is no active login in that state. `TestResolve_NoActiveContextReturnsLoginHint:157` explicitly asserts `NotContains "does not accept your active login"` when there is no active login — so the diff already treats that phrasing as wrong, then emits it anyway via the leading-space trick. The dangling test only asserts `"prod-eu"` and `"entire auth use"`, so it never sees the first line.
+
+So the clever clause buys nothing: it doesn't collapse a template, it hides a wrong sentence behind a nil check. Simpler and correcter — branch on `current == nil` first, then interpolate `current.Name`/`current.CoreURL` inline where `current` is known non-nil, and give the dangling/no-active case its own first line. That deletes the whole helper including its third (empty-`CoreURL`) branch, which only exists because the leading-space form has to also avoid a dangling `()`.
+
+The same conflation is baked into the new docs table (`docs/architecture/upstream-host-resolution.md:145-148`): the row "A saved login is eligible → names the active login" is wrong when `current_context` is dangling.
+
+---
+
+### 3. `resolve.go:261-276` — `eligibleContexts` is over-built for its new report-only role, and diverges from `contextEligible`
+
+It iterates `coreURLs × contexts` via `f.ContextsForIssuer` and needs a `seen` map only because the outer loop can visit the same context twice (duplicated / trailing-slash-variant core URLs). Flipping the loop makes duplicates structurally impossible:
+
+```go
+func eligibleContexts(f *contexts.File, coreURLs []string) []*contexts.Context {
+	var out []*contexts.Context
+	for _, c := range f.Contexts {
+		if contextEligible(c, coreURLs) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+```
+
+Six lines, no map, no nested loop, and — the real win — **one** eligibility predicate instead of two. Today `selectContext` answers "is this context eligible?" twice by different mechanisms: `contextEligible` (explicit `TrimRight`, with a blank-`CoreURL` guard) and `ContextsForIssuer` (its own `trimURL`, no guard).
+
+That divergence is already a latent bug: for a resource advertising `""` among its cores, `eligibleContexts` **lists** a `CoreURL: ""` context as a candidate the user should `auth use`, while `contextEligible` would reject it the moment they did. The error would offer a login that then fails. The rewrite closes it for free, and it's exactly the hazard `TestResolve_ContextWithoutCoreURLIsNeverEligible` was added to guard — the guard just isn't applied on the reporting side.
+
+Nil-safety check done: `contexts.Load` never returns `nil, nil` (`readNoLock` returns `&amp;File{}` for missing/empty files), and `selectContext:236` already dereferences `f`, so `ContextsForIssuer`'s nil tolerance is not load-bearing here. Order doesn't matter either — `contextNames` sorts.
+
+---
+
+### 4. `internal/entireclient/clusterdiscovery/discovery.go:148-165` — `renderLoginHint` is now a one-caller two-line wrapper carrying a 15-line comment, in a different file from its caller
+
+After the split, one 3-line message takes three functions across two files: `renderLoginHint` → `renderLoginInstruction` → `trustedLoginServers`, with the sole caller at `resolve.go:303`. `renderLoginHint`'s entire body is now `fmt.Sprintf("no auth context for %s.\n%s", subject, renderLoginInstruction(coreURLs))`.
+
+Simpler: inline that one `Sprintf` at `resolve.go:303` and delete `renderLoginHint`, keeping `renderLoginInstruction` + `trustedLoginServers` (which do carry real logic and are genuinely shared by two branches). That also removes the need for the split-justification prose, which is currently stated twice in adjacent comments — discovery.go:160-162 ("The instruction half is shared with … which supplies its own first line") and discovery.go:169-170 ("Split out so callers that have already explained the situation in their own words…") say the same thing.
+
+If you'd rather keep the wrapper, the fix is at least to move it next to its caller so the message isn't split across files.
+
+---
+
+### 5. `resolve.go:251-259` — `contextEligible` is a fourth copy of the trailing-slash-insensitive core compare, and byte-for-byte the third body
+
+It duplicates `coreTrusted` at `cmd/git-remote-entire/main.go:438-446` — same body, and the same doc sentence ("comparing on trailing-slash-insensitive equality to match how core URLs are compared … `contexts.ContextsForIssuer`, `auth.sameIssuer`"). `contextEligible(c, coreURLs)` is literally `c.CoreURL != "" &amp;&amp; coreTrusted(c.CoreURL, coreURLs)`.
+
+`cmd/git-remote-entire/main.go:40` already imports `clusterdiscovery`. Exporting one predicate here (e.g. `clusterdiscovery.CoreTrusted`) lets `coreTrusted` and its table test be deleted, leaving `contextEligible` as the thin blank-guard wrapper. Under the threshold each copy is too small for `dupl` to catch — this one only shows up by reading.
+
+---
+
+### 6. Rationale prose is duplicated between code and the architecture doc it points at
+
+`resolve.go:36-43` and `docs/architecture/upstream-host-resolution.md:130-136` are near-verbatim the same paragraph ("Two implicit tiers used to sit under/underneath — 'the sole eligible context' … a predictable error beats a convenient guess"). Two copies of the same eight-line argument will drift, and the diff itself adds the doc section, so the code comment is now redundant with a document one line away.
+
+Separately, the "bare `entire login` re-authenticates against the default server and reproduces the same failure" point is stated **four** times in this diff: `discovery.go:153-158`, `resolve.go:285-288`, `docs md:151-153`, `resolve_test.go:113-117`.
+
+Simpler: keep the full rationale in the architecture doc; replace `resolve.go:36-43` with a one-line pointer ("no implicit selection — see docs/architecture/upstream-host-resolution.md#account-selection"), and keep the `entire login` point in exactly one code location (`renderLoginInstruction`, where the behaviour lives).
+
+This repo does favour thorough "why" comments, so I'm flagging only these two — the per-entry-point comments in `control_plane.go`, `data_api.go`, and `git-remote-entire/main.go` each tell a caller-specific story and read as earning their place.
+
+---
+
+### 7. `internal/entireclient/clusterdiscovery/api_discovery.go:92-94` — edit artifact leaves a dangling participial clause
+
+```
+// There is no implicit selection — sourcing the trusted issuers from
+// /.well-known/entire-api.json (…) instead of entire-cluster.json.
+```
+
+"sourcing …" used to hang off the removed selection-rule sentence ("…else an explicit-choice / login error — sourcing the trusted issuers from…"). Attached to "There is no implicit selection" it no longer parses. Fix: end the sentence after "no implicit selection." and start "It sources the trusted issuers from …".
+
+---
+
+### Checked and clean
+
+- **`dupl`**: the new tests do **not** trip it. At the CI threshold (75) the only hits in this package are pre-existing blocks inside `TestDiscoverAPI` (`api_discovery_test.go:59/70` and `91/126`), untouched by the diff. At the advisory threshold 50, `resolve_test.go:69-75` and `98-105` pair with `api_discovery_test.go` setup blocks — but I diffed those against `HEAD` and they are unchanged context lines; the diff only rewrote the assertions below them. No action. (Aside for the caller: `dupl` is **not** in `.golangci.yaml`'s `enable:` list, so `mise run lint` never runs it — only `mise run dup`/`dup:staged` do. CLAUDE.md's "Normal lint includes dupl at threshold 75" is stale, independent of this diff.)
+- **`sort` → `slices` migration**: clean. `sort` import removed, `slices` used by both `ContainsFunc` and `Sort`; `ambiguousContextError` is fully deleted with no orphaned references.
+- **Dead / test-only code**: none. Every new helper has a production caller (`trustedLoginServers` ← `renderLoginInstruction`; `contextNames` ← branch 1). One triviality: `TestTrustedLoginServers` was added to `resolve_test.go` although `trustedLoginServers` lives in `discovery.go`, which has its own `discovery_test.go`.</result>
+<usage><subagent_tokens>142953</subagent_tokens><tool_uses>30</tool_uses><duration_ms>385800</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a9b811760ad5856dc</task-id>
+<tool-use-id>toolu_019YXQHwqK5e5qcpo3mwTuSP</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-quiet-field-0c15/60622398-2550-4a6f-b585-4bc7aeb7c9b4/tasks/a9b811760ad5856dc.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review of login-selection diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Verdict
+
+**The behavior change itself is at the right altitude.** The tier removal is a single edit inside the one shared function (`selectContext`), and all four consumers inherit it with no per-caller special case, flag, or opt-out. Nothing was bandaided on top of shared infrastructure. Every finding below is in the *peripheral* additions the change brought with it.
+
+---
+
+### A. The diff added a 4th implementation of the issuer-comparison primitive, immediately adjacent to the canonical one it already calls
+
+`internal/entireclient/clusterdiscovery/resolve.go:251` (`contextEligible`)
+
+Pre-diff, `selectContext` tested eligibility by delegating to `contexts.ContextsForIssuer` (which owns `trimURL`) and matching by `Name`. The diff replaced that with a locally re-implemented trailing-slash comparison. The repo now has four matchers and two normalizers for "does this core URL match this issuer":
+
+| site | note |
+| --- | --- |
+| `internal/entireclient/contexts/contexts.go:106`/`:120` `ContextsForIssuer`/`trimURL` | canonical — the package that owns `CoreURL` |
+| `cmd/entire/cli/auth/contexts.go:168` `sameIssuer` | pre-existing |
+| `cmd/git-remote-entire/main.go:438` `coreTrusted(url, []string)` | pre-existing; *exactly* the shape `contextEligible` needs |
+| `internal/entireclient/clusterdiscovery/resolve.go:251` `contextEligible` | **new in this diff** |
+| `internal/entireclient/clusterdiscovery/discovery.go:187` `trustedLoginServers` | **new in this diff** (normalizer) |
+
+The comments are the tell. `resolve.go:249` and `main.go:437` each say *"matching how core URLs are compared everywhere else (contexts.ContextsForIssuer, auth.sameIssuer)"*. A comment that has to cross-reference two sibling implementations is the code asking for the abstraction.
+
+**Concrete cost — verified by running the code, not inferred.** `contextEligible` adds a blank-`CoreURL` guard that `ContextsForIssuer` does not have, so the accept-gate and the candidate-list now disagree:
+
+```
+cluster c.entire.io does not accept your active login "blank".
+These saved logins can authenticate it: blank
+Switch with `entire auth use &lt;context&gt;`, then re-run your command.
+```
+
+The message tells the user to switch to the context they are already on. The diff's own new test, `resolve_test.go:186` `TestResolve_ContextWithoutCoreURLIsNeverEligible`, feeds exactly this input (`[]string{""}`) and asserts only `require.Error` — so it passes over the self-contradictory output.
+
+Second verified divergence: `contextEligible` does not `TrimSpace`, `trustedLoginServers` does. A core advertised with padding yields:
+
+```
+cluster c.entire.io does not accept your active login "eu" (https://eu.auth.entire.io), and no other saved login does either.
+It trusts these login servers: https://eu.auth.entire.io
+```
+
+**Deeper fix:** one primitive on `contexts` — `func (c *Context) IssuedBy(coreURL string) bool` plus `TrustedBy([]string) bool`, with the blank guard and the whitespace rule *inside*. Then `ContextsForIssuer`, `coreTrusted`, `sameIssuer`, and `contextEligible` all route through it. This is the generalize-the-mechanism move and it deletes three functions rather than adding one.
+
+### B. `selectContext` no longer selects; the name and the doc comment now fight each other
+
+`resolve.go:235`. The function returns `f.Find(f.CurrentContext)` or an error. It selects nothing. Its doc comment (`:222-234`) spends 13 lines explaining that it does not select. Same shape at `eligibleContexts` (`:261`), whose doc has to say *"Only ever reported to the user — never used to pick a context, so no element of it is a silent winner"* — a comment compensating for a name.
+
+**Cost:** 2 production call sites (`resolve.go:102`, `api_discovery.go:118`), 1 test (`resolve_test.go:192`), 3 doc cross-references (`resolve.go:33`, `data_api.go:60`, `control_plane_test.go:100`). Cheap today; the cost is that every future reader hunting "how does the CLI pick an identity?" opens a policy engine and finds a validator.
+
+**Fix:** `requireActiveContext` / `activeContextFor(subject, coreURLs)`; `eligibleContexts` → `candidateLogins`. Most of both doc comments then become unnecessary.
+
+### C. Rationale on a consumer rather than the mechanism — real, but milder than the brief assumes
+
+`resolve.go:36-43` holds the "why the tiers were removed" paragraph; `selectContext:230` defers to it.
+
+Correcting the premise: `auth.ResolveControlPlaneTargetForCluster` calls `resolveContextForCluster` → `clusterdiscovery.ResolveContextForCluster`, so it goes *through* the function that holds the rationale. `selectContext` has **two** direct consumers, not three (`ResolveContextForCluster` and `ResolveContextForAPI`), so the misdirection is one hop for the API path only.
+
+What remains is still worth fixing: `ResolveContextForCluster` carries 37 lines of comment (`:15-51`) on a 7-line delegating wrapper (`:52-58`); `ResolveContextForAPI` (`api_discovery.go:86-95`) restates the rule anyway despite opening with *"It mirrors ResolveContextForCluster"*; and `resolve.go:45-49` ("We never fall back to an active context whose core does NOT front the cluster") is now redundant with `:28-34`. **Fix:** rule + rationale once on `selectContext`; each entry point states its contract in one sentence.
+
+### D. The rationale paragraph is duplicated verbatim into the doc — and drifted inside this single commit
+
+`resolve.go:36-43` vs `docs/architecture/upstream-host-resolution.md:131-139`. Same paragraph, already diverged: *"used to sit under the active context"* / *"used to sit underneath"*; *"whose credentials is this **operating** under?"* / *"whose credentials is this **running** under?"*. A third partial copy sits at `data_api.go:54-58`.
+
+Compounding it: **the doc is an orphan.** `grep -rl upstream-host-resolution` (excluding `.git`/`.entire`) returns nothing — it is referenced from no `CLAUDE.md` entry, no Go comment, and no other doc. So the duplicated copy is the one nobody opens when they change `selectContext`. The new table at `md:145-149` also transcribes `unusableActiveContextError`'s three branches row-by-row with nothing tying them.
+
+**Fix:** the topical home is right, but make the two copies findable together — a `// See docs/architecture/upstream-host-resolution.md` on `selectContext` and a pointer from `CLAUDE.md` — and let the doc carry the invariant + "why" while the code carries the mechanism, rather than both carrying both.
+
+### E. Three distinguishable remediation states modeled as prose rather than as a value
+
+`resolve.go:293-304`. `unusableActiveContextError` returns an opaque `errors.New` for three states with three different remedies, so the only way to assert on the state is to assert on the wording. `clusterdiscovery`'s tests now carry **24** `err.Error()` assertions (up from ~5), including four *negative* ones encoding "must NOT mention `entire login`" / "must NOT mention `entire auth use`" (`resolve_test.go:85`, `:138`, `:141`, `:157`).
+
+**On convention, explicitly:** operator prose living in this low-level package **follows** local convention, and the convention is documented as deliberate — `formatDiscoveryError`'s own comment (`resolve.go:331-334`) says it is *"Kept here (not on the sentinels themselves) so the package's errors stay machine-readable while the caller-facing strings remain centralised."* So I am **not** asking for the prose to move to `cmd/entire/cli`.
+
+But the diff breaks the *second half* of that same documented convention: these errors are not machine-readable. The package exposes `ErrDiscoveryUnavailable`, `ErrUnreachable`, `ErrNoIssuers`, `ErrNoCoreURLs` for branchable states; the removed `ambiguousContextError` had the same gap, so this is not a regression — but the diff triples the number of states hidden behind one string. **Fix:** keep the prose here, add the seam — three sentinels, or one error type with a `Kind` plus `Eligible`/`Servers` fields whose `Error()` renders today's text. Tests assert kind; wording becomes free.
+
+### F. Shape inconsistency introduced within the diff, and one verified stale comment it caused
+
+**F1** — `renderLoginHint`/`renderLoginInstruction` (`discovery.go:163`, `:175`) return **strings**, and callers wrap with `errors.New`. That is the established local shape. `unusableActiveContextError` (`resolve.go:293`) returns **error** and inlines `errors.New(fmt.Sprintf(...) + ...)`, which forced the five-line lint apology at `resolve.go:289-292`. Making it `renderUnusableActiveContext(...) string` next to `renderLoginHint`, with the single `errors.New` at `selectContext:244`, eliminates the `errors.New(fmt.Sprintf(…))` shape, deletes the apology, and puts all operator prose in one file instead of split across `discovery.go` and `resolve.go`. (Lint is currently clean — verified with `staticcheck`+`perfsprint` — because S1028 only fires on a lone `Sprintf`.)
+
+**F2, the strongest evidence for the altitude thesis** — `cmd/entire/cli/auth/cell_data_api.go:216-218` justifies `--jurisdiction` bypassing discovery with:
+
+&gt; *"Discovery keys off api.BaseURL() and would pick whichever context that host trusts, silently ignoring the selection."*
+
+That is now false and inverted. `resolveStoredCellSubject` → `resolveContextForCellAPI` (`:61`) → `clusterdiscovery.ResolveContextForAPI` → `selectContext`, which now *honors* the selection and merely validates it. The diff edited comments in six files to restate the policy and missed this one — precisely because no single place owned it. Cell routing is also the **undocumented fourth consumer**: `CLAUDE.md:613-641` puts activity/recap/experts on this path, yet it appears in neither the new doc's list (*"git clusters, the data API, and cluster-addressed control-plane commands"*) nor any of the code comments.
+
+### G. Doc placement defect
+
+`docs/architecture/upstream-host-resolution.md:122`. Heading structure verified: `17 ## The pieces`, `30 ## Resolution per call type`, `32 ### Git cluster`, `40 ### Control plane`, `57 Key files`, `61 ### Web/data API`, `122 ## Account selection`, `155 Key files`. The new H2 lands *between* the Web/data API body (61-121) and that subsection's `Key files:` list (155-166), so the data-API key files now read as belonging to Account selection. **Fix:** place the new H2 after that Key files block, and have it name `clusterdiscovery.selectContext` and the cell path.
+
+### H. `CLAUDE.md` did not need updating — verified
+
+`CLAUDE.md:589-611` ("Control-Plane Core Resolution") documents `coreapi` precedence and `ENTIRE_TOKEN`, not account selection; `:613-641` ("Entire-API Cell Routing") documents cell *routing*, not identity choice. Neither is made stale by this diff, so no update was required. The gap worth naming — given D and F2 — is that `CLAUDE.md` has no pointer to `upstream-host-resolution.md` at all, which is why that doc is an orphan.
+
+---
+
+### Worth crediting
+
+`renderLoginHint`'s dead `_ []string` parameter and its *"We'll display coreURLs to the user as a hint at a later stage"* TODO are now genuinely used (`discovery.go:163`, `:175`). That is a real cleanup made at the right depth — the display normalization is shared by both message shapes rather than being copied into each.</result>
+<usage><subagent_tokens>150521</subagent_tokens><tool_uses>33</tool_uses><duration_ms>476288</duration_ms></usage>
+</task-notification>
+
+---
+
+can you now run an adversarial review, maybe even on all three approaches (old, new PR , this work)
+
+---
+
+do it through a --context flag as that seems to be the most common pattern, or actually both maybe, env and flag
+
+---
+
+can you do meaningful commits and open a PR
+
+---
+
+can you give me a 2 sentence tl;dr wha#s different
+
+---
+
+how does logout work now?
+
+---
+
+how does logout work now? and what happens if I login while already loggedin
+
+---
+
+is there a way to list context
+
+---
+
+so in theory: for any user only using our product as it is today, they can't be multiple logins, right?
+
+---
+
+can you look at the PR comments

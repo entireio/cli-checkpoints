@@ -1,0 +1,513 @@
+see agent comments on pr and run /pr-review-toolkit:review-pr
+
+---
+
+see agent comments on pr and run /pr-review-toolkit:review-pr
+
+---
+
+<task-notification>
+<task-id>a74f03ecaf701fd49</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-pr-review/2b50cb54-f513-40e1-9acb-97fa1f3dd161/tasks/a74f03ecaf701fd49.output</output-file>
+<status>completed</status>
+<summary>Agent "Silent failure hunt PR 1987" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>All context gathered. Here is the audit.
+
+---
+
+# Silent-failure audit: PR #1987 (fix/gated-push-checkpoint-sync-hint)
+
+Scope reviewed: `cmd/entire/cli/strategy/checkpoint_sync_remote.go` (`hintGatedCheckpointSync`), its call site in `cmd/entire/cli/strategy/manual_commit_push.go:85`, and the harness change in `cmd/entire/cli/integration_test/testenv.go`.
+
+Structural context that frames every verdict: the hint only runs after `checkpointSyncAllowedForRemote` (checkpoint_sync_remote.go:95-112) has already returned false **and already logged** — `logging.Warn` for a resolution failure (:101), `logging.Debug` with both remote names for the normal mismatch (:106). So `.entire/logs` always carries a record that the gate fired before the hint is even consulted. The question is only whether the hint's own suppression is traceable.
+
+## Findings, ranked
+
+### 1. MEDIUM-HIGH — `CountUnpushedCheckpoints` error is swallowed with zero trace
+`cmd/entire/cli/strategy/checkpoint_sync_remote.go:133-135`
+
+```go
+count, err := CountUnpushedCheckpoints(ctx, syncRemote.Name)
+if err != nil || count == 0 {
+    return
+}
+```
+
+This is the one silence in the function that no other code path covers. The `count == 0` half is correct silence (nothing to say). The `err != nil` half is not: `CountUnpushedCheckpoints` (unpushed_checkpoints.go:21) has real, persistent failure modes — on the git-refs backend it can fail at `OpenRepository`, `PushQueueForRepo`, or `queue.Peek()` (a corrupt/locked push queue fails on *every* push); on the git-branch backend `git rev-list` can fail. Hidden error types include repo-open failures (reftable/alternates edge cases), queue-file corruption, and rev-list errors from a broken ref.
+
+User impact: if counting fails persistently, the hint never fires, and the exact symptom this PR exists to fix — checkpoints stranding locally with no signal — reappears. Worse, it reappears *undiagnosably*: the gate's Debug line says "sync skipped" (expected, benign-looking), and nothing anywhere records that the hint was attempted and suppressed by an error. A support engineer reading `.entire/logs` six months from now cannot distinguish "hint correctly silent, nothing waiting" from "hint broken, count failing" without reproducing locally. Notably, on the gated path `prePush` returns immediately (manual_commit_push.go:86), so none of the later repo-open warnings (:107) run either — the count failure has no proxy log.
+
+Verdict: **silence not justified.** Silence toward the *user* is right (never degrade a best-effort hint into push noise or a blocked push), but the error must reach `.entire/logs`. Recommend:
+
+```go
+count, err := CountUnpushedCheckpoints(ctx, syncRemote.Name)
+if err != nil {
+    logging.Debug(ctx, "gated checkpoint sync hint suppressed: cannot count unpushed checkpoints",
+        slog.String("sync_remote", syncRemote.Name),
+        slog.String("error", err.Error()))
+    return
+}
+if count == 0 {
+    return
+}
+```
+
+Debug matches the gate's severity for expected-skip paths; Warn is defensible since a failing count is abnormal, but Debug is the floor. This is a two-line, zero-risk change.
+
+### 2. LOW (justified, with a caveat) — `isConfiguredRemote` failure conflated with "URL push"
+`checkpoint_sync_remote.go:126-128`
+
+`isConfiguredRemote` (manual_commit_push.go:241-246) treats *any* `git remote get-url` failure — git binary broken, config unreadable, context cancelled — as "not a configured remote", so a transient git failure silences the hint for a genuinely configured remote, indistinguishably from the intended raw-URL case. However: (a) this is the helper's documented pre-existing contract, used identically at manual_commit_push.go:224; (b) if git subprocesses are failing, the enclosing `git push` is failing too, with far louder symptoms; (c) the gate's Debug line already recorded `push_remote`. Verdict: **justified** — no change required. If finding #1 is fixed, the log gap here becomes negligible.
+
+### 3. Justified — `ResolveCheckpointSyncRemote` error swallowed
+`checkpoint_sync_remote.go:129-131`
+
+The identical call just failed inside `checkpointSyncAllowedForRemote` microseconds earlier on the same code path and was logged at Warn with the wrapped specifics (:101-102). Logging again in the hint would be a duplicate entry for one event. The only theoretical gap is a race where the gate's call succeeds and the hint's re-read fails (settings file mutated between the two reads within one hook invocation) — negligible. Verdict: **silence justified.** (Optional hardening, not a defect: pass the gate's resolved `CheckpointSyncRemote` into the hint instead of re-resolving, which removes the double-read and this race entirely.)
+
+### 4. Justified — silence on `Source == SyncRemoteSourceConfig` and on `Name == ""`
+`checkpoint_sync_remote.go:130`
+
+The config-source suppression is a deliberate, documented, and integration-tested product decision ("a decision already made must not nag" — asserted by `TestCheckpointSyncRemote_ConfigOverride_RoutesToNamedRemote` passing `expectGatedHint: false`), and the gate's Debug log still records the skip with both remote names. The `Name == ""` arm is actually unreachable here — `isConfiguredRemote(pushRemote)` passing means at least one remote exists, so election always returns a name — a harmless defensive check, not a hidden failure. Verdict: **justified.**
+
+### 5. Justified — `Fprintf` return values ignored
+`checkpoint_sync_remote.go:137-142`
+
+Writes go to `stderrWriter` (`os.Stderr` in production, manual_commit_hooks.go:821), inside a git hook where stderr is relayed by git. If the write fails (EPIPE), there is no remaining channel to report on and nothing actionable. This matches every existing user-facing warning in the package (checkpoint_policy.go:60, refs_push_destination.go:114-116). Verdict: **justified.**
+
+### 6. Clean — testenv.go harness change
+`cmd/entire/cli/integration_test/testenv.go:1983-2015`
+
+No error path was lost: `runPrePush` still logs combined output via `T.Logf` on **all** paths (:2010) before returning, still wraps the exec error (:2012), and now also returns the output alongside the error (useful, not lossy). `RunPrePush` still `Fatalf`s through `RunPrePushWithError`; the new `RunPrePushOutput` correctly `Fatalf`s on error rather than returning partial output as if it were a clean run — the important trap, and it was avoided. `RunPrePushWithError` discards the output string, but callers doing error-path assertions still get it in the test log. Verdict: **no issues.**
+
+### 7. Observation (pre-existing, not this PR's defect) — the fail-closed misconfiguration remains user-silent at push time
+
+A typo'd `checkpoint_push_remote` disables checkpoint sync on *every* push with no stderr signal; the hint's comment claims the case "warns through the gate itself", but the gate's warning goes to `.entire/logs`, not the user. This is an accepted design: status.go:281-283 explicitly designates `entire status` as the user's signal for this case (`checkpointSyncInfo.Err`), and the resolver's error message is self-explanatory when found. Worth knowing when triaging "my checkpoints stopped syncing" reports; not a regression here.
+
+## Verdict summary
+
+| # | Location | Severity | Verdict |
+|---|----------|----------|---------|
+| 1 | checkpoint_sync_remote.go:133-135 (count error) | MEDIUM-HIGH | Add `logging.Debug` (Warn defensible); user-silence stays |
+| 2 | checkpoint_sync_remote.go:126 (isConfiguredRemote) | LOW | Justified; caveat noted |
+| 3 | checkpoint_sync_remote.go:129-131 (resolve error) | — | Justified (gate already logs Warn) |
+| 4 | checkpoint_sync_remote.go:130 (config source / empty name) | — | Justified (design decision; Debug-logged by gate) |
+| 5 | checkpoint_sync_remote.go:137-142 (Fprintf) | — | Justified |
+| 6 | testenv.go:1983-2015 | — | Clean |
+| 7 | Fail-closed config error, push-time silence | Info | Pre-existing accepted design (status.go is the signal) |
+
+The single change I would block on before merge is #1: without a Debug log on the count failure, this PR's own fix has an untraceable failure mode that regresses to the exact silent stall it was written to eliminate.</result>
+<usage><subagent_tokens>72808</subagent_tokens><tool_uses>9</tool_uses><duration_ms>140487</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a74f03ecaf701fd49</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-pr-review/2b50cb54-f513-40e1-9acb-97fa1f3dd161/tasks/a74f03ecaf701fd49.output</output-file>
+<status>completed</status>
+<summary>Agent "Silent failure hunt PR 1987" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>All context gathered. Here is the audit.
+
+---
+
+# Silent-failure audit: PR #1987 (fix/gated-push-checkpoint-sync-hint)
+
+Scope reviewed: `cmd/entire/cli/strategy/checkpoint_sync_remote.go` (`hintGatedCheckpointSync`), its call site in `cmd/entire/cli/strategy/manual_commit_push.go:85`, and the harness change in `cmd/entire/cli/integration_test/testenv.go`.
+
+Structural context that frames every verdict: the hint only runs after `checkpointSyncAllowedForRemote` (checkpoint_sync_remote.go:95-112) has already returned false **and already logged** — `logging.Warn` for a resolution failure (:101), `logging.Debug` with both remote names for the normal mismatch (:106). So `.entire/logs` always carries a record that the gate fired before the hint is even consulted. The question is only whether the hint's own suppression is traceable.
+
+## Findings, ranked
+
+### 1. MEDIUM-HIGH — `CountUnpushedCheckpoints` error is swallowed with zero trace
+`cmd/entire/cli/strategy/checkpoint_sync_remote.go:133-135`
+
+```go
+count, err := CountUnpushedCheckpoints(ctx, syncRemote.Name)
+if err != nil || count == 0 {
+    return
+}
+```
+
+This is the one silence in the function that no other code path covers. The `count == 0` half is correct silence (nothing to say). The `err != nil` half is not: `CountUnpushedCheckpoints` (unpushed_checkpoints.go:21) has real, persistent failure modes — on the git-refs backend it can fail at `OpenRepository`, `PushQueueForRepo`, or `queue.Peek()` (a corrupt/locked push queue fails on *every* push); on the git-branch backend `git rev-list` can fail. Hidden error types include repo-open failures (reftable/alternates edge cases), queue-file corruption, and rev-list errors from a broken ref.
+
+User impact: if counting fails persistently, the hint never fires, and the exact symptom this PR exists to fix — checkpoints stranding locally with no signal — reappears. Worse, it reappears *undiagnosably*: the gate's Debug line says "sync skipped" (expected, benign-looking), and nothing anywhere records that the hint was attempted and suppressed by an error. A support engineer reading `.entire/logs` six months from now cannot distinguish "hint correctly silent, nothing waiting" from "hint broken, count failing" without reproducing locally. Notably, on the gated path `prePush` returns immediately (manual_commit_push.go:86), so none of the later repo-open warnings (:107) run either — the count failure has no proxy log.
+
+Verdict: **silence not justified.** Silence toward the *user* is right (never degrade a best-effort hint into push noise or a blocked push), but the error must reach `.entire/logs`. Recommend:
+
+```go
+count, err := CountUnpushedCheckpoints(ctx, syncRemote.Name)
+if err != nil {
+    logging.Debug(ctx, "gated checkpoint sync hint suppressed: cannot count unpushed checkpoints",
+        slog.String("sync_remote", syncRemote.Name),
+        slog.String("error", err.Error()))
+    return
+}
+if count == 0 {
+    return
+}
+```
+
+Debug matches the gate's severity for expected-skip paths; Warn is defensible since a failing count is abnormal, but Debug is the floor. This is a two-line, zero-risk change.
+
+### 2. LOW (justified, with a caveat) — `isConfiguredRemote` failure conflated with "URL push"
+`checkpoint_sync_remote.go:126-128`
+
+`isConfiguredRemote` (manual_commit_push.go:241-246) treats *any* `git remote get-url` failure — git binary broken, config unreadable, context cancelled — as "not a configured remote", so a transient git failure silences the hint for a genuinely configured remote, indistinguishably from the intended raw-URL case. However: (a) this is the helper's documented pre-existing contract, used identically at manual_commit_push.go:224; (b) if git subprocesses are failing, the enclosing `git push` is failing too, with far louder symptoms; (c) the gate's Debug line already recorded `push_remote`. Verdict: **justified** — no change required. If finding #1 is fixed, the log gap here becomes negligible.
+
+### 3. Justified — `ResolveCheckpointSyncRemote` error swallowed
+`checkpoint_sync_remote.go:129-131`
+
+The identical call just failed inside `checkpointSyncAllowedForRemote` microseconds earlier on the same code path and was logged at Warn with the wrapped specifics (:101-102). Logging again in the hint would be a duplicate entry for one event. The only theoretical gap is a race where the gate's call succeeds and the hint's re-read fails (settings file mutated between the two reads within one hook invocation) — negligible. Verdict: **silence justified.** (Optional hardening, not a defect: pass the gate's resolved `CheckpointSyncRemote` into the hint instead of re-resolving, which removes the double-read and this race entirely.)
+
+### 4. Justified — silence on `Source == SyncRemoteSourceConfig` and on `Name == ""`
+`checkpoint_sync_remote.go:130`
+
+The config-source suppression is a deliberate, documented, and integration-tested product decision ("a decision already made must not nag" — asserted by `TestCheckpointSyncRemote_ConfigOverride_RoutesToNamedRemote` passing `expectGatedHint: false`), and the gate's Debug log still records the skip with both remote names. The `Name == ""` arm is actually unreachable here — `isConfiguredRemote(pushRemote)` passing means at least one remote exists, so election always returns a name — a harmless defensive check, not a hidden failure. Verdict: **justified.**
+
+### 5. Justified — `Fprintf` return values ignored
+`checkpoint_sync_remote.go:137-142`
+
+Writes go to `stderrWriter` (`os.Stderr` in production, manual_commit_hooks.go:821), inside a git hook where stderr is relayed by git. If the write fails (EPIPE), there is no remaining channel to report on and nothing actionable. This matches every existing user-facing warning in the package (checkpoint_policy.go:60, refs_push_destination.go:114-116). Verdict: **justified.**
+
+### 6. Clean — testenv.go harness change
+`cmd/entire/cli/integration_test/testenv.go:1983-2015`
+
+No error path was lost: `runPrePush` still logs combined output via `T.Logf` on **all** paths (:2010) before returning, still wraps the exec error (:2012), and now also returns the output alongside the error (useful, not lossy). `RunPrePush` still `Fatalf`s through `RunPrePushWithError`; the new `RunPrePushOutput` correctly `Fatalf`s on error rather than returning partial output as if it were a clean run — the important trap, and it was avoided. `RunPrePushWithError` discards the output string, but callers doing error-path assertions still get it in the test log. Verdict: **no issues.**
+
+### 7. Observation (pre-existing, not this PR's defect) — the fail-closed misconfiguration remains user-silent at push time
+
+A typo'd `checkpoint_push_remote` disables checkpoint sync on *every* push with no stderr signal; the hint's comment claims the case "warns through the gate itself", but the gate's warning goes to `.entire/logs`, not the user. This is an accepted design: status.go:281-283 explicitly designates `entire status` as the user's signal for this case (`checkpointSyncInfo.Err`), and the resolver's error message is self-explanatory when found. Worth knowing when triaging "my checkpoints stopped syncing" reports; not a regression here.
+
+## Verdict summary
+
+| # | Location | Severity | Verdict |
+|---|----------|----------|---------|
+| 1 | checkpoint_sync_remote.go:133-135 (count error) | MEDIUM-HIGH | Add `logging.Debug` (Warn defensible); user-silence stays |
+| 2 | checkpoint_sync_remote.go:126 (isConfiguredRemote) | LOW | Justified; caveat noted |
+| 3 | checkpoint_sync_remote.go:129-131 (resolve error) | — | Justified (gate already logs Warn) |
+| 4 | checkpoint_sync_remote.go:130 (config source / empty name) | — | Justified (design decision; Debug-logged by gate) |
+| 5 | checkpoint_sync_remote.go:137-142 (Fprintf) | — | Justified |
+| 6 | testenv.go:1983-2015 | — | Clean |
+| 7 | Fail-closed config error, push-time silence | Info | Pre-existing accepted design (status.go is the signal) |
+
+The single change I would block on before merge is #1: without a Debug log on the count failure, this PR's own fix has an untraceable failure mode that regresses to the exact silent stall it was written to eliminate.</result>
+<usage><subagent_tokens>72808</subagent_tokens><tool_uses>9</tool_uses><duration_ms>140487</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ad3ff3a887f2eda5b</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-pr-review/2b50cb54-f513-40e1-9acb-97fa1f3dd161/tasks/ad3ff3a887f2eda5b.output</output-file>
+<status>completed</status>
+<summary>Agent "Comment accuracy review PR 1987" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>All claims verified. Here is the analysis.
+
+**Summary**: PR #1987 adds four comment surfaces around the new gated-push checkpoint-sync hint. I cross-checked each against `isConfiguredRemote`, `ResolveCheckpointSyncRemote`, `CountUnpushedCheckpoints`, `checkpointSyncAllowedForRemote`, the `logging` package, and the test helpers. Overall the comments are accurate and match the house tolerance for rich rationale in the strategy package. No critical inaccuracies; two precision nits and one unverifiable claim worth a look.
+
+**Critical Issues**: None.
+
+**Improvement Opportunities**
+
+1. `hintGatedCheckpointSync` doc comment — `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/pr-review/cmd/entire/cli/strategy/checkpoint_sync_remote.go:114-124`
+   - **Reorder compatibility (the main question): still accurate.** The comment phrases silence as a conjunction — "Stays quiet unless every condition holds" — with no first/then ordering, so moving `isConfiguredRemote` ahead of `ResolveCheckpointSyncRemote` (lines 126-132) doesn't create drift. All three predicates are side-effect-free from the user's perspective (`isConfiguredRemote` shells `git remote get-url`; `ResolveCheckpointSyncRemote` does not log or print, it only returns errors that the hint swallows), so the reorder changes only which check short-circuits, not observable semantics. The comment does list the conditions in the *old* code order (election first, configured-remote second); that's cosmetic, not drift, and I would not require a change.
+   - **One precision nit**: "the fail-closed misconfigured case warns through the gate itself." True at the code level — `checkpointSyncAllowedForRemote` calls `logging.Warn` on election error (`checkpoint_sync_remote.go:97-103`) — but that warning goes to `.entire/logs/entire.log` (see `logging/logger.go:126-136`), not the terminal. A reader could infer the user gets stderr feedback in the misconfigured case; they don't. Suggest "…logs a warning through the gate itself" to match the test comment's more accurate wording ("already logs its own warning", test file line ~470).
+   - **Verified accurate**: "Fully local — no network" holds for all three calls (`isConfiguredRemote` is documented and implemented config-only, `manual_commit_push.go:237-247`; `ResolveCheckpointSyncRemote` is pure local; `CountUnpushedCheckpoints` is local for both backends, `unpushed_checkpoints.go:14-26`). "checkpoint_push_remote takes a remote name" is enforced by the fail-closed `isConfiguredRemote` check in `ResolveCheckpointSyncRemote` (lines 69-74), so the raw-URL rationale is sound. "an explicit checkpoint_push_remote is a decision already made" matches the `Source == SyncRemoteSourceConfig` guard.
+
+2. Regression comment above `TestHintGatedCheckpointSync` — `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/pr-review/cmd/entire/cli/strategy/checkpoint_sync_remote_test.go:392-399`
+   - **Mechanism claims verified**: pre-hint, the gate in `manual_commit_push.go:84-86` returned `nil` with only log-file output — genuinely "no signal in the push output." The scenario ("habitual push remote lost the default election to a dormant origin") exactly matches the test fixture (origin + publish, push to publish, default election picks origin). ENT-1451 is the correct ticket for the single-remote gate. "Not parallel: uses t.Chdir()" is correct — every subtest calls `t.Chdir`, and neither the test nor subtests call `t.Parallel()`.
+   - **House rule check: passes.** The comment names a concrete regression, not coverage/symmetry.
+   - **Unverifiable detail**: "had to discover checkpoint_push_remote through support" is a user-history claim nothing in the repo can substantiate. If that reflects a real report, keep it; if it's narrative color, trim to "checkpoints stranded locally with no signal" — the comment loses nothing without it, and fabricated incident history is exactly the kind of claim that misleads a future maintainer.
+
+3. `expectGatedHint` paragraph on `assertSingleRemoteRouting` — `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/pr-review/cmd/entire/cli/integration_test/checkpoint_sync_remote_test.go:58-64`
+   - **Accurate.** Every clause maps to an assertion: "name checkpoint_push_remote" ↔ the `strings.Contains(gatedOutput, "checkpoint_push_remote")` presence/absence check (line 79); "tell the user their checkpoints are waiting for the elected remote" ↔ the `fmt.Sprintf("%q", elected.name)` check (line 82); "explicit checkpoint_push_remote … must stay quiet" ↔ the config-override caller passing `false` (line 148). The three call sites (true/false/true) match the automatic-vs-explicit split described. The parenthetical regression recap ("the gate was previously a silent no-op") triplicates the story already told in the doc comment and the unit-test comment — mild redundancy, but it earns its place here because it explains why a bare boolean parameter exists. Acceptable as-is.
+
+4. `RunPrePushOutput` comment — `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/pr-review/cmd/entire/cli/integration_test/testenv.go:1990-1991`
+   - **Accurate.** "like RunPrePush" is precise: both `Fatalf` on hook error (vs `RunPrePushWithError`, which returns it). "combined output" matches `cmd.CombinedOutput()` in `runPrePush`, which is the right framing since the hint goes to stderr. Appropriately terse for a test helper.
+
+**Recommended Removals**: None.
+
+**Positive Findings**: The `hintGatedCheckpointSync` doc comment is a good example of the strategy package's rationale style — each silence condition carries its *why* (decision-already-made, no-actionable-suggestion, fail-closed-handled-elsewhere), which is exactly what the bare `if ... return` chain can't show. The unit-test comment satisfies the "name the regression" rule concretely rather than generically.
+
+**Net**: two suggested wording tweaks (log-file vs terminal "warns" in the doc comment; the "through support" anecdote if unsubstantiated), nothing blocking.</result>
+<usage><subagent_tokens>66468</subagent_tokens><tool_uses>10</tool_uses><duration_ms>153179</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ad3ff3a887f2eda5b</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-pr-review/2b50cb54-f513-40e1-9acb-97fa1f3dd161/tasks/ad3ff3a887f2eda5b.output</output-file>
+<status>completed</status>
+<summary>Agent "Comment accuracy review PR 1987" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>All claims verified. Here is the analysis.
+
+**Summary**: PR #1987 adds four comment surfaces around the new gated-push checkpoint-sync hint. I cross-checked each against `isConfiguredRemote`, `ResolveCheckpointSyncRemote`, `CountUnpushedCheckpoints`, `checkpointSyncAllowedForRemote`, the `logging` package, and the test helpers. Overall the comments are accurate and match the house tolerance for rich rationale in the strategy package. No critical inaccuracies; two precision nits and one unverifiable claim worth a look.
+
+**Critical Issues**: None.
+
+**Improvement Opportunities**
+
+1. `hintGatedCheckpointSync` doc comment — `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/pr-review/cmd/entire/cli/strategy/checkpoint_sync_remote.go:114-124`
+   - **Reorder compatibility (the main question): still accurate.** The comment phrases silence as a conjunction — "Stays quiet unless every condition holds" — with no first/then ordering, so moving `isConfiguredRemote` ahead of `ResolveCheckpointSyncRemote` (lines 126-132) doesn't create drift. All three predicates are side-effect-free from the user's perspective (`isConfiguredRemote` shells `git remote get-url`; `ResolveCheckpointSyncRemote` does not log or print, it only returns errors that the hint swallows), so the reorder changes only which check short-circuits, not observable semantics. The comment does list the conditions in the *old* code order (election first, configured-remote second); that's cosmetic, not drift, and I would not require a change.
+   - **One precision nit**: "the fail-closed misconfigured case warns through the gate itself." True at the code level — `checkpointSyncAllowedForRemote` calls `logging.Warn` on election error (`checkpoint_sync_remote.go:97-103`) — but that warning goes to `.entire/logs/entire.log` (see `logging/logger.go:126-136`), not the terminal. A reader could infer the user gets stderr feedback in the misconfigured case; they don't. Suggest "…logs a warning through the gate itself" to match the test comment's more accurate wording ("already logs its own warning", test file line ~470).
+   - **Verified accurate**: "Fully local — no network" holds for all three calls (`isConfiguredRemote` is documented and implemented config-only, `manual_commit_push.go:237-247`; `ResolveCheckpointSyncRemote` is pure local; `CountUnpushedCheckpoints` is local for both backends, `unpushed_checkpoints.go:14-26`). "checkpoint_push_remote takes a remote name" is enforced by the fail-closed `isConfiguredRemote` check in `ResolveCheckpointSyncRemote` (lines 69-74), so the raw-URL rationale is sound. "an explicit checkpoint_push_remote is a decision already made" matches the `Source == SyncRemoteSourceConfig` guard.
+
+2. Regression comment above `TestHintGatedCheckpointSync` — `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/pr-review/cmd/entire/cli/strategy/checkpoint_sync_remote_test.go:392-399`
+   - **Mechanism claims verified**: pre-hint, the gate in `manual_commit_push.go:84-86` returned `nil` with only log-file output — genuinely "no signal in the push output." The scenario ("habitual push remote lost the default election to a dormant origin") exactly matches the test fixture (origin + publish, push to publish, default election picks origin). ENT-1451 is the correct ticket for the single-remote gate. "Not parallel: uses t.Chdir()" is correct — every subtest calls `t.Chdir`, and neither the test nor subtests call `t.Parallel()`.
+   - **House rule check: passes.** The comment names a concrete regression, not coverage/symmetry.
+   - **Unverifiable detail**: "had to discover checkpoint_push_remote through support" is a user-history claim nothing in the repo can substantiate. If that reflects a real report, keep it; if it's narrative color, trim to "checkpoints stranded locally with no signal" — the comment loses nothing without it, and fabricated incident history is exactly the kind of claim that misleads a future maintainer.
+
+3. `expectGatedHint` paragraph on `assertSingleRemoteRouting` — `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/pr-review/cmd/entire/cli/integration_test/checkpoint_sync_remote_test.go:58-64`
+   - **Accurate.** Every clause maps to an assertion: "name checkpoint_push_remote" ↔ the `strings.Contains(gatedOutput, "checkpoint_push_remote")` presence/absence check (line 79); "tell the user their checkpoints are waiting for the elected remote" ↔ the `fmt.Sprintf("%q", elected.name)` check (line 82); "explicit checkpoint_push_remote … must stay quiet" ↔ the config-override caller passing `false` (line 148). The three call sites (true/false/true) match the automatic-vs-explicit split described. The parenthetical regression recap ("the gate was previously a silent no-op") triplicates the story already told in the doc comment and the unit-test comment — mild redundancy, but it earns its place here because it explains why a bare boolean parameter exists. Acceptable as-is.
+
+4. `RunPrePushOutput` comment — `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/pr-review/cmd/entire/cli/integration_test/testenv.go:1990-1991`
+   - **Accurate.** "like RunPrePush" is precise: both `Fatalf` on hook error (vs `RunPrePushWithError`, which returns it). "combined output" matches `cmd.CombinedOutput()` in `runPrePush`, which is the right framing since the hint goes to stderr. Appropriately terse for a test helper.
+
+**Recommended Removals**: None.
+
+**Positive Findings**: The `hintGatedCheckpointSync` doc comment is a good example of the strategy package's rationale style — each silence condition carries its *why* (decision-already-made, no-actionable-suggestion, fail-closed-handled-elsewhere), which is exactly what the bare `if ... return` chain can't show. The unit-test comment satisfies the "name the regression" rule concretely rather than generically.
+
+**Net**: two suggested wording tweaks (log-file vs terminal "warns" in the doc comment; the "through support" anecdote if unsubstantiated), nothing blocking.</result>
+<usage><subagent_tokens>66468</subagent_tokens><tool_uses>10</tool_uses><duration_ms>153179</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a95b2fe671d26e9d3</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-pr-review/2b50cb54-f513-40e1-9acb-97fa1f3dd161/tasks/a95b2fe671d26e9d3.output</output-file>
+<status>completed</status>
+<summary>Agent "Test coverage review PR 1987" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have everything I need. Here is the coverage analysis.
+
+## Summary
+
+Test coverage for PR #1987 is strong and well-targeted. The new unit test pins each guard clause of `hintGatedCheckpointSync` with a named regression, and the integration change wires hint presence/absence into the real hook flow on both checkpoint backends. The count source is already independently covered per backend by pre-existing tests (`CountUnpushedCheckpoints` in `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/pr-review/cmd/entire/cli/strategy/unpushed_checkpoints_test.go` — not part of this diff). Remaining gaps are around interactions with the call site's ordering in `prePush`, which the new unit tests cannot see because they call the helper directly.
+
+## Answers to the specific questions
+
+- **Both backends for the count source**: Covered. `assertSingleRemoteRouting` runs under `ForEachBackend` in `TestCheckpointSyncRemote_DefaultElection_OnlyOriginReceivesCheckpoints` and `TestCheckpointSyncRemote_BranchTrackingDoesNotReroute`, so the hint fires end-to-end through both the git-refs queue count and the git-branch rev-list count. Unit-level per-backend count semantics were already pinned in `unpushed_checkpoints_test.go`.
+- **Sole-remote topology**: No test needed. The hint is only invoked inside the gated branch of `prePush` (`manual_commit_push.go:84-87`), and a gated push to a *configured* remote requires ≥2 remotes; with one remote, a gated push can only be a raw URL, which the raw-URL subtest already covers. Asserting silence here would test call-site placement, not behavior.
+- **push_sessions disabled**: Gap (see below). Silence is guaranteed only by the `ps.pushDisabled` early return sitting above the gate; nothing asserts it.
+- **checkpoint_remote exemption**: Gap (see below). The pre-existing `TestCheckpointSyncRemote_DedicatedCheckpointRemoteExemptFromGate` (`cmd/entire/cli/integration_test/checkpoint_sync_remote_test.go:357`) exercises exactly the right scenario — gated-remote push with a dedicated URL — but asserts only data routing, never hint absence.
+
+## Critical Gaps
+
+None at the 8-10 level. The feature is a stderr hint; the worst failure modes are wrong or nagging advice, not data loss.
+
+## Important Improvements
+
+**1. Dedicated checkpoint_remote exemption must stay hint-silent — rating 6.**
+The gate comment at `manual_commit_push.go:78-84` already warns that hoisting above `resolvePushSettings` breaks the `hasCheckpointURL` exemption; the hint call inherits that exact hazard. If a refactor moves `hintGatedCheckpointSync` outside the `!ps.hasCheckpointURL()` conjunct, dedicated-mode users pushing to a non-elected remote would be told their checkpoints are stranded and to set `checkpoint_push_remote` — actively wrong, since their checkpoints *did* sync (to the dedicated store), and following the advice would break their setup. The origin tracking ref is absent in that mode, so `CountUnpushedCheckpoints` would return &gt;0 and the hint would fire. Cheapest fix, extending an existing test per house rules: in `TestCheckpointSyncRemote_DedicatedCheckpointRemoteExemptFromGate`, change `env.RunPrePush("publish")` to `RunPrePushOutput` and assert the output does not contain `checkpoint_push_remote`.
+
+**2. Already-synced steady state stays silent / count is computed against the elected remote — rating 5.**
+No test exercises the common steady state: v1 fully synced to origin (tracking ref up to date), then a gated push to `publish`. That must be silent, and it is the only scenario that pins the wiring `CountUnpushedCheckpoints(ctx, syncRemote.Name)` — if someone passed `pushRemote` instead, every current test still passes (fixtures have no tracking refs, so both counts agree), but real users would be nagged on every `publish` push forever after their checkpoints already reached origin. Extend `TestHintGatedCheckpointSync` with a subtest that sets `refs/remotes/origin/entire/checkpoints/v1` to the local v1 tip and asserts silence.
+
+**3. push_sessions=false + gated remote stays silent — rating 4.**
+Silence depends solely on the `ps.pushDisabled` return preceding the gate. `TestPrePush_PushDisabledSkipsCheckpoints` (`cmd/entire/cli/integration_test/remote_operations_test.go:116`) can't catch a reorder because its env has only `origin` (the elected remote — the gate would never fire anyway). Extending it with a second `publish` remote plus a `RunPrePushOutput("publish")` no-hint assertion would pin it. Regression caught: a hint telling users who deliberately disabled pushing that checkpoints are "waiting", with advice (`checkpoint_push_remote`) that cannot help them.
+
+## Optional (rating ≤3)
+
+- Non-origin election sources (`sole` is unreachable from a configured gated push; `first` is reachable with two non-origin remotes): the hint takes the identical code path, distinguished only by `Source != Config`. A test would only catch someone narrowing the condition to `SourceDefault`. Skip unless trivially added to the unit table.
+- The unit test doesn't assert the count in the message ("2 checkpoint(s)"). Deliberately loose and I'd keep it that way — count semantics live in `unpushed_checkpoints_test.go`; asserting the number here would just couple the hint test to fixture arithmetic. Gap 2 above covers the one count-related behavior that matters.
+
+## Test Quality Issues
+
+Minor only:
+
+- `assertSingleRemoteRouting`'s elected-remote check uses `fmt.Sprintf("%q", elected.name)`, coupling the assertion to the message's quoting style. Acceptable — it's the cheapest way to avoid matching `"publish"` inside an unrelated word — but a reword of the hint that drops quotes will fail this assertion cosmetically.
+- `captureStderrWriter` swaps a package global; safe today because `TestHintGatedCheckpointSync` is non-parallel (`t.Chdir`), and the file documents that. Any future `t.Parallel()` there would race with `checkpoint_policy.go`/`manual_commit_hooks.go` writers — nothing to fix now.
+- The unit tests call `hintGatedCheckpointSync` directly, bypassing the gate ordering in `prePush` — that's the right unit seam, and the integration tests cover the real path, so this is not overfitting; it's exactly why gaps 1 and 3 need the integration-side assertions.
+
+## Positive Observations
+
+- All five unit subtests are non-redundant: each pins a distinct guard (`isConfiguredRemote` false, `Source == Config`, count == 0, election error) or the positive path, and each names its rationale in the assertion message; the top-of-test comment names the concrete regression (silent gate stranding checkpoints post-ENT-1451). This meets the house rule well.
+- The `expectGatedHint` parameter on `assertSingleRemoteRouting` is a model extension of an existing test rather than a new file, and its doc comment explains both the true and false expectations behaviorally (automatic election must speak; explicit config is a decision already made).
+- `RunPrePushOutput` in `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/pr-review/cmd/entire/cli/integration_test/testenv.go` is a clean, reusable seam; `RunPrePushWithError` preserving its signature keeps the change minimal.
+- The `syncRemote.Name == ""` guard in the hint is defensively dead from this call site (zero remotes ⇒ `isConfiguredRemote` already returned) — correctly left untested.</result>
+<usage><subagent_tokens>79275</subagent_tokens><tool_uses>11</tool_uses><duration_ms>190654</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a95b2fe671d26e9d3</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-pr-review/2b50cb54-f513-40e1-9acb-97fa1f3dd161/tasks/a95b2fe671d26e9d3.output</output-file>
+<status>completed</status>
+<summary>Agent "Test coverage review PR 1987" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have everything I need. Here is the coverage analysis.
+
+## Summary
+
+Test coverage for PR #1987 is strong and well-targeted. The new unit test pins each guard clause of `hintGatedCheckpointSync` with a named regression, and the integration change wires hint presence/absence into the real hook flow on both checkpoint backends. The count source is already independently covered per backend by pre-existing tests (`CountUnpushedCheckpoints` in `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/pr-review/cmd/entire/cli/strategy/unpushed_checkpoints_test.go` — not part of this diff). Remaining gaps are around interactions with the call site's ordering in `prePush`, which the new unit tests cannot see because they call the helper directly.
+
+## Answers to the specific questions
+
+- **Both backends for the count source**: Covered. `assertSingleRemoteRouting` runs under `ForEachBackend` in `TestCheckpointSyncRemote_DefaultElection_OnlyOriginReceivesCheckpoints` and `TestCheckpointSyncRemote_BranchTrackingDoesNotReroute`, so the hint fires end-to-end through both the git-refs queue count and the git-branch rev-list count. Unit-level per-backend count semantics were already pinned in `unpushed_checkpoints_test.go`.
+- **Sole-remote topology**: No test needed. The hint is only invoked inside the gated branch of `prePush` (`manual_commit_push.go:84-87`), and a gated push to a *configured* remote requires ≥2 remotes; with one remote, a gated push can only be a raw URL, which the raw-URL subtest already covers. Asserting silence here would test call-site placement, not behavior.
+- **push_sessions disabled**: Gap (see below). Silence is guaranteed only by the `ps.pushDisabled` early return sitting above the gate; nothing asserts it.
+- **checkpoint_remote exemption**: Gap (see below). The pre-existing `TestCheckpointSyncRemote_DedicatedCheckpointRemoteExemptFromGate` (`cmd/entire/cli/integration_test/checkpoint_sync_remote_test.go:357`) exercises exactly the right scenario — gated-remote push with a dedicated URL — but asserts only data routing, never hint absence.
+
+## Critical Gaps
+
+None at the 8-10 level. The feature is a stderr hint; the worst failure modes are wrong or nagging advice, not data loss.
+
+## Important Improvements
+
+**1. Dedicated checkpoint_remote exemption must stay hint-silent — rating 6.**
+The gate comment at `manual_commit_push.go:78-84` already warns that hoisting above `resolvePushSettings` breaks the `hasCheckpointURL` exemption; the hint call inherits that exact hazard. If a refactor moves `hintGatedCheckpointSync` outside the `!ps.hasCheckpointURL()` conjunct, dedicated-mode users pushing to a non-elected remote would be told their checkpoints are stranded and to set `checkpoint_push_remote` — actively wrong, since their checkpoints *did* sync (to the dedicated store), and following the advice would break their setup. The origin tracking ref is absent in that mode, so `CountUnpushedCheckpoints` would return &gt;0 and the hint would fire. Cheapest fix, extending an existing test per house rules: in `TestCheckpointSyncRemote_DedicatedCheckpointRemoteExemptFromGate`, change `env.RunPrePush("publish")` to `RunPrePushOutput` and assert the output does not contain `checkpoint_push_remote`.
+
+**2. Already-synced steady state stays silent / count is computed against the elected remote — rating 5.**
+No test exercises the common steady state: v1 fully synced to origin (tracking ref up to date), then a gated push to `publish`. That must be silent, and it is the only scenario that pins the wiring `CountUnpushedCheckpoints(ctx, syncRemote.Name)` — if someone passed `pushRemote` instead, every current test still passes (fixtures have no tracking refs, so both counts agree), but real users would be nagged on every `publish` push forever after their checkpoints already reached origin. Extend `TestHintGatedCheckpointSync` with a subtest that sets `refs/remotes/origin/entire/checkpoints/v1` to the local v1 tip and asserts silence.
+
+**3. push_sessions=false + gated remote stays silent — rating 4.**
+Silence depends solely on the `ps.pushDisabled` return preceding the gate. `TestPrePush_PushDisabledSkipsCheckpoints` (`cmd/entire/cli/integration_test/remote_operations_test.go:116`) can't catch a reorder because its env has only `origin` (the elected remote — the gate would never fire anyway). Extending it with a second `publish` remote plus a `RunPrePushOutput("publish")` no-hint assertion would pin it. Regression caught: a hint telling users who deliberately disabled pushing that checkpoints are "waiting", with advice (`checkpoint_push_remote`) that cannot help them.
+
+## Optional (rating ≤3)
+
+- Non-origin election sources (`sole` is unreachable from a configured gated push; `first` is reachable with two non-origin remotes): the hint takes the identical code path, distinguished only by `Source != Config`. A test would only catch someone narrowing the condition to `SourceDefault`. Skip unless trivially added to the unit table.
+- The unit test doesn't assert the count in the message ("2 checkpoint(s)"). Deliberately loose and I'd keep it that way — count semantics live in `unpushed_checkpoints_test.go`; asserting the number here would just couple the hint test to fixture arithmetic. Gap 2 above covers the one count-related behavior that matters.
+
+## Test Quality Issues
+
+Minor only:
+
+- `assertSingleRemoteRouting`'s elected-remote check uses `fmt.Sprintf("%q", elected.name)`, coupling the assertion to the message's quoting style. Acceptable — it's the cheapest way to avoid matching `"publish"` inside an unrelated word — but a reword of the hint that drops quotes will fail this assertion cosmetically.
+- `captureStderrWriter` swaps a package global; safe today because `TestHintGatedCheckpointSync` is non-parallel (`t.Chdir`), and the file documents that. Any future `t.Parallel()` there would race with `checkpoint_policy.go`/`manual_commit_hooks.go` writers — nothing to fix now.
+- The unit tests call `hintGatedCheckpointSync` directly, bypassing the gate ordering in `prePush` — that's the right unit seam, and the integration tests cover the real path, so this is not overfitting; it's exactly why gaps 1 and 3 need the integration-side assertions.
+
+## Positive Observations
+
+- All five unit subtests are non-redundant: each pins a distinct guard (`isConfiguredRemote` false, `Source == Config`, count == 0, election error) or the positive path, and each names its rationale in the assertion message; the top-of-test comment names the concrete regression (silent gate stranding checkpoints post-ENT-1451). This meets the house rule well.
+- The `expectGatedHint` parameter on `assertSingleRemoteRouting` is a model extension of an existing test rather than a new file, and its doc comment explains both the true and false expectations behaviorally (automatic election must speak; explicit config is a decision already made).
+- `RunPrePushOutput` in `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/pr-review/cmd/entire/cli/integration_test/testenv.go` is a clean, reusable seam; `RunPrePushWithError` preserving its signature keeps the change minimal.
+- The `syncRemote.Name == ""` guard in the hint is defensively dead from this call site (zero remotes ⇒ `isConfiguredRemote` already returned) — correctly left untested.</result>
+<usage><subagent_tokens>79275</subagent_tokens><tool_uses>11</tool_uses><duration_ms>190654</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a0dada0af9d3478bb</task-id>
+<tool-use-id>toolu_014DiPUhKHU9PTmhg57hKyD3</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-pr-review/2b50cb54-f513-40e1-9acb-97fa1f3dd161/tasks/a0dada0af9d3478bb.output</output-file>
+<status>completed</status>
+<summary>Agent "Code review PR 1987" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I reviewed the committed diff vs `origin/main` plus the uncommitted guard reorder, and verified with: `go test ./cmd/entire/cli/strategy/ -run TestHintGatedCheckpointSync|TestCheckpointSyncAllowedForRemote|TestResolveCheckpointSyncRemote` (pass), `go test -tags integration ./cmd/entire/cli/integration_test/ -run TestCheckpointSyncRemote` (pass), `gofmt -l` (clean), `go vet -tags integration` (clean), `golangci-lint run ./cmd/entire/cli/strategy/...` (0 issues).
+
+## Important (80-89)
+
+**1. The hint tells the user to put a clone-local remote name into the committed settings file — this can disable checkpoint sync for every teammate. (confidence 85)**
+
+`/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/pr-review/cmd/entire/cli/strategy/checkpoint_sync_remote.go:140-142`
+
+```go
+	fmt.Fprintf(stderrWriter,
+		"[entire] To sync checkpoints to %q instead, set strategy_options.checkpoint_push_remote to %q in .entire/settings.json.\n",
+		pushRemote, pushRemote)
+```
+
+`.entire/settings.json` is a tracked file (it is in `git ls-files .entire/`); `.entire/settings.local.json` is the gitignored, clone-local layer (`.entire/.gitignore:2`, and `settings.go:817` describes it as the place for "clone-local preferences"). A git *remote name* is inherently per-clone — that is the entire reason the election tiers in `ResolveCheckpointSyncRemote` exist. If a user follows this advice and commits `checkpoint_push_remote: "publish"`, every teammate whose clone has no remote named `publish` hits the fail-closed branch at `checkpoint_sync_remote.go:70-73`, which makes `checkpointSyncAllowedForRemote` return false for *every* remote (`:96-104`) — all checkpoint sync off, surfaced only in `entire status` and a Warn log.
+
+The repo already has the right precedent for a clone-local remedy: `cmd/entire/cli/checkpoint/remote/util.go:210` hints "configure checkpoint_remote in `.entire/settings.local.json`".
+
+Fix: name `.entire/settings.local.json` in the second line. (The nearby `warnIgnoredPushURLs` precedent at `refs_push_destination.go:116` points at `settings.json`, but `checkpoint_remote` is an `org/repo` slug that is genuinely repo-wide; a remote name is not.)
+
+**2. `docs/architecture/sessions-and-checkpoints.md` not updated for the new behavior. (confidence 82)**
+
+CLAUDE.md, "When Modifying the Strategy": *"Keep this file and `docs/architecture/sessions-and-checkpoints.md` current when changing strategy behavior."* The paragraph this PR changes the behavior of is at `docs/architecture/sessions-and-checkpoints.md:266-272`, which currently says gated pushes "sync nothing" and points at `entire status` as the user's signal. The pre-push hook is now also a signal, with documented silence conditions (explicit config / raw URL / nothing waiting / failed election) that exist nowhere outside the Go doc comment.
+
+## Verdicts on the specific questions asked
+
+**Hook-path safety — clean.** `hintGatedCheckpointSync` returns nothing, so `prePush` still returns `nil` on the gated path (`manual_commit_push.go:85-87`) and `hooks_git_cmd.go:329-342` has nothing to propagate. All work is local: `git remote get-url`, `git config --get-regexp`, `git rev-parse`/`rev-list`, or a push-queue `Peek`. No network, no prompt, no `os.Exit`.
+
+**Spurious firing — I could not find a false-positive path.** Each case you named checks out:
+- `push_sessions: false` → `ps.pushDisabled` returns at `manual_commit_push.go:76`, above the gate. Silent.
+- Dedicated `checkpoint_remote` → `ps.hasCheckpointURL()` short-circuits the gate, so the hint is unreachable. In the sub-case where `PushURL` returns `enabled=false` (inherited-fork detection at `remote/util.go:202`, unparseable URL), the gate *does* apply and the hint fires — but that is consistent with what `entire status` reports for the same state (`status.go:296-315` falls back to the elected remote under exactly the same `PushURL` probe), so the two surfaces agree.
+- `SyncRemoteSourceSole` is structurally unreachable here: with one remote, any *configured* push target is that remote, so the push isn't gated.
+- Raw-URL push → blocked by `isConfiguredRemote`.
+- Empty-remote deferral: the hint can fire before the elected remote has ever been published, and following the advice takes one extra push to take effect (the deferral check runs pre-push, so tracking refs don't exist yet on the push that creates them). Consistent with the existing deferral design; not a defect.
+
+**The uncommitted guard reorder — keep it.** It is behavior-neutral (I confirmed all five subtests pass either way, so nothing pins the order), but it buys a structural property worth having: validating `pushRemote` as a configured remote *first* makes it locally obvious that a raw URL — which may carry an embedded credential, hence `remote.RedactURLOrPath` at `refs_push_destination.go:100` — can never reach `stderrWriter`. Under the committed order that invariant depended on a guard two checks away.
+
+**CLAUDE.md output/logging/privacy rules — compliant.** `stderrWriter` is the documented strategy-package channel for hook-time user output (`manual_commit_hooks.go:818-821`), the `[entire] …` two-line shape matches the nearest precedent (`warnIgnoredPushURLs`), the `(s)` pluralization matches strategy-package convention (`manual_commit_push.go:374`, `metadata_reconcile.go:195`) rather than status.go's richer form, and nothing user-authored is printed or logged.
+
+## Minor, below the reporting bar
+
+- **No log companion.** `warnIgnoredPushURLs` pairs its stderr lines with a `logging.Info` (`refs_push_destination.go:118-121`). The new hint has none; the only record is `checkpointSyncAllowedForRemote`'s **Debug** line, so at the default log level a doctor bundle contains no evidence the user was ever shown this.
+- **Count can overstate on the git-branch backend.** When the elected remote has no `refs/remotes/&lt;remote&gt;/entire/checkpoints/v1`, `countUnpushedV1Commits` counts *every* v1 commit (`unpushed_checkpoints.go:16-20`). Documented as acceptable for a passive status counter; an inflated number is more jarring in a message that appears on every push.
+- **Unbounded flock now reachable from the push hook.** On the git-refs backend the hint calls `PushQueue.Peek`, which uses `flock.Acquire` — the block-forever path (`flock_unix.go:28-32`). Every current holder (`Enqueue`/`Drain`/`Remove`) does file I/O only with no network inside the lock, so there is no practical hang; noting it because the flock doc comment specifically warns about latency-critical hooks.
+- **`RunPrePushOutput` duplicates `RunPrePush`'s `Fatalf`** instead of delegating (`integration_test/testenv.go:1990-1998`), and `RunPrePushWithError` now discards the output it has in hand, so a test asserting on a *failing* hook's message can't get it.</result>
+<usage><subagent_tokens>115925</subagent_tokens><tool_uses>49</tool_uses><duration_ms>415184</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a0dada0af9d3478bb</task-id>
+<tool-use-id>toolu_014DiPUhKHU9PTmhg57hKyD3</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-pr-review/2b50cb54-f513-40e1-9acb-97fa1f3dd161/tasks/a0dada0af9d3478bb.output</output-file>
+<status>completed</status>
+<summary>Agent "Code review PR 1987" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I reviewed the committed diff vs `origin/main` plus the uncommitted guard reorder, and verified with: `go test ./cmd/entire/cli/strategy/ -run TestHintGatedCheckpointSync|TestCheckpointSyncAllowedForRemote|TestResolveCheckpointSyncRemote` (pass), `go test -tags integration ./cmd/entire/cli/integration_test/ -run TestCheckpointSyncRemote` (pass), `gofmt -l` (clean), `go vet -tags integration` (clean), `golangci-lint run ./cmd/entire/cli/strategy/...` (0 issues).
+
+## Important (80-89)
+
+**1. The hint tells the user to put a clone-local remote name into the committed settings file — this can disable checkpoint sync for every teammate. (confidence 85)**
+
+`/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/pr-review/cmd/entire/cli/strategy/checkpoint_sync_remote.go:140-142`
+
+```go
+	fmt.Fprintf(stderrWriter,
+		"[entire] To sync checkpoints to %q instead, set strategy_options.checkpoint_push_remote to %q in .entire/settings.json.\n",
+		pushRemote, pushRemote)
+```
+
+`.entire/settings.json` is a tracked file (it is in `git ls-files .entire/`); `.entire/settings.local.json` is the gitignored, clone-local layer (`.entire/.gitignore:2`, and `settings.go:817` describes it as the place for "clone-local preferences"). A git *remote name* is inherently per-clone — that is the entire reason the election tiers in `ResolveCheckpointSyncRemote` exist. If a user follows this advice and commits `checkpoint_push_remote: "publish"`, every teammate whose clone has no remote named `publish` hits the fail-closed branch at `checkpoint_sync_remote.go:70-73`, which makes `checkpointSyncAllowedForRemote` return false for *every* remote (`:96-104`) — all checkpoint sync off, surfaced only in `entire status` and a Warn log.
+
+The repo already has the right precedent for a clone-local remedy: `cmd/entire/cli/checkpoint/remote/util.go:210` hints "configure checkpoint_remote in `.entire/settings.local.json`".
+
+Fix: name `.entire/settings.local.json` in the second line. (The nearby `warnIgnoredPushURLs` precedent at `refs_push_destination.go:116` points at `settings.json`, but `checkpoint_remote` is an `org/repo` slug that is genuinely repo-wide; a remote name is not.)
+
+**2. `docs/architecture/sessions-and-checkpoints.md` not updated for the new behavior. (confidence 82)**
+
+CLAUDE.md, "When Modifying the Strategy": *"Keep this file and `docs/architecture/sessions-and-checkpoints.md` current when changing strategy behavior."* The paragraph this PR changes the behavior of is at `docs/architecture/sessions-and-checkpoints.md:266-272`, which currently says gated pushes "sync nothing" and points at `entire status` as the user's signal. The pre-push hook is now also a signal, with documented silence conditions (explicit config / raw URL / nothing waiting / failed election) that exist nowhere outside the Go doc comment.
+
+## Verdicts on the specific questions asked
+
+**Hook-path safety — clean.** `hintGatedCheckpointSync` returns nothing, so `prePush` still returns `nil` on the gated path (`manual_commit_push.go:85-87`) and `hooks_git_cmd.go:329-342` has nothing to propagate. All work is local: `git remote get-url`, `git config --get-regexp`, `git rev-parse`/`rev-list`, or a push-queue `Peek`. No network, no prompt, no `os.Exit`.
+
+**Spurious firing — I could not find a false-positive path.** Each case you named checks out:
+- `push_sessions: false` → `ps.pushDisabled` returns at `manual_commit_push.go:76`, above the gate. Silent.
+- Dedicated `checkpoint_remote` → `ps.hasCheckpointURL()` short-circuits the gate, so the hint is unreachable. In the sub-case where `PushURL` returns `enabled=false` (inherited-fork detection at `remote/util.go:202`, unparseable URL), the gate *does* apply and the hint fires — but that is consistent with what `entire status` reports for the same state (`status.go:296-315` falls back to the elected remote under exactly the same `PushURL` probe), so the two surfaces agree.
+- `SyncRemoteSourceSole` is structurally unreachable here: with one remote, any *configured* push target is that remote, so the push isn't gated.
+- Raw-URL push → blocked by `isConfiguredRemote`.
+- Empty-remote deferral: the hint can fire before the elected remote has ever been published, and following the advice takes one extra push to take effect (the deferral check runs pre-push, so tracking refs don't exist yet on the push that creates them). Consistent with the existing deferral design; not a defect.
+
+**The uncommitted guard reorder — keep it.** It is behavior-neutral (I confirmed all five subtests pass either way, so nothing pins the order), but it buys a structural property worth having: validating `pushRemote` as a configured remote *first* makes it locally obvious that a raw URL — which may carry an embedded credential, hence `remote.RedactURLOrPath` at `refs_push_destination.go:100` — can never reach `stderrWriter`. Under the committed order that invariant depended on a guard two checks away.
+
+**CLAUDE.md output/logging/privacy rules — compliant.** `stderrWriter` is the documented strategy-package channel for hook-time user output (`manual_commit_hooks.go:818-821`), the `[entire] …` two-line shape matches the nearest precedent (`warnIgnoredPushURLs`), the `(s)` pluralization matches strategy-package convention (`manual_commit_push.go:374`, `metadata_reconcile.go:195`) rather than status.go's richer form, and nothing user-authored is printed or logged.
+
+## Minor, below the reporting bar
+
+- **No log companion.** `warnIgnoredPushURLs` pairs its stderr lines with a `logging.Info` (`refs_push_destination.go:118-121`). The new hint has none; the only record is `checkpointSyncAllowedForRemote`'s **Debug** line, so at the default log level a doctor bundle contains no evidence the user was ever shown this.
+- **Count can overstate on the git-branch backend.** When the elected remote has no `refs/remotes/&lt;remote&gt;/entire/checkpoints/v1`, `countUnpushedV1Commits` counts *every* v1 commit (`unpushed_checkpoints.go:16-20`). Documented as acceptable for a passive status counter; an inflated number is more jarring in a message that appears on every push.
+- **Unbounded flock now reachable from the push hook.** On the git-refs backend the hint calls `PushQueue.Peek`, which uses `flock.Acquire` — the block-forever path (`flock_unix.go:28-32`). Every current holder (`Enqueue`/`Drain`/`Remove`) does file I/O only with no network inside the lock, so there is no practical hang; noting it because the flock doc comment specifically warns about latency-critical hooks.
+- **`RunPrePushOutput` duplicates `RunPrePush`'s `Fatalf`** instead of delegating (`integration_test/testenv.go:1990-1998`), and `RunPrePushWithError` now discards the output it has in hand, so a test asserting on a *failing* hook's message can't get it.</result>
+<usage><subagent_tokens>115925</subagent_tokens><tool_uses>49</tool_uses><duration_ms>415184</duration_ms></usage>
+</task-notification>

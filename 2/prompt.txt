@@ -1,0 +1,427 @@
+what are we really doing? I thought that entire repo clone, no matter the url, we have as reqiurement to have sessions, if no sessions, prompt to log in before keep going
+
+---
+
+at the end, the ux I want.. entire repo clone should not fail with no session active. So, lets log in the user to the correct region as a prerequisite.
+
+---
+
+<task-notification>
+<task-id>abc6170c62a0d7f2a</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-fix-conflicts/a173588a-6d04-40f4-84a1-1bb54289ab0b/tasks/abc6170c62a0d7f2a.output</output-file>
+<status>completed</status>
+<summary>Agent "Clone flow + cluster host parsing" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Research complete. Here are the findings, all in `github.com/entireio/cli`.
+
+## 1. `newRepoCloneCmd` RunE and the three URL paths
+
+File: `/Users/gtrrz-victor/wks/cli/fix-conflicts/cmd/entire/cli/repo_clone.go`, RunE spans lines 100–190.
+
+Setup (lines 101–108): `SilenceUsage = true`, `ref := strings.TrimSpace(args[0])`, optional `targetDir` from `args[1]`.
+
+(a) Full `entire://` URL — early return, lines 120–122:
+```go
+if isEntireCloneURL(ref) {
+    return runGitClone(cmd.Context(), cmd, ref, targetDir)
+}
+```
+`ref` is passed verbatim to `git clone`; `--cluster` is ignored; the comment (110–119) explicitly notes it is deliberately NOT run through `validateClusterHost`.
+
+Shared shorthand parse (lines 124–129): `parseMirrorCloneRef(ref)` → `owner, repo`.
+
+Active-context session precondition (lines 136–140) — only when no `--cluster`:
+```go
+if cluster == "" {
+    if err := ensureCloneSession(cmd); err != nil {
+        return err
+    }
+}
+```
+
+Placement lookup wiring (lines 142–170): builds `lister` calling `resolvePullablePlacements`. `runWithCore` defaults to `runCore` (active context); if `cluster != ""`:
+```go
+if err := validateClusterHost(cluster); err != nil {
+    return fmt.Errorf("invalid --cluster: %w", err)
+}
+runWithCore = func(cmd *cobra.Command, fn ...) error {
+    return runCoreForCluster(cmd, cluster, fn)
+}
+```
+
+(b) Shorthand with `--cluster`: after the lookup, `selectCloneTarget(cmd, placements, cluster)` (line 176) matches the placement whose `ClusterHost` equals `cluster` (case-folded, in `selectPlacement`, lines 413–419).
+
+(c) Shorthand without `--cluster`: same lookup via active context, then `selectCloneTarget` returns the single placement (line 421–423) or prompts interactively (429–460).
+
+Common tail for both shorthand paths (lines 185–189):
+```go
+if err := validateClusterHost(chosen.ClusterHost); err != nil {
+    return fmt.Errorf("mirror has an invalid cluster host %q: %w", chosen.ClusterHost, err)
+}
+cloneURL := mirrorCloneURL(chosen.ClusterHost, owner, repo)
+return runGitClone(cmd.Context(), cmd, cloneURL, targetDir)
+```
+
+Flag defined at line 192: `--cluster`.
+
+## 2. When the TARGET cluster host is known, per path
+
+(a) Full-URL path: the cluster host is embedded in `ref` but is **never extracted** in this path today — `isEntireCloneURL` only checks the `entire://` prefix (repo_clone.go:42–44) and the URL goes straight to `git clone`. To get the host you would parse it. There IS an existing parser you can reuse: `parseMirrorCloneURL` at `/Users/gtrrz-victor/wks/cli/fix-conflicts/cmd/entire/cli/repo_mirror.go:1263`:
+```go
+func parseMirrorCloneURL(raw string) (clusterHost, provider, owner, repo string, err error) {
+    u, perr := url.Parse(raw)
+    if perr != nil || u.Scheme != "entire" { ... }
+    parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+    if len(parts) != 3 || parts[0] != "gh" { ... }
+    if verr := validateClusterHost(u.Host); verr != nil { return ..., verr }
+    ...
+    return u.Host, ..., strings.ToLower(parts[1]), repo, nil
+}
+```
+It returns `u.Host` as the cluster host and already runs it through `validateClusterHost`. This is the natural helper for the full-URL precondition (a plain `url.Parse(ref)` + `u.Host` would also work, but `parseMirrorCloneURL` gives validated coordinates in one call). Note it also lowercases owner/repo and strips a trailing `.git`.
+
+Related helpers, all in repo_clone.go: `entireCloneURLScheme = "entire://"` (line 38), `isEntireCloneURL` (42), `mirrorCloneURL(host, owner, repo)` (61). `validateClusterHost` is in repo_mirror.go (see below).
+
+(b)/(c) Shorthand: confirmed — the target cluster host is only known **after** `selectCloneTarget` returns, as `chosen.ClusterHost` (repo_clone.go:176, used at 185/188). Before that only `owner/repo` (and possibly the `--cluster` flag value) are known. For path (b) the `--cluster` value equals the target host and is validated at line 161 before the lookup, so technically the target host is known pre-lookup on that sub-path; but the canonical server-confirmed host is still `chosen.ClusterHost` at line 188.
+
+## 3. `runGitClone`
+
+File: `/Users/gtrrz-victor/wks/cli/fix-conflicts/cmd/entire/cli/repo_clone.go:483`.
+```go
+func runGitClone(ctx context.Context, cmd *cobra.Command, cloneURL, targetDir string) error
+```
+It just execs `git clone &lt;cloneURL&gt; [targetDir]` via `exec.CommandContext`, wiring child stdin/stdout/stderr to the cobra command's streams (lines 484–492), prints `Cloning &lt;cloneURL&gt;` to stderr, and on failure wraps the error as a `SilentError` (line 494). No auth/session logic of its own — git-remote-entire handles the STS exchange inside the child process.
+
+## 4. The `ensureCloneSession` seam (current full source)
+
+All in repo_clone.go.
+
+Package-level seams (lines 196–209):
+```go
+var (
+    probeCloneSession      = defaultProbeCloneSession
+    interactiveReauthLogin = defaultInteractiveReauthLogin
+)
+```
+
+`defaultProbeCloneSession` (lines 211–225): resolves the active control-plane target via `auth.ResolveControlPlaneTarget()`, returns `api.DefaultAuthBaseURL` + wrapped error when there is no context, otherwise mints a token with `target.TokenSource(ctx)` to detect an expired/absent session and returns `target.CoreURL` as the login server. **This is the active-context-only piece** — a cluster-aware version would swap in `auth.ResolveControlPlaneTargetForCluster(ctx, clusterHost)` (see section 5).
+
+`defaultInteractiveReauthLogin` (lines 227–258): guards a cancelled context, prints the hint, shows a huh confirm ("Log in now and continue the clone?"), and on confirm calls `runLoginToServer(ctx, ..., loginServer, insecureHTTPRequested(cmd), false)`. Returns `(loggedIn bool, err)`.
+
+`ensureCloneSession(cmd)` (lines 267–299):
+```go
+func ensureCloneSession(cmd *cobra.Command) error {
+    if _, ok := os.LookupEnv(auth.EnvTokenVar); ok {
+        return nil // ENTIRE_TOKEN: verbatim bearer, nothing to probe
+    }
+    if insecureHTTPRequested(cmd) {
+        auth.EnableInsecureHTTP()
+    }
+    loginServer, probeErr := probeCloneSession(cmd.Context())
+    if probeErr == nil {
+        return nil // session usable
+    }
+    msg, isReauth := auth.ReauthMessage(probeErr)
+    if !isReauth {
+        return probeErr // transient — let normal flow surface it
+    }
+    if !interactive.CanPromptInteractively() {
+        return errors.New(msg)
+    }
+    loggedIn, err := interactiveReauthLogin(cmd, loginServer, msg)
+    if err != nil {
+        return err
+    }
+    if !loggedIn {
+        return NewSilentError(errors.New(msg))
+    }
+    return nil
+}
+```
+
+Refactor note toward cluster-awareness: `ensureCloneSession` currently takes only `cmd` and calls `probeCloneSession(ctx)` with no host. A cluster-aware variant would thread a `clusterHost` through to the probe (using `ResolveControlPlaneTargetForCluster`), and would need to be invoked in all three paths — for the full-URL path you'd extract the host via `parseMirrorCloneURL` before the current early return at line 121, and for the shorthand paths after `chosen.ClusterHost` is known (or from the `--cluster` value on path b). The `interactiveReauthLogin` seam already takes `loginServer` explicitly, so it needs no change.
+
+## 5. Reusable helpers
+
+`validateClusterHost` — `/Users/gtrrz-victor/wks/cli/fix-conflicts/cmd/entire/cli/repo_mirror.go:427`. Rejects anything that is not a bare DNS host / IP with optional `:port`: `url.Parse("https://"+host)`, requires no userinfo/path/query/fragment and `u.Host == host`, then validates the hostname is an IP or DNS name (label regex `clusterHostLabelRe` at line 412). This is the anti-token-leak guard already applied at repo_clone.go:161 and 185.
+
+Cluster-host normalization: there is no dedicated normalizer; the code lowercases hosts inline where it dedupes/matches placements (`strings.ToLower(p.ClusterHost)` and `strings.ToLower(strings.TrimSpace(clusterSel))` in `selectPlacement`, repo_clone.go:404 and 414). `parseMirrorCloneURL` uses `u.Host` as-is for the cluster host (only owner/repo are lowercased).
+
+Cluster core resolution (`/Users/gtrrz-victor/wks/cli/fix-conflicts/cmd/entire/cli/corecmd.go`):
+- `clusterCoreClient` seam (line 570) = `coreapi.NewForCluster` (production), which does live `/.well-known/entire-cluster.json` discovery.
+- `runCoreForCluster(cmd, clusterHost, fn)` (line 590) dials the cluster's fronting core via `clusterCoreClient(ctx, clusterHost)` through the shared `runCoreClient` preamble (601–624). `runCoreClient` already maps a not-logged-in/expired construction failure to the clean `auth.ReauthMessage` hint (615–617) — so simply dialing the target cluster's core surfaces re-auth cleanly.
+
+For a cluster-aware probe reuse, the direct analog to `defaultProbeCloneSession` is `auth.ResolveControlPlaneTargetForCluster(ctx, clusterHost)` at `/Users/gtrrz-victor/wks/cli/fix-conflicts/cmd/entire/cli/auth/control_plane.go:81`. It returns a `ControlPlaneTarget{CoreURL, TokenSource}` (same shape as `ResolveControlPlaneTarget`), discovering the cluster's trusted cores and picking the eligible local context, returning a login hint when none is eligible. So a `defaultProbeCloneSessionForCluster(ctx, clusterHost)` could mirror `defaultProbeCloneSession` line-for-line, swapping the resolver call and using the returned `target.CoreURL` as the login server.
+
+One caveat for the full-URL path: it currently bypasses both `validateClusterHost` and any control-plane lookup by design (repo_clone.go:110–122). Adding a session precondition there means introducing a parse of the host (via `parseMirrorCloneURL`, which itself validates) before `git clone` runs — a behavioral change from the current "forward verbatim, no validation" contract described in that comment block.</result>
+<usage><subagent_tokens>37020</subagent_tokens><tool_uses>7</tool_uses><duration_ms>93968</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ab84e6fc42c48ae47</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-fix-conflicts/a173588a-6d04-40f4-84a1-1bb54289ab0b/tasks/ab84e6fc42c48ae47.output</output-file>
+<status>completed</status>
+<summary>Agent "Cluster→region login server resolution" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have everything needed. Here is my report.
+
+## Summary
+
+The cluster's `/.well-known/entire-cluster.json` `core_urls` **are** the candidate login servers. A context's `CoreURL` is the JWT `iss` of the login server it was created against, and cluster resolution matches those two. So the "region / login server" for a cluster is obtained by a **network well-known fetch** of the cluster host; there is no static host-naming derivation. The data (`core_urls`) is available at the no-eligible-context error site but is **not currently surfaced** in the login hint, and no existing code feeds a cluster-discovered core into `entire login --server`.
+
+---
+
+### 1. `internal/entireclient/clusterdiscovery/` — the API and schema
+
+**Well-known schema** — `internal/entireclient/clusterdiscovery/discovery.go:29-42`. `Response` has exactly three consumed fields:
+- `core_urls []string` — the trusted entire-core URLs the cluster accepts JWTs from (the JWT issuers). Comment (discovery.go:18-19): "the cluster advertises which entire-core URLs it accepts as JWT issuers."
+- `jurisdiction_audience string` — data-plane STS audience (e.g. `https://au.entire.io`), "Empty when the cluster does not accept jurisdiction tokens" (discovery.go:33-37).
+- `jurisdiction_core_url string` — "the core (OAuth AS) that mints tokens for JurisdictionAudience" (discovery.go:38-41).
+
+Unknown fields are ignored (discovery.go:30). Path constant: `/.well-known/entire-cluster.json` (discovery.go:20). Fetch is HTTPS-only and refuses redirects because it is a trust root (discovery.go:83-100). `Discover` returns sentinel errors `ErrUnreachable` / `ErrNoIssuers` (HTTP 503) / `ErrNoCoreURLs` (200 with empty list) (discovery.go:47-63, 128-146).
+
+**The resolution API** — `internal/entireclient/clusterdiscovery/resolve.go`:
+- `ResolveContextForCluster(...)` (resolve.go:52) → returns `*contexts.Context` (the local login to use).
+- `ResolveClusterAuth(...)` (resolve.go:76) → returns `*ClusterAuth{Context, JurisdictionAudience, JurisdictionCoreURL}` (resolve.go:62-70).
+- `ResolveClusterCores(...)` (resolve.go:123) → returns `*discovery.CoresEntry` — **the cluster facts without account selection**: the trusted `CoreURLs` plus jurisdiction audience/core. This is the function that exposes the cluster's federation issuers.
+- `resolveClusterAuth` (resolve.go:83) is the shared body: load contexts → `resolveClusterCores` (cache-then-well-known, resolve.go:206) → `selectContext`.
+
+**What it exposes re: login servers**: yes — `CoresEntry.CoreURLs` (the auth/issuer origins) plus the jurisdiction core. Cache type: `discovery.ClusterCoresCache` / `CoresEntry` with `CoreURLs`, `JurisdictionAudience`, `JurisdictionCoreURL` (`internal/entireclient/discovery/cluster_cores.go:34-49`), 24h TTL with stale-fallback (resolve.go:138-199).
+
+There is **no** `resolveContextForCluster` unexported func or `ResolveControlPlaneTargetForCluster` inside this package — those live in `cmd/entire/cli/auth/`.
+
+### 2. `cmd/entire/cli/auth/control_plane.go` — `ResolveControlPlaneTargetForCluster` + no-eligible-context behavior
+
+`ResolveControlPlaneTargetForCluster(ctx, clusterHost)` at **control_plane.go:81-91**. It fetches the cluster's cores via the `resolveContextForCluster` seam (control_plane.go:86, = `clusterdiscovery.ResolveContextForCluster`, wired at control_plane.go:24), then builds the target from the chosen context (`targetForContext`, control_plane.go:97-103). The doc comment (control_plane.go:76-80) states the intent: "With no eligible local context the discovery resolver returns its login hint naming the cluster's cores."
+
+But the actual hint does **not** name the cores today. The no-eligible-context path is `selectContext` → `renderLoginHint` (resolve.go:242-243), and `renderLoginHint` (discovery.go:154-159) produces only:
+```
+no auth context for cluster &lt;host&gt;.
+Log in with `entire login`, then re-run your command.
+```
+The `coreURLs` argument is **deliberately unused** — discovery.go:153 comment: "We'll display coreURLs (2nd param) to the user as a hint at a later stage." So the candidate login servers are available at the call site but **not surfaced**. (The ambiguous-multiple case does list context names, resolve.go:272-280, but not core URLs.)
+
+Note `ResolveControlPlaneTarget` (no cluster, control_plane.go:47-60) is different: it uses the active context's core and errors with `ErrNotLoggedIn` → `entire login` hint, with no cluster discovery.
+
+### 3. `entire login` / `--server` — regions
+
+- `--server` default is `api.DefaultAuthBaseURL` (login.go:87-88), which is **`https://us.auth.entire.io`** (`cmd/entire/cli/api/base_url.go:18-20`). The flag help calls the default "rarely needed; the default serves all standard accounts."
+- `--server` takes an **auth origin** (scheme+host only; userinfo/path/query/fragment rejected) — `parseLoginServer` (login.go:131-156). It becomes "the OAuth issuer, the token-exchange target, and the keyring key" (login.go:127-129).
+- **Multiple regional auth servers exist**: tests and code reference `https://eu.auth.entire.io` and `https://us.auth.entire.io` as valid `--server` values (`cmd/entire/cli/login_validate_test.go:136-138`, `cmd/entire/cli/auth_test.go:19` `testCoreURL = "https://eu.auth.entire.io"`). `provider.go:7` references `us.auth.entire.io`'s OIDC config.
+- **How the login server relates to cluster access**: `persistLogin` (login.go:334-348) → `RecordLoginContext`, which sets the context's `CoreURL` from the token's signed `iss` claim (`cmd/entire/cli/auth/contexts.go:64`), and `validateReceivedToken`/`issMatches` enforce `iss` == the `--server` origin (login.go:379-421). The context model documents `CoreURL` as "the JWT issuer URL … Set from the access token's signed iss claim" (`internal/entireclient/contexts/contexts.go:36-38`). Cluster access then works only when that `CoreURL` is among the cluster's advertised `core_urls` (`eligibleContexts`/`ContextsForIssuer`, resolve.go:255-267 + `contexts/contexts.go:101-113`). **So `--server` origin == the context `CoreURL` == an entry in a cluster's `core_urls`.**
+- `ENTIRE_AUTH_BASE_URL` is retired; setting it hard-errors and points at `entire login --server` (`api/base_url.go:26-43`).
+- **`region`/`jurisdiction` is a separate, data-plane concept**, not the login/auth host. `--region` on `org`/`project` is a "Jurisdiction slug (defaults to the server's home jurisdiction)" (`cmd/entire/cli/org.go:55`, `project.go:88`), tied to `homeJurisdiction` in the core API (`internal/coreapi/oas_schemas_gen.go:5371,5615`, `cross_juris_transport.go`). Jurisdiction maps to `jurisdiction_audience`/`jurisdiction_core_url` (data plane), distinct from `core_urls` (login servers).
+
+### 4. Cluster host → auth/login server for a given host
+
+**No deterministic naming rule.** The only mapping is the network well-known fetch. For `aws-eu-central-1.entire.io` you must GET `https://aws-eu-central-1.entire.io/.well-known/entire-cluster.json` and read `core_urls`; those origins are exactly what you pass to `entire login --server`.
+
+Exact functions that yield it:
+- `clusterdiscovery.Discover(ctx, clusterHost, httpClient, debugf)` → `Response.CoreURLs` (discovery.go:128-146), or
+- `clusterdiscovery.ResolveClusterCores(ctx, cacheDir, clusterHost, httpClient, debugf)` → `*discovery.CoresEntry{CoreURLs, JurisdictionAudience, JurisdictionCoreURL}` (resolve.go:123-128) — the cached wrapper.
+
+If the cluster advertises more than one core, there is no rule to pick one automatically (that is precisely the ambiguous case resolve.go handles by asking the user). There is no code anywhere deriving an auth host from the cluster hostname string.
+
+### 5. Existing code that logs into a specific / cluster-picked login server
+
+There is **no** code that picks a login server from cluster/federation discovery to drive `entire login`. The closest existing re-auth-region logic:
+
+- `cmd/entire/cli/repo_clone.go` — `defaultProbeCloneSession` (repo_clone.go:211-225) returns the **active context's** `target.CoreURL` as the login server to re-auth against (repo_clone.go:222,224), and falls back to `api.DefaultAuthBaseURL` (us) only when there is no active context (repo_clone.go:217). `defaultInteractiveReauthLogin` then calls `runLoginToServer(ctx, ..., loginServer, ...)` (repo_clone.go:254) — i.e. it logs into a non-default region **only** if the already-active context happens to be that region. It never consults the target cluster's `core_urls`.
+- `runLoginToServer` (login.go:101-123) is the reusable in-process login entry that already accepts an arbitrary `server` origin — the hook a "log into the cluster's region" feature would call, passing a `core_urls` entry from `ResolveClusterCores`.
+
+**Gap for your use case**: the pieces exist (`ResolveClusterCores` yields the cluster's login-server origins; `runLoginToServer` logs into any origin) but nothing wires them together, and `renderLoginHint` throws the `core_urls` away (discovery.go:153-159). A clone precondition that logs into the right region would need to call `clusterdiscovery.ResolveClusterCores`/`Discover` for the target cluster host and feed a chosen `CoreURLs` entry into `runLoginToServer --server`, rather than relying on `defaultProbeCloneSession`'s active-context-or-us-default behavior.</result>
+<usage><subagent_tokens>60354</subagent_tokens><tool_uses>17</tool_uses><duration_ms>146772</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a66af54020eb211ef</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-fix-conflicts/a173588a-6d04-40f4-84a1-1bb54289ab0b/tasks/a66af54020eb211ef.output</output-file>
+<status>completed</status>
+<summary>Agent "Trace git-remote-entire clone auth" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have everything I need. Here is the full picture with citations.
+
+## Summary
+
+`git clone entire://aws-eu-central-1.entire.io/gh/...` works like this: git execs the **`git-remote-entire`** helper binary, which resolves a bearer token by mapping the cluster host to a local login context via `clusterdiscovery`. The "no auth context for cluster" fatal is thrown when **no locally-stored login context has a `CoreURL` (JWT issuer) that appears in the cluster's advertised `core_urls`** list. The fix is to run `entire login --server &lt;one of the cluster's advertised core_urls&gt;` — but the CLI does not currently tell you what that URL is, and the full-URL clone path has no interactive login fallback.
+
+---
+
+## 1. The `git-remote-entire` entry point and credential path
+
+`/Users/gtrrz-victor/wks/cli/fix-conflicts/cmd/git-remote-entire/main.go`
+
+- `run()` (main.go:56) parses the `entire://` URL, then calls `resolveCreds(ctx, parsedURL, ...)` at main.go:125. On error it prints `fatal: &lt;err&gt;` and exits 128 (main.go:126-129). This is where the discovery error surfaces to git.
+- `resolveCreds` (main.go:356) has two branches:
+  - **ENTIRE_TOKEN set** (CI path, main.go:365-371 → `resolveEnvTokenCreds`, main.go:414): uses the env JWT verbatim, but first validates its `aud`-derived core against the cluster's advertised cores via `clusterdiscovery.ResolveClusterCores` + `coreTrusted` (main.go:419-426).
+  - **Normal path** (main.go:378-395): `clusterdiscovery.ResolveClusterAuth(ctx, cfgDir, cacheDir, parsedURL.Host, ...)` (main.go:379) selects the login context; then `auth.NewRefreshingLoginCredential(clusterCtx, ...)` (main.go:388) produces the bearer. Note the comment at main.go:14-18: the helper uses the context's **login JWT directly as the git-transport bearer** (or ENTIRE_TOKEN); the "STS exchange" happens inside the transport when the data plane returns a 401 (`refreshingProvider`, main.go:170; `fatalMessage` handles the RFC 8693 `invalid_target`/"lives on" cross-cluster redirect, main.go:237-262).
+- Crucially, the helper protocol owns stdout — diagnostics go to stderr only (main.go:9-12), so **the helper cannot prompt for login**; `resolveCreds` failure is terminal.
+
+---
+
+## 2. Cluster host → auth context mapping (`clusterdiscovery`)
+
+Files: `/Users/gtrrz-victor/wks/cli/fix-conflicts/internal/entireclient/clusterdiscovery/{discovery.go,resolve.go}`
+
+**The well-known document** (`discovery.go:20,31-42`): fetched over hard-coded HTTPS (trust root, no redirects — discovery.go:82-100) from `https://&lt;clusterHost&gt;/.well-known/entire-cluster.json`:
+```go
+const Path = "/.well-known/entire-cluster.json"
+type Response struct {
+    CoreURLs             []string `json:"core_urls"`             // trusted JWT issuers (entire-core URLs)
+    JurisdictionAudience string   `json:"jurisdiction_audience"`
+    JurisdictionCoreURL  string   `json:"jurisdiction_core_url"`
+}
+```
+`core_urls` is documented as "which entire-core URLs it accepts as JWT issuers" (discovery.go:18-19). Empty/absent → `ErrNoCoreURLs`; HTTP 503 → `ErrNoIssuers`; transport failure → `ErrUnreachable` (discovery.go:47-63,135-145).
+
+**`ResolveContextForCluster` / `ResolveClusterAuth`** (resolve.go:52, 76) → `resolveClusterAuth` (resolve.go:83):
+1. `normalizeClusterHost` lowercases/trims the host (resolve.go:91,134).
+2. `resolveClusterCores` (resolve.go:206) returns the cores entry from the `cluster_cores.json` cache when fresh, else a live `/.well-known` fetch (`resolveCachedCores`, resolve.go:154; stale-fallback on fetch failure, resolve.go:182-189).
+3. `selectContext(f, "cluster "+clusterHost, entry.CoreURLs, ...)` (resolve.go:102) picks the local context.
+
+**`selectContext` — what makes a context "eligible"** (resolve.go:227-250):
+- `eligibleContexts` = every local context whose `CoreURL` matches one of the cluster's `coreURLs` (resolve.go:255-267), via `contexts.File.ContextsForIssuer` doing trailing-slash-insensitive equality (`contexts.go:106-125`).
+- Rule 1: the active context (`current_context`) wins if it's in the eligible set (resolve.go:231-238).
+- Rule 2: otherwise — **0 eligible → `renderLoginHint` error** (resolve.go:242-243); exactly 1 → use it; &gt;1 → `ambiguousContextError` telling you to run `entire auth use` (resolve.go:241-249).
+
+**"no auth context for cluster" is exactly the 0-eligible case** — `renderLoginHint` (discovery.go:154):
+```go
+func renderLoginHint(subject string, _ []string) string {
+    ... "no auth context for %s.\n" ... "Log in with `entire login`, then re-run your command."
+}
+```
+So the message means: no stored context's issuer (`CoreURL`) is among the cluster's advertised `core_urls`. It is **not** a network/reachability error (those are distinct sentinels in `formatDiscoveryError`, resolve.go:286-299).
+
+---
+
+## 3. What login actually fixes it — the key relationship
+
+A context's `CoreURL` is **not** the URL you typed for login — it is the token's signed `iss` claim:
+- `contexts.Context.CoreURL` doc (contexts.go:36-38): "CoreURL is the JWT issuer URL — what STS exchanges hit. Set from the access token's signed iss claim, not the typed login URL."
+- `auth.RecordLoginContext` (`/Users/gtrrz-victor/wks/cli/fix-conflicts/cmd/entire/cli/auth/contexts.go:64`): `coreURL := claims.Issuer`.
+
+But login **enforces that the token's `iss` equals the `--server` origin** you logged into:
+- `login.go` → `persistLogin(outW, baseURL, token, ...)` where `baseURL = client.BaseURL()` = the login `--server` (login.go:109,211,328).
+- `persistLogin` → `validateReceivedToken(token, baseURL, ...)` (login.go:335) → `issMatches(claims.Issuer, issuerURL)` rejects any token whose `iss` origin ≠ the login server (login.go:397-399,414-421).
+
+**Therefore `CoreURL == iss == the login `--server` origin`.** For a context to become eligible for a cluster, you must `entire login --server &lt;X&gt;` where `&lt;X&gt;` is (origin-equal to) one of that cluster's advertised `core_urls`.
+
+So **yes, the well-known directly exposes the servers to log into**: the `core_urls` array *is* the list of trusted auth/issuer origins. To fix `aws-eu-central-1.entire.io`, read `https://aws-eu-central-1.entire.io/.well-known/entire-cluster.json`, take a `core_urls` entry, and run `entire login --server &lt;that URL&gt;`.
+
+**Region/federation is a property of the auth server (the core/issuer), not the account.** Evidence:
+- The default login server is `https://us.auth.entire.io` (`/Users/gtrrz-victor/wks/cli/fix-conflicts/cmd/entire/cli/api/base_url.go:18-20`), and the `--server` flag help says "rarely needed; the default serves all standard accounts" (login.go:87-88). A region-fronted cluster (e.g. an EU cluster) that does not trust `us.auth.entire.io` will therefore reject the default-login context and require logging into its own regional core (e.g. an `eu.auth…`-style origin) — whatever its `core_urls` names.
+- The env-token path corroborates the same trust model: it validates the token's issuer against `cluster.CoreURLs` via `coreTrusted` (main.go:419-446), rejecting a token "belong[ing] to a different cluster".
+
+Fields that carry this: `Response.CoreURLs` (`core_urls`) in discovery.go:32; read by `resolveClusterCores` (resolve.go:214-216) and matched in `selectContext`/`eligibleContexts` (resolve.go:228,255-267). (The data-API analogue is `trusted_issuers` in `/.well-known/entire-api.json`, api_discovery.go:20-30.)
+
+---
+
+## 4. Is there a flow that auto-resolves the login server and prompts?
+
+**No — not for a cluster host with no eligible context.** Concretely:
+
+- **The full-URL clone path never prompts.** In `/Users/gtrrz-victor/wks/cli/fix-conflicts/cmd/entire/cli/repo_clone.go`, a full `entire://…` ref short-circuits straight to `runGitClone` (repo_clone.go:120-122) — it deliberately skips `ensureCloneSession` (which is gated on the shorthand path with `cluster == ""`, repo_clone.go:136-140). So the exact command the user ran goes to `git clone` → `git-remote-entire`, whose only output is the raw `renderLoginHint` fatal + "remote helper 'entire' aborted session". The helper can't prompt anyway (main.go:9-12).
+
+- **The interactive re-auth that does exist ignores cluster discovery.** `ensureCloneSession` (repo_clone.go:267) → `probeCloneSession` (repo_clone.go:211) resolves via `auth.ResolveControlPlaneTarget()` and re-logs into **the active context's core, or `api.DefaultAuthBaseURL` (`us.auth.entire.io`) when there's no context** (repo_clone.go:217,224) — it never fetches the cluster's `/.well-known` to pick the correct regional core. So even on the shorthand path it would log you into the default/active core, not necessarily the one the target cluster trusts.
+
+- **The `core_urls` are computed but thrown away in the hint.** `renderLoginHint(subject string, _ []string)` discards the second (coreURLs) argument (discovery.go:154), with the explicit comment "We'll display coreURLs (2nd param) to the user as a hint at a later stage" (discovery.go:153). The caller passes them in (`renderLoginHint(subject, coreURLs)`, resolve.go:243) but they are not surfaced. No other code path renders `core_urls` to the user for login guidance (only the ENTIRE_TOKEN mismatch error at main.go:424-425 lists them, and debug logs).
+
+**Bottom line for the user:** the CLI currently gives no automated way to discover the right login server. The manual fix is to fetch `https://aws-eu-central-1.entire.io/.well-known/entire-cluster.json`, read its `core_urls`, and run `entire login --server &lt;that origin&gt;`; that produces a context whose `CoreURL`/`iss` lands in the cluster's `core_urls`, making it eligible and clearing "no auth context for cluster." Implementing the TODO at discovery.go:153-154 (echoing the `core_urls` in the hint) would close this gap.</result>
+<usage><subagent_tokens>67458</subagent_tokens><tool_uses>16</tool_uses><duration_ms>179562</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>bwm2caem5</task-id>
+<tool-use-id>toolu_012VkFRoryuhT4C5j5oEU9T2</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-fix-conflicts/a173588a-6d04-40f4-84a1-1bb54289ab0b/tasks/bwm2caem5.output</output-file>
+<status>completed</status>
+<summary>Background command "Re-run lint on touched packages" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>bt5jao1ob</task-id>
+<tool-use-id>toolu_01XWfyG5tVDgPXsDZz1SgWtg</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-fix-conflicts/a173588a-6d04-40f4-84a1-1bb54289ab0b/tasks/bt5jao1ob.output</output-file>
+<status>completed</status>
+<summary>Background command "Wait for rate limit, then update PR" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+it works great, can we infere the cluster based on the clone url?
+
+---
+
+Let's reduce the number of cluster to choose. I did run entire clone a repo and I had to choose over 7 different clusters, when only one is valid eu, because the clone url was pointing at eu cluster
+
+---
+
+are u telling me that from this command: entire repo clone entire://aws-eu-central-1.entire.io/gh/gtrrz-victor/testing-rift we can not find out which entire cluster we have to log in ?
+
+---
+
+in case of: - /gh/owner/repo → no cluster in ref, placements lookup, N-way picker. lets login the user to the user region by default
+
+---
+
+<task-notification>
+<task-id>bobt2g6fh</task-id>
+<tool-use-id>toolu_01Cq3rrwhSkN3u7s7rvMhcoz</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-fix-conflicts/d2534251-0804-4c9e-bde5-7477ee449d05/tasks/bobt2g6fh.output</output-file>
+<status>completed</status>
+<summary>Background command "Lint cli package" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>b4i102a8w</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-fix-conflicts/d2534251-0804-4c9e-bde5-7477ee449d05/tasks/b4i102a8w.output</output-file>
+<status>completed</status>
+<summary>Background command "Lint with explicit v2 binary" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>bi1ufja9z</task-id>
+<tool-use-id>toolu_01Yb1UJYoZvZdJ6kHW1eZGtR</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-fix-conflicts/d2534251-0804-4c9e-bde5-7477ee449d05/tasks/bi1ufja9z.output</output-file>
+<status>completed</status>
+<summary>Background command "Build + re-lint" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+why? gtrrz-victor@Victors-Laptop ~/t/clone-test [1]> entire repo clone entire://aws-eu-central-1.entire.io/gh/gtrrz-victor/testing-rift
+no auth context for cluster aws-eu-central-1.entire.io.
+
+---
+
+gtrrz-victor@Victors-Laptop ~/t/clone-test> /tmp/entire-branch repo clone entire://aws-eu-central-1.entire.io/gh/gtrrz-victor/testing-rift
+no auth context for cluster aws-eu-central-1.entire.io.
+Log in to one of its regions, e.g. `entire login --server https://au.auth.entire.io`, then re-run.
+┃ Pick the region to log in to:
+┃ > https://au.auth.entire.io
+┃   https://au.entire.io
+┃   https://eu.auth.entire.io
+┃   https://in.auth.entire.io
+┃   https://in.entire.io
+┃   https://us.auth.entire.io
+┃   https://us.entire.io
+
+---
+
+it works, ship it

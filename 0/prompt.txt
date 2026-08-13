@@ -1,0 +1,274 @@
+/simplify
+
+---
+
+<task-notification>
+<task-id>acd941a5ccb19bc1d</task-id>
+<tool-use-id>toolu_011XBPJkCFkgsesDGFHDTgFa</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-investigate-login-windows/38124fdf-a42f-46a5-95a9-cf7f9e0a4dcf/tasks/acd941a5ccb19bc1d.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Simplification review of `976fd4261` (5 files, +192/-29). The fix itself is the right shape — the per-platform split is forced by the `golang.org/x/sys/windows` import and can't be avoided. What the diff over-builds is the *explanation* and one of the tests: of 192 added lines, ~59 are comment, and the Windows implementation is 7 lines of code under 20 lines of comment.
+
+## F1 — The `runtime.GOOS` switch no longer earns its shape
+
+`/Users/soph/.herdr/worktrees/cli/soph-investigate-login-windows/cmd/entire/cli/browser_open_other.go:17-26`
+
+Once windows leaves, the switch picks between exactly two strings, and its only distinct behavior is the `default` arm — which fails on the BSDs, all of which ship `xdg-open`. That arm is also the sole reason `fmt.Errorf("unsupported platform")` exists, and nothing can reach it on any GOOS this binary is built for, so it is untestable dead weight in practice.
+
+Cost: 10 lines (`var command string` + switch + default) plus a hardcoded platform allowlist that has to be edited to support a platform that already works.
+
+Simpler form:
+
+```go
+// macOS ships `open`; Linux and the BSDs use xdg-open.
+command := "xdg-open"
+if runtime.GOOS == darwinGOOS {
+    command = "open"
+}
+```
+
+−8 lines, one fewer error path, and freebsd/openbsd/netbsd start working instead of returning "unsupported platform". `runtime` and `fmt` both stay imported.
+
+## F2 — `TestOpenBrowserWindows_CmdTruncatesURLAtFirstAmpersand` protects nothing
+
+`cmd/entire/cli/browser_open_windows_test.go:43-64`
+
+The test calls no code from this repo. Its stated purpose — "so nobody reintroduces `cmd /c start "" &lt;url&gt;` as the launcher" — is not something it can detect: it passes identically whether `openBrowserPlatform` uses ShellExecute or `cmd`. That regression protection comes entirely from the sibling test at line 27, which fails (`got` stays `""`) if the seam stops being called.
+
+What it *can* do is fail. It spawns a Windows subprocess and asserts an exact stdout string produced by a third-party shell, on hosted runners, with `echo` standing in for `start`. Any failure is by construction not about our code, and it blocks merges on the `test-windows` job (`.github/workflows/ci.yml:83` runs `-run '(Windows|MSYS)'`, so it does execute).
+
+Simpler form: delete it — 21 lines including its comment block and the `//nolint:errcheck`. The knowledge is already stated twice over (the `openBrowserPlatform` doc comment, and a commit message that explains the mechanism in more detail than the test does). `authorizeURLWithSeparators` stays in use by the surviving test.
+
+## F3 — Five facts, restated across four files
+
+The same rationale is written out repeatedly. Concretely:
+
+| Fact | Places |
+| --- | --- |
+| "`&amp;` is a cmd.exe command separator" | `login.go:512-513`, `browser_open_windows.go:20-21`, `browser_open_windows_test.go:45-46`, and inverted in `browser_open_other.go:13-15` — **4** |
+| The `syscall.EscapeArg` paragraph ("only quotes an argument containing a space, tab, quote, or backslash … a URL has none of those, so it reach(ed) cmd.exe bare") | `browser_open_windows.go:21-24` and `browser_open_windows_test.go:46-48`, near-verbatim — **2** |
+| Bug symptom (`/authorize?client_id=entire-cli`, rejected for missing redirect_uri) | `login.go:513-515`, `browser_open_windows_test.go:17-21`, again at `:58-59` — **3** (+ commit message) |
+| cmd's `%VAR%` expansion | `login.go:515-516`, `browser_open_windows.go:19-21` — **2** |
+| "ShellExecute takes a single wide string, so no command line is parsed" | `browser_open_windows.go:25-26`, `login.go:518-519` — **2** |
+
+Single home: the `openBrowserPlatform` doc comment in **`browser_open_windows.go:15-31`**. That is the code the rationale justifies and the file someone edits if tempted by `cmd /c start`; it should keep all of it, unchanged.
+
+The other three shrink:
+
+- **`login.go:509-519`** — 11 lines down to 3. `openBrowser` is platform-neutral and launches nothing itself; a Windows-only shell hazard is not its doc's job. Keep the invariant plus a pointer:
+  ```go
+  // openBrowser opens browserURL in the user's default browser. The URL is
+  // handed to the platform launcher as a single argument and must never reach
+  // a shell — see openBrowserPlatform in browser_open_windows.go for why.
+  ```
+- **`browser_open_other.go:13-15`** — drop the "Nothing here goes through a shell, so query separators (`&amp;`) and percent-encoding … see browser_open_windows.go" sentence. The first sentence ("as a single argv element") already says it; at most "No shell is involved."
+- **`browser_open_windows_test.go:17-21`** — drop the bug-report restatement; the test name plus "the whole URL must reach the shell association (see openBrowserPlatform)" is enough. (`:44-51` goes with F2.)
+
+Net ~25 of the 59 new comment lines, and one place to update when the reasoning changes rather than four that will drift.
+
+## F4 — The `shellExecute` seam is fine; leave it
+
+`cmd/entire/cli/browser_open_windows.go:13`
+
+Three reasons not to flag it. (1) It is the dominant pattern in this exact package — `newCellCoreClient` (`cell_target.go:46`), `activeCoreClient` (`corecmd.go:564`), `pagerLookupEnv` (`explain.go:2998`), `allowLocalGitURL` (`plugin_gitremote.go:227`), `runTrailCreateForm` (`trail_cmd.go:1795`), and ~7 more — including the "No t.Parallel: package-global test seam" convention already spelled out at `trail_cmd_test.go:175`. It costs a local reader nothing new, and the non-parallel test is the house style, not a new tax. (2) `gochecknoglobals` is not enabled in `.golangci.yaml`, so no nolint is needed. (3) The seam is placed *below* `windows.StringToUTF16Ptr`, the only transformation in the function, so the test observes the one value that could be wrong. A tidier-looking narrower seam (`var openViaShell = func(url string) error`) would swallow that conversion and test nothing.
+
+Its only real cost is that it supports a test whose main value is the reintroduction guard — which is exactly why F2's second test is redundant rather than complementary.
+
+## F5 — The two cross-platform tests are two halves of one table
+
+`cmd/entire/cli/browser_open_test.go:8-40`
+
+Not redundant with `login_test.go`: that file never calls the real `openBrowser`, it injects `noopOpenURL` through the `browserOpenFunc` seam (`login.go:39-40`, `login_test.go:376-378`). This is genuinely the first direct coverage, and `experts_tui_test.go:266` only comments on the behavior. So the coverage is new and worth having.
+
+But the two functions are the same loop with a different expected substring. Simpler form: one table with `{url, wantErr string}` rows — drops a function, a comment block, and a duplicated loop skeleton, and makes the rejected/reaches-launcher pairing visible in one place. Marginal; only worth doing while the file is new.
+
+## F6 — `_ context.Context` is not dead weight
+
+`cmd/entire/cli/browser_open_windows.go:32`
+
+Both build variants must share one signature, the `!windows` variant genuinely uses it (`exec.CommandContext`, `browser_open_other.go:28`), and blanking the parameter is the idiomatic way to say "unused on this platform". No change.
+
+Adjacent observation, not worth acting on: ctx is close to inert on the Unix side too — the launch is fire-and-forget (`Start`, then `Process.Release`, never `Wait`). Dropping it would ripple into `browserOpenFunc` (`login.go:39-40`) and every implementation including test stubs, for no gain.
+
+## F7 — Nothing else left behind
+
+No dead code, redundant state, or derivable values. `login.go` correctly sheds its `os/exec` and `runtime` imports. The `//nolint:errcheck` at `browser_open_windows_test.go:60` is required, not noise (`errcheck.check-blank: true`, `.golangci.yaml:87-89`), and `_test.go` files are only exempted from gosec/wrapcheck/forbidigo. `GOOS=windows go vet ./cmd/entire/cli/` is clean.
+
+## If you only do one thing
+
+Delete `TestOpenBrowserWindows_CmdTruncatesURLAtFirstAmpersand` (F2) and collapse the `login.go` doc comment (F3). Together that removes ~30 lines, one CI-fragile Windows subprocess, and three of the four copies of the ampersand explanation, with zero loss of regression protection.</result>
+<usage><subagent_tokens>92804</subagent_tokens><tool_uses>17</tool_uses><duration_ms>278086</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a185c46da1891c66c</task-id>
+<tool-use-id>toolu_01CujA6nTV1zQkr9tVfx3wnA</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-investigate-login-windows/38124fdf-a42f-46a5-95a9-cf7f9e0a4dcf/tasks/a185c46da1891c66c.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Reuse review — findings
+
+I verified every claim by reading the referenced code. Two real findings, both small; the change is largely clean on reuse.
+
+### 1. Duplicate authorize-URL test fixture (low/medium)
+
+**`cmd/entire/cli/browser_open_test.go:33`** — inline authorize-URL literal duplicates the fixture the sibling test file already defines.
+
+- `browser_open_windows_test.go:14` defines `authorizeURLWithSeparators` — an authorize URL with `&amp;` separators and a percent-encoded `redirect_uri`.
+- `browser_open_test.go:33` hand-writes a second one for the same property: `"https://us.auth.entire.io/authorize?client_id=entire-cli&amp;redirect_uri=http%3A%2F%2F127.0.0.1%3A1%2Fcb&amp;state=x"`.
+- Cost: two hand-maintained fixtures in the same package encoding the same "this is what a real authorize URL looks like" knowledge; they can drift, and the weaker one (3 params) is the one used in the cross-platform test.
+- Existing thing to use: the constant `authorizeURLWithSeparators`. `browser_open_test.go` carries **no** build constraint, so it compiles on Windows too — move the constant there and have `browser_open_windows_test.go:34` and `:55` reference it. That keeps one fixture, and the fuller (7-param, PKCE-shaped) URL becomes the one both tests exercise.
+
+### 2. Fire-and-forget spawn re-implemented (low, and pre-existing/moved code)
+
+**`cmd/entire/cli/browser_open_other.go:28-35`** — `exec.CommandContext` + `Start()` + `Process.Release()` is the same detached-spawn shape already encapsulated in **`cmd/entire/cli/execx/spawn_detached.go:22-49`** (`execx.SpawnDetached`, lines 33/34/43/48: `CommandContext` → `detachFromTTY` → `Start` → `Process.Release`).
+
+- `execx` is the sanctioned home for subprocess spawning in this repo (`execx.go:1-7` states so; `NonInteractive` and `SpawnDetached` are its two entry points), and it is the only other `Process.Release()` call site in the tree.
+- Caveat that keeps this low: `SpawnDetached` hardcodes `os.Executable()`, so it is **not** directly callable for `open`/`xdg-open`; reuse would mean generalizing it to take a program name. Also, this block is moved verbatim from the old `login.go`, not newly written. Flagging it so the choice is deliberate: either generalize `execx` and route the browser launch through it, or leave it and accept a second spawn site outside `execx`.
+
+### 3. Triplicated rationale prose (low)
+
+The cmd.exe `&amp;`/`%VAR%` + `syscall.EscapeArg` explanation is written out three times: `login.go:509-519`, `browser_open_windows.go:17-31`, `browser_open_windows_test.go:42-48`. Three copies to keep in sync. Suggest keeping the canonical version in `browser_open_windows.go` and reducing `login.go`'s to a one-line pointer (it already has one at :517-519).
+
+Related but **not** reusable: `escapeWindowsCMD` at `cmd/entire/cli/agent/hook_command.go:228-243` already models the same cmd.exe metacharacter set (`&amp;`, `|`, `&lt;`, `&gt;`, `(`, `)`) and its doc comment already explains the `%`-expansion caveat. It is unexported in package `agent`, so package `cli` cannot call it — and the fix's whole point is to avoid cmd.exe, so there is no code to reuse here. Mentioned only to confirm I checked it.
+
+## Verified non-findings
+
+- **No existing browser/URL launcher to reuse.** `openBrowser` (`login.go:520`) is the only one, and the change correctly kept it as the single entry point — `experts_tui.go:233` still calls it unchanged. No third-party browser library in `go.mod`/`go.sum` (`pkg/browser`, `webbrowser`, `open-golang` all absent).
+- **`linuxGOOS` does not exist.** The only GOOS constants in package `cli` are `windowsGOOS` and `darwinGOOS` at `cmd/entire/cli/explain.go:54-55`. `darwinGOOS` is already used at `browser_open_other.go:20`; the `"linux"` literal at `:22` has nothing to reuse (other packages each define their own: `versioncheck.go:23 goosWindows`, `paths/paths.go:21-22 osWindows/osDarwin`, `hook_command.go hookWrapperOSWindows` — none exports a linux constant). The one literal that *could* have used `windowsGOOS` (`case "windows":`) was deleted by this change.
+- **`golang.org/x/sys/windows` needs no wrapper.** It is already imported directly at `execx/execx_windows.go:9` and `internal/flock/flock_windows.go:12`; direct use is the established pattern, and `browser_open_windows.go:7` matches it.
+- **No error-substring assertion helper exists** in package `cli` or `cmd/entire/cli/testutil/testutil.go`, so the new tests' inline `strings.Contains(err.Error(), …)` checks duplicate nothing.
+- **No shared authorize-URL fixture pre-existed.** `login_test.go` only has per-test inline `authURL:` literals on `fakeBrowserFlow` (:392, :498, :536, :556, :568, :587, :607) and `integration_test/login_test.go` has none — nothing for the new tests to share (hence finding 1 is about the two *new* files, not about ignoring an existing fixture). The real builder lives in the external dep `github.com/entireio/auth-go/authcode`, whose `authorizationURL` is unexported and whose `Start` binds a loopback listener, so a hand-written fixture is the right call.
+- **The test-seam pattern matches local convention** (`var shellExecute = windows.ShellExecute` + save/swap/`t.Cleanup`), consistent with `explain_test.go:1136` and `explain_repo_test.go:167`; no generic swap helper exists to reuse.
+
+One minor consistency note (not reuse): the repo's other per-platform splits use `_unix.go` with `//go:build unix` (`execx/execx_unix.go:1`, `interactive/rawmode_unix.go`), whereas the new file is `_other.go` with `//go:build !windows`.</result>
+<usage><subagent_tokens>101871</subagent_tokens><tool_uses>32</tool_uses><duration_ms>319250</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a5c406b98b9684328</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-investigate-login-windows/38124fdf-a42f-46a5-95a9-cf7f9e0a4dcf/tasks/a5c406b98b9684328.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have a verified picture. Writing up the findings.
+
+## Verdict: right depth for its bug class — there is no second instance. The altitude gap is in what stops the *next* one.
+
+### 1. KEY QUESTION — no other unfixed instances (verified exhaustively, negative result)
+
+Only three non-test sites in the repo hand a string to a Windows shell. Two are not this bug class, by construction:
+
+**`cmd/entire/cli/versioncheck/autoupdate.go:133`** — `exec.CommandContext(ctx, "cmd", "/C", cmdStr)`. Not the same class. `cmdStr` comes from `updateCommand()` (`versioncheck.go:394`), which returns only compile-time constants, and `canAutoInstall()` (`versioncheck.go:377`) gates Windows to `scoop update entire/cli` / `mise upgrade entire`. The one string with a metacharacter (`curl … | bash`) can only reach the `sh -c` branch, where the pipe is *wanted*. No dynamic value, no `&amp;`, no `%`.
+
+**`cmd/entire/cli/agent/hook_command.go:137,158,168,293`** — the cmd.exe hook wrappers. The `command` interpolated into `(%s)` is built entirely from compile-time constants: `"entire hooks codex "` + a const hook name (`codex/hooks.go:80-93`, `cursor/hooks.go:118-131`). The one variant carrying a dynamic value — `LocalDevHookScript` with its `$(git rev-parse --show-toplevel)` — can never reach the Windows wrapper, because `UseWindowsProductionHooks` returns false when `localDev` (`hook_command.go:283`). The genuinely variable part, the JSON warning payload, goes through `escapeWindowsCMD`. Covered.
+
+Also checked and cleared, since each looked like a candidate: `redact/opf.go:377` runs the **user-configurable** `OPFSettings.Command` as `exec.CommandContext(ctx, s.command, args...)` — bare binary, no shell. `cmd/entire/cli/mcp.go:218` `strings.Fields(call.Arguments.Command)` is resolved in-process against the Cobra tree, never exec'd. Git hooks are `#!/bin/sh` with `shellQuote` on the embedded exe path (`strategy/hooks.go:507`). The pager at `explain.go:3012` is `exec.CommandContext(ctx, pager)` — no shell.
+
+**So the fix is not a bandaid — it is the whole population of the bug.** What it does not do is prevent the next one; the invariant is currently guarded by one behavioural test on one function.
+
+### 2. Two philosophies — the split is coherent, but the boundary is stated nowhere
+
+- `escapeWindowsCMD` (`agent/hook_command.go:235`) = **escape**, because Entire writes a string into *someone else's* config file (Cursor/Codex `hooks.json`) and a third party performs the exec. Bypassing the shell is not available there.
+- `openBrowserPlatform` (`browser_open_windows.go:32`) = **avoid the shell**, because Entire performs the exec itself.
+
+The dividing line — *who owns the exec* — is principled and correct. The problem is that neither doc comment mentions the other, and the two comments are already discussing the same hazard from opposite sides without acknowledging it: `hook_command.go:232` says "`%` is deliberately NOT escaped… if that changes, percent expansion needs separate handling," while the new `login.go:516` says percent-encoded URLs are exposed to `%VAR%` expansion "too, so quoting alone would not be enough." A reader who lands on `escapeWindowsCMD` first gets no signal that it must not be used to launch something.
+
+**Recommendation (cheap, high value):** two reciprocal sentences. On `escapeWindowsCMD`: "Use this only when a third party owns the exec. When Entire launches something itself, do not escape — bypass the shell (see `browser_open_windows.go`)." And the converse pointer on `openBrowserPlatform`.
+
+### 3. CLAUDE.md — yes, and there is a section shaped exactly for it
+
+`CLAUDE.md`/`AGENTS.md` (symlink) contain **zero** mentions of `cmd.exe` and no Windows-exec guidance at all; `docs/` has none either. The natural home is a new `####` sibling under `## Code Patterns`, modeled on `#### Opening Repositories - Always Use gitrepo` (`CLAUDE.md:494`) and `#### Reading Worktree Status` (`:519`) — which have precisely this shape: the invariant, the non-obvious behaviours you don't get otherwise, "Reviewers should flag any new…", and Key files. Content: the who-owns-the-exec rule from §2, plus the fact that made this bug possible and currently lives only in a Go comment (`syscall.EscapeArg` quotes only on space/tab/quote/backslash, so a URL passes through bare).
+
+**On enforcement, be honest about what's available.** `CLAUDE.md:519` cites a forbidigo rule as the teeth for the analogous `gitrepo.Status` invariant. Forbidigo **cannot** express this one — `analyze-types` matches call targets, not argument values, so it can't separate `exec.CommandContext(ctx, "cmd", …)` from the ~100 legitimate `…, "git", …` calls. The usable local precedent is `cmd/entire/cli/deprecated_strings_test.go`, a `filepath.WalkDir` source sweep that fails on forbidden literals in non-test `.go` files. A ~30-line sibling asserting that no production file outside `agent/hook_command.go` passes `"cmd"`/`"cmd.exe"` as argv[0] would pin this mechanically. That is the one thing genuinely missing at this altitude.
+
+### 4. Per-platform file split — right, and forced rather than chosen
+
+`windows.ShellExecute` comes from `golang.org/x/sys/windows`, which doesn't compile off Windows, so a single function with a `runtime.GOOS` switch is not an option. Not a style call. `_other.go` + `//go:build !windows` also has direct local precedent (`interactive/rawmode_other.go`, `proclive/proc_other.go`).
+
+One consistency nit: **`browser_open_windows.go` carries no `//go:build windows` tag**, while all four existing production `_windows.go` files do — `execx/execx_windows.go`, `procutil/procutil_windows.go`, `internal/flock/flock_windows.go`, `checkpoint/remote/command_cancel_windows.go`. Functionally identical, but the new pair ends up asymmetric (the `!windows` side tagged, the windows side not) against 4/4 precedent. One line. (No tag on the *test* file is fine — `agent/hook_command_exec_windows_test.go` has none either.)
+
+Minor: the `!windows` file keeps a `runtime.GOOS` switch over darwin/linux and errors for e.g. freebsd, whereas the closest analogue `interactive/rawmode_*` splits all the way. Not worth changing for `open` vs `xdg-open`; noting only that the split is a hybrid rather than following the three-file precedent.
+
+### 5. Blast radius — correct, and it silently fixes a second user-visible bug
+
+`openBrowser` has exactly two production callers, both fixed: `login.go:97` (covering both the browser and `--device` flows, since `runLogin` at `login.go:158` receives the same func) and `experts_tui.go:233` via `openExpertsSessionCmd`. The second one matters — `primarySessionURL` (`experts_tui.go:218`) builds `expertsSessionURL(repo, sessionID)`, so **"open session" in `entire experts --tui` was silently broken on Windows by the same truncation**, and this change fixes it. Worth stating in the commit/PR, which currently only claims `login`.
+
+There is exactly one browser-open path in the repo: a literal search for `ShellExecute`/`rundll32`/`explorer.exe`/`xdg-open`/`start ""` across all Go files returns only the new files plus `login.go`; `internal/` and `redact/` contain no browser code; `go.mod` pulls in no `pkg/browser`-style dependency. Nothing was left on a shell.
+
+### Recommended actions, in priority order
+
+1. Add the source-sweep test pinning "no production file outside `agent/hook_command.go` passes `cmd`/`cmd.exe` as argv[0]", following `deprecated_strings_test.go`.
+2. Add the `#### Windows…` invariant to `CLAUDE.md` under `## Code Patterns`, in the `gitrepo` sections' shape.
+3. Add the two reciprocal doc sentences between `escapeWindowsCMD` and `openBrowserPlatform` naming the who-owns-the-exec boundary.
+4. Mention the `experts --tui` fix in the PR description.
+5. Add `//go:build windows` to `browser_open_windows.go`.</result>
+<usage><subagent_tokens>135078</subagent_tokens><tool_uses>34</tool_uses><duration_ms>403893</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aa4fa3313335643bd</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-investigate-login-windows/38124fdf-a42f-46a5-95a9-cf7f9e0a4dcf/tasks/aa4fa3313335643bd.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Cleaned up. Here is the efficiency review.
+
+## Findings (2)
+
+### 1. `browser_open_windows_test.go:56` — the cmd.exe test spends a real process spawn per Windows CI run and buys nothing
+
+`TestOpenBrowserWindows_CmdTruncatesURLAtFirstAmpersand` calls **no code from this repo**. It runs `exec.CommandContext(t.Context(), "cmd", "/c", "echo", authorizeURLWithSeparators)` and asserts a fact about cmd.exe's parser.
+
+**Concrete cost.** Windows CI (`.github/workflows/ci.yml:82`, `go test ./cmd/entire/cli/... -run '(Windows|MSYS)'`) selects it, so every PR pays: one cmd.exe process creation, plus 6 failed command resolutions — the URL has 6 `&amp;` separators, so cmd tries to execute `code_challenge`, `code_challenge_method`, `redirect_uri`, `response_type`, `scope`, `state`, each a full PATH×PATHEXT scan on a runner with a long PATH. Tens to low-hundreds of ms.
+
+**The cost buys no protection.** Its comment says it exists "so nobody reintroduces `cmd /c start \"\" &lt;url&gt;` as the launcher" — but it cannot detect that. Reintroducing `cmd /c start` in `browser_open_windows.go` leaves this test green, because it never touches `openBrowserPlatform`.
+
+**Cheaper alternative: delete it.** `TestOpenBrowserWindows_PassesWholeURLToShellAssociation` (line 26) already *is* the enforcement: it asserts through the `shellExecute` seam, so swapping the launcher back to `cmd /c start` means `shellExecute` is never called, `got` stays `""`, and that test fails. It runs in microseconds with no subprocess. The cmd.exe explanation is already recorded prose-wise in two doc comments (`login.go:509-519` and `browser_open_windows.go:15-31`) — it does not need a third copy that CI executes.
+
+### 2. `browser_open_other.go:28-35` — `exec.CommandContext` + `Start()` with no `Wait()` permanently leaks a goroutine per browser open (pre-existing, moved verbatim)
+
+`Start()` launches a `watchCtx` goroutine whenever `Cancel != nil` (Go 1.26 `os/exec/exec.go:780-783`). Its result channel is unbuffered and only drained by `Wait()`, which this code never calls, so the goroutine blocks on `&lt;-c.ctx.Done()`, then blocks *forever* on the unreceivable `resultc &lt;- ctxResult{err}` send — retaining the `*exec.Cmd` (argv, env, the URL, the ctx) for the process lifetime.
+
+Measured: 20 opens → 21 goroutines, still 21 after `cancel()` + `runtime.GC()`.
+
+```
+goroutines before: 1
+goroutines after 20 opens (ctx live): 21
+goroutines after ctx cancel + GC: 21
+```
+
+Bounded and small for `entire login` (one open, process exits shortly after), more relevant for `experts_tui.go:233`, which is long-lived and can open several links. **Cheaper alternative:** `exec.Command` (no ctx) with `//nolint:noctx` — the ctx is dead weight here, since the code deliberately `Release()`es the child and never wants to kill the user's browser on login-context cancellation. Worth noting the new Windows path has none of this, so the fix *removes* the leak on Windows.
+
+## Measured non-findings (all of the flagged concerns check out clean)
+
+**Dependency weight is free.** `golang.org/x/sys/windows` was already in the Windows import graph at `main` with 26 importers, two of them in-repo (`cmd/entire/cli/execx`, `cmd/entire/cli/internal/flock`), plus go-git, bubbletea, wincred, posthog. On non-Windows it is absent from both the binary graph and the darwin test binary graph (`go list -test -deps` → 0 hits), because `_windows.go` filename constraints apply to test files too.
+
+Measured `GOOS=windows go build -trimpath ./cmd/entire`: **72,246,784 → 72,247,808 = +1,024 bytes (+0.0014%)**, which is PE page rounding around 5 new symbols (`cli.shellExecute`, `cli.openBrowserPlatform`, `windows.ShellExecute`, `windows.procShellExecuteW`, `windows.StringToUTF16`). Darwin: +80 bytes.
+
+Also worth correcting the premise: `pr-binary-size.yml` runs `scripts/check-pr-binaries.sh` with `MAX_BINARY_SIZE_BYTES=1048576` against *committed blobs* in the PR diff. It never compiles anything, so compiled binary weight is not what that workflow guards.
+
+**Process cost: strictly cheaper, nothing added.** Old path was a cmd.exe process whose `start` builtin then did its own ShellExecuteEx. New path is one lazy `shell32.dll` resolve plus one `Syscall6`. It also drops the `watchCtx` goroutine leak from finding 2 on Windows.
+
+**`var shellExecute = windows.ShellExecute` has zero init cost.** Verified by codegen: the var is statically initialized into `SDATA size=8` with a relocation, and the package `init` body is `STEXT nosplit size=1` — empty. Indirection is one extra `MOVQ shellExecute(SB), DX` before an indirect call; the function measured 100 bytes via the var vs 98 bytes calling directly. It defeats no inlining — `windows.ShellExecute` wraps `syscall.Syscall6`, and both variants report `cost 132 exceeds budget 80`. The only genuinely new init work is x/sys's `procShellExecuteW = modshell32.NewProc("ShellExecuteW")`, which was dead-code-eliminated at `main` (confirmed: absent from `base.exe`, present in `head.exe`). `LazyDLL.NewProc` is `return &amp;LazyProc{l: d, Name: name}` — one 32-byte alloc, no DLL load, no symbol resolution. `modshell32` itself was already in `base.exe`, so the DLL descriptor was already paid. Tens of nanoseconds, once per process, Windows only.
+
+**`StringToUTF16Ptr` allocates once, and once is the minimum.** `&amp;StringToUTF16(s)[0]` heap-allocates `(len(s)+1)*2` bytes (~450 bytes for a real authorization URL). Called exactly once per `openBrowser`, and any wide-string Win32 API requires it. Nothing to shave.
+
+**Not a hot path.** Two callers: `login.go` and `experts_tui.go:233`, both explicit one-shot user actions. Nothing was added to startup or to the hook path.
+
+**The test closure retains ~220 bytes at worst.** It captures `got` only — not `t` — so `got` boxes to a heap string cell. `t.Cleanup` always runs (including after `t.Fatalf`), making the closure unreachable at test end. Even if the restore were skipped, the retained set is a 16-byte string header plus one ~200-byte URL string. Genuinely negligible.
+
+**Bonus: the `runtime.GOOS` switch in `browser_open_other.go:19` costs nothing.** Go treats `runtime.GOOS` as a constant, so it constant-folds — confirmed by the strings `xdg-open` and `unsupported platform` being absent from the darwin binary. No branch at runtime, no dead-string bloat.</result>
+<usage><subagent_tokens>98691</subagent_tokens><tool_uses>36</tool_uses><duration_ms>504452</duration_ms></usage>
+</task-notification>

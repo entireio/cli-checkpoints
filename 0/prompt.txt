@@ -1,0 +1,93 @@
+<cross-session-message from="uds:/tmp/cc-socks/19757.sock" from-name="cli-trail-branch-update" from-mode="prompting">
+Handoff from the trail-787 session. Standalone CI flake fix in entireio/cli, against main — unrelated to trail 787, please do NOT put it on feat/trail-update-branch.
+
+THE SYMPTOM
+CI job `test-core` goes red intermittently on unrelated PRs. Two tests in
+`internal/remotehelper/transport` fail together:
+
+  --- FAIL: TestColdPathRedirectAllReplicasFail (proxy_test.go:975)
+        Error: An error is expected but got nil.
+  --- FAIL: TestServiceRPC (proxy_test.go:221)
+        method = GET, want POST
+        path = /et/alice/repo/info/refs
+        content-type =
+
+Both pass locally at -count=20, so it only shows under CI's timing.
+
+THE ROOT CAUSE (confirmed, not a guess)
+`closedServerURL()` at internal/remotehelper/transport/proxy_test.go:869:
+
+    func closedServerURL() string {
+        s := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+        url := s.URL
+        s.Close()
+        return url
+    }
+
+It manufactures a "guaranteed dead" node URL by starting a server and closing
+it. Closing returns the port to the OS. Every test in that file is
+t.Parallel(), so while one test is still using that URL as a dead node,
+another test's httptest.NewServer can be handed the SAME port by the OS.
+
+That is one event producing both failures:
+- TestColdPathRedirectAllReplicasFail (path "/et/alice/repo") expects both dead
+  replicas to fail so the proxy reports "all 2 nodes failed". One "dead" node
+  was alive and answered 200, so require.Error got nil.
+- TestServiceRPC owned the server that inherited the port, so the other test's
+  request landed in its handler — which is exactly why it logged the foreign
+  path /et/alice/repo/info/refs and method GET.
+
+Neither test is wrong on its own. The helper hands out an address it does not
+own. 12 call sites use it in that file, so this will keep firing.
+
+THE FIX
+Own the port for the test's lifetime instead of releasing it. Replace the
+helper with one that keeps a listener bound and fails every connection:
+
+    func deadServerURL(t *testing.T) string {
+        t.Helper()
+        l, err := net.Listen("tcp", "127.0.0.1:0")
+        require.NoError(t, err)
+        t.Cleanup(func() { _ = l.Close() })
+        go func() {
+            for {
+                c, err := l.Accept()
+                if err != nil {
+                    return
+                }
+                _ = c.Close() // dial connects, request never completes
+            }
+        }()
+        return "http://" + l.Addr().String()
+    }
+
+Nothing else can bind the port because it stays held. Requests still fail, so
+the existing assertions hold: "all 2 nodes failed" and "after entry-domain
+redirect" come from the proxy's own aggregation, not from the dial error text.
+It now needs a *testing.T, so update all 12 call sites to pass t.
+
+Simpler alternative if you prefer a one-liner: return "http://127.0.0.1:0".
+Connecting to port 0 fails immediately and nothing can ever bind it. Race-free,
+but less faithful to "a node that went away" — your call which reads better.
+
+VERIFY
+- go test ./internal/remotehelper/transport/ -count=20   (and -race)
+- Ideally -race with high -parallel to reproduce the interleaving; the bug is
+  timing-dependent so a green run is necessary, not sufficient. The structural
+  argument (the port is now owned) is the real proof.
+- mise run fmt && mise run lint && mise run test:ci before pushing (repo
+  requires it; lint after fmt, since fmt rewrites files).
+
+STILL OPEN, NOT DIAGNOSED — separate issue, do not assume it is the same bug
+A different flake was reported earlier on the same CI job:
+TestRoundTripper_TokenCacheReusesExchanged in
+internal/coreapi/cross_juris_transport_test.go, failing with
+  "net/http: HTTP/1.x transport connection broken: http: CloseIdleConnections called"
+I did NOT diagnose that one, and it is in a different package with a different
+signature. I earlier speculated the two shared a connection-reuse root cause;
+that was wrong and I retracted it — treat them as unrelated until someone shows
+otherwise. Worth picking up as a second item if you have room.
+
+Context: internal/coreapi and internal/remotehelper have had no relevant main
+commits since trail 787's merge base, so both flakes are live on main.
+</cross-session-message>

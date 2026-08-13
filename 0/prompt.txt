@@ -1,0 +1,98 @@
+can you take a look:
+
+Written to `scratchpad/cli-handoff.md` — self-contained, so the CLI session needs none of this context. Here it is:
+
+---
+
+# Handoff: slow Entire hook (~1.76 s) — go-git object I/O
+
+## Verdict
+
+The go-git code paths involved are fine. The cost comes from **how the CLI opens repositories**: every open builds a brand-new object cache, and in go-git that cache *is* the delta-base cache. So each open starts cold and re-reads pack data a warmed cache would have served.
+
+Measured: sharing one cache cuts pack reads by **86%** and wall time by **~4×** for identical work.
+
+## The change
+
+`cmd/entire/cli/gitrepo/repository.go:114` currently constructs a fresh cache per call:
+
+```go
+storage := gitfilesystem.NewStorageWithOptions(
+    repositoryFS,
+    cache.NewObjectLRUDefault(),   // <-- new empty cache on every open
+    gitfilesystem.Options{
+        AlternatesFS: newAlternatesFilesystem(),
+    },
+)
+```
+
+Hoist it to one shared instance:
+
+```go
+// One process-wide object cache. go-git uses this as the delta-base cache, so a
+// per-open cache makes every open re-read pack data from scratch.
+var sharedObjectCache = cache.NewObjectLRUDefault()
+```
+
+…and pass `sharedObjectCache`. There are **20 call sites** of `gitrepo.OpenCurrent` / `gitrepo.OpenPath` and no memoisation in the package, so several opens per hook run all pay the cold cost today.
+
+Reusing a single `*git.Repository` would also work, but it is a much larger change and measured no better than sharing the cache alone.
+
+## Evidence
+
+Workload: read every blob (733) reachable from one commit's tree in a packed repo. Filesystem reads counted via a billy wrapper.
+
+| case                             | file opens | reads      | bytes read | wall      |
+| -------------------------------- | ---------- | ---------- | ---------- | --------- |
+| fresh storage each round (today) | 5          | **47,958** | 18.7 MB    | ~69 ms    |
+| one storage reused               | 0          | **6,685**  | 2.79 MB    | ~15 ms    |
+| fresh storage + **shared cache** | 4          | **6,699**  | 2.92 MB    | ~17–26 ms |
+
+18.7 MB re-read to deliver 2.79 MB of blobs: the delta bases fall out of the cache between opens. Sharing only the cache recovers essentially the whole win. Pack handles still reopen per storage, but that is 4–5 opens against thousands of reads.
+
+Consistent with the trace: one cold pass is ~48k reads here vs the reported ~61.7k, average read ~390 bytes ("mostly tiny reads").
+
+## Safety notes (all verified in go-git)
+
+- `cache.ObjectLRU` guards `Put`/`Get`/`Clear` with a `sync.Mutex`, so sharing it across the concurrently-reading threads in the trace is safe.
+- `Storage.Close()` / `ObjectStorage.Close()` close alternates and pack indexes but **do not** clear the object cache, so the existing `storage.Close()` calls will not defeat sharing.
+- Memory goes **down**: one 96 MiB-capacity cache for the process instead of one per open.
+- Objects are content-addressed, so cache entries stay valid even across different repositories in one process.
+
+## How to verify
+
+Count reads before and after — wrap the billy filesystem in a counter, or on Linux compare `strace -c -f -e trace=pread64,openat` across one hook invocation. Expect pack reads to drop sharply while blob output is unchanged.
+
+## Ruled out
+
+Not caused by the recent partial-clone/promisor work (go-git#2312). The CLI calls none of the paths it touched — no `RepackObjects`, no `Prune`, no promisor APIs, no `packp.Filter` — and the new object-walk behaviour only activates for partial clones, reached only from those two entry points.
+
+## Please confirm while implementing
+
+1. **Dynamic open count per hook run.** The 20 call sites and absent memoisation are *static* evidence; a counter logged per storage construction would confirm how many opens a real hook does.
+2. **Object overlap between opens.** The 86% assumes the opens touch overlapping objects (likely: same commit graph and checkpoint objects). If disjoint, the shared cache helps less and the next suspect is the traversal in `checkpoint/fetching_tree.go` and `checkpoint/parse_tree.go`.
+
+## Out of scope here
+
+- **go-git small reads.** ~9 read syscalls per blob warm, ~65 cold, averaging ~390 bytes — pack headers and delta chains look to be read unbuffered. A go-git-side optimisation that lowers the floor rather than improving the hit rate.
+- **~0.5 s of 10 ms polling sleeps** in one Entire thread. Separate from object I/O, and probably the easier win.
+
+---
+
+The two "please confirm" items are the honest gaps — I measured the mechanism, not the live hook. If you'd rather I close them first, I can prototype the shared cache and measure a real hook run end to end before you hand this over.
+
+---
+
+do 1 first if there is newer logic for this
+
+---
+
+I think we should do metrics always with a repo that is not the cli since we know we pay the price for compiled hooks, but that's not the case anywhere else and especially not if reported by users
+
+---
+
+but that also means it does not really explain the claims in the initial user report?
+
+---
+
+yes

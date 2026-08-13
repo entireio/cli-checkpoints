@@ -1,0 +1,189 @@
+/reviewer this
+
+---
+
+<task-notification>
+<task-id>ab30094ae289c7180</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-fix-conflicts/035c25e5-b976-4f47-a5e4-534fcc896f0f/tasks/ab30094ae289c7180.output</output-file>
+<status>completed</status>
+<summary>Agent "Review branch changes" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Review written to `/Users/gtrrz-victor/wks/cli/fix-conflicts/review-01.md`.
+
+## Summary
+
+**Verdict: APPROVE** (with follow-up suggestions, no merge blockers).
+
+The branch does three coherent things: (1) strips the noisy ogen/command-wrapper chain off re-auth errors and surfaces a clean context-named hint via a new `auth.ReauthMessage` accessor wired into both `runCoreClient` and `renderCoreError`; (2) makes a usable session a precondition of `entire repo clone` across all URL forms (`entire://`, `--cluster`, and the mirror-lookup path), probing up front and offering an in-process login interactively / clean hint + non-zero exit non-interactively; (3) logs the user into the target cluster's *region* (jurisdiction core) rather than its whole trust list, and defaults the placement picker to the caller's home jurisdiction.
+
+What's strong:
+- Excellent seam-based testability and genuinely thorough branch coverage (usable / expired / no-eligible / ambiguous / discovery-failure / decline / login-error / ENTIRE_TOKEN).
+- Agent-safe non-interactive fallbacks are respected **and** explicitly tested — matches the CLAUDE.md requirement.
+- `ENTIRE_TOKEN` presence-based precedence handled correctly and consistently with coreapi.
+- Errors are classified via `errors.Is`/`errors.As` sentinels, not string parsing; `classifiedError.Error()` stays byte-identical.
+- No security or correctness issues: hosts still pass `validateClusterHost`/`parseLoginServer`, no user content logged.
+
+Follow-ups I flagged (none blocking):
+- **Important:** the no-`--cluster` path can prompt for login twice in one clone (active context, then the resolved cluster) when they're different federations — intentional per comments, but worth a product decision and a clearer second-prompt hint.
+- **Important:** no RunE-level wiring test for that same no-flag path (only `entire://` and `--cluster` are wired-tested); the underlying functions are unit-tested.
+- **Suggestion:** `defaultCloneHomeJurisdiction` doesn't guard `ENTIRE_TOKEN` like its sibling helpers do (best-effort, picker-only impact).
+- **Suggestion:** doc update in CLAUDE.md for the new precondition/region-login behavior.
+
+Verification: ran the six new `cli` tests plus `TestReauthMessage` (all pass), `go vet` clean on all three changed packages.</result>
+<usage><subagent_tokens>98715</subagent_tokens><tool_uses>11</tool_uses><duration_ms>192139</duration_ms></usage>
+</task-notification>
+
+---
+
+let first fix this:
+• The new placement default can be derived from a different identity than the one actually used for the control-plane request when ENTIRE_TOKEN is present, leading to incorrect mirror selection.
+
+  Review comment:
+
+  - [P2] Derive the default jurisdiction from ENTIRE_TOKEN — /Users/gtrrz-victor/wks/cli/fix-conflicts/cmd/entire/cli/repo_clone.go:543-548
+    When ENTIRE_TOKEN is set, the placement lookup uses that bearer and ignores the stored active context, but this helper still derives the home jurisdiction from the stored context. If the environment token is for an EU identity while a saved active context
+    is US, the clone silently filters or auto-selects a US placement. Read the environment token first and only fall back to the active context when it is unset.
+
+---
+
+<task-notification>
+<task-id>aa98fe537bb734a4c</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-fix-conflicts/035c25e5-b976-4f47-a5e4-534fcc896f0f/tasks/aa98fe537bb734a4c.output</output-file>
+<status>completed</status>
+<summary>Agent "Find ENTIRE_TOKEN guard patterns" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I now have everything needed. Here is my report.
+
+## Summary of findings
+
+The key realization: an ENTIRE_TOKEN env token carries a `home_jurisdiction` claim just like a login JWT, and `HomeJurisdictionFromLoginJWT` reads that claim from any JWT payload regardless of type. The idiomatic env-first-then-context pattern is used in several places; `defaultCloneHomeJurisdiction` is the one spot that skipped it.
+
+### 1. Sibling helpers in the clone flow that guard ENTIRE_TOKEN first
+
+Both live in the same file as the function you're fixing, `/Users/gtrrz-victor/wks/cli/fix-conflicts/cmd/entire/cli/repo_clone.go`. They use presence-based `os.LookupEnv(auth.EnvTokenVar)` guards that short-circuit before touching the stored/active-context session:
+
+- `ensureCloneSession` — lines 331-338:
+```go
+if _, ok := os.LookupEnv(auth.EnvTokenVar); ok {
+    return nil
+}
+```
+(comment: "Match coreapi's presence-based env-token precedence so this precondition never probes a stored session.")
+
+- `ensureClusterCloneSession` — lines 400-405: identical guard, same rationale ("match coreapi's presence-based precedence").
+
+The exact idiomatic pattern is: `if raw, ok := os.LookupEnv(auth.EnvTokenVar); ok { &lt;env-token branch&gt; }` then fall through to the active-context branch.
+
+### 2. `auth.EnvTokenVar` and the auth.go status-target resolvers
+
+- Definition: `/Users/gtrrz-victor/wks/cli/fix-conflicts/cmd/entire/cli/auth/env_token.go:18` — `const EnvTokenVar = "ENTIRE_TOKEN"`.
+- `/Users/gtrrz-victor/wks/cli/fix-conflicts/cmd/entire/cli/auth.go:292-297` — `resolveAuthStatusTarget` is the dispatcher, exactly the pattern you want:
+```go
+func resolveAuthStatusTarget(ctx context.Context, listContexts contextsProvider, resolveLogin loginTokenResolver) (statusTarget, error) {
+    if raw, ok := os.LookupEnv(auth.EnvTokenVar); ok {
+        return resolveEnvTokenStatusTarget(raw)
+    }
+    return resolveStatusTarget(ctx, listContexts, resolveLogin)
+}
+```
+- `/Users/gtrrz-victor/wks/cli/fix-conflicts/cmd/entire/cli/auth.go:304-310` — `resolveEnvTokenStatusTarget` derives core+token from the env token via `auth.ParseEnvToken(raw)` (fail-closed, no fallback):
+```go
+func resolveEnvTokenStatusTarget(raw string) (statusTarget, error) {
+    coreURL, token, err := auth.ParseEnvToken(raw)
+    if err != nil {
+        return statusTarget{}, err
+    }
+    return statusTarget{coreURL: coreURL, token: token, envToken: true}, nil
+}
+```
+
+### 3. `HomeJurisdictionFromLoginJWT` and whether it works on env tokens
+
+`/Users/gtrrz-victor/wks/cli/fix-conflicts/cmd/entire/cli/auth/cell_data_api.go:565-581`:
+```go
+func HomeJurisdictionFromLoginJWT(loginJWT string) (string, error) {
+    parts := strings.Split(loginJWT, ".")
+    if len(parts) &lt; 2 {
+        return "", errors.New("login token is not a JWT")
+    }
+    payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+    ...
+    var claims struct {
+        HomeJurisdiction string `json:"home_jurisdiction"`
+    }
+    if err := json.Unmarshal(payload, &amp;claims); err != nil { ... }
+    return claims.HomeJurisdiction, nil
+}
+```
+
+There is no separate env-token home-jurisdiction helper, and none is needed. This function just reads the `home_jurisdiction` claim from any JWT payload. ENTIRE_TOKEN env tokens carry `home_jurisdiction` — confirmed both by the test fixture `/Users/gtrrz-victor/wks/cli/fix-conflicts/cmd/entire/cli/auth/cell_data_api_test.go:553` (`{"aud":"https://us.auth.entire.io","home_jurisdiction":"us",...}`) and by the existing reuse in `resolveJurisdiction` (below), which passes an env token straight into `HomeJurisdictionFromLoginJWT`.
+
+The canonical reuse is `resolveJurisdiction` at `/Users/gtrrz-victor/wks/cli/fix-conflicts/cmd/entire/cli/auth/cell_data_api.go:378-395`: explicit override wins, else `HomeJurisdictionFromLoginJWT(loginJWT)` — and `loginJWT` there is the env token when ENTIRE_TOKEN is set (wired via `resolveCellSubject` → `resolveEnvTokenCellSubject`, cell_data_api.go:219-224 and 328-342). Test at cell_data_api_test.go:580-586 asserts "Empty jurisdiction falls back to the env token's home_jurisdiction claim."
+
+Note the `aud` claim (env_token.go `CoreURLFromEnvToken`) encodes the core *host/origin*, not the jurisdiction label. So do NOT parse `aud` to get the jurisdiction — use the `home_jurisdiction` claim via `HomeJurisdictionFromLoginJWT`.
+
+### 4. `ResolveControlPlaneTarget` and getting the bearer under ENTIRE_TOKEN
+
+`/Users/gtrrz-victor/wks/cli/fix-conflicts/cmd/entire/cli/auth/control_plane.go:47-60` — `func ResolveControlPlaneTarget() (ControlPlaneTarget, error)`. It reads only the active contexts.json context; it has NO awareness of ENTIRE_TOKEN. The struct (control_plane.go:32-35) is:
+```go
+type ControlPlaneTarget struct {
+    CoreURL     string
+    TokenSource func(context.Context) (string, error)
+}
+```
+`TokenSource` is a refreshing login provider bound to the context's core (`targetForContext`, control_plane.go:126-132).
+
+This is exactly why the current `defaultCloneHomeJurisdiction` is wrong: it calls `target.TokenSource(ctx)` which mints/refreshes a *stored-context* login JWT, ignoring ENTIRE_TOKEN entirely. When ENTIRE_TOKEN is set, the bearer a coreapi.Client actually uses is the raw env token itself (see #5), not anything from `ResolveControlPlaneTarget`.
+
+The env-token-aware analog is `resolveAuthStatusTarget`/`resolveEnvTokenStatusTarget` (auth.go, #2), which get the bearer via `auth.ParseEnvToken(raw)` → returns `(coreURL, token)` where `token` is the verbatim bearer.
+
+### 5. coreapi ENTIRE_TOKEN bypass
+
+`/Users/gtrrz-victor/wks/cli/fix-conflicts/internal/coreapi/client.go`:
+- `New()` at line 35 and `NewForCluster()` at line 58 both delegate to `clientFromEnvToken()` first.
+- `clientFromEnvToken()` at lines 102-113:
+```go
+func clientFromEnvToken() (*Client, bool, error) {
+    raw, ok := os.LookupEnv(auth.EnvTokenVar)
+    if !ok {
+        return nil, false, nil
+    }
+    coreURL, envToken, err := auth.ParseEnvToken(raw)
+    if err != nil {
+        return nil, true, err
+    }
+    client, err := NewWithBearer(coreURL, envToken)
+    return client, true, err
+}
+```
+So `auth.ParseEnvToken` (env_token.go:27-37) is the single owner of the trim/blank/aud validation: it derives the core origin from the token's `aud` (`CoreURLFromEnvToken`) and returns the raw token as the verbatim bearer. `NewWithBearer` (client.go:146) sends it verbatim.
+
+### Recommended fix pattern for `defaultCloneHomeJurisdiction` (repo_clone.go:543-557)
+
+Mirror `resolveAuthStatusTarget`/`resolveCellSubject`: guard ENTIRE_TOKEN first, extract the jurisdiction from the env token via the existing helpers, else keep the current active-context path. Concretely:
+
+```go
+func defaultCloneHomeJurisdiction(ctx context.Context) string {
+    if raw, ok := os.LookupEnv(auth.EnvTokenVar); ok {
+        _, token, err := auth.ParseEnvToken(raw)
+        if err != nil {
+            return ""
+        }
+        jur, err := auth.HomeJurisdictionFromLoginJWT(token)
+        if err != nil {
+            return ""
+        }
+        return strings.TrimSpace(jur)
+    }
+    target, err := auth.ResolveControlPlaneTarget()
+    ... // existing fallback unchanged
+}
+```
+
+This reuses `auth.EnvTokenVar`, `auth.ParseEnvToken`, and `auth.HomeJurisdictionFromLoginJWT` — no new parsing — and preserves the best-effort "return empty on any uncertainty" contract. `os`, `strings`, and `auth` are all already imported in repo_clone.go (os and auth used at lines 336/403, strings at 556/570).
+
+Note: this is Plan Mode and I have made no edits — the code block above is a recommendation for your reference, not an applied change.</result>
+<usage><subagent_tokens>45341</subagent_tokens><tool_uses>19</tool_uses><duration_ms>100207</duration_ms></usage>
+</task-notification>

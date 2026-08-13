@@ -1,0 +1,61 @@
+do not post it
+
+---
+
+<cross-session-message from="uds:/tmp/cc-socks/1192.sock" from-name="review-1928" from-mode="prompting">
+Next up is finding #1 on trail #992 — but DO NOT START YET. The user wants to discuss the approach first. Just load the context and hold; I'll send an explicit "go ahead" before you touch anything.
+
+Context for when we proceed:
+
+FINDING #1 (medium, confidence 0.95) — the test guard is illusory.
+File: `cmd/entire/cli/agent_group_test.go`, test `TestRunAgentList_ExternalFlagListsAvailablePlugin` (doc comment claims it verifies "the default (built-in) listing does not touch $PATH").
+
+The problem: the test asserts the external agent name is ABSENT from the default-listing output. But absence is guaranteed by the filter in `agent_group.go:97` (`external.IsExternal(ag) != externalOnly`) regardless of whether a $PATH scan ran. So if someone reintroduced an unconditional `external.DiscoverAndRegisterAlways(ctx)` on the default (non-external) path, this test would STILL PASS. The assertion is filter-driven, not scan-driven — it does not actually guard the "default path never scans $PATH" guarantee that the PR claims.
+
+The finding's suggested fix: assert on exec count rather than absence-from-output. The mock external agent is a `#!/bin/sh` script (see `writeExternalAgentBinary` in the same test file). Add a line to the script that appends to an exec log (e.g. `echo "$1" >> "$ENTIRE_TEST_EXEC_LOG"`), then assert the log is EMPTY after the default call and NON-EMPTY after the `--external` call. The finding author measured this working: default = 0 execs, --external = 2 execs (info + are-hooks-installed).
+
+Do not implement anything yet — reply to confirm you've got the context and are holding.
+</cross-session-message>
+
+---
+
+<cross-session-message from="uds:/tmp/cc-socks/1192.sock" from-name="review-1928" from-mode="prompting">
+Go ahead on finding #1. User approved. Agreed shape:
+
+1. Add an exec-log signal to the mock shell script, guarded so other tests are unaffected: only append when the env var is set, e.g. at the top of the generated `#!/bin/sh` script:
+   `[ -n "$ENTIRE_TEST_EXEC_LOG" ] && echo "$1" >> "$ENTIRE_TEST_EXEC_LOG"`
+   Thread this minimally through the shared helper (`writeExternalAgentBinary`/`writeExternalAgentBinaryEx`) so the existing installed/available tests are undisturbed (they just won't set the env var).
+
+2. Add a NEW dedicated test (e.g. `TestRunAgentList_DefaultPathDoesNotScanPath`) that owns the exec-log setup rather than overloading the existing `TestRunAgentList_ExternalFlagListsAvailablePlugin`. Assert:
+   - after the default call (`externalOnly=false`): exec log is EMPTY (0 execs — proves no $PATH scan)
+   - after the `--external` call (`externalOnly=true`): exec log is NON-EMPTY (proves the scan does run in that mode)
+   Use `t.Setenv("ENTIRE_TEST_EXEC_LOG", <tempfile>)` and `t.Cleanup(agent.SnapshotForTesting())` per the existing patterns.
+
+3. Leave the existing test's assertion as-is (don't remove it); optionally tighten/clarify its doc comment if it currently overclaims.
+
+Constraints as before: no new $PATH scan on the default path; run `mise run fmt && mise run lint` and the package tests before finishing. When done, report exactly what you changed so I can verify and resolve #1 on the trail.
+</cross-session-message>
+
+---
+
+<cross-session-message from="uds:/tmp/cc-socks/1192.sock" from-name="review-1928" from-mode="prompting">
+New task (design decision made with the user). Refactor `entire agent list` so `--external` becomes a SUPERSET instead of an external-only view. This lets us simplify away most of the a418c8e2c messaging. Edit forward (don't git-revert).
+
+TARGET BEHAVIOR in `cmd/entire/cli/agent_group.go` `runAgentList(ctx, w, externalOnly)`:
+- Discovery still runs ONLY `if externalOnly` (keep the 0-scan default guarantee — do not change this).
+- Filter change: default lists built-ins only; `--external` lists EVERYTHING (built-in + external). So replace the current mutually-exclusive filter `if external.IsExternal(ag) != externalOnly { continue }` with: skip external agents only on the default path, i.e. `if !externalOnly && external.IsExternal(ag) { continue }`.
+- Header: plain `"Agents:"` in BOTH modes. Drop the "External agents:" header.
+- Empty-state (`if !hasSomeInstalled`), scoped by mode:
+  - default: `"\nNo built-in agents installed. Use 'entire agent add <name>' to install hooks."`
+  - `--external`: `"\nNo agents installed. Use 'entire agent add <name>' to install hooks."` (globally correct now — it's the complete view)
+- Footer: only on the default path — `"\nRun 'entire agent list --external' to also list external plugins on your PATH."` No footer under `--external` (it's the complete/terminal view).
+- DROP the `listed` counter and the "No external agent plugins found on your PATH." distinction — in superset mode the list always includes built-ins, so that branch is no longer needed. Simpler is the goal.
+
+TESTS:
+- Keep `TestRunAgentList_DefaultPathDoesNotScanPath` (the #1 exec-log guard) — unchanged.
+- The existing `TestRunAgentList_ExternalFlagListsAvailablePlugin` / `...MarksInstalled` assert the external agent appears / is ✓ under `--external`; those still hold under superset — verify they pass.
+- REMOVE or rewrite the three a418c8e2c message tests that assert the old external-only wording: `TestRunAgentList_ExternalHeaderAndReciprocalFooter`, `TestRunAgentList_ExternalEmptyStateNonePlugins`, `TestRunAgentList_ExternalEmptyStateNoneInstalled` — they assert "External agents:" header, reciprocal footer, and "found on your PATH", all of which we're removing.
+- ADD a test asserting the superset: under `--external`, a built-in agent ALSO appears in the output (not just the external one). And a test that the default empty-state says "No built-in agents installed" while `--external` empty-state says "No agents installed".
+
+Constraints: no new $PATH scan on the default path; `mise run fmt && mise run lint`; run the cli package tests. Report back the diff summary when done — do NOT commit yet.
+</cross-session-message>

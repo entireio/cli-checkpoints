@@ -1,0 +1,308 @@
+running entire login fixed the issue, but this error needs some love
+
+❯ entire repo clone /gh/entirehq/wad-san-jose-booth-experience
+resolve mirror placements: security “BearerAuth”: security source “BearerAuth”: refresh login token: refresh token: Post “https://localhost:8180/oauth/token”: dial tcp [::1]:8180: connect: connection refused
+
+Is this still a thing with recent merges into main
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>abc69a0f98fef0b4f</task-id>
+<tool-use-id>toolu_01NBUHZnChxcxDgCHE72D7np</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-checkout-error/ea1c8041-5321-4da8-9eab-ff4628dbb037/tasks/abc69a0f98fef0b4f.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result># REUSE review
+
+Two real duplications worth acting on (one production, one test), one minor test-idiom miss, one I checked and recommend *against* changing. The core new machinery (`StripSecurityWrapping`) is genuinely new — nothing in the repo does it.
+
+---
+
+## 1. Transport-error classifier duplicated — `contextUnreachableError` vs `isRecapNetworkError`
+
+**File:** `/Users/soph/.herdr/worktrees/cli/soph-checkout-error/cmd/entire/cli/auth/refresh.go:207-214`
+
+The gate is line-for-line the pre-existing predicate:
+
+| new `contextUnreachableError` | existing `isRecapNetworkError` |
+| --- | --- |
+| `errors.As(err, &amp;urlErr)` → yes | `errors.As(err, &amp;urlErr)` → true |
+| `Canceled`/`DeadlineExceeded` → no | `Canceled`/`DeadlineExceeded` → false |
+| — | `errors.As(err, &amp;dnsErr)` → true |
+
+**Existing symbol:** `isRecapNetworkError` at `/Users/soph/.herdr/worktrees/cli/soph-checkout-error/cmd/entire/cli/recap_errors.go:69`. Related: `dnsNotFoundHost` at `recap_errors.go:51`.
+
+**Cost:** two independent answers to "is this a transport failure" now live in one binary, and they *already* disagree: a bare `*net.DNSError` not wrapped in a `*url.Error` is a network error for recap and a non-network error here. Any future refinement (honour `net.Error.Timeout()`, treat TLS-verify failures specially) must be made twice or the two silently drift.
+
+**Strictness caveat — direct reuse is not available.** `isRecapNetworkError` is unexported in package `cli`, and `cli` imports `cmd/entire/cli/auth` (`cmd/entire/cli/api_client.go:9`), so `auth` cannot import back. `internal/coreapi` also imports `auth` (`internal/coreapi/client.go:12`), so it isn't a viable shared home either. Reuse means extracting the six-line predicate into a leaf package (e.g. `internal/neterr`) and calling it from both. That is a 3-file change for 6 lines — defensible to decline, but the divergence should be a decision, not an accident. Minimum ask: a comment at `refresh.go:207` pointing at `recap_errors.go:69` and stating why the DNS tier is intentionally absent.
+
+## 2. Token-store seeding block: the new tests add copies #3 and #4
+
+**File:** `/Users/soph/.herdr/worktrees/cli/soph-checkout-error/cmd/entire/cli/auth/refresh_test.go:214-237` and `:271-290`
+
+Both new tests repeat a ~10-line block that already existed twice: `UseFileBackendForTesting` → `CoreKeyringService(url)` → expired `makeJWT` → `tokenstore.Set(svc, …)` → `tokenstore.Set(RefreshService(svc), "alice", "entr_old")` → `&amp;contexts.Context{…}`. It now appears at lines **149-158** (stale variant), **228-237** (new), **281-290** (new), **331-340** (existing). The four copies differ only in the URL and the context name.
+
+**Cost:** ~100 duplicated tokens × 4, and the seeding contract (refresh-token literal `entr_old`, the `+TokenExpirationSeparator+"0"` encoding for "already expired") is now restated four times — change the encoding and four call sites must move together.
+
+**Fix:** one file-local helper beside the existing `failRoundTripper` (`refresh_test.go:426`), named after the existing convention in `/Users/soph/.herdr/worktrees/cli/soph-checkout-error/cmd/entire/cli/auth/context_store_test.go:47` (`seedLoginWithJurisdictionTokens`):
+
+```go
+func seedExpiredLoginWithRefresh(t *testing.T, name, coreURL string) *contexts.Context
+```
+
+Collapses all four sites to four calls. `seedLoginWithJurisdictionTokens` itself is *not* reusable here — it goes through `RecordLoginContext` and needs `ENTIRE_CONFIG_DIR`, and it seeds a *valid* token; these tests need an expired one and no contexts.json.
+
+**Correctly reused, no action:** `makeJWT` (`cmd/entire/cli/auth/contexts_test.go:23`) — the new tests call it rather than re-rolling JWT construction.
+
+## 3. Hand-rolled port reservation where the repo has a 2-line idiom
+
+**File:** `/Users/soph/.herdr/worktrees/cli/soph-checkout-error/cmd/entire/cli/auth/refresh_test.go:217-225`
+
+Nine lines of `net.ListenConfig` / `Listen` / `Addr()` / `Close()` (plus the new `net` import) to obtain a closed port.
+
+**Existing in-repo idiom:** `/Users/soph/.herdr/worktrees/cli/soph-checkout-error/internal/remotehelper/transport/proxy_test.go:314-315` — `down := httptest.NewServer(...); down.Close()` for exactly the "this node is down" case. `refresh_test.go` already imports `net/http/httptest` for the sibling test, so this is a strict reduction: 9 lines → 2, and the `net` import goes away.
+
+**Not a duplication of a helper** — none exists, and none is warranted. This is pattern reuse only, hence low priority. Note `cmd/entire/cli/lifecycle_test.go:2263` also uses `ListenConfig`, but for a *blackhole* (accepts, never responds); that is a different requirement and is not precedent for the closed-port case.
+
+## 4. `rewrittenError` duplicates `strippedError` — checked, recommend NO change
+
+`/Users/soph/.herdr/worktrees/cli/soph-checkout-error/internal/coreapi/security_wrap_test.go:98-104` defines a type with the same two fields, the same two methods, and the same semantics as `strippedError` at `/Users/soph/.herdr/worktrees/cli/soph-checkout-error/internal/coreapi/security_wrap.go:19-25`, in the same package. `&amp;strippedError{msg: …, err: sentinel}` is a mechanical drop-in at `security_wrap_test.go:69`.
+
+**But reuse would be wrong here.** Feeding the production wrapper back in as the fixture makes the test self-referential: `StripSecurityWrapping` is now applied twice on the `renderCoreError` → `main.go` path (`corecmd.go:650`, `main.go:133`), so someone will plausibly special-case `*strippedError` for idempotency — at which point the "walk stops at a rewritten message" case would silently stop exercising that path. Keep the independent fixture. Reported only so the duplication isn't mistaken for an oversight.
+
+---
+
+## Checked, genuinely no duplication
+
+- **`StripSecurityWrapping` / chain peeling.** The only non-test `errors.Unwrap(` call in `cmd/` + `internal/` is the new one (`internal/coreapi/security_wrap.go:55`). Nothing else decomposes an error chain and rebuilds a message. Nearest neighbours are all different jobs: `coreapi.APIError` (`internal/coreapi/client.go:215`) pulls a problem-detail out of a typed status error; `cli.SilentError` (`cmd/entire/cli/errors.go:9`) delegates `Error()` unchanged; `loginHintErr` (`cmd/entire/cli/search_v4.go:43`) maps one sentinel to one literal; `redactURL` (`cmd/entire/cli/plugin_gitremote.go:162`) redacts URLs, not error text.
+- **The `entire login` / `entire auth use &lt;context&gt;` hint.** No helper produces it. The three existing sites are inline literals in three packages: `cmd/entire/cli/logout.go:116`, `cmd/entire/cli/auth.go:445`, `internal/entireclient/clusterdiscovery/resolve.go:332`. The clusterdiscovery renderers (`renderLoginHint`/`renderLoginInstruction`, `discovery.go:163-182`; `renderUnusableActiveContext`, `resolve.go:330`) are unexported **and answer a different question** — which login servers a *resource* trusts, i.e. eligibility. Reusing them would print a trusted-issuer list for a resource that is not the thing that failed. Only a cosmetic inconsistency is left (`&lt;context&gt;` here and in `logout.go` vs `&lt;name&gt;` in `auth.go:445`) — a wording call, not duplication.
+- **`strings.TrimRight(c.CoreURL, "/")` at `refresh.go:221`.** Repeats `refresh.go:173` and `:125`, but this is the repo-wide idiom (~30 sites). The one named version, `normalizeCoreURL` (`internal/entireclient/clusterdiscovery/resolve.go:293`), is unexported and additionally `TrimSpace`s. At most, hoist a local since `contextReauthError` and `contextUnreachableError` are adjacent; not worth a shared helper.
+- **Double `StripSecurityWrapping` (`corecmd.go:650` + `main.go:133`) is not redundant.** `renderCoreError`'s result is also consumed by the mirror wizard, which prints `res.err` itself instead of returning it (`cmd/entire/cli/repo_mirror_create_wizard.go:591`, `:627`), so `main.go` never sees those errors. The comments already say this correctly.</result>
+<usage><subagent_tokens>128714</subagent_tokens><tool_uses>38</tool_uses><duration_ms>281657</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a3065b7bf25a5bef7</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-checkout-error/ea1c8041-5321-4da8-9eab-ff4628dbb037/tasks/a3065b7bf25a5bef7.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I restored the working tree after an accidental `git stash` (all changes intact, verified). Measurements below are on this machine, Go 1.26.5, Apple M4 Max.
+
+## Verdict: nothing in this diff is worth changing for efficiency.
+
+Every new code path is error-only or once-per-process, and the one claim worth checking hard (startup cost) turns out to be a non-event. Details, including the two things I expected to be findings and aren't:
+
+### 1. `internal/coreapi/security_wrap.go:14` — package-level `regexp.MustCompile`: no startup regression. Verified, do not change.
+The premise that the new `main.go` import pulls `coreapi` onto the hook path is **false**. `cmd/entire/cli` already imports `internal/coreapi` from ~28 non-test files (`corecmd.go:20`, `auth.go:18`, `repo.go:13`, `repo_mirror.go:20`, …), and `main.go` has always imported `cmd/entire/cli`. `go list -deps ./cmd/entire/cli | grep coreapi` hits — independent of the diff. So `coreapi`'s init already ran on every `entire` invocation, `entire hooks` included. The new import adds zero packages to the binary.
+
+`regexp` is likewise already in `coreapi`'s own dep closure (`ogenregex` at `oas_cfg_gen.go:13`), so no new package init and no new binary bytes either.
+
+Cost of the one added pattern compile: **2.8–4.8µs**, against a measured **58ms** per `entire version` (20 warm runs). That is ~0.008% of startup, and the repo already compiles ~70 package-level regexps at init. A hand-rolled matcher (`CutPrefix "security "` → `TrimPrefix "source "` → quoted-check) benches at 8.6ns/match vs 135ns with no init cost, but it buys single-digit microseconds once per process and costs readability. Don't.
+
+### 2. `internal/coreapi/security_wrap.go:33-45` — the peel loop is genuinely O(n²), and it does not matter.
+The quadratic behaviour is real, and for a non-obvious reason worth recording: for chains built by `fmt.Errorf`, `Error()` is a precomputed field read, so re-rendering is free. But the security segments come from **go-faster/errors** (`oas_security_gen.go:199,207`), whose `wrapError.Error()` is `fmt.Sprint(e)` → recursive `FormatError` over the entire tail through the `fmt` reflection machinery, allocating a fresh full string per call. So on exactly the chains this function targets, each link's message is re-rendered from scratch.
+
+Measured on go-faster chains: reported real shape (depth 4, 2 go-faster links) **1.33µs**; synthetic depth 5 **2.5µs**; depth 20 **26.5µs** — 4× depth for 10.5× cost, confirming superlinear.
+
+Path: error-only. Both call sites (`main.go:133`, `corecmd.go:650`) sit inside `err != nil` branches and run at most once per process, immediately before printing and exiting.
+
+The cheaper alternative works — hoist `innerMsg := inner.Error()` and carry it forward as the next iteration's `curMsg`: **1.33µs → 0.83µs** on the real chain, 26.5µs → 13.9µs at depth 20. That is 500ns once per failed command against a 58ms process. **Not worth it**; the current form also reads more plainly as "decompose each link independently."
+
+### 3. `cmd/entire/cli/auth/refresh.go:207-223` — 3 extra chain walks + a duplicated `TrimRight` on the error path; ~2ns on the success path. Negligible.
+`contextAuthError` runs `contextReauthError` (2 `errors.Is` walks + `strings.TrimRight(c.CoreURL, "/")`) and then `contextUnreachableError` (1 `errors.As` + 2 more `errors.Is` walks + a second `TrimRight` of the same value) — 5 walks of the same ~4-link chain, and one `TrimRight` computed twice. Each walk is ~10-40ns; `TrimRight` with a one-byte cutset returns a substring with no allocation. ~100ns total, once, on the error path.
+
+The path that actually runs per request is the success path, and there the addition is ~2ns: `result()` and the resource-provider closure call `contextAuthError(c, nil)` unconditionally, and `errors.As(nil, &amp;urlErr)` returns at its first line — I checked go1.26.5 `errors/wrap.go`, the `err == nil` short-circuit precedes all reflection and the target-type panics. No reflection, no walk. Merging the two predicates to share one walk and one `TrimRight` would trade three separately-documented functions for ~100ns before the process exits. Leave it.
+
+### 4. `cmd/entire/cli/corecmd.go:650` + `cmd/entire/main.go:133` — the strip runs twice per core-command error. ~1µs. Negligible.
+`renderCoreError` returns a `*strippedError`, which `main.go` then hands back to `StripSecurityWrapping`. The second pass isn't free: it costs one `inner.Error()` — a full go-faster render of the original chain — before `CutSuffix` fails and it bails. ~1µs, once, per failed command. A two-line `if _, ok := err.(*strippedError); ok { return err }` guard at the top would erase it, but the backstop-in-`main` design is the right shape and the magnitude doesn't justify special-casing.
+
+### 5. Closure/retention: nothing extended. No finding.
+`NewRefreshingResourceProvider`'s returned closure already captured `c` (it called `contextReauthError(c, err)`); swapping in `contextAuthError(c, err)` changes neither the capture set nor its size. `RefreshingLoginCredential.result` reads `c.context`, a field the long-lived struct already holds. And `contextUnreachableError` wraps `urlErr.Err` rather than `urlErr`, so the returned error retains only the freshly formatted message plus the transport cause — the `*url.Error` and its `Op`/`URL` strings become collectible, which is marginally *better* for retention than wrapping the `*url.Error` would have been. The error itself is printed and then the process exits.
+
+### 6. New tests: cheap, no sleeps, no network waits. No finding.
+- `refresh_test.go:213` (`UnreachableCore`) measured **0.01s**. It obtains an unreachable address by binding `127.0.0.1:0` and closing it, so the dial returns an immediate loopback `ECONNREFUSED` instead of waiting on a timeout — the correct construction. No `time.Sleep`, no retry loop, no fixed wait.
+- `refresh_test.go:270` (`RejectedRefreshIsNotUnreachable`) measured **0.00s**. Its `httptest.NewServer` is one loopback listener (sub-millisecond) and matches the pattern already used by `ForceRefreshesRejectedFreshToken` and `RefreshesAndRotates` in the same file. A canned `RoundTripper` would skip the listener and save microseconds while diverging from the file's convention — not worth it.
+- `security_wrap_test.go` is pure in-memory, `t.Parallel()` on parent and every subtest, **0.00s**.
+- The two auth tests correctly omit `t.Parallel()`: `tokenstore.UseFileBackendForTesting` is process-global, and no test in `refresh_test.go` is parallel. No reclaimable parallelism.
+
+### 7. One small saving the diff introduces
+`internal/coreapi/cross_juris_transport.go:216` drops a `fmt.Errorf` wrap, removing one allocation and one format per transport failure. Error path, so immaterial — but it is work removed, not added.</result>
+<usage><subagent_tokens>101584</subagent_tokens><tool_uses>32</tool_uses><duration_ms>342498</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a6943603d4666848d</task-id>
+<tool-use-id>toolu_01MTjnBd2cHy9etz2hcw2wk3</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-checkout-error/ea1c8041-5321-4da8-9eab-ff4628dbb037/tasks/a6943603d4666848d.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Findings (ordered by value)
+
+**1. `internal/coreapi/security_wrap.go:59-69` — two `CutSuffix` steps + two `break`s collapse into one.**
+The `prefix` intermediate exists only to be trimmed of `": "` on the next line. The two conditions are algebraically the same condition: "outer message ends with `inner.Error()`" AND "the remainder ends with `": "`" ⟺ "outer message ends with `": " + inner.Error()`", and the resulting `segment` is byte-identical.
+Cost: 11 lines and two exit points where one suffices, plus a reader holding `prefix` (with trailing `": "`) and `segment` (without) apart in their head — the sort of pair that invites a future edit to use the wrong one.
+Simpler form (keep the existing comment verbatim above it):
+```go
+segment, ok := strings.CutSuffix(cur.Error(), ": "+inner.Error())
+if !ok {
+    break
+}
+```
+Verified: I copied `security_wrap.go` + `security_wrap_test.go` into a scratch module, applied exactly this change, and the diff's own tests pass unchanged. Loses nothing (one extra small string concat per link).
+
+**2. `cmd/entire/cli/auth/refresh.go:215-218` — the `urlErr.Err != nil` fallback is unreachable and contradicts the comment directly above it.**
+Every `*url.Error` a caller can observe here comes from `http.Client.Do`; both construction sites in `net/http/client.go` (:603, :633) always set a non-nil `Err`, all four `uerr(...)` calls pass a non-nil error, and `net/url`'s three sites do too.
+Cost: 4 lines that make a reader hunt for the case where a `*url.Error` has no cause — and in that (impossible) case the branch wraps `urlErr` itself, producing exactly the "message repeats the core URL" outcome the doc comment at :204-206 says the design avoids. A defensive branch that defeats its own documented invariant is worse than none.
+Simpler form: drop the rebind and pass `urlErr.Err` directly to `fmt.Errorf`. Honest loss: if some third-party transport ever hand-built `&amp;url.Error{Err: nil}`, `%w` renders `%!w(&lt;nil&gt;)` instead of the `url.Error`'s own text. If you want a guard anyway, the one-line `if urlErr.Err == nil { return nil }` (fall through to the caller's own wording) is cheaper and preserves the invariant.
+
+**3. `cmd/entire/cli/auth/refresh.go:153-163` — `contextAuthError` is a pure-delegation wrapper worth folding away.**
+Its whole body is "call A; else call B". Grep confirms `contextReauthError` and `contextUnreachableError` now have no caller other than this wrapper and no direct tests, so the split buys no testability.
+Cost: a third function in a chain of three, and a 5-line doc comment whose second half ("Returns nil for everything else, leaving the caller to wrap the residual error in its own terms (refresh vs exchange)") is copied near-verbatim from `contextReauthError`'s comment at :169-171 — two places now describe the same contract, and a future third mapper means updating both.
+Simpler form: rename `contextReauthError` → `contextAuthError` and end its `switch` with `return contextUnreachableError(c, err)`. Both call sites (:256, :339) stay exactly as the diff has them, `contextUnreachableError` keeps its own (valuable) doc block, and `coreURL := strings.TrimRight(c.CoreURL, "/")` gets computed once for both branches instead of once per function. Net −1 function, −6 lines, no behavior change.
+Conservative caveat: if a third mapper is imminent, the composition point earns its keep — at two it does not.
+
+**4. `cmd/entire/cli/auth/refresh_test.go:217-226` — the bind-then-release port dance is 9 lines and a `net` import for what `httptest` already does in 3.**
+Cost: `net.ListenConfig` + two error branches to obtain a dead address, when the sibling test two functions down already imports `httptest`.
+Simpler form:
+```go
+// A port nobody is listening on: start a server, take its URL, stop it.
+srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+coreURL := srv.URL
+srv.Close()
+```
+Drops the `net` import. Verified in a scratch module (5 runs): a GET against a closed `httptest` server's URL unwraps to `syscall.ECONNREFUSED`, same as the released-listener trick, and rests on the same "just-released port stays free" assumption.
+
+**5. `cmd/entire/cli/auth/refresh_test.go:228-245` vs `281-298` — 18 lines of identical seeding between the two new tests.**
+The blocks differ only in the core URL, the transport argument, and the context name. Note this matches pre-existing local style (:106-120, :130-159, :184-198 all copy it), so this is optional — but the two *new* functions are the closest pair in the file and are the cheapest place to break the pattern before a fourth copy lands (`mise run dup`'s advisory threshold-50 pass will likely see it).
+Simpler form: one helper in this file —
+```go
+// seedExpiredLogin seeds an expired access token plus an "entr_old" refresh
+// token for coreURL and returns a login provider for a context named name.
+func seedExpiredLogin(t *testing.T, name, coreURL string, transport http.RoundTripper) func(context.Context) (string, error)
+```
+— after which each new test is fixture + one call + its own assertions, and `TestNewRefreshingLoginProvider_ExpiredNoRefresh` can adopt it later.
+Do **not** table-drive these two: they need different fixtures (dead port vs live 400-ing server) and opposite assertions, so a table would need a per-case setup closure — more machinery than it removes.
+
+**6. `cmd/entire/cli/auth/refresh_test.go:247-257` — the 5-element `Contains` loop over-splits one sentence.**
+Cost: a slice, a loop, and 3 inline comments to assert what one check asserts better. Splitting `"cannot reach the login server"`, `"local"` and `coreURL` also *weakens* the test: it passes if the host appears anywhere in the string, including inside an unrelated segment.
+Simpler form: one `strings.Contains(got, fmt.Sprintf("cannot reach the login server for %q (%s)", "local", coreURL))` (pins the three together, in order), plus the two existing hint checks (`entire login`, `entire auth use &lt;context&gt;`) as plain `Contains` calls — 5 checks become 3, and the first is stricter.
+
+**7. `internal/coreapi/security_wrap_test.go:73` — the case name `"no leading dot on a scheme-less wrapper"` names something the code has no notion of.**
+There is no dot anywhere in `security_wrap.go`; the row asserts that an empty scheme name still matches `[^"]*` and leaves no stray separator. Reads like a leftover from an earlier join implementation.
+Cost: a reader greps for "dot", finds nothing, and can't tell what the row is defending — and the row's real subject is an input ogen cannot emit (schemes always come from the spec).
+Simpler form: rename to `"empty scheme name still matches"`, or drop the row.
+
+**8. `internal/coreapi/security_wrap_test.go:51` — `"wrapper is stripped when it is the only segment"` describes an axis the row above it also has.**
+The row at :46 (`security "SessionAuth"`) is *also* the only segment; the actual distinction is the optional `source ` group in the regexp.
+Cost: three near-identical rows (:46, :51, :73) all expecting `"boom"` with names that don't separate them — someone tidying up will delete the wrong one and silently drop regexp coverage.
+Simpler form: rename to something like `"the security source form is stripped too"`. Keep all three rows; this is naming only.
+
+**9. `internal/coreapi/security_wrap_test.go:19, 25` — `StripSecurityWrapping(err)` is called twice.** Assign once (`stripped := StripSecurityWrapping(err)`) and use it for both the message and the `errors.Is` check. Micro-nit.
+
+## Considered and deliberately not flagged
+
+- **The `context.Canceled`/`DeadlineExceeded` guard (`refresh.go:212`) is reachable and necessary.** `http.Client.Do` returns a `*url.Error` wrapping the context error, so without it a Ctrl-C during a token refresh would be reworded as "cannot reach the login server". Keep.
+- **`strippedError` cannot be `fmt.Errorf`.** No `fmt.Errorf` verb produces an error whose message is *independent* of the wrapped error's text while still unwrapping to it; a 6-line type is the only shape. (It is now the third instance of the `msg`+`err` pair — `auth.reauthError`, `coreapi.strippedError`, plus the test's `rewrittenError`. Since `internal/coreapi` already imports `cmd/entire/cli/auth`, a shared exported constructor is *possible*, but exporting one for two uses is not yet worth it. Revisit at four.)
+- **`if !stripped { return err }`** is not redundant: the walk decomposes by exact suffix, so recomposition would reproduce the same string, but returning `err` itself preserves error *identity* for `renderCoreError`'s pass-through contract. Keep.
+- **The regexp vs plain string replacement.** I checked the shorter alternative honestly. `strings.NewReplacer` over the rendered message (or an unanchored `regexp.ReplaceAllString`) is ~25 lines shorter, but loses three things: (a) the "matching text inside a message is preserved" behavior the diff has a test for — `create org: security "BearerAuth": rejected by policy` would become `create org: rejected by policy`; (b) scheme-agnosticism, if you hardcode `BearerAuth` (a new scheme silently stops being stripped, and the `SessionAuth` test row is what catches that); (c) an anchored variant (`(^|: )security …`) does not handle *back-to-back* wrappers, because RE2 has no lookbehind and the scan resumes past the first match — so the real reported chain would only get half-stripped. Given this runs on every fatal error path in the CLI, I'd keep the structural walk as written (with finding 1 applied). The anchored `^security (source )?"[^"]*"$` against an already-isolated whole segment is the right shape; a hand-rolled `CutPrefix`/`HasSuffix` equivalent would be longer, not shorter.
+- **Applying the strip in both `corecmd.go:650` and `main.go:133` is not redundant.** I traced it: `renderCoreError`'s result reaches `repo_mirror_create_wizard.go:796`, which prints `r.err` itself and never routes through `main.go`'s default branch. The comment's framing (main.go as the backstop) is accurate.
+- **`TestNewRefreshingLoginProvider_RejectedRefreshIsNotUnreachable` is not redundant** despite being 30 lines for one negative assertion. It pins a third-party fact the `*url.Error` gate depends on — that auth-go/`http.Client` does *not* wrap an answered 400 in a `*url.Error` — which a cheap unit table over `contextUnreachableError` could not prove, and which is exactly what an auth-go upgrade could break. Keep as is.
+- **Comment density**: no findings. The long doc blocks at `refresh.go:189-206` and `security_wrap.go:27-46` carry the reasoning (why gate on `*url.Error`, why peel structurally) rather than restating code; the `cross_juris_transport.go` comment justifies a `//nolint:wrapcheck` that would otherwise look arbitrary. The only comment-level problems are the two misleading test-case names in findings 7 and 8, and the doc-comment duplication noted in finding 3.</result>
+<usage><subagent_tokens>113904</subagent_tokens><tool_uses>21</tool_uses><duration_ms>374090</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aad07e21c1912e0e7</task-id>
+<tool-use-id>toolu_01HgCAHPFAacuxQ2AMcTRZCa</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-checkout-error/ea1c8041-5321-4da8-9eab-ff4628dbb037/tasks/aad07e21c1912e0e7.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have what I need. Here is the altitude review.
+
+## Finding 1 — The two strip points miss the search TUI, which renders coreapi errors verbatim
+
+**Files:** `/Users/soph/.herdr/worktrees/cli/soph-checkout-error/cmd/entire/cli/search_tui.go:335`, `:354`, `:396` (displayed at `:790`, `:851`, `:869`)
+
+`m.searchErr = msg.err.Error()` / `m.codeSearchErr = msg.err.Error()` capture the rendered string inside the Bubble Tea model. Both message sources are coreapi calls:
+
+- `codeSearchResultsMsg` ← `performCodeSearch` (`search_tui.go:676`) → `searchAllCells` (`search_cmd.go:495-508`), which does `coreapi.New()` then `coreClient.ListRepos(...)` and wraps it `"listing repos for cell discovery: %w"`.
+- `searchResultsMsg` / `searchMoreResultsMsg` ← the semantic searcher → `search_v4.go:182` `s.coreClient.ListRepos(...)`.
+
+A bearer-resolution failure on either produces the exact reported chain. `renderCoreError` is never called on this path, and main.go's default branch cannot help — the string is already captured, and the command returns nil after the TUI exits. So `entire search` in TUI mode still shows `Error: listing repos for cell discovery: security "BearerAuth": security source "BearerAuth": cannot reach the login server for …`.
+
+**Cost:** the reported symptom survives on the one command most likely to be run interactively.
+**Deeper alternative, in scope:** one named renderer in the `cli` package (`renderUserFacingError(err) error`) that main.go's default branch, `renderCoreError`, and these three TUI sites all call. ~5 lines plus 3 call-site edits, and it gives the choke point a name so the next generated client or TUI has somewhere to plug in.
+
+## Finding 2 — Two applications is defensible, but the comments describe each other as the backstop
+
+**Files:** `cmd/entire/main.go:133` and `cmd/entire/cli/corecmd.go:650`
+
+`corecmd.go:648-649` says main.go is "a backstop for the command paths that don't route through here"; `main.go:131-132` says it is applied there "rather than one call site at a time." Each is true in isolation, but together they hide the actual asymmetry:
+
+- main.go's `default:` branch **is** the choke point. It makes `renderCoreError`'s copy redundant for every path that returns the error upward (`org`, `project`, `repo`, `grant`, `mirror` — all of `runCoreClient`, `corecmd.go:613-615`).
+- `renderCoreError`'s copy is load-bearing for exactly one shape: the mirror-create wizard, which prints `r.err` itself at `repo_mirror_create_wizard.go:796` and returns `NewSilentError` at `:799`, so main.go's `errors.As(err, &amp;silent)` branch fires and the default branch never runs.
+
+Naming that single reason is what stops a third copy being added. Two supporting details worth a sentence each in the doc comments:
+
+- The double application is a no-op only because `strippedError.Unwrap()` (`internal/coreapi/security_wrap.go:22`) returns the *original* chain, so the second pass's `CutSuffix(cur.Error(), inner.Error())` fails on the first link and bails. That interaction is the only thing keeping the second call harmless.
+- The "one call site at a time" fragility the main.go comment warns about is already present in the wizard: `repo_mirror_create_wizard.go:580` assigns `res.err = clientErr` (from `coreapi.NewForCluster`, `:531`) with no `renderCoreError`, while its two siblings at `:591` and `:627` do call it. That specific error can't carry ogen wrappers today, so it is not a bug — it is evidence the per-assignment discipline is already drifting.
+
+## Finding 3 — Stripping at render time is the right depth; a generation-level fix does not exist (verified)
+
+The wrappers come from `internal/coreapi/oas_security_gen.go:199,207` and `oas_client_gen.go:506,517,…`. I checked every source-level lever:
+
+- **Templates:** `gen/_template/security.tmpl:145,154` and `client.tmpl:390`. Embedded via `//go:embed _template/*` (`gen/templates.go:218`), parsed by the **unexported** `vendoredTemplates()` (`gen/templates.go:227`), hard-wired at `gen/write.go:238`. No override path.
+- **CLI flags** (`cmd/ogen/main.go:286-315`): only `config`, `target`, `package`, `clean`, `strict`, profiling, `version`. No `--templates`.
+- **Config** (`gen/options.go`): `Parser`, `Generator{Features, Filters, IgnoreNotImplemented, ConvenientErrors, ContentTypeAliases, …}`. Nothing touching security error text; `ConvenientErrors` is server-side.
+- **Features** (`gen/features.go`): the full name set is `paths/{client,server}`, `webhooks/{client,server}`, `ogen/{otel,unimplemented}`, `client/editors`, `client/request/{options,validation}`, `client/security/reentrant`, `server/response/validation`. None affects the wrap.
+- **The security source itself** (`internal/coreapi/client.go:180`) cannot help: the generated caller wraps any error that isn't `ErrSkipClientSecurity`, unconditionally.
+- **The one structural alternative** — attach the bearer in `crossJurisRoundTripper` instead of the SecuritySource, so failures return from `RoundTrip` — trades the two segments for an `*url.Error` prefix (`Get "https://…/api/v1/orgs": `), which this same diff argues is noise at `cross_juris_transport.go:216-222`. It makes the message worse.
+- A post-generation rewrite appended after `gofmt -s -w .` (`internal/coreapi/gen.go:25`) is the only remaining "source" option and is strictly worse: it edits `DO NOT EDIT` files and vanishes silently on an ogen bump.
+
+**Verdict:** no change. Render-time is the correct depth, and `internal/coreapi` is the right owner (it owns its own generated noise).
+
+## Finding 4 — `refresh.go` is the wrong layer for the unreachable-core message; the split is user-visible
+
+**File:** `cmd/entire/cli/auth/refresh.go:207` (`contextUnreachableError`), reached only from `:256` and `:339`
+
+`contextUnreachableError` fires only when a token actually has to be minted. `refresh.go:279-281` documents the other half itself: *"A still-valid token is returned with no network call."* So with a locally-valid cached access token and a dead core, `entire org list` never enters this path. The failure comes from the request instead — `cross_juris_transport.go:214` → `http.Client` — arriving as:
+
+```
+Get "http://localhost:8180/api/v1/orgs": dial tcp [::1]:8180: connect: connection refused
+```
+
+No context name, no `entire login`/`entire auth use` hint. These are two independent HTTP paths to the same host: the refresh client is built with `transport=nil` at `control_plane.go:97`, the request client with `newCrossJurisHTTPClient()` at `client.go:120`.
+
+**Cost:** the same "my core is down" reproduces the good message or the bare one depending on whether the cached access token happens to have expired — state the user cannot see or predict. The diff's own edit at `cross_juris_transport.go:214-223` shows this second path was in view; it only got noise trimmed. Relatedly, the doc at `refresh.go:197-198` overstates the coverage — "on any command that needs a token" is really "any command that needs to *mint* a token".
+
+**Deeper fix:** `auth.ControlPlaneTarget` (`control_plane.go:32-35`) carries `CoreURL` and `TokenSource` but not the context name. Add `ContextName`, and have `clientForTarget` (`client.go:118`) wrap the transport so a transport-level `*url.Error` on a *request* maps to the same wording. That puts "which login context chose this host" next to `CoreOrigin()` — the place CLAUDE.md already designates as the single source of truth for "which core am I talking to".
+
+**Scope:** larger than this change — new field, one new RoundTripper, plus a fallback label for `NewWithBearer`/`ENTIRE_TOKEN` clients that have no context name. Reasonable as a follow-up; shipping the refresh-path message first is fine. Just narrow the doc claim so the next reader doesn't assume the request path is covered.
+
+## Finding 5 — The `//nolint:wrapcheck` is correct and matches an established local convention
+
+**File:** `internal/coreapi/cross_juris_transport.go:223`
+
+`.golangci.yaml:101-103` does list `internal/coreapi` under `wrapcheck.ignore-package-globs`, but that suppresses errors *originating from* coreapi. Here the error comes from `http.RoundTripper` (net/http), so the glob does not cover it and a directive is genuinely required.
+
+The repo convention for exactly this shape is a per-site directive: `internal/entireclient/httpclient/useragent.go:26`, `internal/remotehelper/httpdebug/roundtripper.go:29,45`, `internal/remotehelper/httpdebug/timing.go:24,32`, `internal/remotehelper/transport/proxy.go:164` — all `//nolint:wrapcheck // passthrough…`. The `// see above` form has precedent at `cmd/entire/cli/client.go`'s sibling `internal/coreapi/client.go:109` and `cmd/entire/cli/plugin_manifest.go:52`, and satisfies `nolintlint`'s `require-explanation` / `require-specific`.
+
+The only project-level alternative — `wrapcheck.ignoreInterfaceRegexps` for `net/http.RoundTripper`, which would retire six existing directives — is a repo-wide config change and correctly out of scope here. **No change.**</result>
+<usage><subagent_tokens>156229</subagent_tokens><tool_uses>42</tool_uses><duration_ms>459677</duration_ms></usage>
+</task-notification>

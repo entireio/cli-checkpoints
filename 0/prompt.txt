@@ -1,0 +1,392 @@
+<task-notification>
+<task-id>ba5v7fq9f</task-id>
+<summary>Monitor event: "CI checks on PRs 1984 and 1985"</summary>
+<event>PR#1984 Entire Gates: fail</event>
+If this event is something the user would act on now, send a PushNotification. Routine or benign output doesn't need one.
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ba5v7fq9f</task-id>
+<summary>Monitor event: "CI checks on PRs 1984 and 1985"</summary>
+<event>PR#1985 Entire Gates: fail</event>
+If this event is something the user would act on now, send a PushNotification. Routine or benign output doesn't need one.
+</task-notification>
+
+---
+
+can yxou look at both PRs and the corresponding trail for comments and findings
+
+---
+
+does this fit in the initial investigation:
+
+The trace is definitive:
+
+  stop  69432ms
+
+  copy_transcript                    751ms
+  extract_metadata                    55ms
+  detect_file_changes                 35ms
+  filter_and_normalize_paths           6ms
+  write_temporary_checkpoint       67822ms
+
+  So parsing is not the issue. write_temporary_checkpoint is the issue. It consumed ~67.8s of the ~69.4s hook runtime.
+
+  The debug log also shows the transcript size at that moment:
+
+  raw_bytes:    70,114,971
+  stored_bytes: 67,748,804
+
+  That means the Stop hook is copying/sanitizing the transcript quickly enough, then spending almost all time creating the
+  temporary checkpoint. With a dirty worktree, that checkpoint path walks .entire/metadata, rereads full.jsonl, redacts
+  the .jsonl, and writes it into the shadow branch as Git objects.
+
+  Side effect: this forced run advanced the session checkpoint count from 13 to 14. The visible worktree status is otherwise
+  the same set of modified files.
+
+  Concrete conclusion: fix write_temporary_checkpoint, specifically the metadata/full-transcript checkpoint path. We should
+  stop re-redacting and re-blob-writing the entire Codex transcript on every dirty Stop hook.
+
+---
+
+1984 and 1985 are merged, so yeah let's start a new brnach of main and look at the fix
+
+---
+
+let's build a and b together
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>acfcd59965b122cdd</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-slow-entire-hook/494613eb-2fb9-404c-b7b6-587999007d63/tasks/acfcd59965b122cdd.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review of redaction diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have everything I need. Here are the findings.
+
+## Simplification review — incremental redaction diff
+
+### F1. `gitrepo.CommonDir` + `redactCacheHolder` reinvent a memoized helper that already exists in the same package
+`cmd/entire/cli/gitrepo/repository.go:60-82`, `cmd/entire/cli/checkpoint/redact_cache.go:249-269`, `cmd/entire/cli/checkpoint/store.go:26-34,50-60`
+
+`cmd/entire/cli/checkpoint/git_common_dir.go:39` already has `resolveGitCommonDir(ctx, repo)` — same job (`git rev-parse --git-common-dir`, which the new doc comment cites as the behaviour it mirrors), already memoized process-wide by worktree root, and already called on both write paths this diff touches (`shadow_ref.go:47` on every shadow write, `pushqueue.go:48` on ref writes), so the value is warm by the time a redact cache is wanted.
+
+Cost: a new exported 26-line pure-Go reimplementation of common-dir resolution with no direct test, plus a `sync.Once` holder type whose only stated justification ("resolution touches the filesystem, so it is deferred and never repeated") is exactly what the existing cache already provides — plus two struct fields and two identical accessor methods, each serving one call site.
+
+Simpler form — delete `gitrepo.CommonDir`, `redactCacheHolder`, both fields and both methods (~55 lines), and add one function in `redact_cache.go`:
+
+```go
+func repoRedactCache(ctx context.Context, repo *git.Repository) *redactCache {
+	dir, err := resolveGitCommonDir(ctx, repo)
+	if err != nil {
+		return nil // no incremental reuse; not a write failure
+	}
+	return newRedactCache(dir)
+}
+```
+
+Call sites become `repoRedactCache(ctx, s.repo)` (both `ephemeral.go:837` and `persistent.go:2331` have `ctx` in hand). No memoization needed: it runs once per checkpoint write, and its cost is one stat plus `MkdirAll` on an existing dir, against seconds of redaction.
+
+### F2. `redactIncrementally`'s tri-state collapses to zero booleans — the doc comment already describes the better API
+`cmd/entire/cli/checkpoint/redact_cache.go:157-170`, `cmd/entire/cli/checkpoint/persistent.go:2387-2412`
+
+`eligible` is not load-bearing. Every `eligible == false` return (`redact_cache.go:172`) also returns `cacheable == false`, so `if eligible &amp;&amp; cacheable` ≡ `if cacheable`. Its only other reader is one test assertion (`redact_cache_test.go:182`). And `cacheable` is *not* just "ends with `\n`" — it also encodes eligibility (cache non-nil, ≥1MiB, `.jsonl`), which the caller cannot derive, so computing it at the call site would be wrong, not clearer.
+
+Note the doc comment on the function already promises a different, better signature than the code has: *"returns the redacted bytes plus the entry to persist … (nil when nothing should be cached)"*. There is no entry in the signature. Either the code or the comment is stale.
+
+Cost: the caller has to know the cache's internal record format (fingerprint recomputation, `sha256`, `hex`, `redactPrefixEntry` field-by-field) to complete an operation the cache owns, and a reader must prove a boolean-pair invariant across seven return statements to see that one of them is dead.
+
+Simplest form that preserves behaviour — one bool out, and the entry built where the format lives:
+
+```go
+// redact_cache.go
+func redactIncrementally(...) (redacted []byte, storePrefix bool)   // drop `eligible`
+
+// storePrefix records the prefix just written for the next checkpoint.
+func (c *redactCache) storePrefix(ctx context.Context, treePath string, source []byte, blob plumbing.Hash) {
+	sum := sha256.Sum256(source)
+	c.store(ctx, treePath, redactPrefixEntry{
+		Fingerprint:  redactionFingerprint(),
+		SourceBytes:  len(source),
+		SourceHash:   hex.EncodeToString(sum[:]),
+		RedactedBlob: blob.String(),
+	})
+}
+
+// persistent.go
+redacted, storePrefix := redactIncrementally(ctx, repo, cache, content, treePath)
+if redacted == nil {
+	redacted = RedactBlobBytes(ctx, content, treePath, false)
+}
+hash, err := CreateBlobFromContent(repo, redacted)
+if err != nil { ... }
+if storePrefix {
+	cache.storePrefix(ctx, treePath, content, hash)
+}
+```
+
+If you want `createRedactedBlobFromFile` untouched by cache concerns at all, fold the four steps into one `redactAndWriteBlob(ctx, repo, cache, content, treePath) (plumbing.Hash, error)` in `redact_cache.go`; the caller only ever needs the hash.
+
+### F3. Redundant state and a duplicated fingerprint computation in the caller
+`cmd/entire/cli/checkpoint/persistent.go:2390,2407`
+
+`sourceLen := len(content)` exists because the *old* code overwrote `content` with the redacted bytes; the new code assigns to a separate `redacted`, so `content` is never mutated and `len(content)` at the store site is identical. Drop the variable (F2's `storePrefix` helper does this for free).
+
+`redactionFingerprint()` is computed twice per file — once at `redact_cache.go:176`, once at `persistent.go:2407` — each a fresh SHA-256 over the whole redaction config. Harmless in cost, but it means two places must agree on which fingerprint the entry is keyed by; F2's helper leaves exactly one call.
+
+### F4. Two dead guards
+- `cmd/entire/cli/checkpoint/redact_cache.go:180` — `cacheable = len(content) &gt; 0 &amp;&amp; content[len(content)-1] == '\n'`. Unreachable when `len(content) == 0`: line 171 already returned for anything under 1MiB. Drop `len(content) &gt; 0 &amp;&amp;`.
+- `cmd/entire/cli/checkpoint/redact_cache.go:106-108` — `load`'s `if c == nil { return nil }`. The only production caller is line 182, after the `cache == nil` early return; tests always pass a non-nil cache. `store`'s nil guard *is* load-bearing (the caller invokes it on a possibly-nil cache), `load`'s is not.
+
+### F5. The IIFE in `redactSingleJSONValue` — a named helper reads better and satisfies `nilerr` by construction
+`redact/redact.go:596-607`
+
+`isSingle := func() bool { … }()` exists only to hide a `return false` after `err != nil` from `nilerr`. Compressing the condition (`if err := dec.Decode(&amp;parsed); err != nil || !isSingleJSONValue(dec)`) will most likely still trip `nilerr` — the SSA branch on `err != nil` still lands on a block returning a nil error. Extract instead, so the enclosing function has no error result and `nilerr` cannot apply:
+
+```go
+// parseSingleJSONValue reports whether s decodes as exactly one JSON value.
+// A decode failure is a routing signal, not an error.
+func parseSingleJSONValue(s string) (any, bool) {
+	dec := json.NewDecoder(strings.NewReader(s))
+	var parsed any
+	if err := dec.Decode(&amp;parsed); err != nil {
+		return nil, false
+	}
+	return parsed, isSingleJSONValue(dec)
+}
+```
+
+Caller: `parsed, ok := parseSingleJSONValue(trimmed); if !ok { return "", false, nil }`. Also scopes `parsed` properly instead of declaring it outside the closure that fills it.
+
+### F6. `jsonlConcurrentMinBytes` is subsumed by `shardCount &lt; 2` — the documented threshold is not the real one
+`redact/redact.go:623-629,648`
+
+Both constants are 1MiB, so `shardCount = len(content)/jsonlShardTargetBytes &lt; 2` already rejects everything under 2MiB; `len(content) &lt; jsonlConcurrentMinBytes` (1MiB) can never fire on its own. Cost: the constant's doc claims to be the sharding threshold while the effective threshold is 2× the shard target, so anyone tuning `jsonlShardTargetBytes` will silently move a threshold they think is pinned. Either delete the constant and the check and document "sharding engages at 2 × `jsonlShardTargetBytes`", or make the min-bytes gate the only size check. (`concurrent_test.go` uses 2–4MiB fixtures, so neither change moves a test.) The `len(lines) &lt; 2` guard and the `min(shardCount, len(lines))` clamp are both genuinely needed — keep those.
+
+### F7. The local `type shard struct` and `shards` slice are avoidable
+`redact/redact.go:653-673`
+
+Index arithmetic gives the same shards without the anonymous type or the intermediate slice:
+
+```go
+linesPerShard := (len(lines) + shardCount - 1) / shardCount
+results := make([]string, (len(lines)+linesPerShard-1)/linesPerShard)
+g := new(errgroup.Group)
+g.SetLimit(runtime.GOMAXPROCS(0))
+for i := range results {
+	lo, hi := i*linesPerShard, min((i+1)*linesPerShard, len(lines))
+	g.Go(func() error {
+		out, err := redactJSONLLines(lines[lo:hi], redactor)
+		if err != nil {
+			return err
+		}
+		results[i] = out
+		return nil
+	})
+}
+```
+
+Same shard boundaries, same ordered rejoin, ~6 fewer lines and one fewer type.
+
+### F8. `ConfigFingerprint`: two of the three build-sort-loop blocks are one line each
+`redact/fingerprint.go:61-80`
+
+`Categories` and `CustomPatterns` are maps, so the temp slice + `sort.Strings` + format loop is just sorted iteration:
+
+```go
+for _, cat := range slices.Sorted(maps.Keys(cfg.Categories)) {
+	fmt.Fprintf(h, "cat:%s=%t\n", cat, cfg.Categories[cat])
+}
+for _, label := range slices.Sorted(maps.Keys(cfg.CustomPatterns)) {
+	fmt.Fprintf(h, "piipat:%s\x00%s\n", label, cfg.CustomPatterns[label])
+}
+```
+
+(`PIICategory` has underlying type `string`, so it satisfies `cmp.Ordered`; both stdlib packages are already used elsewhere in the repo.) That drops ~10 lines and the `sort` import; the custom-rules block keeps its explicit build since `cfg.rules` is a slice of structs. If you want all three deduped, a `hashLines(h io.Writer, prefix string, lines []string)` helper covers them — the emitted bytes change shape, which is fine: the fingerprint is opaque and only compared for equality, so the one-time effect is a single full redaction per file (no `configFingerprintVersion` bump needed, since it is not a redaction-behaviour change).
+
+### F9 (low). `jsonlContentImpl` / `jsonlContentConcurrent` share the routing prologue
+`redact/redact.go:575-580` vs `641-650`
+
+Both open with the identical `redactSingleJSONValue` routing call, and the sharded path falls back to `redactJSONLLines` anyway — i.e. `jsonlContentConcurrent` with sharding disabled *is* `jsonlContentImpl`. The duplication is only 4 lines, but it is a correctness-sensitive invariant (single-JSON-value routing must stay identical in both, or OPF and non-OPF paths diverge on pretty-printed input). If you touch it, keep both names as one-line wrappers over a shared body so no call site changes (`jsonlContentImpl` has 6 callers in `batch.go`/OPF):
+
+```go
+func jsonlContentImpl(c string, r func(string) string) (string, error) { return jsonlContent(c, r, false) }
+func jsonlContentConcurrent(c string, r func(string) string) (string, error) { return jsonlContent(c, r, true) }
+func jsonlContent(content string, redactor func(string) string, allowShards bool) (string, error) { … }
+```
+
+It is close to break-even on line count; take it only for the single-routing-site property. Also, `Impl` is a non-name — `jsonlContentSequential` says what it is.
+
+### F10 (naming). `redactCaches` / `redactCache()` / `redactCache`
+`cmd/entire/cli/checkpoint/store.go:28,33`
+
+A plural field holding one value, a method with the same identifier as a type in the same package, and a type whose name reads like the accessor. F1 removes all three; if the holder survives, the field wants `redactCacheOnce` and the method `prefixCache()`.
+
+Also minor: `addDirectoryToChanges` (`ephemeral.go:951`) is now 5 params, two of which (`repo`, `cache`) are pure pass-through to `createRedactedBlobFromFile`. Not worth churn on its own, but if F1 lands, `s.repo` + `repoRedactCache(ctx, s.repo)` at one place inside the walk is the same thing with one fewer parameter to thread.
+
+**Nothing else flagged**: the `redactPrefixEntry` fields, the atomic `store` temp-file dance, `readBlobBytes`, and the per-check debug logging in `redactIncrementally` are all pulling weight, and the fallback-on-anything-suspicious structure is flat rather than nested.</result>
+<usage><subagent_tokens>131003</subagent_tokens><tool_uses>25</tool_uses><duration_ms>339373</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a69c5f2626875564c</task-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-slow-entire-hook/494613eb-2fb9-404c-b7b6-587999007d63/tasks/a69c5f2626875564c.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review of redaction diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Verified everything directly. Here are the findings.
+
+## F1 — `gitrepo.CommonDir` duplicates a resolver already in the caller's own package (highest value)
+
+**`cmd/entire/cli/checkpoint/redact_cache.go:262`** calls the newly added `gitrepo.CommonDir(repo)` (`cmd/entire/cli/gitrepo/repository.go:66`).
+
+The `checkpoint` package **already has one**: `resolveGitCommonDir(ctx context.Context, repo *git.Repository) (string, error)` at **`cmd/entire/cli/checkpoint/git_common_dir.go:39`** — same input (`*git.Repository`), same output (absolute + `filepath.Clean`), already memoized process-wide by worktree root (`commonDirCache`, `git_common_dir.go:26-29`), already used by the two sibling write paths (`pushqueue.go:48`, `shadow_ref.go:47`), and already covered by three dedicated tests (`git_common_dir_test.go:32,57,74`). Same package — no import question, no cycle.
+
+Duplicated cost:
+- A new public entry point for a value the repo already resolves in ~6 places (`session/state.go:799`, `strategy/common.go:1102`, `checkpoint/git_common_dir.go:39`, plus inline copies in `trail_checkout_worktree.go:60`, `settings/settings.go:505`, `strategy/manual_commit_session.go:288`).
+- `gitrepo.CommonDir` ships with **zero tests** — no `CommonDir` reference in any file under `cmd/entire/cli/gitrepo/*_test.go`.
+- `redactCacheHolder`'s `sync.Once` (`redact_cache.go:252-269`, wired in `store.go`) re-memoizes what `commonDirCache` already memoizes.
+- `ctx` is not the blocker: both call sites (`persistent.go:2331`, `ephemeral.go:837`) already hold `ctx`, so a `redactCache(ctx)` signature threads trivially.
+
+**Recommended shape, and this is the interesting part:** don't just delete `gitrepo.CommonDir` — its implementation is genuinely better. It resolves purely on the filesystem via `resolveDotGitPath`/`resolveCommonGitPath` (`gitrepo/repository.go:181`, `:209`) with **no `git rev-parse` subprocess**, where `resolveGitCommonDir` forks git (~10ms) on first resolve. So point `resolveGitCommonDir` at `gitrepo.CommonDir` and keep its memo, its tests, and its two callers. That converts a duplicate into a consolidation and hands the subprocess saving to the shadow-branch and push-queue write paths too — on-theme for a perf PR. One behavior delta to weigh: `gitrepo.CommonDir` errors on bare repos where `git rev-parse` succeeds.
+
+## F2 — `store()` hand-rolls atomic write; two helpers exist, one already imported
+
+**`cmd/entire/cli/checkpoint/redact_cache.go:127-155`** — ~20 lines of `os.CreateTemp` / Write / Close / `os.Rename` with manual tmp cleanup on each failure branch.
+
+Call instead: **`jsonutil.WriteFileAtomic(filePath string, data []byte, perm fs.FileMode) error`** at **`cmd/entire/cli/jsonutil/write.go:31`**. Exported, generic, stdlib-only deps (`go list -deps ./cmd/entire/cli/jsonutil` returns only itself), and **`checkpoint` already imports `jsonutil`** at `persistent.go:25`, `ephemeral.go:20`, `migrate.go:16`. Zero cycle risk, one-line swap. It also fsyncs the temp file and the parent dir and chmods to the requested perm — none of which the new code does.
+
+Same package, 100 lines away: `writeFileAtomicInDir(dir, path string, data []byte) error` at **`cmd/entire/cli/checkpoint/pushqueue.go:230`**, same temp+rename shape with a cleaner `defer os.Remove(tmpName)`. It hardcodes the push-queue temp prefix, so `jsonutil.WriteFileAtomic` is the better target.
+
+The closest structural twin to `redactCache` is **`cmd/entire/cli/checkpoint/fsstore/fsstore.go:70-106`** — `path()` / `load()` / `save()` over one JSON file per key, identical shape, and its `save()` at `:102` does `json.MarshalIndent` → `jsonutil.WriteFileAtomic(..., 0o600)` with a comment calling it "the shared helper".
+
+On the **load** side: no read-JSON helper exists anywhere; raw `os.ReadFile` + `json.Unmarshal` is the actual repo idiom (`fsstore.go:76-87`, `trail_context_cache.go:138-147`). `redactCache.load()` is correct as written — no finding.
+
+## F3 — third test-repo builder in one package (minor)
+
+`newTestRepoForCache(t)` at **`cmd/entire/cli/checkpoint/redact_cache_test.go:44`** has the identical body to `openTestRepo(t)` at **`cmd/entire/cli/checkpoint/git_common_dir_test.go:15`** (TempDir + `InitRepo` + `WriteFile` + `GitAdd` + `GitCommit` + open), and overlaps `newTestRepo(t)` at **`cmd/entire/cli/checkpoint/persistent_read_store_test.go:23`**.
+
+The new one is the *best* of the three — it uses `gitrepo.OpenPath`, which CLAUDE.md mandates, while both older ones use `git.PlainOpen` — so the cheap consolidation is to widen `openTestRepo` to return `(*git.Repository, string)` via `gitrepo.OpenPath` and drop `newTestRepoForCache` (2 call sites to update). Related: the new tests hardcode `filepath.Join(dir, ".git")` (`redact_cache_test.go:74`, and 6 more), so they never exercise common-dir resolution at all; worth one case through the real resolver if F1 is taken.
+
+## F4 — `readBlobBytes` duplicates `strategy.readBlob` (low, cross-package)
+
+**`cmd/entire/cli/checkpoint/redact_cache.go:231-247`** is structurally identical to `readBlob(repo, hash) ([]byte, error)` at **`cmd/entire/cli/strategy/manual_commit_opf_rewrite.go:729-744`** (BlobObject → Reader → `io.ReadAll`).
+
+Not directly reusable: it's unexported in `strategy`, and the dependency runs one way — `go list -deps` confirms `strategy` depends on `checkpoint` and `checkpoint` does **not** depend on `strategy`. So the new helper is the right *location*; the cleanup is to export it as `checkpoint.ReadBlobBytes` and have `strategy.readBlob` delegate. Only 5 `BlobObject(` call sites exist repo-wide, so it's contained — reasonable to defer. In-package, `readJSONFromBlob[T]` at `persistent.go:993` reads a blob but JSON-decodes it, so it can't serve the raw-bytes need.
+
+## Nothing real for these three bullets
+
+- **sha256-hex helper**: none exists. 20+ inline `sha256.Sum256(...)` + `%x`/`hex.EncodeToString` sites (`ephemeral.go:48`, `persistent.go:1116/1955/2023/2145`, `agent/geminicli/gemini.go:206`, …) and zero helper functions. The new code follows the convention. Sole nit: `persistent.go:1116/2023/2145` use the prefixed `fmt.Sprintf("sha256:%x", …)` form for the same "did this transcript content change" question, while the new `SourceHash` uses bare hex — cosmetic.
+- **errgroup / parallel pattern**: the sharding at `redact/redact.go:663-679` matches the existing idiom exactly — `new(errgroup.Group)` + `SetLimit` + pre-allocated indexed results slice + `g.Go` closure, same as `cmd/entire/cli/repo_mirror_create_wizard.go:548-557`. The only generic fan-out helper, `fanOutCells` at `cmd/entire/cli/cell_fanout.go:280`, is cell/API-specific and lives in package `cli`, which `redact` (verified zero first-party deps) must not import. Nothing to reuse.
+- **JSONL fixture builder**: `cmd/entire/cli/testutil/testutil.go` has only repo/git helpers, and `redact/testhelpers.go` exposes only `ResetOPFConfigForTest`. The nearest analogue, `generateBenchmarkJSONL` at `redact/redact_bench_test.go:63`, takes `*testing.B` and generates a different content mix (no base64, no non-JSON lines), so `buildJSONLFixture` at `redact/concurrent_test.go:19` isn't worth merging with it.</result>
+<usage><subagent_tokens>136937</subagent_tokens><tool_uses>45</tool_uses><duration_ms>447276</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>adce3e0232d2b3076</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-slow-entire-hook/494613eb-2fb9-404c-b7b6-587999007d63/tasks/adce3e0232d2b3076.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review of redaction diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have everything I need. Here are the findings.
+
+## Genuinely mis-levelled
+
+**1. The prefix cache sits one level too low: it's wired into the blob writer, not into "redact a session transcript"**
+
+`cmd/entire/cli/checkpoint/persistent.go:2360` (`createRedactedBlobFromFile`) is the only place `redactIncrementally` is called. The other whole-transcript redactions are untouched:
+
+- `cmd/entire/cli/strategy/manual_commit_hooks.go:2907` — `redact.JSONLBytes(fullTranscript)` in `finalizeAllTurnCheckpoints`, which runs in the **same Stop hook** (`HandleTurnEnd`, line 2698) whenever the turn had mid-turn commits (`TurnCheckpointIDs` non-empty — the Codex "commit/push" pattern). Same 70MB file, from byte zero.
+- `cmd/entire/cli/strategy/manual_commit_condensation.go:523` → `redactSessionJSONLBytes` (line 119-121) — full transcript on **every user commit**, since `full.jsonl` is full-session per checkpoint.
+- `cmd/entire/cli/checkpoint/persistent.go:1064` — the store's `TranscriptPath` fallback, reads and redacts whole from disk.
+
+Cost: the "67s → O(appended)" claim in the new doc block holds only for a Stop with no mid-turn commit. A Codex session that commits mid-turn still pays the full 67s at line 2907, and every user commit pays it again at condensation. The fix as landed is one of three or four.
+
+Deeper place: a pure primitive in `redact` — `(prevRedactedPrefix []byte, prevSourceHash string, content []byte) → (redacted []byte, newRecord)`. That keeps the "concatenation is sound" argument in the package that owns the invariant while leaving blob storage in `checkpoint`. `strategy` already imports `checkpoint`, so a shared helper there is the cheaper interim.
+
+**2. The correctness argument lives in a different package from the invariant it depends on**
+
+`cmd/entire/cli/checkpoint/redact_cache.go:34` grounds the whole cache on `redact.redactJSONLLines` being per-line and stateless — an **unexported** function in another package. The only guards are a prose comment at `redact/redact.go:690` ("Keep it that way") and `TestIncrementalRedaction_MatchesFullRedaction`, which lives in `checkpoint`. A refactor inside `redact` that made line handling stateful breaks `checkpoint`'s cache while `redact`'s own test suite stays green.
+
+Deeper place: assert `redact(A+B) == redact(A)+redact(B)` for newline-terminated `A` in `redact`'s tests. The new `concurrent_test.go` almost does this, but only across shard boundaries within one call — not across the two separate calls the cache actually makes.
+
+**3. Speculative wiring on `treeWriter`, and the cache key means two different things in the two call sites**
+
+`cmd/entire/cli/checkpoint/store.go:28,33` adds a `redactCacheHolder` to `treeWriter`, consumed at `persistent.go:2331`. That path is reached only when `WriteOptions.MetadataDir != ""` (`persistent.go:648`) — and **no production caller sets it**: `CondenseSession` (condensation.go:398-430), `attach.go:352`, and `agentimport.go:370` are the only three `cp.Session(...)` writers and all omit it. `benchutil.go:372` sets it on `Ephemeral.Write`, a different path. So half the wiring is dead.
+
+Worse, if it ever becomes live the key is wrong-shaped. `redactCache.path` (redact_cache.go:? `path(treePath)`) hashes the string it's handed:
+- ephemeral: `.entire/metadata/&lt;sessionID&gt;/full.jsonl` — session-scoped ✓
+- persistent `copyMetadataDir`: `relPath = filepath.Rel(metadataDir, path)` = `full.jsonl` — one global slot shared by every session, and OS-separator rather than slash-normalized.
+
+The only thing that keeps that safe is the `SourceHash` check, i.e. correctness is preserved by the fallback rather than by the key. Concurrent sessions (explicitly supported) would drive that slot to a 0% hit rate.
+
+Deeper place: the key should be a caller-declared identity (session ID + file role), not "whatever string happened to be passed as tree path". Until then, drop the `treeWriter` wiring — it's unreachable.
+
+**4. Sharding is gated on *which exported function you call*, not on whether the redactor is pure**
+
+`redact/redact.go:566` routes `JSONLContent` → `jsonlContentConcurrent`, so the property "this redactor is goroutine-safe" is encoded in a function name. `redact/batch.go:156` (`applyRegexLayersToBlobs`) calls `jsonlContentImpl(..., String)` — the *same pure `String` redactor*, over whole `full.jsonl` blobs of every unpushed commit — and gets no sharding. That's the OPF-disabled/breaker-tripped fast path of `BatchBytesWithPrivacyFilter` (`batch.go:47,51`), reachable in production. `batch.go:121` (`collectLeaves`) and `batch.go:193` (`SumProseLeafBytes`) correctly *must* stay sequential — their closures mutate a shared map / accumulator — but nothing in the code says so; it's inferred from the call chain.
+
+On the "should concurrency be the caller's choice" question: I checked every `JSONLContent`/`JSONLBytes` caller (doctor_bundle.go:283, attach.go:346, explain.go:1164, ephemeral.go:375/446, persistent.go:496/555/1064/2442, condensation.go:120, hooks.go:2907, agentimport.go:265). None is already inside a parallel loop — the repo's only other `errgroup` users are activity_cmd.go, repo_mirror_create_wizard.go, dispatch/mode_local.go, none near redaction. So unconditional sharding is not currently harmful, and making it a caller flag would be over-engineering. The real defect is the implicit safe/unsafe split.
+
+Deeper place: `jsonlContentImpl(content, redactor, concurrencySafe bool)` (or two explicitly named internal wrappers). Then `applyRegexLayersToBlobs` opts in and the three collector closures declare themselves unsafe at the call site.
+
+## Reasonable scoping choices, with caveats
+
+**5. The `.jsonl` suffix gate is safe today but is a guess about the producer expressed in the consumer** — `redact_cache.go:171`
+
+Verified: `.entire/metadata/&lt;session&gt;/` on disk contains only `full.jsonl` (written whole each Stop at `lifecycle.go:761-762`) and `prompt.txt` (line 790). `transcript.jsonl` is written **straight into the git tree** (`persistent.go:1131`, `writeCompactTranscript`) and never lands on disk, so the regenerated file never reaches this gate.
+
+Applying the cache to a regenerated `.jsonl` would be **merely wasteful, not wrong-shaped**: the reuse test is `sha256(content[:SourceBytes]) == entry.SourceHash` (redact_cache.go:~188) and it runs *before* the blob read, so a changed prefix costs one SHA-256 and falls back to a full redaction with correct output. But the hit rate then silently depends on the producer's behaviour with no signal — no metric, no log distinguishing "eligible and hitting" from "eligible and never hitting".
+
+The right gate at identical cost: `filepath.Base(treePath) == paths.TranscriptFileName`. That matches what the doc comment already claims ("append-only transcripts"), makes the `transcript.jsonl` question moot permanently, and is the caller's own constant. Note also `agent.ChunkFileName` (`agent/chunking.go:122`) produces `full.jsonl.001`, which the suffix gate misses — irrelevant on disk today, but it's the first shape that would slip through.
+
+**6. `gitrepo.CommonDir` is the right home — but it's now the third resolver**
+
+`gitrepo/repository.go:67` composes `resolveDotGitPath` + `resolveCommonGitPath`, both already private to `gitrepo`, and resolves from the repo object rather than `os.Getwd()` + a `git rev-parse` subprocess. For a store bound to a specific repo on a hook path, that is strictly better than `session.GetGitCommonDir` (state.go:791, cwd-keyed cache + subprocess) — and `strategy.GetGitCommonDir` (common.go:1102) is already a third, uncached copy of the same subprocess.
+
+Import cycles did **not** force this: `go list -deps ./cmd/entire/cli/checkpoint` already includes `session`, and `gitrepo` imports only `paths`. So it was a free choice, and the right one. Deeper cleanup available (out of scope for this diff): expose `gitrepo.CommonDirForPath(root)` and have `session`/`strategy` delegate, deleting two subprocess implementations.
+
+**7. The fingerprint split is defensible in shape, but its stated justification is half wrong**
+
+`redact/fingerprint.go:30` says the betterleaks ruleset version is something "the library does not expose", so the caller must mix in the binary version — and `redact_cache.go:97` does. But `github.com/betterleaks/betterleaks v1.5.0` is a plain module dependency (go.mod:12, no `vendor/`, no `replace`), so `debug.ReadBuildInfo().Deps` yields its version and `h1:` sum at runtime. `redact` can own that half itself, with no caller cooperation and no manual bump on dependency upgrades.
+
+That matters because of what's left: `configFingerprintVersion` (fingerprint.go:17) is a hand-bumped constant, and the caller's `versioninfo.Version+Commit` mixin already subsumes it for *released* binaries. So the constant only bites in local builds — where `versioninfo.Version` stays `"dev"` and `Commit` is the unchanged HEAD sha even with a dirty tree (`versioninfo.go:39-56`). In other words the one population that needs the manual bump is exactly the developer editing `redact/`, and nothing enforces it. Moving the dep-version half into `redact` shrinks the manual constant's remit to "changes to redact's own source", which is the genuinely un-introspectable part.
+
+The OPF exclusion is handled correctly *by construction* (this path always passes `usePrivacyFilter=false`, `persistent.go:2393`), but neither the key nor the fingerprint carries a pipeline discriminator, so nothing stops a future OPF-enabled caller from sharing the cache dir. Worth a discriminator byte in the key while it's cheap.
+
+## Minor
+
+**8.** `entire-redact-cache` isn't registered with cleanup — `strategy/cleanup.go:25-28` knows only shadow-branch / session-state / checkpoint. One ~200-byte JSON per session accumulates in the git common dir forever and `entire clean` won't touch it. It shadows session-state 1:1, so it belongs as a `CleanupType` next to it.
+
+**9.** Two independent 1MiB thresholds for the same phenomenon in two packages: `redact_cache.go:54` and `redact/redact.go:626`.
+
+**10.** Single-JSON-value transcripts (OpenCode export) get *neither* mechanism: `redactSingleJSONValue` (redact.go:590) short-circuits before the shard split, and the trailing-newline requirement (redact_cache.go:~178) excludes them from the prefix cache. Consistent, but worth stating as a scope limit in the doc block, which currently reads as if all large transcripts are covered.</result>
+<usage><subagent_tokens>191904</subagent_tokens><tool_uses>63</tool_uses><duration_ms>510711</duration_ms></usage>
+</task-notification>
+
+---
+
+ok, can you do meaningful commits and create a PR
+
+---
+
+<task-notification>
+<task-id>br46ev197</task-id>
+<summary>Monitor event: "CI checks on PR 2002"</summary>
+<event>FAILED: test
+FAILED: test-core</event>
+If this event is something the user would act on now, send a PushNotification. Routine or benign output doesn't need one.
+</task-notification>

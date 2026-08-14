@@ -1,0 +1,278 @@
+ok, let's open a PR
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>a1f9a1bf1876783a4</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-investigate-enable-timeout/4bf4b198-080d-4b2f-8194-6aa0cc10dad6/tasks/a1f9a1bf1876783a4.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Altitude review
+
+Overall the change is at a sensible depth. The recovery tier lands at the one chokepoint every git-branch read already funnels through (`getSessionsBranchTree`), the seam is shaped like its siblings, and the backend guards reuse a predicate that already exists and is already used in ~8 places. Four things where a deeper expression is clearly better, then two places where the special case is genuinely right.
+
+---
+
+### 1. The backend guards express "primary is refs" where the actual invariant is "nothing in this topology writes v1"
+
+**Files:** `cmd/entire/cli/strategy/common.go:684`, `cmd/entire/cli/strategy/checkpoint_remote.go:112` (and pre-existing `common.go:500`)
+
+`primaryIsGitRefs(ctx)` is not a new special case — it is `checkpoint.PrimaryIsRefs`, already consulted in `manual_commit_push.go:94`, `unpushed_checkpoints.go:22`, `attach.go:521`, `status.go:310`, and elsewhere. Adding two callers to an established shared predicate is not layering. **The guards are in the right functions**, and I'd keep them there: the two justifications genuinely differ (bootstrap: there is no orphan to protect against; push: the "one-time cost" amortization is false because the branch is never created), so hoisting them into a shared `ensureV1BranchLocal` helper would collapse two different reasons into one.
+
+What is wrong is the *predicate*, and it fails concretely. `buildMirrors` (`open.go:171`) explicitly supports **git-refs primary + git-branch mirror** ("during the branch-&gt;refs rollout"). In that topology `primaryIsGitRefs` is true, so both new guards fire — yet the mirror *does* write v1, and `GitStore.ensureSessionsBranch` (`persistent.go:2176`) creates a fresh orphan when the ref is missing. That is precisely the diverging orphan `bootstrapPrimaryFromCheckpointRemote` exists to prevent, now unguarded.
+
+The staleness is already visible in the tree: the comment at `common.go:491-499` still says "We still adopt real v1 data that already exists on origin or a checkpoint_remote below (so legacy checkpoints stay readable); we only suppress the empty-orphan fallback." After this PR that sentence is false for the checkpoint_remote half.
+
+**Deeper alternative:** put the answer on the backend registry, next to the `gitBacked` capability flag that is already there for exactly this purpose (`registry.go:47-60`) — a `writesMetadataBranch bool`, surfaced as `checkpoint.TopologyWritesMetadataBranch(cfg)` that considers primary *and* mirrors. Call sites don't collapse, but the guard then names the rule instead of the backend.
+
+**Why less fragile:** a third git-backed backend, or a mirror that writes v1, declares its answer once instead of falling into whichever branch a `== "git-refs"` string comparison happens to take at 8 sites. It also removes the need to re-derive "git-refs never writes v1" in ~10 lines of prose at each guard (`common.go:685-696`, `checkpoint_remote.go:106-111`), which is where the invariant currently drifts.
+
+---
+
+### 2. `MetadataBranchFetchFunc` is at the right layer, but drops the one argument its sibling carries
+
+**File:** `cmd/entire/cli/checkpoint/fetching_tree.go:42`
+
+The seam is consistent with its siblings in every structural respect: field on `OpenOptions` → copied to `OpenEnv` → applied by the backend factory behind a nil check → consumed at the point of local miss → degrades to the pre-existing error on failure. `resolveSessionsBranchRef` (`persistent.go:2270`) extracting the local-only resolution so the fetch can retry it is the right shape, and it mirrors `resolveRefMaybeFetch` in the refs store. Placing it in `getSessionsBranchTree` rather than in `List`/`getFetchingTree` separately is correct — that is the single chokepoint.
+
+The one asymmetry: `RefFetchFunc` takes the ref it must fetch; `MetadataBranchFetchFunc` takes nothing, so the injected implementation re-derives the target itself (`FetchMetadataFromCheckpointRemote` → `strategy.FetchMetadataBranch` → `checkpoint.ResolveRefs(ctx).Primary`). The store knows `s.refs.Read`/`s.refs.Primary`; the fetcher independently recomputes it from ambient context. Callers that override the topology — `resume.go:428` passes `Refs: &amp;refs` — can make those two disagree.
+
+**Deeper alternative:** `type MetadataBranchFetchFunc func(ctx context.Context, ref plumbing.ReferenceName) error`, passing `s.refs.Primary`.
+
+**Why less fragile:** it makes the seam a literal sibling of `RefFetchFunc` and removes a second, ambient source of truth for "which ref". Costs one parameter today and closes the divergence permanently.
+
+---
+
+### 3. Selective wiring is a real trap, and `resume.go` is already caught in it
+
+**Files:** `cmd/entire/cli/explain.go:828`, `:1012`, `:2520` (wired) vs `cmd/entire/cli/resume.go:215,300,428,997` (not)
+
+The doc comment ("Only wire it on foreground, user-initiated read paths") states a policy the code does not enforce — omission at a foreground site silently yields unreadable checkpoints rather than a compile or test failure. The repo already has the mechanism that fixes this, twice: `checkpoint.WithRemoteListDiscovery` (`refs_store.go:95`) gates `RemoteRefListFunc` on a context marker so the seam can be wired freely and only fires when a caller opts in; `strategy.WithCheckpointRemoteBootstrap` (`common.go:69`) does the same thing for the enable-time fetch. This PR introduces a *third* expression of the same "foreground vs hook path" distinction, this time as convention.
+
+That the trap is live, not hypothetical: `resume.go` is a foreground read path with four unwired `Open` calls, and it compensates by hand-rolling the identical recovery ladder inline in `getMetadataTree` (`resume.go:465`: checkpoint_remote → local → origin → remote tree). That hand-rolled ladder is exactly the duplication this seam should have absorbed. `checkpoint_list.go` (via `GetStrategy` → `manual_commit.go:44`), `tokens_profile.go:115`, and `attribution.go:360` are also foreground and unwired.
+
+**Deeper alternative:** gate the store's use of the fetcher on a context marker (reuse `WithRemoteListDiscovery`, or generalize both into one `checkpoint.WithForegroundNetwork`), then wire `MetadataBranchFetcher` at every CLI-layer `Open` that already passes `BlobFetcher`/`RefFetcher`. The principled version of "foreground vs hook" is to set that marker once at command entry — Cobra commands are foreground by definition, the `entire hooks` subtree is not — rather than at each `Open`.
+
+**Why less fragile:** it inverts the failure mode. Today, forgetting the field costs a user their checkpoints with no signal; with the gate, the safe answer is the default and opting in is the deliberate act. The minimal, immediately-scoped step is just wiring the four `resume.go` sites and deleting the hand-rolled ladder.
+
+---
+
+### 4. `FetchMetadataBranch` bakes in both the budget *and* the filter policy, so new consumers silently inherit `resume`'s choices
+
+**File:** `cmd/entire/cli/strategy/checkpoint_remote.go:132`
+
+This PR establishes a good principle in `bootstrapPrimaryFromCheckpointRemote` (`common.go:722-728`): fetch the ref blob-filtered, let `BlobFetcher` hydrate on demand, because v1's blobs are the whole transcript archive. The new read-recovery tier does not follow it. `FetchMetadataBranch` hard-codes `noFilter: true` *and* `checkpointRemoteForegroundFetchTimeout`, so the `MetadataBranchFetcher` path pulls the entire archive unfiltered — at all three explain call sites that already pass `BlobFetcher: FetchBlobsByHash` and would have hydrated only what they read.
+
+The same baked-in budget leaks onto a hook path. `FetchBlobsByHash` (`git_operations.go:582`) falls back to `FetchMetadataFromCheckpointRemote` → `FetchMetadataBranch`, and `FetchBlobsByHash` is wired into `GetStrategy()` (`config.go:70`), which the lifecycle hooks use. That fallback's budget went from 30s to 2 minutes as a side effect of a change aimed at foreground commands.
+
+**Deeper alternative:** follow the in-repo precedent for exactly this, `remote.BoundedCheckpointRefFetcher(d)` / `remote.HookCheckpointRefFetcher()` (`checkpoint/remote/checkpoint_ref.go:161-177`) — return a configured fetcher whose budget and filter are chosen at the wiring site, rather than fixing them inside a shared exported call.
+
+**Why less fragile:** the policy ends up attached to the caller that knows its own constraints, instead of being inherited by whoever calls the shared function next. (Related, same root cause: `fetchMetadataBranchIfMissing` now spends `checkpointRemoteFetchTimeout` on the ls-remote probe *and* again on the fetch, so the push hot path's worst case is 60s, not the 30s the constant's doc claims — per-call-site budgets don't compose when they're applied at two nesting levels.)
+
+---
+
+### Genuinely the right call — do not change
+
+- **Two named timeout constants chosen per call site** (`checkpoint_remote.go:19-32`) is the right altitude, and the context should *not* carry it. It matches the existing split between `remote.WriteProbeFetchBudget` and `readFetchTimeout` in the same subsystem, keeps the budget visible at the site that knows whether a user is blocked, and avoids a context value that would silently apply to unrelated work further down. Threading `timeout` through the private `fetchURLIntoTmpRef` is ordinary parameterization, not a special case — and it correctly retired the `//nolint:unparam` on `noFilter` by giving that parameter a second real value.
+- **The recovery tier living in `getSessionsBranchTree` rather than in each caller** is right. It is the one function both `List` and `getFetchingTree` route through, and keeping the "purely local" resolution separate (`resolveSessionsBranchRef`) so the fetch is a strict retry — preserving the original not-found error on failure — is the correct shape for a store that treats not-found as an empty list.</result>
+<usage><subagent_tokens>175217</subagent_tokens><tool_uses>26</tool_uses><duration_ms>270455</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aa8f29a873e865e6c</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-investigate-enable-timeout/4bf4b198-080d-4b2f-8194-6aa0cc10dad6/tasks/aa8f29a873e865e6c.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Findings — efficiency only, ordered by cost. All paths verified by reading call chains, not inferred.
+
+## 1. `cmd/entire/cli/checkpoint/persistent.go:2235-2251` — recovery fetch re-fires on every `getSessionsBranchTree` call; nothing memoizes the attempt
+
+**Cheaper alternative:** a `metadataBranchFetchAttempted bool` on `GitStore` (or nil the fetcher after it runs) so the recovery fetch fires at most once per store instance.
+
+**Cost, and on which path:** `getSessionsBranchTree` is entered ≥3 times per `entire explain` on the same `GitStore` instance — `List` (persistent.go:1627, via `newExplainCheckpointLookup`), `Read` → `getFetchingTree` (persistent.go:1384), `ReadSessionContent`/`ReadSessionMetadata*` → `getSessionTree` → `getFetchingTree` (persistent.go:1432), plus `GetCheckpointAuthor`. When the fetch cannot recover the branch (remote has no v1, unreachable, auth refused), the failure is only logged at Debug and discarded, so each entry re-runs `FetchMetadataFromCheckpointRemote`. Each of those costs, *before* the network: `remote.Configured` → `settings.Load` (3 file reads), `remote.FetchURL` → `settings.Load` again + a `git remote get-url origin` subprocess (`gitremote.go:99`, uncached), then a `git fetch` subprocess with the new **2-minute** `checkpointRemoteForegroundFetchTimeout`. So one failing `explain` = 3-4 network fetch attempts, ~4 extra git subprocesses, ~12 settings file reads — and against a hanging remote the wall clock is 3-4 × 2 min instead of 2 min. This is the largest waste the diff introduces, and it is amplified by the timeout raise in the same diff.
+
+## 2. `cmd/entire/cli/explain.go:2520` — the fetcher is wired on the *enumeration* path, where `kindRoutingStore.List` always hits the branch store
+
+**Cheaper alternative:** drop `MetadataBranchFetcher` from the `getBranchCheckpoints` Open, or gate the fetch behind the same context marker `RemoteRefLister` already uses (`WithRemoteListDiscovery`), so only by-ID reads (`Read`/`ReadSession*`) can trigger it.
+
+**Cost, and on which path:** `routing_store.go:109` calls `s.branch.List(ctx)` unconditionally, regardless of primary type. So on a git-refs-primary repo with a `checkpoint_remote` — exactly the shape the new integration test models, and exactly the shape where the enable fix now guarantees no local v1 — `entire checkpoint list` (prose at explain.go:2924, `--json` at explain_export.go:639) fires a full **unfiltered** `git fetch` of v1: the entire transcript archive, i.e. the same 1.5GiB transfer the PR just removed from `enable`, now on a browse command with a 2-minute budget instead of 30s. And `GitStore.List` swallows the result (`persistent.go:1628` returns an empty list on error), so the transfer is paid to enumerate a list that may be empty. On a repo that was refs-native from the start (remote has no v1 at all) it degrades to one failing round trip on *every* list invocation, forever, on a command that was previously local-only. Note the diff switched the enable bootstrap/heal fetches to blob-filtered for precisely this reason (common.go:728, :823) while `FetchMetadataBranch` stays `NoFilter: true` (checkpoint_remote.go:145).
+
+## 3. `cmd/entire/cli/strategy/checkpoint_remote.go:112` + `cmd/entire/cli/strategy/manual_commit_push.go:94` — `LoadCheckpointsConfig` now loads twice per `git push`
+
+**Cheaper alternative:** carry the answer on `pushSettings` (`ps.primaryIsRefs`) and use it at manual_commit_push.go:94 — `resolvePushSettings`' own doc comment already promises "loads settings once".
+
+**Cost, and on which path:** pre-push hot path. `LoadCheckpointsConfig` is uncached (`settings/checkpoints.go:66`; no cache anywhere in the settings package): per call it does `os.OpenRoot` + `Open` + `ReadAll` + 2 closes for `settings.local.json` and `settings.json` (~10-12 syscalls) plus a full `json.Unmarshal` of each whole settings file into `checkpointsEnvelope`. The new `primaryIsGitRefs(ctx)` inside `resolvePushSettings` computes the identical `PrimaryIsRefs` decision that prePush recomputes ~20 lines later. ~10 syscalls + 2 whole-file JSON parses per push, removable for free. (Reusing the `settings.Load(ctx)` result already in hand at checkpoint_remote.go:72 via `s.Checkpoints` would be cheaper still, but semantics differ — `LoadCheckpointsConfig` honours `ENTIRE_CHECKPOINTS_PRIMARY` and local-replaces-base wholesale — so the `pushSettings` field is the safe dedup.)
+
+## 4. `cmd/entire/cli/strategy/common.go:684` — same duplicate one level down on the enable path
+
+**Cheaper alternative:** pass the `skipEmptyOrphan` value already computed at common.go:500 into `bootstrapPrimaryFromCheckpointRemote`.
+
+**Cost:** `EnsurePrimaryRef` computes `primaryIsGitRefs(ctx)` at line 500, then `bootstrapPrimaryFromCheckpointRemote` (called at line 533) recomputes it at line 684. Same ~10 syscalls + 2 JSON parses. Enable path only, so low absolute cost — flagged for consistency with #3.
+
+## 5. `cmd/entire/cli/strategy/checkpoint_remote.go:222-231` — the new `ls-remote` probe is additive, not a replacement
+
+**Cheaper alternative:** fetch first, and run `ls-remote` only to classify a *failed* fetch as absence-vs-error. That keeps the success path at one round trip and pays the second only on the rare error path, while preserving the positive-evidence contract the comment describes.
+
+**Cost, and on which path:** pre-push, but genuinely narrow. The probe needs `checkpoint_remote` configured AND git-branch primary AND a missing local v1 ref — and under git-branch primary `EnsurePrimaryRef` always ends with a local v1 ref (bootstrap fetch, or `createOrphanMetadataRef` at common.go:543), so the window is effectively one-shot per clone, not recurring. In that window: branch present on the remote → `git ls-remote` **plus** `git fetch` = 2 connections/auth handshakes where main did 1 (+1 SSH/HTTPS handshake, ~150-800ms); branch absent → 1 `ls-remote` where main did 1 failing fetch, a wash or marginally cheaper. So the probe does **not** replace more expensive work — it adds one handshake, once. Low severity; noted because the comment frames it as establishing a cheaper fact than it does.
+
+## Explicitly not waste
+
+- `MetadataBranchFetcher: FetchMetadataFromCheckpointRemote` is a top-level func reference, not a closure — zero captured scope, zero allocation, one word on `GitStore` (store.go:38).
+- `registry.go:152` / `OpenEnv` growth: one nil check and one pointer store per backend build (≤4 per `Open`); `OpenEnv` grew by one word, copied per build. Negligible.
+- `persistent.go:2270 resolveSessionsBranchRef`: the post-fetch re-resolve repeats only 1-2 in-process ref lookups (a packed-refs read), trivially cheap next to the fetch that just ran, and required for correctness. No repo re-open. The extraction adds no I/O on the success path.
+- Skipping `fetchMetadataBranchIfMissing` under git-refs primary is a net saving beyond the network: it also skips the `OpenRepository(ctx)` go-git open inside it.
+- The 30s → 2min foreground timeout adds no work by itself; it only raises the ceiling on paths that already fetch. It becomes costly only in combination with finding #1.
+- No new work was added to any per-turn hook path: `MetadataBranchFetcher` is wired at exactly three sites, all in `explain.go`, none reachable from the Stop/PreToolUse/post-commit hooks.</result>
+<usage><subagent_tokens>161862</subagent_tokens><tool_uses>39</tool_uses><duration_ms>367111</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a01bcaee03fafa8c8</task-id>
+<tool-use-id>toolu_01D2frZmLSx1kyhW3HmWNDn1</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-investigate-enable-timeout/4bf4b198-080d-4b2f-8194-6aa0cc10dad6/tasks/a01bcaee03fafa8c8.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I read the diff and cross-checked each new helper against the existing package APIs. I also ran `golangci-lint` with `dupl@75` over both touched test packages to check the lint claim.
+
+## Findings (reuse only)
+
+**1. `cmd/entire/cli/strategy/checkpoint_remote_test.go:1594` — new `checkpointRemoteGitOutput` used for a plain `rev-parse` that an existing helper already does**
+`checkpointRemoteRevParse(ctx, t, dir, rev)` (same file, line 1424) is literally `git rev-parse &lt;rev&gt;` in `dir`. The call at 1594-1595 passes `"rev-parse", "refs/heads/…:aa/…/metadata.json"` and should be `checkpointRemoteRevParse(ctx, t, remoteDir, "refs/heads/"+…)`.
+Separately, the new helper's body (1566-1575) is a fourth copy of the same 7-line `exec.CommandContext` + `GitIsolatedEnv` + `cmd.Output` + `TrimSpace` block already present as `checkpointRemoteCurrentBranch` (1414), `checkpointRemoteRevParse` (1424) and `checkpointRemoteMetadataFiles` (1447). Keeping the general form is fine, but the three specializations should collapse onto it. **Cost: ~21 duplicated lines.**
+
+**2. `cmd/entire/cli/strategy/checkpoint_remote_test.go:1597-1611` — inline copy of `gitRefsPrimaryLocalRepo`, added 100 lines earlier in the same diff**
+`TestEnsurePrimaryRef_BootstrapFetchIsBlobFiltered` re-inlines the exact local-repo construction of `gitRefsPrimaryLocalRepo` (1480-1501) — tempdir, `testutil.InitRepo/WriteFile/GitAdd/GitCommit`, `remote add origin git@github.com:org/main-repo.git`, `.entire` mkdir, settings write, `redirectGitURL(... "git@github.com:org/checkpoints.git", "file://"+remoteDir)`. The only difference is the settings JSON literal. Parameterize the helper with the settings body (or add `checkpointRemoteLocalRepo(ctx, t, remoteDir, settingsJSON)` and have `gitRefsPrimaryLocalRepo` delegate). **Cost: 15 lines, duplicated inside this diff.**
+
+**3. `cmd/entire/cli/strategy/checkpoint_remote_test.go:1457` and `:1480` — the two new helpers are correct extractions, but the pre-existing copies were left inline**
+`checkpointRemoteWithV1` matches verbatim blocks at 965-976, 1041-1052 and 1114-1124; `gitRefsPrimaryLocalRepo`'s repo/settings/redirect block matches 980-998, 1058-1080, 1128-1147 and 1174-1192. Folding those callers onto the new helpers is the whole payoff of extracting them. **Cost: ~33 lines (remote setup) + ~45 lines (local setup) left duplicated.**
+
+**4. `cmd/entire/cli/integration_test/enable_checkpoint_remote_test.go:163-171` — `requireMetadataBranchPresent` re-implements `testutil.BranchExists`**
+`testutil.BranchExists(t, repoDir, branchName)` at `cmd/entire/cli/testutil/testutil.go:216` does exactly this (and opens via `gitrepo.OpenPath`, the sanctioned opener, rather than `git.PlainOpen`). This same PR already uses it in the strategy tests. Replace the body with `require.True(t, testutil.BranchExists(t, dir, paths.MetadataBranchName), msg)`; the local half of `requireNoMetadataBranch` (line 156-157) can use the same call negated, leaving only the origin remote-tracking check hand-rolled. **Cost: 9 lines → 1, plus 2 lines in the sibling.**
+
+**5. `cmd/entire/cli/integration_test/enable_checkpoint_remote_test.go:184-194` — `runEntireInDir` duplicates `runEntire`**
+`runEntire(t, env, workDir, args...)` at `cmd/entire/cli/integration_test/plugin_remote_install_test.go:148` is the same package-level spawn (`execx.NonInteractive` + `getTestBinary()` + `cmd.Dir` + `cmd.Env`), just returning `(stdout, stderr, err)` instead of fataling. `runEntireInDir` should be a 4-line wrapper over it. **Cost: ~8 lines.**
+
+**6. `cmd/entire/cli/integration_test/enable_checkpoint_remote_test.go:103-122` — settings write duplicates `writeMinimalEntireSettings`**
+`writeMinimalEntireSettings(dir, bareURL)` at `cmd/entire/cli/integration_test/explain_test.go:412-434` builds the identical structure (`enabled`/`local_dev`/`strategy`/`strategy_options{filtered_fetches, checkpoint_remote}` → `jsonutil.MarshalIndentWithNewline` → write to `paths.SettingsFileName`). The new copy differs only in the `checkpoint_remote` sub-map and one extra `checkpoints` key. Give the existing function a `checkpointRemote map[string]any` + `extra map[string]any` parameter. **Cost: ~20 lines.**
+
+**7. `cmd/entire/cli/integration_test/enable_checkpoint_remote_test.go:92-125` — `setupGitRefsCheckpointRemoteRepo` re-implements TestEnv primitives on a raw dir**
+Line-for-line overlaps: `NewTestEnv(t)` (`testenv.go:82`) already does the `t.TempDir()` + `EvalSymlinks` dance (93-97); `env.InitRepo()` (`:216`) covers 98; `env.WriteFile`/`GitAdd`/`GitCommit` (`:398`/`:447`/`:469`) cover 100-101 and 124-125; `env.WriteSettings(map[string]any)` (`:566`) covers 103-122; downstream, `env.ReadFile` (`:415`) covers `readFileInDir` and `env.RunCLI` (`:158`) covers `runEntireInDir`. **Cost: ~25 lines.**
+Two caveats that make this a judgment call rather than a mechanical swap: `NewRepoEnv`/`NewRepoWithCommit` are *not* usable (they call `InitEntire`, which pre-enables the repo this test is trying to `enable`) — it has to be `NewTestEnv` + `InitRepo`; and TestEnv's `.git/config` guard (`setGitConfigBaseline`, `testenv.go:249`) fatals on any config mutation, so the `url.*.insteadOf` writes would need an `AcceptGitConfigChanges` call. Worth noting as a side benefit: `env.RunCLI` passes `ENTIRE_TEST_CLAUDE_PROJECT_DIR` et al., which `runEntireInDir` omits while the test runs `enable --agent claude-code`.
+
+**8. `cmd/entire/cli/strategy/checkpoint_remote.go:222-228` — third copy of the "ls-remote → empty output means absent" probe**
+The new probe in `fetchMetadataBranchIfMissing` repeats the pattern in `cmd/entire/cli/checkpoint/remote/checkpoint_ref.go:110-126` (which its own comment cites as the contract) and `cmd/entire/cli/checkpointpolicy/remote.go:48-54`. No shared helper exists today, so this is an extraction candidate — e.g. `remote.RefExistsOnRemote(ctx, dir, target, ref) (bool, error)` next to `LsRemoteInDir` (`checkpoint/remote/git.go:452`) — rather than a call site that should have used something. **Cost: ~6 lines × 3.**
+
+## Checked and clean (no reuse issue)
+
+- **`MetadataBranchFetchFunc` / `SetMetadataBranchFetcher`**: no existing seam covers a missing v1 *ref* — `BlobFetchFunc` only fires on missing blobs and `RefFetchFunc` is git-refs-only. It correctly delegates to the existing `FetchMetadataFromCheckpointRemote` (`cmd/entire/cli/git_operations.go:449`). Adjacent overlap worth knowing but outside this diff: `getMetadataTree` (`cmd/entire/cli/resume.go:441`) and `explain_export.go:301-312` already hand-roll a CLI-level "fetch v1, re-open, retry" recovery that the new store tier partly subsumes.
+- **`resolveSessionsBranchRef` (`cmd/entire/cli/checkpoint/persistent.go:2268`)**: pure extraction of code that was already inline in `getSessionsBranchTree`. Every other read-ref-with-origin-fallback site lives in `strategy`/`cli`, which `checkpoint` cannot import.
+- **`dropV1Branch` (new checkpoint test)**: only trivially reusable — the package has `v1BranchRef()` and `setRef()` (`persistent_read_store_test.go:45-52`) for the two ref-manipulation lines. ~2 lines; not worth a change on its own.
+- **dupl**: I ran `golangci-lint` with `dupl` at threshold 75 over `./cmd/entire/cli/strategy/...` and `./cmd/entire/cli/integration_test/...` — none of the new code trips it. Note `dupl` is also *not* in `.golangci.yaml`'s `linters.enable` list (only its settings block is there); it runs only via `mise run dup` at threshold 50. So none of the above is a CI blocker — treat them as maintenance findings.</result>
+<usage><subagent_tokens>173783</subagent_tokens><tool_uses>49</tool_uses><duration_ms>387607</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ad27d866d7832cdbc</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-investigate-enable-timeout/4bf4b198-080d-4b2f-8194-6aa0cc10dad6/tasks/ad27d866d7832cdbc.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Simplification review — `soph/investigate-enable-timeout`
+
+The production code is close to minimal; the extra parameter and the ls-remote probe are both justified (see "Not findings" at the end). Most of the recoverable complexity is in the tests and in comment duplication.
+
+### Findings
+
+**1. `cmd/entire/cli/strategy/common.go:495-497` — a comment this diff invalidates but doesn't update**
+
+The `skipEmptyOrphan` comment still says:
+
+&gt; We still adopt real v1 data that already exists on origin **or a checkpoint_remote** below (so legacy checkpoints stay readable)
+
+The new gate at `common.go:684` makes the checkpoint_remote half false: `bootstrapPrimaryFromCheckpointRemote` now returns `false` before it resolves a URL, so nothing is adopted from the checkpoint remote under git-refs. Origin adoption is unaffected.
+**Simpler form:** strike `or a checkpoint_remote`, and change the parenthetical to point at the read-path fetcher (`MetadataBranchFetchFunc`) as the reason legacy checkpoints stay readable. **Cost:** 1 line edited; the alternative is a reader trusting a claim the same commit disabled.
+
+**2. `cmd/entire/cli/strategy/checkpoint_remote_test.go:1597-1614` — copy-pasted repo setup**
+
+`TestEnsurePrimaryRef_BootstrapFetchIsBlobFiltered` re-implements `gitRefsPrimaryLocalRepo` (1480-1501) line for line — TempDir, `InitRepo`, `WriteFile`/`GitAdd`/`GitCommit`, `remote add origin`, `.entire` mkdir, settings write, `redirectGitURL`. Only the settings JSON differs.
+**Simpler form:** `checkpointRemoteLocalRepo(ctx, t, remoteDir, settingsJSON string) string`, with `gitRefsPrimaryLocalRepo` reduced to a one-line call passing its JSON. **Cost saved:** ~15 lines, one copy; likely also the difference between passing and tripping `mise run dup` at threshold 50.
+
+**3. `cmd/entire/cli/strategy/checkpoint_remote_test.go:1567-1575` — the new generic helper is added beside two existing copies of itself**
+
+`checkpointRemoteGitOutput` is exactly the body of the pre-existing `checkpointRemoteCurrentBranch` (1414-1421) and `checkpointRemoteRevParse` (1424-1431) — same `exec.CommandContext` + `GitIsolatedEnv` + `Output()` + `require.NoError` + `TrimSpace`. The diff makes it four copies instead of collapsing to one.
+**Simpler form:** having introduced the general helper, reduce the two specific ones to `return checkpointRemoteGitOutput(ctx, t, dir, "rev-parse", rev)` etc. **Cost saved:** 12 lines, 2 of 4 copies, behavior-identical. (`checkpointRemoteMetadataFiles` at 1447 differs only in not trimming, so leave it unless you want the trim.)
+
+**4. `cmd/entire/cli/integration_test/enable_checkpoint_remote_test.go:162-178` — two single-use helpers where a call-site line does the job**
+
+`requireMetadataBranchPresent` (10 lines, one call site) duplicates `requireNoMetadataBranch`'s open-repo preamble and re-implements `testutil.BranchExists`, which the strategy tests in this same diff already use. `readFileInDir` (6 lines, one call site) wraps a 2-line `os.ReadFile` + `require.NoError`.
+**Simpler form:** `require.True(t, testutil.BranchExists(t, consumerDir, paths.MetadataBranchName), "explain should have fetched v1 …")` at the call site, and inline the file read. **Cost saved:** ~14 lines and one of the two `git.PlainOpen` sites.
+
+**5. `cmd/entire/cli/checkpoint/persistent.go:2236-2252` — the fetch-and-retry block nests one level deeper than it needs to**
+
+```go
+ref, err := s.resolveSessionsBranchRef()
+if err != nil &amp;&amp; s.metadataBranchFetcher != nil {
+    if fetchErr := s.metadataBranchFetcher(ctx); fetchErr != nil {
+        logging.Debug(ctx, "sessions branch: checkpoint remote fetch failed", …)
+    } else {
+        ref, err = s.resolveSessionsBranchRef()
+    }
+}
+if err != nil {
+    return nil, err
+}
+```
+
+Identical semantics in all four cases (no fetcher → original error; fetch fails → original error preserved, as `TestGetSessionsBranchTree_FetchFailureKeepsOriginalError` pins; fetch succeeds → second resolve's outcome wins; happy path untouched). **Cost saved:** 3 lines, 2 of 3 `return` statements, one nesting level.
+
+**6. `cmd/entire/cli/strategy/checkpoint_remote.go:222-231` — third hand-rolled "ls-remote one ref → present/absent" block**
+
+The same eight lines exist in `checkpoint/remote/checkpoint_ref.go:110-116` (down to the `"probe %s on %s: %w"` wording) and, in a variant, in `checkpointpolicy/remote.go:48-54`. The probe *mechanism* is right — it is the established absence-vs-failure contract — but the code is copied rather than shared.
+**Simpler form:** `remote.RefPresentOnRemote(ctx, dir, target string, ref plumbing.ReferenceName) (bool, error)` in the `remote` package; this call site becomes 4 lines and drops the new `bytes` import. **Cost saved:** ~5 lines here, ~5 more if `FetchCheckpointRef` adopts it.
+
+**7. Comment duplication: the "fresh clone + dedicated checkpoint_remote → origin never carried v1" rationale appears 4-5 times**
+
+`checkpoint/fetching_tree.go:32-36`, `checkpoint/persistent.go:2231-2234`, `explain.go:1006-1010`, and `integration_test/enable_checkpoint_remote_test.go:26-37` each restate it in full. The type doc on `MetadataBranchFetchFunc` is the right home.
+**Simpler form:** keep `fetching_tree.go`'s version; reduce `getSessionsBranchTree`'s second paragraph and `explain.go`'s inline block to a pointer (`see MetadataBranchFetchFunc`). Separately, `fetching_tree.go:35-36` repeats verbatim the closing sentence of `RefFetchFunc`'s doc 12 lines above, while the paragraph's own first sentence already frames it as that type's counterpart. **Cost saved:** ~14 comment lines, and one canonical place to update when the tier changes.
+
+**8. `checkpoint_remote.go:26-31` and `:198-208` — ~11 lines of "what it used to do and why that was wrong" in doc comments** *(lower confidence — house style favors thorough comments)*
+
+Sentences like "each attempt failed the same way with nothing to show for it" and "Returning nil unconditionally meant a checkpoint remote that was unreachable, too slow, or refusing auth looked identical to one that was never contacted" describe the *previous* code. Both facts are already pinned, with the same explanation, in `TestFetchBranchIfMissing_ReportsUnreachableRemote`'s doc (test file 1635-1642) — so this is the third statement of each. **Simpler form:** keep the one-sentence rule in the doc, let the test doc and commit message carry the history. **Cost saved:** ~8 lines.
+
+**9. `explain.go:825-829` and `:1005-1013` — identical `OpenOptions` literals** *(optional)*
+
+Both are the same three fields; `:2516` is the same plus `RemoteRefLister`. **Simpler form:** an `explainReadOpenOptions()` helper carrying the legacy-hex-ID rationale once. **Cost saved:** ~8 lines and one copy of a 5-line comment. Worth doing mainly because it gives the rationale a single home.
+
+### Not findings (checked, deliberately clean)
+
+- **The 8th parameter on `fetchURLIntoTmpRef` is the cheapest option.** The alternative — callers wrapping their own `context.WithTimeout` — costs 2 lines at each of 4 call sites to remove 1 parameter. The `FetchMetadataBranch` / `fetchMetadataBranchWithin` split is 4 lines and is the minimum way to give the exported foreground entry point a different budget from the push path. The now-obsolete `//nolint:unparam` on `noFilter` was correctly removed.
+- **The ls-remote probe is the right mechanism**, not over-engineering: it matches `remote.FetchCheckpointRef`'s absence-vs-failure contract, and the alternative (string-matching git's "couldn't find remote ref") is strictly worse. Only the code sharing (#6) is on the table.
+- **The two gating blocks are not redundant.** `resolvePushSettings` (pre-push) and `bootstrapPrimaryFromCheckpointRemote` (enable) sit on disjoint call paths. Two things worth a line in the PR description rather than a code change: `primaryIsGitRefs(ctx)` — a settings load — is now evaluated twice per `EnsurePrimaryRef` call (`common.go:500` and `:684`), and the third fetch path, `healEmptyOrphanFromCheckpointRemote`, is *not* gated. Moving the gate into `resolveCheckpointFetchURL` would collapse them to one but would change the heal path, so I'm not proposing it.
+- **The `insteadOf` redirection in the integration test is necessary**, not incidental complexity: `settings.GetCheckpointRemote` (settings.go:1465-1472) requires a `repo` field containing `/`, so the simpler `{"provider":"url","url":…}` shape used by `writeMinimalEntireSettings` would resolve to "not configured".
+- **The `runExplainInDir` → `runEntireInDir` extraction in `explain_test.go` is a clean dedup** the diff already did correctly, including moving the `execx.NonInteractive` rationale to the new helper.</result>
+<usage><subagent_tokens>160656</subagent_tokens><tool_uses>33</tool_uses><duration_ms>388590</duration_ms></usage>
+</task-notification>
+
+---
+
+what is buildMirrors used for?
+
+---
+
+can yxou look at comments on the PR and check the trail for findings, if addressed already please resolve them

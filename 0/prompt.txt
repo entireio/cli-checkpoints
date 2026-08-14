@@ -1,0 +1,316 @@
+One thing found along the way: entire trail finding add --patch/--patch-file is broken — every call fails with invalid_request: unified_diff change requires expected_file_path. buildTrailReviewCommentInput (trail_review_cmd.go:775-780) sets only ChangeType, Patch, and Instruction on TrailReviewSuggestedChangeCreateRequest, never ExpectedFilePath — the field exists on the struct (api/trail_review_types.go:173) but nothing populates it, and the server requires it for unified_diff. So a machine-applicable patch can't be attached from the CLI at all; only manual_instruction gets through, which is why the findings above carry prose instructions rather than diffs. That also means entire trail finding apply has no CLI-created patches to apply. Verified by two calls: identical bodies, one with --patch-file, one with --instruction — the first 400s, the second succeeds.
+
+can you take a look, also since when is this broken?
+
+---
+
+hmm, but we used --patch before and it worked. I'm quite sure
+
+---
+
+can you go through the recent session logs in claude logs search for "add findings" and check if we never used patch? or just search for the command?
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>ad24cd3810c979e7e</task-id>
+<tool-use-id>toolu_011D7oefa2XnQMGpbj447GNq</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-fix-trail-patch/9529e772-2e3f-45dd-9959-44f9179a5374/tasks/ad24cd3810c979e7e.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Read the diff, the full command file, the API types, and the sibling paths (`review_bridge.go`, `gitrepo`). Findings below, altitude only.
+
+## Overall judgment
+
+The **seam** is right — resolve the anchor in `runTrailReviewCommentAdd`, pass it as a value into a pure `buildTrailReviewCommentInput` — and that keeps the builder testable. But the anchor is a *second, independent* derivation of facts the command already has or already computes elsewhere, and it lands as ~200 lines of general diff/git machinery inside the command file. Three of the five points below are one shape: same concept, two mechanisms, nothing reconciling them.
+
+---
+
+### 1. Two unreconciled notions of "which file and which lines" — the biggest altitude problem
+`cmd/entire/cli/trail_review_cmd.go:901` (`parseTrailReviewPatchTarget`) vs `:1020` (`buildTrailReviewCommentLocation`)
+
+The command already takes `--file/--line/--start-line/--end-line` and turns them into the finding's location. The fix derives a *separate* file + line span from the patch and never compares the two. Concretely, today:
+
+- `--patch` with no `--file`: the CLI has just parsed the exact path and hunk span out of the patch, then throws it away and sends `granularity: whole_change` (`:1043-1045`). An agent that passes only a patch gets a locationless finding — no `file:line` in the dashboard, nothing to group or navigate by — while the suggested change knows precisely where it goes.
+- `--file a.go` with a patch touching `b.go`: accepted silently; finding points one place, its fix another.
+- `--start-line 88 --end-line 91` disagreeing with the hunk range: both shipped, contradicting each other.
+
+**Deeper fix:** one resolution step producing a single `(path, start, end)` that feeds *both* the location and the anchor — default the location from the patch when `--file` is absent, and reject (or let the flags win and validate the patch against them) when they disagree. That's the difference between "the command knows where the finding is" and "the command has two guesses."
+
+**Cost of leaving it:** the server stores two conflicting anchors per finding, patch-only findings are permanently locationless, and whoever later writes "is this finding still valid?" has to pick which one to trust.
+
+---
+
+### 2. `expected_lines` and `selected_text` are the same idea computed two different ways
+`:988` (`patchAnchorLines`) vs `:1108` (`trailReviewSelectedTextFromWorktree`)
+
+Both read lines N..M of a worktree file to give the server a pre-image for staleness detection. They disagree on semantics: `patchAnchorLines` uses `SplitAfter` and preserves line endings and hard-errors out of range; `trailReviewSelectedTextFromWorktree` normalizes CRLF→LF, joins with `\n` (dropping the trailing newline), and silently degrades granularity out of range. Same file, same request, two answers.
+
+Path safety diverges too: `safeWorktreeFilePath` (`:1132`) exists for exactly "resolve a repo-relative path under the worktree root" and is used by the sibling function, but the new code hand-rolls `filepath.Join(repoRoot, filepath.FromSlash(target.Path))` with a `//nolint:gosec` at `:849` and leans on `validatePatchPath` instead.
+
+**Deeper fix:** one `worktreeLines(root, path, start, end)` returning the raw slice (built on `safeWorktreeFilePath`), with normalization left to the caller that wants it.
+
+**Cost:** the next fix to one — a CRLF correction, a symlink guard, a size cap — silently misses the other.
+
+---
+
+### 3. A second unified-diff parser beside the existing one, with narrower dialect coverage
+`:896`/`:901`/`:967` vs `:1432` (`validateUnifiedDiffPatchPaths`) / `:1449` (`patchHeaderPaths`)
+
+These are *not* legitimately different concerns — both scan the same patch text for header paths; the new one additionally wants hunk ranges. The new parser only recognizes `--- `/`+++ `; it ignores `diff --git`, `rename from/to`, `copy from/to`, which `patchHeaderPaths` handles. And it validates only the old path (`:958`), where the apply path validates both sides plus rename/copy headers. So the **write** path applies weaker path safety than the **read** path, on identical input.
+
+**Deeper fix:** one `parseUnifiedDiff(text) → []fileDiff{oldPath, newPath, hunks}` (~80 lines, own file). Anchor derivation reads its first file's hunk span; validation walks every path it produced instead of running a second scanner. Path-safety rules then exist once.
+
+**Cost:** two parsers drift. The asymmetry above is already the first instance, and the "one file per suggested change" rule now lives only inside the parser rather than being visible where the singular anchor is defined.
+
+---
+
+### 4. `expected_file_hash` — an invented convention with no consumer
+`:1002` (`gitBlobHash`), `:870-882` (`trailReviewObjectFormat`), `api/trail_review_types.go:174`
+
+Two separate altitude issues:
+
+**(a) Wrong authority.** The hash is taken from the *dirty working tree*. But the finding is pinned to a code version, and `verifyTrailReviewHead` (`:1372`) refuses to apply unless current HEAD matches the review's head commit. The naturally authoritative source is the blob git already has at that commit — stable, and something the server could independently recompute from the code version it stores. Hashing disk means the recorded pre-image is one nothing else can reproduce, and it changes if the user saves the file between writing the finding and posting it. This is exactly the "should the anchor come from git itself" question, and the answer here is yes — and it's a purely local change, no server coordination.
+
+**(b) No consumer keeps it honest.** Nothing reads `ExpectedFileHash`: `applyTrailReviewSuggestions` (`:1387`) ignores it entirely and just runs `git apply --check`; `:1690` prints only `ExpectedFilePath`. So the CLI is unilaterally defining the field's meaning as write-only data. The meaning isn't stated anywhere either — `api/trail_review_types.go:174` is a bare `*string`, and there's no doc in `docs/`.
+
+**Deeper fix (cheap, CLI-only):** hash the blob at the review head rather than the worktree; write the convention down on the type in `api/trail_review_types.go`; and have `applyTrailReviewSuggestions` verify against it before shelling out to `git apply`. That converts an invented convention into an enforced one.
+
+**Cost of leaving:** a format nobody can later rely on. The moment the server or the web UI starts checking it, whichever meaning it picked will not be the one the CLI writes, and there is no test or consumer to catch that.
+
+Also note `trailReviewObjectFormat` is the CLI's only reader of `Extensions.ObjectFormat`, and this command file is now the only place that hand-builds a blob OID. That belongs in `gitrepo` (per CLAUDE.md, the single source of truth for repo access) — otherwise `trail_review_cmd.go` imports `plumbing` and `plumbing/format/config` for a job git already exposes.
+
+---
+
+### 5. Placement: ~200 lines of general machinery in a 1888-line command file
+`:820-1008`
+
+None of the new code depends on cobra or the trail API — it's diff text parsing, worktree reads, and git object hashing. `trail_review_cmd.go` already carries command wiring, request shaping, the apply path, and dashboard rendering. **Deeper fix:** `trail_review_patch.go` at minimum; combined with finding 3 the natural home is a shared unified-diff helper used by both create and apply. Low cost now, and it's what makes finding 3 tractable rather than a rewrite.
+
+---
+
+### Where the altitude is right — don't change these
+
+- **CLI-side pre-validation is justified, not a maintenance trap.** The multi-file rejection, the hunk-header requirement, and the file-creation rejection are not copies of server rules; they fall out of the anchor being singular and line-based, which the CLI must satisfy to build the request at all. And the messages ("attach one suggested change per file", "use --instruction instead") are actionable in a way a 400 isn't. The one true server echo is the `anchor == nil` guard at `:789`, and that's three lines guarding a threading mistake — fine.
+- **Don't chase a coordinated server change here.** Nothing in these findings requires the API to move. Every deeper fix listed is local to the CLI, including making the anchor authoritative (finding 4a).
+- **The anchor-as-a-value seam** into `buildTrailReviewCommentInput` is good and the tests exercise it at the right level.</result>
+<usage><subagent_tokens>106441</subagent_tokens><tool_uses>17</tool_uses><duration_ms>186117</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>af1aa9a3b705e08fe</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-fix-trail-patch/9529e772-2e3f-45dd-9959-44f9179a5374/tasks/af1aa9a3b705e08fe.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I've read the diff and the surrounding code. Here are my simplification findings, ordered by value.
+
+## Findings
+
+**1. `trail_review_cmd.go:786-791` — the `anchor == nil` guard is unreachable, and the "is this a patch finding?" predicate is now computed twice.**
+
+`buildTrailReviewCommentInput` has exactly one production caller (`runTrailReviewCommentAdd`, line 362), which resolves the anchor under the identical condition `strings.TrimSpace(opts.Patch) != ""` and returns on error six lines earlier. So inside `build`, `patch != "" &amp;&amp; anchor == nil` cannot happen. The guard's only exerciser is `TestBuildTrailReviewCommentInputRejectsUnanchoredPatch` (test:322-333), which exists solely because the guard exists.
+
+Simpler form: key the branch on the anchor the caller already decided about, and drop the re-derivation:
+```go
+if anchor != nil {
+    input.SuggestedChange = &amp;api.TrailReviewSuggestedChangeCreateRequest{
+        ChangeType: "unified_diff",
+        Patch:      stringPtr(strings.TrimSpace(opts.Patch)),
+        ...
+    }
+} else if instruction := strings.TrimSpace(opts.Instruction); instruction != "" {
+```
+That deletes the error branch, its test, and one of the two copies of the predicate.
+
+Trade-off to weigh, honestly: today a future caller that forgets to resolve gets a loud error; with the anchor-keyed form it would silently produce no suggested change. If you value that loudness, the cost of leaving it as-is is small — one dead branch plus a test that only guards it — but the duplicated predicate in caller and callee must then stay in sync by hand.
+
+**2. `trail_review_cmd.go:831-868` — `resolveTrailReviewCommentPatchAnchor` and the `repoRoot`/`objectFormat` parameters are a test seam the tests don't need.**
+
+The wrapper resolves the worktree root and object format, then delegates. The inner function is parameterized on both purely so tests can pass them. But `newTrailReviewApplyRepo` (test:883) already does `t.Chdir(dir)` and clears the worktree-root cache — the sibling apply tests rely on `paths.WorktreeRoot` resolving from exactly that CWD — and the test then passes `repo` (the dir it just chdir'd into) plus `format.SHA1` (what a bare `git init` yields anyway). Both arguments restate the environment the test already built.
+
+Simpler form: one function, `resolveTrailReviewPatchAnchor(ctx context.Context, patch string)`, doing the root + format resolution inline. Tests call it with `context.Background()` after `newTrailReviewApplyRepo(t)` and behave identically (the format fallback returns SHA1 even if the open fails). Cost of leaving: an extra indirection layer and two parameters every call site fills with the same thing.
+
+**3. `trail_review_cmd.go:902-940` — `files` and `hunks` are `int` but only ever used as booleans.**
+
+`files` is only tested for `&gt; 1` and `== 0`; `hunks` for `== 1` (a first-iteration sentinel) and `== 0`. Simpler form: `var sawFile, sawHunk bool`, with `if sawFile { return ... }` / `sawFile = true` and `if !sawHunk || start &lt; target.StartLine`. Same behavior, one less thing that looks like it carries a count someone might later read.
+
+To answer the specific question: `hunks == 1 || start &lt; target.StartLine` is already the right shape — a min-accumulator needs a first-iteration sentinel, and `StartLine == 0` can't serve as one because a `-0,0` creation hunk legitimately yields start 0. Only the type is inflated, not the logic.
+
+**4. `trail_review_cmd.go:920-921, 955-956` — `newPath` tracking earns its keep only for one error string.**
+
+The `+++ ` case exists solely to name the file in the creation error ("patch creates %s"). Nothing else reads `newPath`; removing the case breaks nothing else, since `+++` matches no other branch. Simpler form: drop the case and the variable, and say `"patch creates a new file; a suggested change must modify an existing file (use --instruction instead)"`. That's −4 lines and −1 variable at the cost of a less specific message. I'd call this the author's call — the message is genuinely better with the name — but the two halves are separable, so you can take finding 3 without taking this one.
+
+**5. `trail_review_cmd.go:823-829, 887-891, 861-867` — `trailReviewPatchTarget` collapses into `trailReviewPatchAnchor` by embedding.**
+
+The anchor is the target plus two fields, and the construction restates three of them (`FilePath: target.Path`, `StartLine: target.StartLine`, `EndLine: target.EndLine`). Simpler form:
+```go
+type trailReviewPatchAnchor struct {
+    trailReviewPatchTarget
+    FileHash string
+    Lines    string
+}
+...
+return &amp;trailReviewPatchAnchor{trailReviewPatchTarget: target, FileHash: hash, Lines: lines}, nil
+```
+`&amp;anchor.StartLine` still works; `anchor.FilePath` becomes `anchor.Path`, which also removes the Path/FilePath naming split for the same value. Small win — 3 restated lines — but it keeps the parse-only struct as a testable seam, which is the one thing the two-struct split actually buys.
+
+**6. `trail_review_cmd.go:994` — the `start &gt; len(lines)` disjunct is unreachable.**
+
+`EndLine &gt;= StartLine` always holds out of the parser (each hunk's end is `&gt;= ` its start, and the accumulator takes min-of-starts and max-of-ends), so `end &gt; len(lines)` subsumes it. It also isn't defense-in-depth for the index that could actually panic — `start == 0` would reach `lines[-1:0]` past both checks. Simpler form: `if end &gt; len(lines) {`.
+
+The rest of `patchAnchorLines` is already minimal: the `SplitAfter` + trailing-empty trim is load-bearing, because the trim is what makes `len(lines)` the real line count that both the bounds check and the error message report. I wouldn't touch it.
+
+**7. `trail_review_cmd_test.go:301-319 — five near-identical assertion blocks that one comparison covers.**
+
+Each of the five is `if X == nil || *X != want { t.Fatalf("X = %#v", X) }` with the name substituted. Since all five values come from the same `anchor`, assert the whole struct once:
+```go
+want := api.TrailReviewSuggestedChangeCreateRequest{
+    ChangeType: "unified_diff", Patch: stringPtr(patch),
+    ExpectedFilePath: stringPtr(anchor.FilePath), ExpectedFileHash: stringPtr(anchor.FileHash),
+    ExpectedStartLine: &amp;anchor.StartLine, ExpectedEndLine: &amp;anchor.EndLine,
+    ExpectedLines: stringPtr(anchor.Lines),
+}
+if change == nil || !reflect.DeepEqual(*change, want) { ... }
+```
+`reflect.DeepEqual` is already idiomatic in this package's tests (13 test files use it) and compares pointees, so this also pins `Instruction` to nil and catches any field the API request struct gains later. Cost of the change: per-field failure messages get replaced by one struct dump — real, but this file already prints `%#v` structs for `Location`.
+
+**8. `trail_review_cmd_test.go:916-934` — `trailReviewGitOutput` is `runTrailReviewApplyGit` with `.Output()` instead of `.CombinedOutput()`.**
+
+Two 8-line helpers differing in one method call and a return value. Simpler form: keep one that returns the trimmed stdout (capturing stderr into a buffer for the failure message) and let the existing call sites ignore the result. Cost of leaving: a second git-runner in the same file that the next test author has to choose between.
+
+## Examined and not flagged
+
+- **`gitBlobHash` + `trailReviewObjectFormat` vs shelling out to `git hash-object`** (which this file already does for `git apply`): tempting — it would delete ~25 lines and both new go-git imports — but it is *not* equivalent. `git hash-object &lt;file&gt;` runs clean filters/`core.autocrlf`, so in a repo with autocrlf it returns a different OID than hashing the raw bytes. The test's own comment about avoiding `testutil`'s `core.autocrlf=true` suggests the raw-bytes hash is deliberate. Leaving this alone.
+- **`TestResolveTrailReviewPatchAnchorErrors`** is already a table and doesn't restate itself.
+- **The `hunks == 1` first-hunk condition** and the `SplitAfter`/trim in `patchAnchorLines` are about as simple as they can be; see findings 3 and 6 for the only removable parts.</result>
+<usage><subagent_tokens>104750</subagent_tokens><tool_uses>11</tool_uses><duration_ms>241345</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a2a202cf23fa71c12</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-fix-trail-patch/9529e772-2e3f-45dd-9959-44f9179a5374/tasks/a2a202cf23fa71c12.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Read the diff and verified each candidate helper in the tree.
+
+## Findings (reuse)
+
+**1. `cmd/entire/cli/trail_review_cmd.go:849` — hand-rolled worktree-root join instead of the file's own safe joiner**
+
+```go
+content, err := os.ReadFile(filepath.Join(repoRoot, filepath.FromSlash(target.Path))) //nolint:gosec // path is validated by validatePatchPath before use.
+```
+
+Use `safeWorktreeFilePath(worktreeRoot, filePath string) (string, bool)` — `cmd/entire/cli/trail_review_cmd.go:1132`, same file and package. It does exactly this join plus the containment check the new code substitutes a comment for: rejects absolute paths, `filepath.FromSlash` + `filepath.Clean` on the relative part, rejects `.`/`..`, joins on `filepath.Clean(root)`, then re-checks with `filepath.Rel` that the result stays under the root. It is already the sanctioned way this file reads a worktree file by repo-relative path — `trailReviewSelectedTextFromWorktree` calls it at line 1112 and then does the same `os.ReadFile` at 1116. Signature matches (`target.Path` is a cleaned, slash-separated repo-relative path); the caller just turns `ok == false` into the read error it already returns.
+
+**2. `cmd/entire/cli/trail_review_cmd.go:958` — single-path validation instead of the existing whole-patch path validator**
+
+```go
+if err := validatePatchPath(oldPath); err != nil {
+```
+
+`validateUnifiedDiffPatchPaths(patchText string) error` already exists at `cmd/entire/cli/trail_review_cmd.go:1432`. It scans the whole patch and runs every header path through the same `validatePatchPath` — `diff --git` (both sides), `--- `, `+++ `, `rename from/to`, `copy from/to` — via `patchHeaderPaths` (line 1449). The new parser checks only the `---` side; `newPath` is never validated (it is only fed to `cleanPatchPath` for an error string at line 956), and the `+++`/`rename to` paths are the ones a later `git apply` writes to. The apply path (`combinedSafeUnifiedDiffPatch`, line 1419) already calls it — the add path should too, rather than the narrower ad-hoc check.
+
+## Checked, not findings (the specific questions asked)
+
+- **Unified-diff parser:** none exists in the repo — `parseTrailReviewPatchTarget`/`parseUnifiedDiffHunkRange` are the only `@@`-header parsing anywhere (grep for `"@@ -"`, `hunk`, `unified_diff` hits only this file). `github.com/gitleaks/go-gitdiff v0.9.1` is in `go.mod` as indirect but is *not* actually used: `go mod why` reports "main module does not need package github.com/gitleaks/go-gitdiff", and nothing imports it. Using it (`gitdiff.Parse` → `File.OldName`/`IsNew` + `TextFragment.OldPosition`/`OldLines`) would be more robust and would subsume the regex, but it means promoting a transitive requirement to a direct dep — and the file's established convention is exactly this line-scanning style (`validateUnifiedDiffPatchPaths`, `patchHeaderPaths`). Not a reuse violation as written. `sergi/go-diff` (direct dep) is diff-match-patch, used only in `strategy/manual_commit_attribution.go`; it has no git-unified-diff parser.
+- **Blob hash:** no exported helper is applicable. `checkpoint.CreateBlobFromContent` (`checkpoint/persistent.go:2257`) *writes* the object into the store — wrong side effect for an anchor. `checkpoint.hashBlob` (`checkpoint/migrate.go:234`) is unexported. The nearest prior art is `strategy.workingTreeMatchesCommit` (`strategy/content_overlap.go:524-539`), which is unexported, in another package, and returns a bool comparison — so `gitBlobHash` is a second implementation of "git-blob-hash on-disk content" but there is nothing to call today. Worth knowing if someone later extracts it into `gitrepo`. `plumbing.FromObjectFormat(f).Compute(plumbing.BlobObject, content)` would replace the manual `NewHasher`/`Write`/`Sum`, but nothing in the repo uses it while `content_overlap.go:534` uses `NewHasher` — the new code matches the existing convention.
+- **Object format resolution:** no existing helper. `Extensions.ObjectFormat` is read nowhere else (only `content_overlap.go` infers it, from hash size). `trailReviewObjectFormat` is genuinely new.
+- **Line slicing:** `trailReviewSelectedTextFromWorktree` (line 1108) is not a substitute for `patchAnchorLines` — it normalizes CRLF and rejoins with `\n`, while `expected_lines` must be the exact pre-image bytes. `strings.SplitAfter` appears nowhere else in non-test code.
+- **`cleanPatchPath`:** an extraction of the normalization that was already inside `validatePatchPath`, not a duplicate. `paths.ToRelativePath`/`normalizeMSYSPath` do not handle `a/`/`b/` prefixes or quoted paths, so they are not equivalents.
+
+## Minor
+
+`cmd/entire/cli/trail_review_cmd_test.go:916` `trailReviewGitOutput` is near-identical to `runTrailReviewApplyGit` at line 927 (same exec setup, differing only in `Output()` vs `CombinedOutput()` and returning the value). `runTrailReviewApplyGit` could delegate. Likely under the `dupl` 75-token threshold, so cosmetic.</result>
+<usage><subagent_tokens>129616</subagent_tokens><tool_uses>37</tool_uses><duration_ms>271136</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ae26c9624b3903b66</task-id>
+<tool-use-id>toolu_01D6SgEqjEsdtLLesvf7s1dC</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-fix-trail-patch/9529e772-2e3f-45dd-9959-44f9179a5374/tasks/ae26c9624b3903b66.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Verdict
+
+For a one-shot interactive command that already blocks on two HTTP round trips, this code is **appropriately efficient**. The file is read exactly once, the patch is scanned exactly once, and the hash is unavoidable. I measured every candidate rather than guessing; only one item is worth acting on, and it's hygiene rather than throughput.
+
+---
+
+## Findings
+
+### 1. `trailReviewObjectFormat` never closes the repository it opens
+`/Users/soph/.herdr/worktrees/cli/soph-fix-trail-patch/cmd/entire/cli/trail_review_cmd.go:873-883`
+
+`gitrepo.OpenCurrent`'s doc comment states "The caller owns the returned repository and must close it," and **every other call site in this package** does `defer repo.Close()` — `checkpoint_policy.go:62`, `checkpoint_policy_warning.go:36`, `hooks_git_cmd.go:72`, `strategy/common.go:1091`. This one doesn't, so the filesystem storer's dotgit/packfile descriptors stay open until process exit.
+
+Cheaper alternative: `defer func() { _ = repo.Close() }()` after the error check.
+
+Magnitude: no measurable runtime win — the process exits within a second. It's worth fixing because it's the one place in the package that breaks a documented contract, and it will get copied.
+
+### 2. The 2.2 ms git open is paid even when it is never used
+`cmd/entire/cli/trail_review_cmd.go:838`
+
+`trailReviewObjectFormat(ctx)` is passed as a call argument, so Go evaluates it *before* `resolveTrailReviewPatchAnchor` runs. Every failure path — multi-file patch, missing `@@` header, `/dev/null` creation, unreadable target file — pays the full repo open + config parse for a value that is then discarded.
+
+Cheaper alternative: resolve the format after `os.ReadFile` succeeds (or pass a `func() format.ObjectFormat`).
+
+Magnitude: ~2.2 ms, **on error paths only**. Below the noise floor. Only worth folding in while touching this function for finding 1.
+
+---
+
+## Measured: the git-open question
+
+Benchmarked in this worktree (M4 Max, warm page cache, 200-500 iterations, scratch benchmarks since removed):
+
+| Approach | Cost |
+|---|---|
+| Current: `gitrepo.OpenCurrent` + `repo.Config()` + `Close` | **2.2 ms** (open 1.5 ms, `Config()` 0.68 ms) |
+| `git rev-parse --show-object-format` subprocess | **10.6 ms** — 5× worse |
+| Direct decode of the common-dir `config` via `format/config` | **0.46 ms** |
+
+**The current choice is right.** The obvious "cheaper" alternative (shelling out to git) is five times more expensive; fork/exec dominates. The genuinely faster path saves ~1.7 ms but would re-implement the `.git`-file / `commondir` resolution that `gitrepo` exists to own, against the CLAUDE.md rule that `gitrepo` is the single place a repository is opened. Not worth 1.7 ms in a command that does network I/O.
+
+One unavoidable waste worth knowing about: `git.Open` already parses `.git/config` internally (`Open` → `s.Config()` → `verifyExtensions`), and `repo.Config()` re-reads and re-parses it because go-git's `ConfigStorage.Config()` is uncached. The config file is read twice, ~0.68 ms. Not fixable without leaving `gitrepo`.
+
+**The repo is opened once, not twice.** `paths.WorktreeRoot` is called twice (line 834, then again inside `gitrepo.OpenCurrent` at `gitrepo/repository.go:26`), but it caches per-cwd behind an RWMutex (`paths/paths.go:67-98`), so only one `git rev-parse` subprocess is forked; the second call costs an `os.Getwd` plus an RLock.
+
+---
+
+## Theoretically wasteful, practically irrelevant — do not change
+
+- **`patchAnchorLines` full-file split** (`trail_review_cmd.go:988`). `strings.SplitAfter(string(content), "\n")` copies the whole file and allocates a `[]string` of every line to keep ~10 of them. A byte-offset scan with `bytes.IndexByte` is measurably better — on a 660 KB / 19k-line file: **253 µs / 967 KB / 3 allocs → 42 µs / 704 B / 1 alloc** (6× faster, ~1000× less garbage). But on a realistic source file being patched (20-100 KB) that's ~10-40 µs saved, invisible next to one HTTP round trip, and the offset version is more code with an off-by-one risk. The current form is clearer and correct. (Aside, robustness not efficiency: peak memory is 2× file size plus 16 B/line, so a pathologically large target would spike — irrelevant for the source-file flow this serves.)
+
+- **`gitBlobHash` hashing the whole file** (`trail_review_cmd.go:1002`). Necessary by definition — `expected_file_hash` must equal what `git hash-object` prints, which is the OID over the entire content. The content is already in memory from the single `os.ReadFile` at line 849, so there is no extra I/O, and `plumbing.NewHasher(..., int64(len(content)))` seeds the object header without a second pass. Nothing to win.
+
+- **Patch scanned once.** `parseTrailReviewPatchTarget` (line 901) makes exactly one `bufio.Scanner` pass. `strings.TrimSpace(opts.Patch)` runs twice (lines 357 and 786), but `TrimSpace` only walks leading/trailing whitespace — O(1) here, not a re-scan. `scanner.Text()` allocating per line and the one 64 KB `scanner.Buffer` are noise for patches of tens of lines.
+
+- **`regexp.MustCompile` at package scope** (`trail_review_cmd.go:896`). This *does* run at init for every `entire` invocation including git hooks. Measured: **4.4 µs**. `cmd/entire/cli/*.go` already carries 19 package-level regexps, and hook p50 is ~3.4 s. This is 0.0001% of a hook. Non-issue.
+
+- **No free concurrency.** The only two independent units are the object-format lookup (2.2 ms, I/O-bound) and the patch parse + file read (sub-ms). Overlapping them in a goroutine would save ~2 ms and cost error-plumbing complexity in a command that blocks on the network. Not worth it.</result>
+<usage><subagent_tokens>108086</subagent_tokens><tool_uses>23</tool_uses><duration_ms>257607</duration_ms></usage>
+</task-notification>
+
+---
+
+hmm can you explain the skipped ones more
+
+---
+
+hmm, 1 feels worth fixing, can we explain the options more

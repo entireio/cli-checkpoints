@@ -1,0 +1,19 @@
+Root-cause WHY `entire search` (CLI) and entire.io web search STILL return different results for the SAME query, and pin down exactly where the fix belongs. This is a focused investigation into the remaining client-side divergence — related to ENT-1595 (read it via the Linear MCP).
+
+## Important: two prior investigations already did a lot of this — start from them, don't re-derive
+Read these preserved findings files FIRST (they're on THIS machine, outside the repo):
+- `~/.claude/tmp/search-parity-cli-vs-web-findings/FINDINGS.md` — a dedicated CLI-vs-web parity dig. Its verdict: the Cohere reranker is ONE shared server-side impl in query-serve (identical by construction), BUT the cross-cell merge/ordering layer is reimplemented twice (Go in the CLI, TS in the BFF) and has drifted — the CLI's result model has NO rerankScore field, so the CLI sorts tier-0 by BM25 and tier-1 by retrieval Score and is effectively NOT reranked; it also promotes tier-2 (cap 15) while the web drops tier-2. Different sort keys + different tiers = different sets, even single-repo.
+- `~/.claude/tmp/ent-1595-dispatches-search-findings/FINDINGS.md` — the ENT-1595 dig. Verdict: two distinct root causes — (1) dispatches never indexed [separate], (2) client divergence from scope defaults + result presentation + independent merge/facet logic; both clients hit the SAME backend and get the SAME data. Note a fix already merged: entire-search #175 "two-phase retrieval so broad searches don't drop deep checkpoints (ENT-1595)".
+
+## Your job — what's NEW
+Given #175 has merged, determine what STILL differs and why:
+1. Reproduce fresh: run `entire search "<q>" --json` (try both `--all-repos` and current-repo) AND the entire.io web/BFF search for the same query + same user, and diff the result sets (ids, types, order, counts/facets). Use a query you know the answer to. Prefer staging; nothing destructive.
+2. Confirm which of the previously-identified divergences still hold post-#175 and which are now closed: the CLI's missing rerankScore / wrong sort key, the tier-2 promote-vs-drop asymmetry, scope defaults (`--all-repos` vs web default), and the facet/results mismatch (e.g. counts.commits=0 while results are all commits).
+3. Decide the fix and WHERE it belongs: is the right fix to make the CLI consume the shared rerankScore and match the web's tier handling, or to collapse the two hand-rolled merges into one shared ordering contract so they can't drift again? Say which, with the tradeoff.
+
+## How to work
+- You're in a `cli` worktree off main (the CLI's Go merge/ordering layer that ignores rerankScore is the leading suspect and where a fix likely lands). The web ordering lives in entire.io BFF `api/src/routes/search.ts`; the shared reranker + response contract live in entire-search query-serve.
+- Prefer Entire search — `search_entire_code` to locate the CLI result model + Go merge, the BFF merge/facet logic, and the query-serve response contract across cli / entire.io / entire-search — over grepping and reading whole files. Fall back to reading files only where search doesn't cover it.
+- Deliverable: write up using the architecture-findings skill — a high-level narrative of why the two clients still diverge and where the single fix belongs, NO file paths/line numbers/symbols in the write-up. Keep the code-level detail (the still-divergent sort keys, the exact fix location, repro diffs) in a FINDINGS.md kept UNTRACKED (do not commit it).
+
+Report: the remaining divergences (with which are now closed by #175), the recommended fix + its home, and whether this fully answers ENT-1595's symptom 2. If a query now returns IDENTICAL results in both, say so — don't invent a divergence that #175 already fixed.

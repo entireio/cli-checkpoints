@@ -22,6 +22,87 @@
   "session_metrics": {
     "turn_count": 6
   },
+  "summary": {
+    "intent": "Investigate a reported bug where `entire enable` on a fresh clone of the cli repo silently stalls ~30s (twice) attempting to clone a 2GB checkpoint archive, then implement, test, and land a fix, followed by a `/simplify` cleanup pass and responding to PR review findings.",
+    "outcome": "Landed a multi-commit fix on branch soph/investigate-enable-timeout (PR #1994): gated eager v1-branch fetches under git-refs primary, added a read-time recovery tier for explain, split timeouts and surfaced failures, added an integration test tying all four together, ran a /simplify pass that fixed real efficiency/reuse issues, and iteratively resolved three PR review findings (two regressions the fixes themselves introduced: an over-broad blob-filter that silently degraded checkpoint listings, and an ungated third heal path) — ending with trail at 0 open findings and `mise run check` green.",
+    "learnings": {
+      "repo": [
+        "entireio/cli's own repo settings.json commits checkpoint_remote pointing at entireio/cli-checkpoints (1.5+ GiB, 104k objects) with filtered_fetches:true and checkpoints.primary=git-refs — a fresh clone's `entire enable` bootstraps this remote.",
+        "Under the git-refs primary backend, `skipEmptyOrphan` is true, so a failed bootstrap fetch creates nothing and `enable` is a no-op-but-retry every time — non-convergent, unlike git-branch which seeds an orphan and stops.",
+        "checkpoint.PrimaryIsRefs is an established shared predicate already used in ~8 places (manual_commit_push.go:94, unpushed_checkpoints.go:22, attach.go:521, status.go:310, etc.) — reuse it rather than reinventing a git-refs check.",
+        "buildMirrors implements a primary+mirrors fan-out model (fanoutStore) where mirrors get write-only best-effort fan-out and all reads go to primary; but the architecture doc (docs/architecture/ref-checkpoint-backend.md) explicitly rules out running git-branch as a mirror of git-refs — cross-format compat comes from read routing + version policy, not dual-writing. Only fsstore (test-only) is a real mirror-only backend today.",
+        "GitStore.List reads each checkpoint's metadata.json via a plain *object.Tree (readCommittedInfoFromCheckpointTree) with no blob fetcher — so a blob-filtered v1 branch silently degrades every listing to bare IDs (no prompt/date/counts) since go-git doesn't lazily resolve promisor objects.",
+        "checkpoint.treeHasCheckpointData and strategy.metadataBranchHasData must stay in agreement on what counts as an 'uninitialized' branch, or enable-time heal and read-time recovery disagree about whether a branch needs recovering.",
+        "dupl linter is configured in .golangci.yaml's settings block but NOT enabled in linters.enable — it only runs via `mise run dup` at threshold 50, so duplication findings from cleanup reviews aren't CI blockers.",
+        "settings.GetCheckpointRemote requires a repo field containing '/' (provider+repo shape); the {'provider':'url','url':...} shape used by writeMinimalEntireSettings parses to 'not configured' — a real fixture trap.",
+        "remote.FetchURL needs origin to be a parseable URL (file:// works, bare filesystem paths don't) to derive a checkpoint remote URL — otherwise it silently falls back to origin itself.",
+        "TestEnv's NewRepoEnv/NewRepoWithCommit call InitEntire, which pre-enables the repo — unusable when the test needs to exercise `entire enable` itself; must use NewTestEnv + InitRepo instead."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/strategy/checkpoint_remote.go",
+          "line": 19,
+          "finding": "Bootstrap/heal fetch timeout constant (checkpointRemoteFetchTimeout, 30s) — originally same budget as origin-side fetches despite checkpoint-remote holding strictly more data; later split into a separate foreground budget."
+        },
+        {
+          "path": "cmd/entire/cli/strategy/common.go",
+          "line": 673,
+          "finding": "bootstrapPrimaryFromCheckpointRemote — calls fetchURLIntoTmpRef with NoFilter:true unconditionally; gating added here for git-refs primary, and blob-filtering added/reverted based on whether the branch itself is later read as the checkpoint store."
+        },
+        {
+          "path": "cmd/entire/cli/strategy/checkpoint_remote.go",
+          "line": 92,
+          "finding": "resolvePushSettings calls fetchMetadataBranchIfMissing unconditionally (not gated on bootstrap flag) — every git push in a fresh git-refs clone paid the same 30s fetch tax, outside the 2-min checkpointPushBudget."
+        },
+        {
+          "path": "cmd/entire/cli/strategy/checkpoint_remote.go",
+          "line": 180,
+          "finding": "fetchMetadataBranchIfMissing returned nil unconditionally on failure, making the logging.Warn at line 93 unreachable dead code — fixed by classifying failures via an ls-remote absence probe."
+        },
+        {
+          "path": "cmd/entire/cli/checkpoint/persistent.go",
+          "line": 2235,
+          "finding": "getSessionsBranchTree's fetch-and-retry recovery originally re-fired on every entry (List, getFetchingTree, getSessionTree, GetCheckpointAuthor all funnel through it) with no memoization — latched to one attempt per GitStore instance after /simplify."
+        },
+        {
+          "path": "cmd/entire/cli/explain.go",
+          "line": 2520,
+          "finding": "getBranchCheckpoints wired MetadataBranchFetcher onto the pure-enumeration List path, causing checkpoint list to trigger a full unfiltered branch fetch; removed since it contradicts the names-only design of WithRemoteListDiscovery on the adjacent refs side."
+        },
+        {
+          "path": "cmd/entire/cli/checkpoint/fetching_tree.go",
+          "line": 42,
+          "finding": "MetadataBranchFetchFunc takes no ref argument (unlike sibling RefFetchFunc), re-deriving the target ref internally via ResolveRefs — a noted but accepted asymmetry since no caller currently overrides the topology."
+        },
+        {
+          "path": "cmd/entire/cli/strategy/common.go",
+          "line": 500,
+          "finding": "healEmptyOrphanFromCheckpointRemote (heal path) was the third checkpoint-remote fetch path and the only one left ungated after the initial fix — a data-free orphan ref resolves successfully, masking the miss so the read-path recovery tier never fires either; both enable-side gating and read-side 'treat data-free branch as a miss' had to move together."
+        }
+      ],
+      "workflow": [
+        "Before implementing a fix based on a hypothesis (e.g. 'the branch is vestigial'), verify empirically against the real remote (git fetch timing, ls-remote, object counts) rather than trusting code-read inference alone.",
+        "When writing a new test, deliberately run it against the pre-fix/unfixed source to confirm it fails for the right reason (guard against vacuous passes) before re-applying the fix.",
+        "The /simplify workflow's 4-parallel-agent (reuse/simplification/efficiency/altitude) review surfaced genuinely different, non-overlapping findings — worth the pattern for a change of this size; verify the highest-impact claim empirically before mass-applying fixes.",
+        "PR reviewers (Copilot, Cursor Bugbot, in-repo 'trail' findings) caught two real regressions the human/agent fix had introduced and briefly rationalized away — a reminder to re-examine self-dismissed risks when independent review flags the same spot.",
+        "When a fix is later reverted, go back and correct any PR comment replies that had cited the reverted behavior as correct, rather than leaving stale claims for reviewers."
+      ]
+    },
+    "friction": [
+      "Constructing the integration test fixture required two non-obvious corrections: checkpoint_remote settings needed a real provider/repo shape (not the url shape used by an existing helper), and origin had to be a file:// URL rather than a bare path for FetchURL derivation to engage.",
+      "The author (agent) initially mis-attributed the explain gap to loadPrimaryMetadataRootTree; writing the integration test revealed the actual gap was one level down in GitStore.getSessionsBranchTree, requiring a correction mid-task.",
+      "During /simplify, the agent speculated that git-refs-primary + git-branch-mirror was a real supported topology needing a deeper fix (writesMetadataBranch capability) — a follow-up investigation showed the architecture docs explicitly exclude this topology, so the concern was a false lead.",
+      "Two review-driven regressions occurred in sequence: an overly broad blob-filter change silently broke checkpoint listing (high-severity trail finding), and gating the heal path alone (without also fixing read-side recovery) would have permanently orphaned legacy checkpoints (medium-severity trail finding) — both required a second pass to fully resolve."
+    ],
+    "open_items": [
+      "The primaryIsGitRefs/PrimaryIsRefs predicate answers 'is primary refs?' rather than the true invariant 'does anything in this topology write v1?' — flagged as imprecise but not fixed since no live topology currently exercises the gap (git-branch-as-mirror-of-git-refs is architecturally excluded).",
+      "resume.go has four foreground Open call sites not wired to MetadataBranchFetcher and instead hand-rolls an equivalent recovery ladder in getMetadataTree — noted as real duplication but explicitly left out of scope (well outside the diff).",
+      "MetadataBranchFetchFunc doesn't take an explicit ref parameter like its sibling RefFetchFunc (relies on ambient ResolveRefs) — accepted as low-risk since no current caller overrides the topology, but flagged as a latent divergence risk.",
+      "A shared remote.RefPresentOnRemote (or similar) helper was proposed to dedupe three copies of the ls-remote absence-vs-failure probe pattern (checkpoint_remote.go, checkpoint_ref.go, checkpointpolicy/remote.go) — not extracted, left as a maintenance note.",
+      "Whether the read-path recovery fetch itself should ever be blob-filtered was explicitly deferred as needing real measurement (tree-only could turn one packed fetch into thousands of blob fetches for List's metadata.json reads).",
+      "PR #1994 CI was still running as of the last check; final merge status not confirmed in transcript."
+    ]
+  },
   "prompt_attributions": [
     {
       "checkpoint_number": 2,

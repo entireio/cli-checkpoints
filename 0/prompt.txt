@@ -1,0 +1,104 @@
+the old trail backend is gone, and we switched to the new one. This means we can cleanup ENTIRE_TRAILS_BACKEND and should assume entire-api the default backend
+
+---
+
+<task-notification>
+<task-id>bn7oszh1u</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-lucky-forest-341c/364e66bb-6219-435d-9d06-b0f0c235b979/tasks/bn7oszh1u.output</output-file>
+<status>completed</status>
+<summary>Background command "Run the full pre-commit check" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+how was 2. before?
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>a5d159cdce3204c96</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-lucky-forest-341c/364e66bb-6219-435d-9d06-b0f0c235b979/tasks/a5d159cdce3204c96.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review of trail cleanup" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>This is clean — `newTrailAPIClient` now delegates cleanly to `NewAuthenticatedEntireAPICellClient` with no duplicated logic. `NewAuthenticatedAPIClient` is now dead for trail purposes but still used by other callers (test seam), so it's correctly retained, not orphaned.
+
+I've covered the three specific angles plus a broader scan. My conclusion:
+
+## Finding: none
+
+I reviewed this diff specifically for reuse/duplication issues and found nothing worth flagging. Detail on each angle investigated:
+
+- **`decodeTrailResource` (cmd/entire/cli/trail_cmd.go:444-451)**: Now a thin wrapper (`api.DecodeJSON` + a fixed error message), but it is not a redundant reimplementation of an existing helper — no other function in `api` or `cli` already does "decode into `TrailResource`, wrap error." It's called from two sites (`trail_cmd.go:434` in `fetchTrailDescription`, and `trail_cmd.go:2053` in `findTrailByNumber`), both of which correctly reuse it rather than inlining `api.DecodeJSON` themselves. This matches the established pattern elsewhere in the file (e.g. `createResp`/`updateResp`/`listResp` decode sites), so it's not a new anti-pattern.
+
+- **Test helpers** (`trail_checkout_cmd_test.go`, modified `TestResolveTrailBySelector_FindsBySelector`): already reuses the existing `trailTestBasePath` constant (`trail_cmd_test.go:41`) for its route switch. It does construct its own inline `httptest.NewServer`, but the existing `trailShowTestServer` helper (`trail_cmd_test.go:1487`) serves a single-resource shape (one trail, keyed by its own number) and can't represent this test's two-trail selector-resolution matrix, so hand-rolling here isn't a missed-helper case — it also matches the file's dominant convention of inline per-test servers (used by ~15 other unmodified tests in the same file).
+
+- **`pageSize=1` probe (`cmd/entire/cli/api/trails.go:14`) vs. `trailListPageQuery` (`cmd/entire/cli/trail_cmd.go:632`)**: these do share knowledge of the `pageSize` query key, but `trailListPageQuery` lives in package `cli`, which imports `api` — `api` cannot call back into `cli` without an import cycle, so unifying them isn't available without moving the builder down into `api`, which is a structural change out of scope for this diff. More importantly, the literal `"pageSize=1"` string was already present pre-diff (in the `entire-api` branch of the old conditional); this diff only deletes the sibling `"limit=1"` branch, it doesn't introduce the duplication.
+
+No other reuse issues surfaced elsewhere in the diff (`api_client.go`'s `newTrailAPIClient` cleanly delegates to `NewAuthenticatedEntireAPICellClient` with no logic duplicated; `deleteTrailByNumber` correctly reduces to reusing `checkTrailResponse`; no leftover `TrailBackend`/`ENTIRE_TRAILS_BACKEND` references remain anywhere in the tree).</result>
+<usage><subagent_tokens>125470</subagent_tokens><tool_uses>27</tool_uses><duration_ms>193723</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a1a59f1bd537fbdba</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-lucky-forest-341c/364e66bb-6219-435d-9d06-b0f0c235b979/tasks/a1a59f1bd537fbdba.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review of trail cleanup" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Findings
+
+### 1. Double GET to the identical URL on `entire trail show &lt;number&gt;` — confirmed
+
+- `cmd/entire/cli/trail_cmd.go:217-251` (`runTrailShowWithClient`): calls `resolveTrailBySelector` (line 218), then unconditionally calls `fetchTrailDescription(ctx, client, forge, owner, repo, found.Number)` (line 236) whenever `found.Number &gt; 0`.
+- For a numeric selector, `resolveTrailBySelector` (line 276) → `findTrailBySelector` (`trail_cmd.go:2008`) → `findTrailByNumber` (`trail_cmd.go:2040`) already does `client.Get(ctx, trailNumberPath(forge, owner, repo, number))` (line 2041) and decodes the full `api.TrailResource` via `decodeTrailResource` (line 2053), which includes `BodyDocument` (`api/trail_types.go:79`, `TrailBodyDocument.TextSnapshot`).
+- `fetchTrailDescription` (`trail_cmd.go:425-442`) then does `client.Get(ctx, trailNumberPath(forge, owner, repo, number))` again — **the exact same path** — and decodes into `api.TrailResource` again (via the same `decodeTrailResource`) just to read `.BodyDocument.TextSnapshot`.
+- The first response's `BodyDocument` is never read; `runTrailShowWithClient` only reads `found.Body` (the list-shaped field) as a fallback seed before overwriting it with the second fetch's result.
+
+**Cost**: 2 identical HTTP round trips (same method, path, headers, auth) to the repo's entire-api cell per `entire trail show &lt;number&gt;` invocation, each also paying the full JSON-decode cost described in finding 2 below (so effectively duplicated codec work as well as duplicated network I/O).
+
+**Scope check** — I verified the other four resolvers that call `resolveTrailBySelector`/`findTrailBySelector` (`trail_approval_cmd.go:40`, `trail_resume_cmd.go:221`, `review_target.go:40`, `trail_cmd.go:1702` for checkout, `trail_review_cmd.go:510`) and none of them call `fetchTrailDescription` afterward — they only need `found.Branch`/`found.Number`, so they don't double-fetch. `runTrailUpdateWithClient`'s `resolveTrailUpdateBody` (`trail_cmd.go:1215`, called from `trail_cmd.go:1367`) also calls `fetchTrailDescription`, but its trail is resolved via `findTrailByBranch` (a list scan), not the number route, so that second GET is fetching genuinely new data (the list response doesn't carry `bodyDocument`) rather than repeating the same request. **Only `entire trail show &lt;number&gt;`** (numeric selector) does the literal duplicate GET.
+
+Note this pattern isn't new in this diff — it already existed when a user opted into `ENTIRE_TRAILS_BACKEND=entire-api`. What the diff does is make it the mandatory, only path, so it now fires on 100% of `entire trail show &lt;number&gt;` calls instead of an opt-in edge case.
+
+**Cheaper alternative**: skip the second GET when `found` already carries `BodyDocument` (i.e., when it came back from `findTrailByNumber`'s direct-route decode) — read `found.BodyDocument.TextSnapshot` directly instead of calling `fetchTrailDescription` again.
+
+### 2. `findTrail`'s bounded page walk — no issue found
+
+`findTrailBySelector` (`trail_cmd.go:2008`) already tries the direct number route (`findTrailByNumber`) first for numeric selectors and only falls through to the `trailFindMaxPages`-bounded list walk (`findTrail`, `trail_cmd.go:2065`) for ID/branch matches, where no direct-lookup route exists in the API. Checked all callers (`findTrailByBranch`, `resolveTrailReviewTarget`) — none invoke the list walk when a cheaper direct route was available. Nothing to flag here.
+
+### 3. Dead normalization double-pass left in `cmd/entire/cli/api/trail_json.go` — confirmed, universal
+
+- `trail_json.go:13-38` (`normalizeLegacyTrailJSON` / `decodeNormalizedTrailJSON`): for every trail response decode, it (1) `json.Unmarshal`s into `any`, (2) reflect-walks the value against the destination struct via `normalizeTrailJSONValue`/`trailJSONStructField` (`trail_json.go:40-93`, a linear per-field tag-string-split scan for every JSON key at every nesting level), (3) `json.Marshal`s the rebuilt map back to bytes, (4) `json.Unmarshal`s again into the real destination struct.
+- This is wired into `UnmarshalJSON` on essentially every trail response type: `TrailResource` (`api/trail_types.go:82-85`), `TrailListResponse` (`:28-36`), `TrailApproval` (`:157-166`), plus `TrailReviewStateResponse`, `TrailReviewCommentsResponse`, `TrailReviewComment`, `TrailReviewStartResponse`, `TrailReviewCommentBatchResponse` (`api/trail_review_types.go`), and `TrailThreadsResponse`, `TrailThreadDetailResponse`, `TrailThreadCreateResponse`, `TrailThreadUpdateResponse`, `TrailThreadMessageResponse` (`api/trail_thread_types.go`) — 12 call sites total.
+- The diff removed the *outbound* counterpart of this shim (`legacyTrailRequestBody`/`snakeCaseTrailJSONValue`/`lowerCamelToSnake`, deleted in this patch) because entire-api is camelCase-native and request bodies no longer need snake-casing. The diff's own updated tests confirm responses are camelCase now too (e.g. `TestClient_TrailRequestsUseCamelCase`). But the *inbound* mirror — this legacy-snake-case-acceptance decode path — was left in place and still runs unconditionally on every response.
+
+**Cost**: 4 JSON codec passes plus an `O(fields × keys)` reflection walk instead of 1 direct `json.Unmarshal`, on every decoded trail object. This multiplies across `findTrail`'s pagination (up to `trailFindMaxPages` × `trailListServerMaxLimit` = 20 × 100 = 2000 `TrailResource` values potentially re-normalized in one branch/ID lookup) and every `trail list`, `trail show`, `trail update`, review, and thread command.
+
+**Cheaper alternative**: since entire-api's camelCase payload already matches the Go struct tags, drop the `decodeNormalizedTrailJSON` call from these `UnmarshalJSON` overrides and decode directly (`json.Unmarshal(data, (*plain)(r))` with no normalization pass). Keep `NormalizeTrailJSONKey`/`snakeToLowerCamel` themselves — they're still used independently for the `reviewSessionId`→`reviewId` SSE-event alias in `trail_watch_cmd.go:485-487`, which is unrelated to the retired-backend concern.
+
+### 4. Cell routing now costs more on every trail command, not just the enablement probe
+
+- `cmd/entire/cli/api_client.go:73-82` (`newTrailAPIClient`): unconditionally calls `NewAuthenticatedEntireAPICellClient` (line 74), which is the single constructor `runAuthenticatedTrailAPI` (`trail_context_cache.go:481-495`) uses for every trail command (show, list, update, checkout, resume, review, delete, approvals — all of them).
+- `NewAuthenticatedEntireAPICellClient` (`api_client.go:63-69`) calls `resolveRepoCellTarget` (`cell_target.go:68-84`), which does two sequential, uncached control-plane HTTP calls — `listMirrorsForRepo` (`cell_target.go:198`) then `c.ListClusters(ctx)` (`cell_target.go:91`) — followed by a jurisdictional identity-token exchange in `auth.NewEntireAPICellClient` (`auth/cell_data_api.go:96-102`, via `resolveStoredCellSubject`/`ClientFor`). I confirmed `cell_target.go` has no local caching (`grep -n "cache"` returns nothing) — every process pays this fresh.
+- Before this diff, the default (legacy) path used `NewAuthenticatedAPIClient` (`api_client.go:22-50`), a single token resolution against the fixed `api.BaseURL()` — no mirror lookup, no cluster catalog fetch, no per-jurisdiction token exchange.
+
+**Cost**: every trail command process now performs up to 2 extra control-plane round trips plus a token exchange before it even reaches the trail request itself. This was previously true only when a user manually opted into `ENTIRE_TRAILS_BACKEND=entire-api`; the diff makes it universal.
+
+**On the hook/startup path specifically** (`trail_context_cache.go`): I verified this is *not* blocking. `refreshTrailsEnabledCacheIfStaleForScope` (`trail_context_cache.go:248-257`, called from `lifecycle.go:160` on SessionStart) only ever spawns a detached `__refresh_trail_enablement` subprocess (`spawnDetachedTrailEnablementRefresh`) and returns immediately; the synchronous hook path only reads the local cache via `cachedTrailsEnablementForScope` (pure file read, no network). So the added cell-discovery/token-exchange cost does **not** add latency to SessionStart itself — but the detached background refresh subprocess that runs roughly hourly per repo scope (`trailEnablementCacheTTL = time.Hour`, `trail_context_cache.go:30`) now does 2-3x the network work it used to for the same enablement check, via `trailRefreshAPIClient` → `newTrailAPIClient` (`trail_context_cache.go:264-266`).
+
+**Cheaper alternative**: none proposed here beyond what the codebase already does for other discovery flows (e.g. `cluster_cores.json`, referenced in `internal/entireclient/clusterdiscovery/resolve.go`) — caching the resolved repo→cell mapping locally (keyed by repo + TTL) would let all of `trail show`/`list`/`update`/etc. skip the mirrors+clusters round trip on repeat invocations instead of re-resolving it fresh every process.</result>
+<usage><subagent_tokens>158043</subagent_tokens><tool_uses>39</tool_uses><duration_ms>350504</duration_ms></usage>
+</task-notification>
+
+---
+
+if --add-label/--remove-label are not a thing on the entire-api endpoints, let's remove it from code

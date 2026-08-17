@@ -1,0 +1,541 @@
+does this also hint to the agent, so then the agent will also automatically run this too?
+
+---
+
+so for example, in this session, this was a stuck session and you resolved by running this. i would want the result of this pr to be that this would detect that it was stuck, the hook, you see the warn, then run the command to make the hook unstuck
+
+---
+
+no we can do A
+
+---
+
+yes, but you need to write the plan, run reviewer on it, etc. like we normally do
+
+---
+
+<task-notification>
+<task-id>a6c61033d62c87fba</task-id>
+<tool-use-id>toolu_01V7iaejhfwNthjtykQVdVmd</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-claude-hooks/0153df40-cf3f-429a-bd42-56a3f8dc0a0b/tasks/a6c61033d62c87fba.output</output-file>
+<status>completed</status>
+<summary>Agent "Review zombie-sweep plan" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>All claims verified against source. Consolidating the review.
+
+## Plan Review - Chunk 1
+
+**Status:** Issues Found
+
+The plan is structurally strong — atomic TDD tasks, checkbox syntax throughout, chunk ~640 lines, scope matches the spec exactly (condense-only, 24h gate, no global lock, no configurability, out-of-scope list mirrors the spec). Nearly every API claim checked out: `SessionState = session.State` is a type alias (`strategy/manual_commit_types.go:26`) so all the cross-package type interop compiles; `ListSessionStates` at `session_state.go:144`, `finalizeExitedSessions(ctx, states) int` (returns count, refreshes in place — exactly as the plan claims), `isWarnableStaleEndedSession(repo, state)` at `manual_commit_session.go:130` with exactly one internal caller, `GetStrategy(ctx)` returning `*ManualCommitStrategy` so `.CondenseSessionByID` resolves, `openRepository(ctx) (*git.Repository, error)` with `Close()`, the skip-list case string at `checkpoint_policy_warning.go:28` verbatim, `handleLifecycleSessionStart` ending `return nil` at `lifecycle.go:264` with `ctx` in scope, `SpawnDetached`'s `testing.Testing()` no-op, `activeSessionInteractionThreshold = 24h` at `manual_commit_hooks.go:855`, fixtures `testBaseCommit`/`createShadowBranchRef` in `doctor_test.go` where `git.PlainOpen` is indeed the file-local pattern, and all referenced files are identical to `origin/main`, so Task 0's branch point is safe. The Task 3 hedge about `CondenseSessionByID` on a minimal fixture is accurate: `result.Skipped` sets `FullyCondensed = true` (`manual_commit_condensation.go:1291-1296`), so the "no longer condensable" assertion will hold.
+
+**Issues:**
+
+- **[Task 1, Step 1.1] The dead-owner fixture is wrong twice — it neither compiles nor produces a dead owner.** (1) There is no `session.Owner` type; `State.Owner` is `*proclive.Identity` (`cmd/entire/cli/session/state.go:369`). (2) Even as `&amp;proclive.Identity{PID: -1}`, `proclive.Check` returns `LivenessUnknown` for `PID &lt;= 0` (`cmd/entire/cli/proclive/proclive.go:160-162`), so `OwnerExited()` returns **false** and the "active with dead owner is a zombie" case fails. The plan's inline comment (`// no such PID → OwnerExited() true`) is a wrong assumption about the API. The established fixture is `&amp;proclive.Identity{PID: os.Getpid(), Start: "bogus-start-fingerprint"}` (`cmd/entire/cli/session_finalize_test.go:34`) — live PID with a mismatched start fingerprint reads as PID reuse → `LivenessDead`. The plan does carry a hedge sentence pointing at exactly this fallback, but the primary snippet should be correct: a zero-context engineer following TDD hits `undefined: session.Owner` and then a semantically failing test with no signal which is the bug. Replace the fixture inline (and add the `proclive` + `os` imports).
+- **[Context § Safety invariants / Task 3]: the claimed under-lock re-validation for the ended path does not exist as stated.** The plan asserts "the ended-zombie path re-validates phase/condensed state inside `CondenseSessionByID`'s `MutateSessionState`". The mutation closure (`manual_commit_condensation.go:1271-1315`) re-checks only shadow-branch existence — never `Phase == PhaseEnded`, `FullyCondensed`, or age. Two residual races the plan should acknowledge instead of claiming away: (a) a zombie resumed (ENDED→IDLE/ACTIVE) between the sweep's snapshot and the lock gets condensed anyway — coherent but touches what is now a live session; (b) if the shadow branch vanishes between the sweep's `IsCondensableEndedSession` pre-check and the engine's own re-check, the engine takes its `clearAfter` path and **clears the session state** (`:1277-1284, :1323-1327`) — the "condense-only, never discard" contract is enforced only by the pre-check outside the lock. In practice (b) means a concurrent condense already succeeded, so clearing is correct cleanup, and (a)'s window is seconds against a &gt;24h-idle precondition — but the plan (and spec) state a guarantee the engine does not provide. Fix: either add an explicit re-load + phase/`FullyCondensed`/age re-check immediately before calling `CondenseSessionByID` (narrows but doesn't close the window; say so), or rewrite the invariant text to describe the true residual races and why they are acceptable. An engineer must not inherit a false safety claim into code comments and the PR description.
+- **[Task 5, Step 5.3]: `paths.WorktreeRoot()` takes `ctx`.** Actual signature: `WorktreeRoot(ctx context.Context) (string, error)` (`cmd/entire/cli/paths/paths.go:67`). The plan hedges ("if it needs ctx, pass it") — the snippet should simply say `paths.WorktreeRoot(ctx)`; note `lifecycle.go:195` already calls it that way in the same file being modified.
+- **[Task 3, Step 3.1]: missing import in the "imports to add" list.** The test uses `git.PlainOpen`, so `github.com/go-git/go-git/v6` must be added to `session_sweep_test.go`'s imports; the list names only `context`, `strategy`, `require`.
+
+**Recommendations (advisory):**
+
+- The fixture table says `setupGitRepoForPhaseTest` lives in `doctor_test.go`; it actually lives in `cmd/entire/cli/phase_wiring_test.go:133` (same package, so everything compiles — just fix the pointer so the engineer reads the right file).
+- `CondenseSessionByID` is at `manual_commit_condensation.go:1255`, not 1253 — trivial drift.
+- Task 4's smoke run (`go run ./cmd/entire __sweep_sessions`) executes the real sweep against the developer's actual repo; "repo has no zombies" is an assumption, not a guarantee — in a repo with a genuine &gt;24h ended session it will condense it for real (lossless, but the "Expected" text should say output may include real sweep work rather than promising a quiet exit).
+- The predicate's "No I/O" framing is slightly overstated: for ACTIVE states `isSweepableZombie` → `OwnerExited()` → `proclive.Check` does a hostname lookup plus a per-state process probe. It's cheap (the existing `entire status` path already does this per state), but "no repo access, one cheap process probe per active state" is the honest characterization for the hook-latency argument.
+- Task 2's expected-output note says "any test referencing the old name gets the same mechanical rename" — in fact no test references `isWarnableStaleEndedSession` directly (only `countWarnableStaleEndedSessions`, at `strategy/phase_postcommit_test.go:2378`), so the rename touches production code only. Harmless, but the note can be simplified.
+
+Everything else — task decomposition, single-responsibility file layout (`session_sweep.go` stays a small predicate + runner + spawn trio, well under any size concern), verification gates (`mise run fmt &amp;&amp; mise run lint`, full-package test runs), commit boundaries (4 logical commits, matching the few-commits-per-PR house rule), docs task, and the out-of-scope fence — is complete and ready once the four issues above are patched into the plan text.</result>
+<usage><subagent_tokens>106818</subagent_tokens><tool_uses>32</tool_uses><duration_ms>425219</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a52491cf47b9b8500</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-claude-hooks/0153df40-cf3f-429a-bd42-56a3f8dc0a0b/tasks/a52491cf47b9b8500.output</output-file>
+<status>completed</status>
+<summary>Agent "Re-review zombie-sweep plan" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>All referenced APIs, line numbers, and fixes verified against source. Final assessment:
+
+## Plan Review - Chunk 1 (re-review)
+
+**Status:** Approved
+
+**Verification of the four required fixes:**
+
+1. **Dead-owner fixture — fixed correctly.** Plan line 114 now uses `&amp;proclive.Identity{PID: os.Getpid(), Start: "bogus-start-fingerprint"}` with `os` and `proclive` imports present in the test snippet. Verified byte-identical to the existing fixture at `cmd/entire/cli/session_finalize_test.go:34` (exact line confirmed). Verified against `proclive.Check` (`proclive.go:159`): `PID &lt;= 0` returns `LivenessUnknown`, and a live PID with a mismatched `Start` fingerprint (empty Boot/Host skip those guards) reads as PID reuse → `LivenessDead`. The plan's explanatory comment about why `PID: -1` doesn't work is accurate.
+
+2. **Safety invariants — fixed correctly and honestly.** Plan lines 29–32 now describe (a) the resumed-session (ENDED→ACTIVE) residual window with the correct rationale, and (b) the engine's `clearAfter` path when the shadow branch vanishes — I verified the cited code at `manual_commit_condensation.go:1277–1284` (exact lines: `if !hasShadowBranch { ... clearAfter = true; return ErrMutationSkip }`). The `runSessionSweep` snippet re-loads each candidate via `session.NewStateStore(ctx)` + `store.Load(ctx, id)` (both signatures verified at `state.go:559/578`) and re-runs `isSweepableZombie` plus the `IsCondensableEndedSession` shadow-branch gate before condensing. The active-path claim ("finalizeExitedSessions re-validates OwnerExited under the per-session lock") is accurate per `session_finalize.go:37-39`, and the snippet's comment that finalize "refreshes the matched entries in `states` from disk" is true (`*st = *reloaded` in-place refresh, verified).
+
+3. **`paths.WorktreeRoot(ctx)` — fixed.** Plan line 647 passes ctx; signature verified as `WorktreeRoot(ctx context.Context) (string, error)` at exactly `paths/paths.go:67`, and `lifecycle.go:195` does call it the same way as claimed.
+
+4. **go-git v6 import — fixed.** Task 3 Step 3.1 now lists `github.com/go-git/go-git/v6`; go.mod confirms v6 (`v6.0.0-alpha.5...`), matching the `git.PlainOpen` and `strategy.IsCondensableEndedSession(repo, ...)` usages (strategy's function takes the same v6 `*git.Repository`).
+
+**Verification of the advisory fixes:**
+
+- `setupGitRepoForPhaseTest` pointer: exactly `phase_wiring_test.go:133` — correct.
+- `CondenseSessionByID` line ref 1255 — exact (func declaration line). Also spot-checked the secondary refs: skip-path `FullyCondensed = true` is at :1291–1296 as claimed.
+- Task 4.3 smoke-run text now warns the real sweep may condense a genuine zombie in the dev repo — present at plan line 565.
+- Predicate comments no longer claim "no I/O": both the impl comment ("the priciest thing it does is OwnerExited()'s per-active-state process probe") and the Task 1 intro acknowledge the process probe.
+- Task 2 note corrected: "No test references the old name directly (only `countWarnableStaleEndedSessions` is tested, at `strategy/phase_postcommit_test.go:2378`)" — verified accurate by grep; `isWarnableStaleEndedSession` has exactly one caller (`countWarnableStaleEndedSessions`, same file), so "update the one internal caller" is also correct (the other production call site, `manual_commit_hooks.go:1049`, calls the count wrapper whose name doesn't change).
+
+**Standard checks (all pass):**
+
+- Every other cited symbol/line spot-checked and exact: `ListSessionStates` at `session_state.go:144`, `isWarnableStaleEndedSession` at `manual_commit_session.go:130` with matching signature, `newSendAnalyticsCmd` at `root.go:191` (registered at :157), skip-list case at `checkpoint_policy_warning.go:28` (current contents match the plan's extension string exactly), `handleLifecycleSessionStart` at `lifecycle.go:124`, `activeSessionInteractionThreshold` at `manual_commit_hooks.go:855`, `testBaseCommit`/`createShadowBranchRef` in `doctor_test.go` (:38/:42, 4-arg signature matches), `execx.SpawnDetached(dir string, args ...string)`, `GetStrategy` returning `*strategy.ManualCommitStrategy` (so `.CondenseSessionByID` compiles — same shape doctor.go:175/184 uses), `strategy.SessionState = session.State` alias (so `ListSessionStates` output feeds both `finalizeExitedSessions` and `isSweepableZombie` without conversion).
+- All snippets compile against real APIs: `session.State` fields (`Phase`, `Owner`, `FullyCondensed`, `StepCount int`, `EndedAt *time.Time`, `LastInteractionTime *time.Time`, `StartedAt time.Time`), `Phase.IsActive()`, phase constants including `PhaseIdle`, `logging.Debug/Info/Warn` variadic-attr signatures — all verified.
+- No path where the sweep discards data: `IsCondensableEndedSession` gates the no-shadow-branch case, and the one residual engine-side clear is honestly documented rather than overclaimed.
+- No expensive work in the hook: hook side is a state-file list + pure predicate (process probe acknowledged), spawn is detached.
+- Checkbox syntax throughout, tasks atomic with TDD red/green steps, tests name the regressions they catch, chunk is 731 lines, no TODOs/placeholders.
+
+**Recommendations (advisory):**
+
+- Step 6.4's PR body contains `&lt;summarize: ...&gt;` — clearly an instruction to the implementer, not an unfinished placeholder, but the implementer should remember to also honor the plan's earlier directive to mirror the honest safety contract verbatim in the PR body (the runSessionSweep comment already says this).
+- Step 3.1's two test sessions share one `BaseCommit`/shadow branch; if `CondenseSessionByID` ever fully condenses (rather than skips) on the minimal fixture and deletes the branch, the fresh session's assertions still hold since they read only its state file — no change needed, just context for the implementer if Step 3.4's hedge triggers.
+
+The plan is complete, accurate, and ready for implementation by an engineer with zero codebase context.</result>
+<usage><subagent_tokens>87915</subagent_tokens><tool_uses>16</tool_uses><duration_ms>241710</duration_ms></usage>
+</task-notification>
+
+---
+
+did you run reviewer on it
+
+---
+
+can you give me full path please
+
+---
+
+does this include implementation plan
+
+---
+
+yes
+
+---
+
+<task-notification>
+<task-id>ac1382c9fe44678a7</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-claude-hooks/0153df40-cf3f-429a-bd42-56a3f8dc0a0b/tasks/ac1382c9fe44678a7.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement Task 1: zombie predicate" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Working tree is clean, only the two new files were touched.
+
+**Status:** DONE
+
+What I implemented: `isSweepableZombie(st *session.State, now time.Time) bool` in `cmd/entire/cli/session_sweep.go` plus its 9-case table test in `cmd/entire/cli/session_sweep_test.go`, exactly per spec — no deviations from the given code.
+
+Step 1.2 (failing test, pre-implementation):
+```
+cmd/entire/cli/session_sweep_test.go:118:29: undefined: isSweepableZombie
+FAIL	github.com/entireio/cli/cmd/entire/cli [build failed]
+```
+
+Step 1.4 (after implementation):
+```
+--- PASS: TestIsSweepableZombie (0.00s)
+    (all 9 subtests PASS)
+PASS
+ok  	github.com/entireio/cli/cmd/entire/cli	0.605s
+```
+
+`gofmt -s -l` reported no files needing changes (both were already correctly formatted).
+
+Files changed:
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/claude-hooks/cmd/entire/cli/session_sweep.go` (new)
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/claude-hooks/cmd/entire/cli/session_sweep_test.go` (new)
+
+Commit: `fd0095c62d46e22ee9c725549e3c4e1977e64701` on branch `feat/zombie-session-sweep`.
+
+Self-review: no other files modified (`git status` clean post-commit); no other tests were run per instructions (scoped `-run` only). API assumptions all verified against source before writing: `session.Phase.IsActive()`, `PhaseActive`/`PhaseEnded`/`PhaseIdle` constants, `State.Owner *proclive.Identity`, `State.OwnerExited()`, `State.EndedAt`/`LastInteractionTime *time.Time`, `State.StepCount int`, `State.FullyCondensed bool` all match `cmd/entire/cli/session/state.go` and `phase.go` exactly as the task description implied. The `session_finalize_test.go` dead-owner fixture pattern was confirmed identical to the one prescribed in the test comment.</result>
+<usage><subagent_tokens>75862</subagent_tokens><tool_uses>11</tool_uses><duration_ms>68332</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a969e35f35fba8a32</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-claude-hooks/0153df40-cf3f-429a-bd42-56a3f8dc0a0b/tasks/a969e35f35fba8a32.output</output-file>
+<status>completed</status>
+<summary>Agent "Spec review Task 1" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>All 9 subtests pass, gofmt clean, working tree clean (no stray changes), and commit touches exactly the two named files.
+
+## Report
+
+✅ Spec compliant.
+
+Verified against `git show fd0095c62`:
+
+- **Files touched**: exactly `cmd/entire/cli/session_sweep.go` (new, 43 lines) and `cmd/entire/cli/session_sweep_test.go` (new, 121 lines) — `git show --stat` confirms nothing else changed, `git status --short` is clean in the working tree.
+- **`session_sweep.go`**: `endedSessionSweepAge = 24 * time.Hour` const with a carry-forward rationale comment; `isSweepableZombie(st *session.State, now time.Time) bool` implements exactly the specified branches — `Phase.IsActive()` → `OwnerExited()`; not-ENDED/`FullyCondensed`/`StepCount&lt;=0` → false; `EndedAt` falling back to `LastInteractionTime`, nil → false; `now.Sub(*ref) &gt;= endedSessionSweepAge`. Doc comment explicitly calls out `OwnerExited()`'s process-probe cost (does not claim "no I/O") and states the condense-only/nominate-only contract.
+- **`session.Phase.IsActive()`** (`cmd/entire/cli/session/phase.go:48`) is `p == PhaseActive`, an exact match to `PhaseActive` — confirms idle sessions are correctly excluded (not conflated with active).
+- **`session_sweep_test.go`**: `TestIsSweepableZombie` with `t.Parallel()` on the test and every subtest; top-of-file doc comment states the conservative bias and cites the PostCommit carry-forward window; dead-owner fixture is exactly `&amp;proclive.Identity{PID: os.Getpid(), Start: "bogus-start-fingerprint"}` with a comment explaining why `PID&lt;=0` doesn't work (`proclive.Check` returns `LivenessUnknown` for `PID&lt;=0`).
+- All 9 required cases present and correctly mapped: active+dead-owner→true, active+nil-owner→false, ended+uncondensed+steps+48h-old→true, ended+uncondensed+1h-fresh→false, ended+FullyCondensed+old→false, ended+zero-steps+old→false, ended+nil-EndedAt-fallback-to-LastInteractionTime(old)→true, ended+no-timestamps→false, idle→false.
+- No extras: no sweep runner, spawn logic, command registration, or extra exported symbols/helpers found.
+- Ran `go test ./cmd/entire/cli/ -run TestIsSweepableZombie -v`: all 9 subtests pass. `gofmt -l` on both files produced no output (clean).</result>
+<usage><subagent_tokens>65863</subagent_tokens><tool_uses>6</tool_uses><duration_ms>51837</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a55ed8069a7a57b5e</task-id>
+<tool-use-id>toolu_01NRVFtsvXoYMCQttd3JQsaB</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-claude-hooks/0153df40-cf3f-429a-bd42-56a3f8dc0a0b/tasks/a55ed8069a7a57b5e.output</output-file>
+<status>completed</status>
+<summary>Agent "Quality review Task 1" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Review complete. I verified the diff (one commit, `fd0095c62`), read the plan's Task 1, and cross-checked the predicate against the real `session.State` / `Phase` / `OwnerExited` implementations. Lint (`mise run lint`: 0 issues), `gofmt -s`, and the test itself all pass locally.
+
+## Strengths
+
+- **Exact plan conformance.** Files, names, constant, predicate logic, and all 9 test cases match Task 1 of `docs/superpowers/plans/2026-08-17-zombie-session-sweep.md` verbatim. One logical commit, TDD as required.
+- **Predicate semantics are correct against the real APIs, not just the plan.** `OwnerExited()` (`cmd/entire/cli/session/state.go:520`) itself guards non-active phases and returns false on `LivenessUnknown`, so the "active with no owner (legacy state)" case reflects real behavior. `Phase.IsActive()` is `== PhaseActive` only, so IDLE correctly falls through to the ENDED gate and returns false.
+- **The 24h constant's comment is accurate and load-bearing.** I verified `activeSessionInteractionThreshold = 24 * time.Hour` at `cmd/entire/cli/strategy/manual_commit_hooks.go:855`, and the carry-forward rationale (CondenseAndMarkFullyCondensed deliberately skipping `FilesTouched` sessions) is the plan's documented design. This is exactly the kind of constraint the code cannot show — condensing early is *valid* code that silently forfeits linkage — so the comment earns its length.
+- **Test comments name the regressions.** The header states the false-positive/false-negative asymmetry that justifies each conservative case, and the dead-owner fixture comment documents a real trap: `proclive.Check` returns `LivenessUnknown` for PID ≤ 0, so a "simpler" `PID: -1` fixture would make the dead-owner test vacuously pass in the wrong direction. That comment prevents a future cleanup from hollowing out the test. Fixture matches `session_finalize_test.go:34` as claimed.
+- **House style.** `t.Parallel()` on the test and each subtest (no global state touched), no repo access, lint- and gofmt-clean on first landing.
+
+## Issues
+
+**Critical:** none.
+
+**Important:** none.
+
+**Minor:**
+
+1. **Dangling forward reference** — `cmd/entire/cli/session_sweep.go:24`: "see runSessionSweep's safety notes" references a function that does not exist yet (Tasks 3/4). Fine if the whole plan lands in one PR (the name comes from the plan itself, so it should stay consistent); if Task 1 were ever merged standalone, this comment would dangle. Just verify the later task actually names the function `runSessionSweep` when it lands — if it drifts, update this comment.
+
+2. **Scope observation, inherited from the plan (not a Task 1 defect):** an agent killed *between* turns leaves a session in `PhaseIdle` with a dead owner and uncondensed steps. Neither predicate arm claims it — `OwnerExited()` requires ACTIVE, and the ENDED arm requires `PhaseEnded`. This matches `finalizeExitedSessions`' existing scope (the engine the sweep reuses can't fix IDLE either), so the predicate is right to mirror it, but it's a real zombie shape the feature won't self-heal. Worth one sentence in the eventual PR body or a plan note so it reads as a known boundary rather than an oversight.
+
+3. **Cosmetic:** `st.StepCount &lt;= 0` — `StepCount` can't go negative in practice; `== 0` would state intent slightly more precisely. The defensive form is harmless; not worth a change on its own.
+
+## Assessment
+
+**Approved.** Clean, small, plan-faithful, and independently verified against the underlying session/proclive code. The two minor notes are things to carry forward into Tasks 3/4 and the PR body, not blockers on this commit.
+
+Relevant files:
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/claude-hooks/cmd/entire/cli/session_sweep.go`
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/claude-hooks/cmd/entire/cli/session_sweep_test.go`
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/claude-hooks/docs/superpowers/plans/2026-08-17-zombie-session-sweep.md` (plan, uncommitted)</result>
+<usage><subagent_tokens>65956</subagent_tokens><tool_uses>10</tool_uses><duration_ms>138046</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aab58451b09426b0f</task-id>
+<tool-use-id>toolu_01Q85HdnVo2BBo7aZGkD38k2</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-claude-hooks/0153df40-cf3f-429a-bd42-56a3f8dc0a0b/tasks/aab58451b09426b0f.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement Task 2: export predicate" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>**Status: DONE**
+
+What I changed: In `cmd/entire/cli/strategy/manual_commit_session.go`, renamed `isWarnableStaleEndedSession` → `IsCondensableEndedSession`, replacing its doc comment with the purpose-neutral text specified in the task (function body left byte-for-byte identical, including the inline shadow-branch re-check comment). Updated the sole internal caller `countWarnableStaleEndedSessions` to use the new name (left that function's name unchanged, as instructed).
+
+Verification:
+- `grep -rn "isWarnableStaleEndedSession"` across the repo returned no hits — confirms no other callers/tests referenced the old name.
+- `gofmt -s -l cmd/entire/cli/strategy/` → empty (no formatting issues).
+- `go build ./...` → succeeded.
+- `go test ./cmd/entire/cli/strategy/ -count=1` → `ok  github.com/entireio/cli/cmd/entire/cli/strategy  43.657s`.
+
+Files changed: `cmd/entire/cli/strategy/manual_commit_session.go` (only file touched, as required).
+
+Commit: `7c38880e4` — "refactor(strategy): export IsCondensableEndedSession for the zombie sweep" (1 file changed, 8 insertions, 4 deletions).
+
+Self-review: matched the task exactly — single caller, no other references, pure rename with doc-comment swap, no behavior change.</result>
+<usage><subagent_tokens>60479</subagent_tokens><tool_uses>7</tool_uses><duration_ms>88500</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ac2247b2b2fb1efc1</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-claude-hooks/0153df40-cf3f-429a-bd42-56a3f8dc0a0b/tasks/ac2247b2b2fb1efc1.output</output-file>
+<status>completed</status>
+<summary>Agent "Spec review Task 2" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>All checks pass. Verification complete.
+
+## Report
+
+✅ Spec compliant.
+
+Verified against `git show 7c38880e4` on branch `feat/zombie-session-sweep`:
+
+1. **Only one file changed**: `cmd/entire/cli/strategy/manual_commit_session.go` (+8/-4, per `git show --stat`).
+2. **Rename**: `isWarnableStaleEndedSession` → `IsCondensableEndedSession`, confirmed at `manual_commit_session.go:130`. Repo-wide `grep -rn "isWarnableStaleEndedSession"` over `*.go` returns zero hits — no lingering references anywhere.
+3. **Doc comment**: matches the specified intent — states the function reports whether an ENDED session carries uncondensed data AND has its shadow branch (salvageable via `CondenseSessionByID`), that ENDED sessions with steps but no shadow branch are NOT condensable (doctor's discard case, human decides), and names the two callers (PostCommit stale-session warning, background zombie sweep).
+4. **Function body byte-for-byte unchanged**: the diff only touches the doc-comment block and the `func` signature line; the body (phase/condensed/step-count check, the inline comment explaining the shadow-branch re-check because PostCommit deletes shadow branches during condensation, and the final `repo.Reference`/`err == nil` return) is identical to before.
+5. **Caller updated correctly**: `countWarnableStaleEndedSessions` (at `manual_commit_session.go:152`) now calls `IsCondensableEndedSession`, and its own name was left untouched — also confirmed unchanged at its two other call sites (`manual_commit_hooks.go:1049`, `phase_postcommit_test.go:2378`).
+6. **Build + tests**: `go build ./...` succeeds; `go test ./cmd/entire/cli/strategy/...` passes (all green, 41.6s).
+
+No discrepancies found between the implementation and the Task 2 spec.</result>
+<usage><subagent_tokens>60517</subagent_tokens><tool_uses>3</tool_uses><duration_ms>81394</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a651bc345c73258bd</task-id>
+<tool-use-id>toolu_01FimiSbdusNqGfXEtyoSbBj</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-claude-hooks/0153df40-cf3f-429a-bd42-56a3f8dc0a0b/tasks/a651bc345c73258bd.output</output-file>
+<status>completed</status>
+<summary>Agent "Quality review Task 2" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Review: Task 2 — Export `IsCondensableEndedSession`
+
+Scope reviewed: `git diff fd0095c62..7c38880e4`, one commit touching only `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/claude-hooks/cmd/entire/cli/strategy/manual_commit_session.go` (+8/-4).
+
+### Strengths
+
+- **Exact plan conformance.** The rename, doc comment, and single-caller update match the plan's Task 2 spec verbatim (comment text is character-for-character the plan's proposed text). Function body is byte-for-byte unchanged, as required. No stray references to the old name remain anywhere in `cmd/` or `e2e/`, and the commit message matches the plan's Step 2.3. Package builds and vets clean.
+- **The new name is accurate.** Every clause of the predicate maps onto "condensable ENDED session": `Phase != PhaseEnded` → not ended; `FullyCondensed` → nothing left to condense; `StepCount &lt;= 0` → nothing to condense; missing shadow branch → cannot condense (only discard). The name does not overclaim "should be condensed" — the 24h age gate correctly stays in the sweep's own predicate, and the doc comment's framing ("can be salvaged by condensing") makes that a capability statement, not a policy one.
+- **Exporting is the right call versus the alternatives.** Duplicating the check in the `cli` package would require re-deriving `getShadowBranchNameForCommit(state.BaseCommit, state.WorktreeID)`, which is strategy-internal shadow-branch naming — a duplicate would silently drift if the naming scheme changes, and the repo has an explicit dup-prevention policy. A higher-level helper would be premature: the sweep composes this check with an age gate and a state re-load, and the composition point belongs in the sweep (Task 3), not here. A plain exported package-level function (not a new `Strategy` interface method) is also the right shape — consistent with `ListSessionStates` and it keeps the interface untouched.
+- **The doc comment clears the repo's bar.** It states constraints the code cannot show: *why* the no-shadow-branch case is excluded (discard is reserved for `entire doctor` with a human in the loop) and *which* engine consumes a true result (`CondenseSessionByID`). No narration of the body.
+
+### Issues
+
+**Critical:** none.
+
+**Important:** none.
+
+**Minor:**
+
+1. **Stale inner comment (`manual_commit_session.go:139-144`).** The re-check comment inside the body still reasons only in warn terms: "Without this re-check we would warn about sessions that this commit just cleaned up." Once the sweep becomes the second caller, the rationale generalizes (a branch present at list time may be gone by decision time — for the sweep the consequence is condensing a nothing, not a spurious warning). The plan's "body unchanged" constraint makes leaving it correct *for this task*, but the sweep task (or a follow-up) should generalize this sentence so the comment doesn't describe only one of two callers.
+2. **Forward reference in the doc comment.** "Used by the PostCommit stale-session warning and the background zombie sweep" names a caller that does not exist at this commit (the sweep lands in Task 3). Momentarily inaccurate in isolation; acceptable given the tasks land as one PR, but if Task 3 were ever dropped this sentence must go with it. No action needed now — just noting the coupling.
+
+Neither minor issue requires rework of this task; both resolve naturally when Task 3 lands or can be swept into it.
+
+### Assessment
+
+**Approved.** Clean, plan-faithful mechanical export; the name is accurate, exporting beats the alternatives for concrete drift-prevention reasons, and the doc comment is constraint-bearing rather than narrative. The two minor comment-freshness notes are follow-ups for Task 3, not blockers.</result>
+<usage><subagent_tokens>61255</subagent_tokens><tool_uses>8</tool_uses><duration_ms>98700</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a058d1e49c1f12ffc</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-claude-hooks/0153df40-cf3f-429a-bd42-56a3f8dc0a0b/tasks/a058d1e49c1f12ffc.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement Task 3: sweep runner" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Committed successfully.
+
+**Status: DONE**
+
+## What I implemented
+
+- **`cmd/entire/cli/session_sweep.go`**: Added `runSessionSweep(ctx context.Context) error`, the detached background pass that (1) calls `finalizeExitedSessions` for ACTIVE sessions with dead owners, then (2) iterates `strategy.ListSessionStates` looking for `isSweepableZombie` ENDED sessions, re-loads each candidate via `session.NewStateStore`/`store.Load` to re-validate right before acting, gates on `strategy.IsCondensableEndedSession`, and condenses via `GetStrategy(ctx).CondenseSessionByID`. Logging via the `logging` package throughout (no `fmt.Print*`).
+- **`cmd/entire/cli/session_sweep_test.go`**: Added `TestRunSessionSweep_CondensesOldEndedZombie_LeavesFreshAlone` exactly as specified, plus the new imports (`context`, `strategy`, `go-git/v6`, `testify/require`).
+- **`cmd/entire/cli/strategy/manual_commit_session.go`**: Generalized the comment inside `IsCondensableEndedSession` (lines ~139-144) to describe both callers (PostCommit warning vs. background zombie sweep) instead of only the PostCommit case. No code changes in that function.
+
+## TDD evidence
+
+- **Before implementation** (`go test ./cmd/entire/cli/ -run TestRunSessionSweep -count=1`):
+  ```
+  cmd/entire/cli/session_sweep_test.go:166:21: undefined: runSessionSweep
+  FAIL	github.com/entireio/cli/cmd/entire/cli [build failed]
+  ```
+- **After implementation**, same command: `PASS` — log shows the old zombie session's condense being skipped (empty tree/no transcript, so `FullyCondensed` is set true) and logged as `sweep condensed ended zombie session`.
+- **Full `cmd/entire/cli` package**: `ok  github.com/entireio/cli/cmd/entire/cli  64.368s`
+- **Full `cmd/entire/cli/strategy` package**: `ok  github.com/entireio/cli/cmd/entire/cli/strategy  44.990s`
+- `gofmt -s -l` on all three files: empty.
+- `golangci-lint run ./cmd/entire/cli/... ./cmd/entire/cli/strategy/...`: `0 issues.`
+
+## Adaptations
+
+- `wrapcheck` flagged the two direct `return err` cases (`strategy.ListSessionStates`, `session.NewStateStore` — both external packages relative to `cli`). Wrapped both with `fmt.Errorf("...: %w", err)` matching doctor.go's existing style; added `fmt` to imports. `openRepository`'s error is same-package so it didn't need wrapping (mirrors doctor.go, which also returns it wrapped there, but wrapcheck only flags cross-package returns — left as bare `return err` since that's what compiled clean under lint).
+
+## Commit
+
+`e5641901d` — "feat(sweep): add runSessionSweep background pass over zombie sessions" — only the three named files changed (155 insertions, 4 deletions), confirmed via `git diff --stat` before committing.
+
+No blockers; all APIs matched the plan exactly (openRepository, GetStrategy, CondenseSessionByID, IsCondensableEndedSession, session.NewStateStore/Load, strategy.SaveSessionState, setupGitRepoForPhaseTest, createShadowBranchRef/testBaseCommit all existed with the expected signatures).</result>
+<usage><subagent_tokens>81638</subagent_tokens><tool_uses>32</tool_uses><duration_ms>389032</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a16641a9ff55d8b29</task-id>
+<tool-use-id>toolu_01656pE7pE3FtHmC5NUJphRR</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-claude-hooks/0153df40-cf3f-429a-bd42-56a3f8dc0a0b/tasks/a16641a9ff55d8b29.output</output-file>
+<status>completed</status>
+<summary>Agent "Spec review Task 3" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Lint clean, gofmt clean. Everything checks out.
+
+## Report
+
+✅ **Spec compliant.** Reviewed `git show e5641901d` in full and independently verified every claim.
+
+**File 1 — `cmd/entire/cli/session_sweep.go`:**
+- `runSessionSweep(ctx context.Context) error` matches the spec order exactly: `strategy.ListSessionStates` → `finalizeExitedSessions` (logs count via `logging.Info`/slog when &gt;0) → `openRepository(ctx)` (confirmed it's the `cli` package's wrapper, not `git.PlainOpen`) with `defer repo.Close()` → `session.NewStateStore` → per-state loop.
+- Loop logic matches the required order precisely: cheap `Phase==PhaseEnded &amp;&amp; isSweepableZombie` filter → `store.Load` re-load (skip on err/nil) → re-check `fresh.Phase==PhaseEnded &amp;&amp; isSweepableZombie(fresh, now)` → `strategy.IsCondensableEndedSession(repo, fresh)` gate (with the exact "no shadow branch → doctor's discard case, never automatic" comment) → `GetStrategy(ctx).CondenseSessionByID`, Warn+continue on failure, Info on success.
+- Doc comment carries the honest safety contract: explicitly states condense-only is enforced by the sweep's own pre-checks ("not by the engine"), describes the resumed-session residual race and argues it's acceptable (bounded to a seconds-wide window against a &gt;24h precondition, and a condense of a just-resumed session is still coherent — not claimed away), and describes the engine's `clearAfter` path. I traced `ManualCommitStrategy.CondenseSessionByID` in `manual_commit_condensation.go` (lines ~1255-1320) and confirmed the `clearAfter`/state-clear-only behavior when no shadow branch exists is real, not fabricated.
+- All logging goes through `logging.Info`/`logging.Warn` with slog attrs; no `fmt.Print*`. The two cross-package `return err`s (`strategy.ListSessionStates`, `session.NewStateStore`) are wrapped with `fmt.Errorf("...: %w", err)` — matches the reported allowed deviation exactly, and the `openRepository` error (same-package call) is correctly left unwrapped.
+
+**File 2 — `cmd/entire/cli/session_sweep_test.go`:**
+- `TestRunSessionSweep_CondensesOldEndedZombie_LeavesFreshAlone` uses `setupGitRepoForPhaseTest` + `t.Chdir`, no `t.Parallel()`, with the required comment explaining why. Creates a shadow branch via `createShadowBranchRef(t, repo, testBaseCommit, "")`, two ENDED sessions (48h-old zombie, 1h-fresh), both `StepCount: 2`. Runs `runSessionSweep`, asserts the fresh session is untouched (`PhaseEnded`, `!FullyCondensed`, `StepCount 2`) and the zombie is no longer `IsCondensableEndedSession` (or absent). Doc comment names the regression and the "4 days" real-incident detail. Ran it: `go test ./cmd/entire/cli/ -run TestRunSessionSweep -count=1 -v` → PASS.
+
+**File 3 — `cmd/entire/cli/strategy/manual_commit_session.go`:** Diff is comment-only inside `IsCondensableEndedSession` — generalizes the shadow-branch re-check rationale to cover both PostCommit and the sweep. No code lines changed (confirmed via diff).
+
+**Scope check:** `git show --stat` confirms exactly 3 files changed (+155/-4), no other files touched — no hidden command, no spawn logic, no `lifecycle.go` changes. Verified `SaveSessionState`, `ListSessionStates`, `openRepository`, `finalizeExitedSessions`, `GetStrategy`, and `CondenseSessionByID` all pre-existed before this commit (no new exported symbols introduced).
+
+**Tooling:** `gofmt -l` on all three files → clean. `mise run lint` → `0 issues`.</result>
+<usage><subagent_tokens>71373</subagent_tokens><tool_uses>11</tool_uses><duration_ms>125341</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>accc349116440dd57</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-claude-hooks/0153df40-cf3f-429a-bd42-56a3f8dc0a0b/tasks/accc349116440dd57.output</output-file>
+<status>completed</status>
+<summary>Agent "Quality review Task 3" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Review complete. I verified the diff against the plan, spot-checked every factual claim in the safety-contract comment against the called code, ran two mutation checks to confirm the test pins the behavior, and ran fmt/lint/full package tests (all green, tree restored to HEAD `e5641901d`).
+
+## Strengths
+
+- **Plan alignment is essentially exact**, with two small improvements over the plan's literal code: error wrapping added on `ListSessionStates` and `NewStateStore` failures (the plan returned them bare), and the predicate comment's plan-internal "(Task 3/4)" reference was cleaned to plan-free wording. Both are the right kind of deviation.
+- **The safety-contract comment is accurate.** I verified each claim: `finalizeExitedSessions` really does re-validate `OwnerExited` under the per-session lock (the guard runs inside `MutateSessionState`'s closure, `lifecycle.go:1446-1450`); `CondenseSessionByID`'s locked closure really re-checks only shadow-branch existence and takes a state-clearing `clearAfter` path when it's gone (`manual_commit_condensation.go:1271-1284`); and `doctor --force` really uses the same engine (`doctor.go:184,211`). The length is earned — every sentence states a race or engine behavior the code cannot show.
+- **The test genuinely pins the behavior — verified by mutation.** With `endedSessionSweepAge` set to 0, the test fails on the fresh session's `FullyCondensed` flipping (line 180); with the condense call skipped, it fails on "old zombie must not remain condensable" (line 187). Both regressions the reviewer prompt asked about are caught. The "absent from list is also success" escape hatch is not a soft assertion — an untouched zombie still exists in the list and fails the predicate check.
+- **Control flow is clear and genuinely best-effort**: list failure and repo-open failure abort (nothing sensible to do without them), per-session condense failures are Warn-logged and skipped, successes are Info-logged, and the loop's fresh re-load → re-predicate → shadow-branch gate ordering matches the documented contract. The `st.Phase != session.PhaseEnded` pre-filter correctly keeps ACTIVE sessions whose finalize *failed* out of the condense loop.
+- **File responsibility holds**: `session_sweep.go` is the coherent "zombie sweep" feature file (age constant + nomination predicate + runner), matching the plan's trajectory where Task 5 adds the spawn decision here too.
+- The comment-only generalization in `IsCondensableEndedSession` accurately reflects its new second caller.
+
+## Issues
+
+**Critical** — none.
+
+**Important** — none.
+
+**Minor**
+
+1. **Silent skip on `store.Load` error** (`session_sweep.go:102-105`). `fresh == nil` is self-evidently benign (state already cleaned up), but `lerr != nil` is a real failure that leaves a zombie in place with no trace — and the doc comment promises "a failed session is logged and retried by the next sweep." A persistent load failure (corrupt state file, permissions) would never surface. A `logging.Debug`/`Warn` with the session ID on the `lerr != nil` branch would make the comment's promise true.
+2. **"mirror this in the PR description"** (`session_sweep.go:57`) is an instruction to the PR author baked into a permanent code comment; after merge it's noise that will rot. Trim the parenthetical when the PR goes up (the plan asked for the contract in both places — that's satisfied by copying it, not by referencing it).
+3. **Slight overclaim in the vanished-branch sentence** (`session_sweep.go:65-67`): "that only happens when a concurrent condense already succeeded" — the branch could also vanish via a manual `git branch -D entire/...` or `entire clean` inside the seconds-wide window, in which case the engine's clear *is* discard-shaped. The plan dictates this wording and the practical risk is negligible against a &gt;24h-old zombie, but "in practice only happens" would be honest without weakening the argument.
+4. **The `st.Phase != session.PhaseEnded` pre-filter's purpose is undocumented** (`session_sweep.go:96`). It looks redundant next to `isSweepableZombie` but is load-bearing: the predicate returns `true` for ACTIVE-with-dead-owner sessions whose finalize errored, and this clause is what keeps them out of the condense path (the fresh re-check would also catch them, but only after a pointless load). Half a line — "ENDED-only here; ACTIVE zombies were finalizeExitedSessions' job" — would save the next reader the derivation.
+
+House-style checks: `logging.*` throughout, no `fmt.Print*`; test uses existing fixtures (`setupGitRepoForPhaseTest`, `createShadowBranchRef`) in an existing file, no `t.Parallel()` with `t.Chdir` (correctly annotated); the test's `git.PlainOpen` follows the file's plan-sanctioned local test convention while production goes through `openRepository`. `mise run fmt` clean, `mise run lint` 0 issues, `cli` and `strategy` packages pass in full.
+
+## Assessment
+
+**Approved.** All four minor items are polish (one Debug log, three comment tweaks) — reasonable to fold into a later task's commit rather than re-opening this one.
+
+Key files reviewed:
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/claude-hooks/cmd/entire/cli/session_sweep.go`
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/claude-hooks/cmd/entire/cli/session_sweep_test.go`
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/claude-hooks/cmd/entire/cli/strategy/manual_commit_session.go`
+- Cross-checked: `cmd/entire/cli/session_finalize.go`, `cmd/entire/cli/lifecycle.go` (`endSessionNow`/`markSessionEnded`), `cmd/entire/cli/strategy/manual_commit_condensation.go` (`CondenseSessionByID`), `cmd/entire/cli/doctor.go`</result>
+<usage><subagent_tokens>93404</subagent_tokens><tool_uses>22</tool_uses><duration_ms>422261</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a6efa9a472cd40f3a</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-claude-hooks/0153df40-cf3f-429a-bd42-56a3f8dc0a0b/tasks/a6efa9a472cd40f3a.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement Task 4: hidden command" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>**Status: DONE**
+
+What I changed:
+- `cmd/entire/cli/root.go`: added `newSweepSessionsCmd()` constructor (hidden `__sweep_sessions`, `NoArgs`, calls `runSessionSweep(cmd.Context())`) next to `newSendAnalyticsCmd`, and registered it in the hidden-infrastructure block right after `newRefreshTrailEnablementCmd()`.
+- `cmd/entire/cli/checkpoint_policy_warning.go`: extended the skip-list case to include `"__sweep_sessions"` (existing case was exactly `"hooks", "__send_analytics", "__refresh_trail_enablement", "curl-bash-post-install"` as expected, no divergence).
+
+Verification:
+- `gofmt -s -l` on both files: empty.
+- `go build ./...`: clean.
+- `go run ./cmd/entire __sweep_sessions`: exit 0, printed `SWEEP-OK` (no zombie found in this dev repo, so no log-looking output was produced — consistent with "fine either way" per the task note).
+- `go run ./cmd/entire help | grep -c sweep`: `0` — command confirmed hidden.
+- `mise run lint`: `[lint:go] 0 issues` — no CI classification complaint about `agent_help_cmd.go`; that file was untouched.
+
+Commit: `687209b96bb19b0fa03f5ee82a89f9c683d176f9` — "feat(sweep): add hidden __sweep_sessions infra command", 2 files changed, 17 insertions(+), 1 deletion(-). Only the two named files were modified.</result>
+<usage><subagent_tokens>63534</subagent_tokens><tool_uses>12</tool_uses><duration_ms>75413</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>af2362caba8180688</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-claude-hooks/0153df40-cf3f-429a-bd42-56a3f8dc0a0b/tasks/af2362caba8180688.output</output-file>
+<status>completed</status>
+<summary>Agent "Spec review Task 4" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>All checks pass — build clean, `newSweepSessionsCmd` registered via `cmd.AddCommand` in `NewRootCmd`, `help` output contains zero mentions of "sweep", and a direct run exits 0.
+
+## Report
+
+✅ Spec compliant.
+
+Verified against `git show 687209b96`:
+
+- **Exactly two files changed**, matching the claimed +17/-1: `cmd/entire/cli/root.go` (+16/-0) and `cmd/entire/cli/checkpoint_policy_warning.go` (+1/-1).
+- `cmd/entire/cli/root.go:207-217` — `newSweepSessionsCmd()` returns a `*cobra.Command` with `Use: "__sweep_sessions"`, `Hidden: true`, `Args: cobra.NoArgs`, and `RunE` calling `runSessionSweep(cmd.Context())`. Doc comment (lines 203-206) correctly states the session-start hook spawns it detached and that `entire doctor` is the interactive surface.
+- **Registration confirmed live**, not dangling: `root.go:160` — `cmd.AddCommand(newSweepSessionsCmd())`, placed right after `newSendAnalyticsCmd()`, `newCurlBashPostInstallCmd()`, `newRefreshTrailEnablementCmd()` in the hidden-infra block, as requested.
+- `runSessionSweep` already exists at `cmd/entire/cli/session_sweep.go:69` (from an earlier task in the plan), so the `RunE` wiring resolves correctly — no dangling reference.
+- `checkpoint_policy_warning.go:28` — skip-list case now reads `"hooks", "__send_analytics", "__refresh_trail_enablement", "curl-bash-post-install", "__sweep_sessions"`.
+- **No scope creep**: no changes to `lifecycle.go`, no changes to `agent_help_cmd.go`, no `agentHelpAnnotation` set on the new command (confirmed via grep — the annotation only appears in `agent_help_cmd.go` itself, untouched), no flags added, and no spawn logic added.
+- `go build ./...` succeeds cleanly.
+- `go run ./cmd/entire help | grep -ci sweep` → `0` (command stays hidden).
+- `go run ./cmd/entire __sweep_sessions` exits `0` (smoke run confirmed).
+
+No issues found.</result>
+<usage><subagent_tokens>60037</subagent_tokens><tool_uses>3</tool_uses><duration_ms>35398</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a759cbffc1cc0abe1</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-claude-hooks/0153df40-cf3f-429a-bd42-56a3f8dc0a0b/tasks/a759cbffc1cc0abe1.output</output-file>
+<status>completed</status>
+<summary>Agent "Quality review Task 4" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Code Review: Task 4 — Hidden `__sweep_sessions` command
+
+Scope reviewed: `git diff e5641901d..687209b96` (single commit `687209b96`, 17 lines across `cmd/entire/cli/root.go` and `cmd/entire/cli/checkpoint_policy_warning.go`), checked against Task 4 of `docs/superpowers/plans/2026-08-17-zombie-session-sweep.md` and the sibling hidden commands.
+
+### Strengths
+
+- **Exact plan conformance.** The constructor and skip-list edit match Task 4's spec character-for-character, registered exactly where Step 4.1 says (end of the "Hidden infrastructure" block in `NewRootCmd`, `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/claude-hooks/cmd/entire/cli/root.go:160`).
+- **RunE is the right call, and better-precedented than the task description claims.** The description says the pattern was copied from `__send_analytics` (which uses `Run`), but the truly analogous sibling is `__refresh_trail_enablement` (`trail_context_cache.go:414`) — also detached-spawned, `Hidden: true`, `Args: cobra.NoArgs`, **RunE**. `__send_analytics` uses `Run` only because `telemetry.SendEvent` returns nothing. Returning the error from `runSessionSweep` costs nothing when detached (stderr discarded, nobody waits on the exit code) and pays off for the manual invocation path the doc comment itself anticipates (Task 4.3's smoke run, or a developer running `entire __sweep_sessions` by hand gets a real nonzero exit and a printed error via main.go). Swallowing the error to mimic `Run` would have been strictly worse.
+- **Naming, hiding, and doc-comment style all consistent** with siblings: `__` + snake_case, `Hidden: true`, "should/is not for direct use" comment. The pointer to `entire doctor` as the interactive surface for the same repairs is a nice touch beyond the siblings' comments.
+- **Skip-list edit verified complete.** I grepped for every list the sibling infra commands appear in — `isCheckpointPolicyWarningExcludedCommand` is the only one. No telemetry/version-check exclusion list was missed.
+
+### Issues
+
+**Important**
+
+1. **The detached child has no logging destination — sweep diagnostics and the returned error are all discarded.** `execx.SpawnDetached` wires both stdout and stderr to `io.Discard` (`cmd/entire/cli/execx/spawn_detached.go:40-41`), and there is no global `logging.Init` — each command bootstraps its own. `runSessionSweep`'s `logging.Warn("sweep condense failed", ...)` — precisely the diagnostic you need when a zombie fails to self-heal — plus its `logging.Info` lines and the error main.go prints will all vanish. The direct precedent solves exactly this: `newRefreshTrailEnablementCmd` (`trail_context_cache.go:416-437`) does a `paths.WorktreeRoot`-guarded `logging.SetLogLevelGetter(GetLogLevel)` + `logging.Init(ctx, "")` + `defer logging.Close()` in its RunE, with a comment explaining why ("a failing background refresh ... is diagnosable in .entire/logs/entire.log rather than vanishing").
+
+   Note this is a **gap in the plan, not a deviation by the implementer** — Task 4's code block omits it, and I grepped the whole plan: no later task adds `logging.Init` to this command either (Task 5's logging calls run in the hook process, which initializes logging separately). Recommend: add the same guarded bootstrap to `newSweepSessionsCmd`'s RunE (~6 lines, copy the trail-refresh block verbatim including its WorktreeRoot rationale) and amend the plan so Task 4 reflects it.
+
+**Minor**
+
+2. The task description's "pattern copied from `__send_analytics`" is inaccurate (it copied the `__refresh_trail_enablement` shape). Cosmetic — the commit message doesn't repeat the claim.
+3. CLAUDE.md's "Hidden infrastructure commands" list (line 163) doesn't mention `__sweep_sessions` — but it already omits `__refresh_trail_enablement`, so this is pre-existing drift, not a new obligation. Worth folding into the plan's final docs task if one exists.
+4. No test asserts `__sweep_sessions` is in the skip-list — acceptable, since the switch is a data list and no sibling entry is individually tested either (`checkpoint_policy_warning_test.go` exercises the mechanism, not each name).
+
+### Assessment: Needs fixes
+
+One Important fix before this task can be called done: the file-logging bootstrap in the RunE (issue 1), plus the corresponding plan amendment. Everything else is clean — the change is small, correctly placed, correctly hidden, and the RunE choice is a justified improvement over the `__send_analytics` template it was nominally copied from.</result>
+<usage><subagent_tokens>71334</subagent_tokens><tool_uses>14</tool_uses><duration_ms>146898</duration_ms></usage>
+</task-notification>

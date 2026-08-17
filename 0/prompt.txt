@@ -1,0 +1,99 @@
+can you review the changes in this branch
+
+---
+
+<task-notification>
+<task-id>afa8c5bcba0d7f070</task-id>
+<tool-use-id>toolu_01MyCqoa7QXo7A4BPmmdFCxE</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-codex-title/233bf178-33a9-4bc5-b242-bf88ecfad685/tasks/afa8c5bcba0d7f070.output</output-file>
+<status>completed</status>
+<summary>Agent "/code-review branch" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Review complete. Verified the key defects by running the real Codex fixture ordering through the new filter and by exercising the JSONL path directly.
+
+```json
+[
+  {
+    "file": "cmd/entire/cli/strategy/manual_commit_rewind.go",
+    "line": 850,
+    "summary": "isInjectedInstructionPrompt only recognizes `&lt;environment_context&gt;` and `# AGENTS.md instructions for `, but a real Codex rollout's first injected user items are `&lt;permissions instructions&gt;` and a bare `# AGENTS.md`, so the codex-title bug this PR targets is not actually fixed.",
+    "failure_scenario": "The repo's own Codex fixture (cmd/entire/cli/transcript/compact/testdata/codex_full.jsonl) has user items in this order: `&lt;permissions instructions&gt;…`, `# AGENTS.md\\nThese are the project instructions.`, `&lt;environment_context&gt;…`, then the genuine prompt. I ran FirstDisplayPrompt over exactly that list: it returns `\"&lt;permissions instructions&gt;\\nYou are sandboxed.\\n&lt;/permissions instructions&gt;\"`, and IsInjectedInstructionPrompt returns false for both the permissions block and the bare `# AGENTS.md` block. So `entire session attach` on a real Codex rollout still titles the checkpoint with the sandbox permissions preamble. The two new tests pass only because their fixtures put `&lt;environment_context&gt;` first. Missing prefixes (already enumerated in transcript/compact/codex.go:280): `&lt;permissions`, `&lt;collaboration_mode&gt;`, `&lt;skills_instructions&gt;`, `&lt;turn_aborted&gt;`, bare `# AGENTS.md`."
+  },
+  {
+    "file": "cmd/entire/cli/attach_transcript.go",
+    "line": 32,
+    "summary": "The generic JSONL branch adds the injected-prompt filter with no fallback, so a transcript whose only user content is an injected preamble now yields an empty FirstPrompt where it previously yielded the preamble — and the empty-metadata warning is suppressed.",
+    "failure_scenario": "Verified by running extractTranscriptMetadata on `{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"# AGENTS.md instructions for /repo\\n\\nfollow them\"}}`: result is FirstPrompt=\"\" TurnCount=1. Consequences: (a) attachPrompts (attach.go:198) returns nil, so no prompt.txt is written and the checkpoint has no title at all; (b) warnEmptyTranscriptMetadata (attach.go:417) returns early because TurnCount != 0, so the user gets no warning; (c) with --review, reviewPromptForAttach (attach.go:726) returns \"\" so state.ReviewPrompt is silently empty, and the \"--review was set, but with no parsed prompt\" warning is also suppressed by the same TurnCount check. The agent-extractor branch (line 76) has the prompts[0] fallback for exactly this case; the JSONL branch does not, contradicting the PR's own test comment that \"an attach checkpoint with no prompt at all is worse than a noisy-but-present one\"."
+  },
+  {
+    "file": "cmd/entire/cli/strategy/common.go",
+    "line": 935,
+    "summary": "The fix is applied only at the attach call site; ExtractFirstPrompt — the shared title reader for checkpoint list, explain, and restoredPromptPreview's first branch — still has no injected-prompt filter, so the primary Codex title path is untouched.",
+    "failure_scenario": "lifecycle.go:797-802 backfills prompt.txt from ExtractPrompts by joining ALL prompts with \"\\n\\n---\\n\\n\", which puts the injected preamble first. ExtractFirstPrompt then splits on that separator and skips only empty/separator-only entries, so it returns `&lt;environment_context&gt;…` / `&lt;permissions instructions&gt;…`. Every consumer inherits it: ReadSessionPromptFromTree (common.go:963) → explain.go:1727/2874, ReadLatestSessionPromptFromCommittedTree (common.go:1072) → manual_commit_rewind.go:229, explain.go:2782, trail_resume_cmd.go:510. Worse, restoredPromptPreview checks ExtractFirstPrompt FIRST (manual_commit_rewind.go:805) and returns early, so the FirstDisplayPrompt filter it was refactored around is unreachable whenever prompt.txt exists — i.e. in the normal case. The new filter should live in ExtractFirstPrompt (or in each agent's ExtractPrompts), not only in attach."
+  },
+  {
+    "file": "cmd/entire/cli/attach_transcript.go",
+    "line": 79,
+    "summary": "TurnCount still counts injected preambles as user turns, so attach reports an inflated step count for every Codex session — and the new test enshrines the wrong number.",
+    "failure_scenario": "`meta.TurnCount = len(prompts)` includes every injected item. For the real Codex ordering (permissions, AGENTS.md, environment_context, 1 real prompt), TurnCount = 4: state.SessionTurnCount is set to 4 (attach.go:698-700) and attachStepCount renders \"4 steps\" for a one-prompt session. The JSONL branch has the same problem (line 31 increments before the filter — verified TurnCount=1 for a transcript containing only an injected preamble). TestExtractTranscriptMetadataForAgent_CodexSkipsEnvironmentContext asserts TurnCount == 2 for a session with exactly one genuine prompt, locking the off-by-N in. Once the code decides an item is not a user prompt, it should not be counted as a user turn."
+  },
+  {
+    "file": "cmd/entire/cli/strategy/manual_commit_rewind.go",
+    "line": 854,
+    "summary": "The third clause uses strings.Contains over the whole prompt, so a genuine user prompt that merely mentions both `&lt;INSTRUCTIONS&gt;` and \"AGENTS.md instructions\" is misclassified as injected — and the diff extends that misclassification from a preview to the persisted attach title.",
+    "failure_scenario": "A user prompt like \"why does the AGENTS.md instructions block get wrapped in &lt;INSTRUCTIONS&gt; tags?\" (an entirely plausible prompt in this repo) satisfies both Contains checks regardless of position. Before this PR the only cost was a skipped rewind preview line; now, via attach_transcript.go:32, the JSONL path sets FirstPrompt=\"\" for that session, so the checkpoint is written with no prompt.txt and no title (see the missing-fallback finding). A prefix/anchored match (or reusing isCodexSystemContent's prefix-only approach) avoids this."
+  },
+  {
+    "file": "cmd/entire/cli/strategy/manual_commit_rewind.go",
+    "line": 831,
+    "summary": "This classification already exists in the codebase as transcript/compact/codex.go:isCodexSystemContent with a complete prefix list; the diff exports a second, narrower copy instead of reusing it.",
+    "failure_scenario": "Two independent implementations of \"is this content agent-injected?\" now exist: isCodexSystemContent (6 prefixes: `&lt;permissions`, `&lt;collaboration_mode&gt;`, `&lt;skills_instructions&gt;`, `&lt;environment_context&gt;`, `&lt;turn_aborted&gt;`, `# AGENTS.md`) and isInjectedInstructionPrompt (3 patterns, a strict subset for Codex). They will drift — indeed they already have, which is the direct cause of the headline bug. CLAUDE.md, 'Code Duplication Prevention': 'Check if a helper already exists in common.go or nearby utility files' / 'Before implementing Go code, use /go:discover-related to find existing utilities and patterns that might be reusable.' Promote isCodexSystemContent (or a textutil equivalent alongside StripIDEContextTags) and have both call sites use it."
+  },
+  {
+    "file": "cmd/entire/cli/attach_transcript.go",
+    "line": 74,
+    "summary": "Wrong depth: agent-specific transcript-shape knowledge is being consumed from strategy/manual_commit_rewind.go by the cli attach path, rather than each agent's own extractor dropping its own injected items.",
+    "failure_scenario": "Codex's ExtractPrompts (agent/codex/transcript.go:334) returns every input_text item verbatim, including its own injected preambles, and every consumer is then expected to re-filter. Today there are three consumers (attach_transcript.go:69, lifecycle.go:797, manual_commit_rewind.go:872) and only one of them filters; the next agent that injects a preamble, or the next consumer added, silently regresses again. The codebase already has the capability pattern for exactly this (agent.TranscriptSanitizer / agent.AsPromptExtractor), so filtering belongs in the agent (or in textutil next to StripIDEContextTags), which would fix titles, prompt.txt backfill, and previews in one place instead of layering a special case on a rewind-file helper."
+  },
+  {
+    "file": "cmd/entire/cli/attach_transcript.go",
+    "line": 33,
+    "summary": "The comment claims the JSONL branch applies \"the same filter the rewind display path applies\", but it omits FirstDisplayPrompt's isOnlySeparators and TrimSpace checks, so the two filters are not the same.",
+    "failure_scenario": "FirstDisplayPrompt skips entries that are empty after trimming, separator-only (isOnlySeparators, e.g. \"---\", \"  --  \"), or injected. The JSONL branch only skips injected. A Claude Code / Cursor / OpenCode transcript whose first user message is `---` (or `- - -`) still becomes the checkpoint title, while the same content is skipped on the rewind path. The mismatched comment makes the divergence invisible to the next reader, who will assume the two paths agree."
+  },
+  {
+    "file": "cmd/entire/cli/strategy/manual_commit_rewind.go",
+    "line": 846,
+    "summary": "IsInjectedInstructionPrompt is a pure pass-through wrapper whose body is `return isInjectedInstructionPrompt(prompt)` — two functions and two doc comments for one behavior.",
+    "failure_scenario": "Cost: the predicate now has two names and two doc comments that must be kept in sync, and a reader has to follow one hop to find the logic. The unexported function has exactly one other caller (line 834, in the same file), so the simpler form is to rename isInjectedInstructionPrompt → IsInjectedInstructionPrompt, keep its single doc comment, and delete the wrapper."
+  },
+  {
+    "file": "cmd/entire/cli/attach_test.go",
+    "line": 19,
+    "summary": "The codex package is imported twice in the same file — blank (`_`, for registration) and named (`codexagent`) — making the blank import dead.",
+    "failure_scenario": "Cost: a redundant import line that reads as if the named import somehow doesn't trigger package init, plus the gofmt comment-alignment churn the diff had to make on the two neighbouring lines to accommodate it. Dropping `_ \"…/agent/codex\" // register agent` (line 18) is behaviour-preserving: the named `codexagent` import at line 19 already runs the package's init and registers the agent."
+  },
+  {
+    "file": "cmd/entire/cli/attach_test.go",
+    "line": 844,
+    "summary": "Test-coverage asymmetry: the agent-extractor path got an all-injected degenerate-case test, but the JSONL path — the one that actually lost its fallback — did not.",
+    "failure_scenario": "TestExtractTranscriptMetadata_CodexOnlyEnvironmentContext covers 'every prompt is injected' for extractTranscriptMetadataForAgent, where the prompts[0] fallback saves it. TestExtractTranscriptMetadata_JSONLSkipsInjectedPreamble covers only the happy path (injected preamble followed by a real prompt). The uncovered combination — JSONL + every user message injected — is precisely the regression where FirstPrompt becomes \"\" and the checkpoint ends up with no title and no warning. A test asserting the intended behaviour there would have caught it."
+  },
+  {
+    "file": "cmd/entire/cli/strategy/manual_commit_rewind.go",
+    "line": 837,
+    "summary": "FirstDisplayPrompt is documented as returning a value \"worth showing as a title/preview\" but no longer truncates, and the new attach caller does not truncate either, so an unbounded prompt lands in persisted state.",
+    "failure_scenario": "Truncation moved out of the helper into restoredPromptPreview (line 820); the attach caller (attach_transcript.go:75) omits it. A first prompt containing a large pasted log or file dump becomes state.LastPrompt / state.ReviewPrompt and the sole content of prompt.txt at full length. The old attach code had the same shape (prompts[0], untruncated), so this is not a regression — but naming the shared helper 'DisplayPrompt' while making truncation the caller's job invites the next caller to forget it too. Either truncate inside the helper or rename it to signal that it returns raw text."
+  }
+]
+```</result>
+<usage><subagent_tokens>120779</subagent_tokens><tool_uses>35</tool_uses><duration_ms>400051</duration_ms></usage>
+</task-notification>
+
+---
+
+this was the linear issue: https://linear.app/entirehq/issue/ENT-1653/codex-agent-review-sessions-are-titled-environment-context-instead-of
+
+---
+
+ok, do it

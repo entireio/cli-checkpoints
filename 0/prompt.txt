@@ -1,0 +1,248 @@
+<task-notification>
+<task-id>afe50e2414332392d</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-support/1073c709-a71b-411c-ace0-860452ddd25f/tasks/afe50e2414332392d.output</output-file>
+<status>completed</status>
+<summary>Agent "Test-coverage review PR 2042" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>All verification is done. Here is the coverage analysis for PR #2042.
+
+# Test Coverage Analysis — PR #2042 (betterleaks 1.5.0 → 1.8.0)
+
+## Summary
+
+The two new table cases in `TestString_BoundedCredentialValueOverRedactionGuards` are well-aimed and non-vacuous: I verified empirically (running betterleaks 1.8.0 directly, and the full `redact.String` pipeline) that both route through the new `isPlaceholderFinding` code. Both directions of the `&amp;`-delimiter branch are pinned, and the exact-match branch turns out to be pinned too (by a pre-existing case that 1.8.0 made load-bearing). However, there is one verified **under-redaction behavior that no test pins and that looks like an actual bug**: 4 of the 5 delimiter classes in the head-check are only reachable via *quoted* betterleaks captures, where the "greedy trailer" rationale doesn't apply — and there they suppress real quoted passwords.
+
+## Branch-by-branch coverage of `isPlaceholderFinding` (redact.go:421-429)
+
+| Branch | Pinned? | By |
+|---|---|---|
+| (a) exact placeholder match, via betterleaks path | **Yes (accidentally)** | `DB_PASSWORD=REDACTED (redact_test.go:971). Verified: betterleaks 1.8.0 fires on this input with secret `secret_here`; removing `isPlaceholderFinding` would fail this case. It predates the PR, so nothing documents that it now guards the new code. |
+| (b) head-before-`&amp;` placeholder → suppress | **Yes** | redact_test.go:978 (`password=changeme&amp;sslmode=require`; verified finding secret is `changeme&amp;sslmode=require`) |
+| (c) head-before-`&amp;` non-placeholder → redact | **Yes** | redact_test.go:983 (`password=hunter2secret&amp;...`), plus :931 (https query case, finding secret `not-a-db-credential&amp;debug=true`) |
+| (d) delimiter at position 0 (`i &gt; 0` guard) | **No** | Nothing. Reachable: upstream's unquoted first-char class `[^:=\s'"`,;]` permits `&amp;`, so a finding secret can start with a delimiter. |
+| (e) no delimiter, real secret → redact | Yes | redact_test.go:918 and the many existing betterleaks rule tests |
+| `;` `,` space `\t` delimiter classes | **No** | Only `&amp;` is tested — see Critical Gap 1 for why the others matter most. |
+
+## Critical Gaps
+
+**1. Quoted-capture head suppression exposes real passwords — untested and verified end-to-end (criticality 9, under-redaction).**
+The upstream generic-password *unquoted* value charset is `[^\s'"`,;]{4,}` — it can never contain `;`, `,`, space, or tab, only `&amp;`. So those four delimiters at redact.go:425 fire exclusively on *quoted* captures — exactly where the finding is the verbatim password and splitting at the first delimiter misclassifies. Verified through the real `redact.String`:
+- `password="changeme;realSecret42"` → **unredacted** (head `changeme`)
+- `password="example S3cr3t!x"` → **unredacted** (head `example` is in `placeholderSecretValues`, redact.go:75)
+- `password="changeme now rotate B4Prod!"` → **unredacted**
+- `password="redacted then reset to Xk29!f"` → **unredacted** (head `redacted`)
+
+No other layer rescues these (layer 7's `[^\s,;&amp;]+` value capture stops at the space/`;` and sees only `"changeme`, which quote-trims to a placeholder). Regression it prevents: this is the exact failure mode redaction exists for — a real secret shipped to the checkpoint branch. At minimum a test should pin the intended behavior for a quoted secret with a placeholder first token; more likely the fix is to restrict the head check to `&amp;` (or to unquoted-shaped secrets). Given the repo's redaction-corpus practice, this deserves a decision, not silence.
+
+**2. `i &gt; 0` guard has no test (criticality 7, under-redaction on refactor).**
+If the guard regresses to `i &gt;= 0` (e.g. a refactor to `strings.Cut`), the head becomes `""`, and `isPlaceholderSecretValue("")` returns **true** (redact.go:432-434) — every delimiter-leading finding would be suppressed. A one-case pin (finding secret starting with `&amp;`, e.g. `password=&amp;Xk29!fQz7`) would catch that mutation. Currently nothing does.
+
+## Important Improvements
+
+**3. Exact-match branch is pinned only by an inherited case (criticality 5).**
+`DB_PASSWORD=REDACTED (:971) now does double duty guarding branch (a), but nothing marks it as such; a future cleanup could rewrite it against layer 7 semantics and silently orphan the branch. A dedicated `password=changeme` case (verified: betterleaks secret is exactly `changeme`) would pin it explicitly — note the table has no bare-`changeme` case at all, only the `&amp;`-trailer variant.
+
+**4. `;`-DSN placeholder shape (criticality 5).**
+`Server=db;User=app;Password=changeme;Database=x` → betterleaks secret is exactly `changeme` (unquoted capture stops at `;`), suppressed via branch (a), full line preserved — verified. This is the realistic DSN-placeholder scenario the PR's own comment gestures at ("query/DSN text"), and it's untested. The `,` variant behaves identically.
+
+## Are the updated `password=REDACTED` expectations still meaningful pins?
+
+Yes — not tautological. `password=not-a-secret-setting` → `password=REDACTED` (:918) and the https query case (:931) are the negative controls proving `isPlaceholderFinding` doesn't over-suppress ordinary values, and they pin the 1.8.0 behavior change itself (pre-1.8.0 these produced no finding). If a future placeholder-list addition accidentally swallowed generic values, these fail. The comments correctly document the accepted over-redaction direction, including the greedy consumption of `&amp;debug=true` in :933.
+
+## Test Quality Issues (minor)
+
+- Several long-standing cases in this table (`${DB_PASSWORD}` :891, `&lt;password&gt;` :946, masks :961/:966, `your_password` :951, `placeholder` :988) are **vacuous with respect to the new code** — verified: betterleaks 1.8.0 produces zero findings for them (its own filter drops these shapes), so only layer 7 is exercised. Meanwhile the code comment at redact.go:211-214 cites "${VAR}, mask runs" as motivations for the new filter — those paths are actually dead against 1.8.0's generic-password rule and untestable through it. Not a defect, but the comment overstates what the filter does.
+
+## Positive Observations
+
+- Both new cases were verified to genuinely route through `isPlaceholderFinding` (no vacuous passes), and they cover suppress + redact directions of the same branch — good mutation sensitivity.
+- Policy compliance: cases extend the existing table in the existing file, the enclosing test has `t.Parallel()` (redact_test.go:888), and added test lines (~21) don't exceed added prod lines.
+- The providers.go comment rewrite accurately tracks the 1.8.0 supabase rule changes (RequiredRules → validation component) — documentation-only, no coverage needed.
+
+**Bottom line:** merge-blocking question is Gap 1 — it's a verified silent under-redaction path introduced by this PR's new code, not just missing coverage. Gaps 2-4 are cheap one-line table additions to the existing test.</result>
+<usage><subagent_tokens>84943</subagent_tokens><tool_uses>12</tool_uses><duration_ms>255520</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a44a48169d6b9861d</task-id>
+<tool-use-id>toolu_01Pme653YpbdJ4Saaetekqa4</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-support/1073c709-a71b-411c-ace0-860452ddd25f/tasks/a44a48169d6b9861d.output</output-file>
+<status>completed</status>
+<summary>Agent "Comment-accuracy review PR 2042" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>All claims are verified. Here is my analysis.
+
+## Summary
+
+I analyzed the comments added/modified across `redact/redact.go`, `redact/providers.go`, and `redact/redact_test.go` in PR #2042 (commits 9b4bfa5fa + 149f43098), verifying every factual claim against the code in this repo and the installed betterleaks v1.8.0 module (`~/go/pkg/mod/github.com/betterleaks/betterleaks@v1.8.0`), including empirical probes through the repo's own `getDetector()`. One claim is factually wrong, one accurate claim from the old comment was dropped, and one phrasing is a mild overstatement. The rest checked out.
+
+## Critical Issues
+
+**1. The sb_secret_ "fires standalone in 1.8.0" claim is false — the project-url pairing still gates detection.**
+- Location: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/support/redact/providers.go:13-17`
+- Issue: The rewritten comment says "the supabase-project-api-key rule fires standalone in 1.8.0 (the project-url pairing moved from a RequiredRules gate to a validation-only component)". In the v1.8.0 config, the rule declares `components = [{ id = "supabase-project-url" }]` with `optional` unset. `config.Component.Optional` defaults to `false` (`config/config.go:91-95`, `config/rule.go:92-98`: "Required components gate the rule"), and `detect.hasAllRequiredComponents` (`detect/detect.go:1188-1199`) drops the primary finding when a non-optional component has no nearby match. Empirically confirmed via the repo's detector: a standalone high-entropy 31-char `sb_secret_` key produces **0 findings**; the identical key with a `*.supabase.co` URL nearby produces the finding. The component also appears in the `validate` script, but validation is *in addition to* the detection gate, not a replacement for it. The 1.5.0-era comment this text replaced (composite rule, only fires with a matching URL present, secret alone passes straight through regardless of entropy) is still substantively correct in 1.8.0 — only the TOML spelling changed (`components` vs. `[[rules.required]]`).
+- Why it matters: this is the paragraph that justifies why the provider layer exists. The new text understates the gap betterleaks leaves (only "low-entropy or odd-length" secrets, line 16-17), when in fact *any* lone `sb_secret_` key — high-entropy, exact-length included — passes betterleaks. A future maintainer trusting this comment could conclude the provider pattern is mostly redundant and narrow or remove it.
+- Suggestion: restore the gating description, e.g. "the supabase-project-api-key rule is still gated by a required supabase-project-url component in 1.8.0 (spelled `components` rather than `RequiredRules`; the URL also feeds validation) — a secret captured without a nearby `*.supabase.co` URL passes straight through regardless of entropy. When it does fire, it matches an exact 31-char body and drops findings with entropy&lt;=4.0."
+
+## Improvement Opportunities
+
+**2. The sbp_ bullet silently dropped the still-real two-digit minimum.**
+- Location: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/support/redact/providers.go:18-22`
+- Current state: the old comment documented "entropy&lt;=3.5 and a two-digit minimum … what this layer adds for sbp_ is coverage of bodies at other lengths, lower entropy, or without two digits". The new text keeps only entropy and length. The two-digit filter is still present in v1.8.0 (`filter = entropy &lt;= 3.5 || !matchesAny(secret, [^sbp_[a-z0-9_-]*[0-9][a-z0-9_-]*[0-9]...$])`), and I confirmed empirically: a 40-char lowercase body with digits fires; the same-length body without digits yields 0 findings. So the "what this layer adds" enumeration is now incomplete — this layer also covers digit-poor bodies, and that accurate documentation was removed by this PR.
+- Suggestion: reinstate "or without two digits" in both the filter description and the coverage sentence.
+
+**3. "run to end of line" overstates the generic-password match behavior.**
+- Location: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/support/redact/redact.go:416-417` (and the softer echo at `redact/redact_test.go:928-930`)
+- Current state: the generic-password unquoted-value branch is `[^:=\s'"`,;][^\s'"`,;]{4,249}` — it stops at whitespace, comma, semicolon, quote, or backtick, and caps at 250 chars. It reaches end of line only when none of those intervene, which happens to be true for `&amp;`-joined query strings (the motivating case, since `&amp;` is *not* in the stop set). "Run to end of line" as a general claim is wrong for e.g. `password=changeme foo` or `password=changeme,timeout=5`.
+- Suggestion: "Greedy rules (generic-password) match through `&amp;` and other non-delimiter text, so a placeholder value can carry trailing query/DSN text in the finding…" — this also makes the *reason* the `&amp;` case specifically needs the head-check more precise. The test comment at redact_test.go:928-930 is true for its specific input but would read better aligned with the corrected wording.
+
+## Recommended Removals
+
+None. All new comments state constraints the code cannot show on its own (external rule semantics, deliberate over-redaction acceptance) and are within the repo's comment policy. Note the test comments at `redact_test.go:916-917` and `928-930` lean toward justification prose, but they explain a behavior change in expected output (preserved → redacted), which a future reader genuinely needs — I'd keep them.
+
+## Positive Findings (verified accurate)
+
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/support/redact/redact.go:419` — the "[^\s,;&amp;]+ value charset of the bounded credential layer" claim matches `credentialValuePattern` at redact.go:44 exactly, and the `IndexAny(secret, "&amp;;, \t")` delimiter set covers every delimiter a generic-password finding secret can actually contain (unquoted secrets can't contain whitespace; quoted ones can't contain \r\n).
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/support/redact/redact.go:211-214` — the placeholder-policy loop comment's examples all check out: `changeme` (line 75) and `secret_here` (line 77) are in `placeholderSecretValues`, `${VAR}` is handled at lines 440-442, mask runs by `isRepeatedCharPlaceholder`.
+- `redact_test.go:916-917` — "betterleaks &gt;= 1.8.0 detects generic password assignments" is correct: the `generic-password` rule exists in the 1.8.0 config and is absent from 1.5.0's.
+- Unchanged surrounding text in providers.go (lines 38-42 charsets/lengths, 44-53 false-positive class, 55-65 no-`\b` rationale, 30-36 publishable-key non-redaction) all remain consistent with both the code (lines 67-68) and the 1.8.0 rules — 1.8.0 even explicitly allowlists `^sb_publishable_[A-Za-z0-9_-]{31}$` out of a generic rule, reinforcing the "not a secret" claim.
+- The two new test cases at `redact_test.go:975-986` have accurate comments; "the placeholder guard must still see 'changeme'" matches `isPlaceholderFinding`'s head-check exactly.
+
+**Rot-risk note:** the providers.go header pins its claims to "v1.8.0" — appropriate for this pattern, but it means every future betterleaks bump must re-verify this block (this PR is itself the cautionary example: the version string was updated while the behavioral claim regressed).</result>
+<usage><subagent_tokens>79393</subagent_tokens><tool_uses>18</tool_uses><duration_ms>292369</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a3888444a567131dd</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-support/1073c709-a71b-411c-ace0-860452ddd25f/tasks/a3888444a567131dd.output</output-file>
+<status>completed</status>
+<summary>Agent "Code-review PR 2042 diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Reviewed
+
+PR #2042 on `chore/bump-betterleaks-1.8.0` — `git diff HEAD~2` (2 commits): `.github/dependabot.yml`, `go.mod`/`go.sum`, `redact/providers.go`, `redact/redact.go`, `redact/redact_test.go`.
+
+Verification performed: `mise run lint` → **0 issues**; `mise run test` → **9251 tests PASS**. I also built an isolated probe module (scratchpad, outside the repo — no repo files touched) that calls `redact.String` and `detect.Detector.DetectString` directly against betterleaks v1.8.0 to check the under-redaction question empirically rather than by inspection.
+
+---
+
+## Critical (90–100)
+
+### 1. `isPlaceholderFinding`'s head-check causes demonstrable under-redaction — real secrets leak (confidence 95)
+
+`/Users/peytonmontei/Documents/entire/devenv/entireio/cli/redact/redact.go:415-428`
+
+The head-check discards the **entire** greedy finding when the head looks like a placeholder. Because `generic-password` matches to end of line, the discarded finding often contains a *second, real* credential. Verified through `redact.String`:
+
+```
+IN : "password=changeme&amp;db_pass=hunter2hunter2"
+OUT: "password=changeme&amp;db_pass=hunter2hunter2"     &lt;-- hunter2hunter2 LEAKS
+     finding rule=generic-password secret="changeme&amp;db_pass=hunter2hunter2"
+
+IN : "password=example&amp;password2=REDACTED"
+OUT: "password=example&amp;password2=REDACTED"     &lt;-- REDACTED LEAKS
+     finding rule=generic-password secret="example&amp;password2=REDACTED"
+```
+
+Without the head-check, both findings survive `isPlaceholderSecretValue` (the full string isn't a placeholder) and the whole span is redacted. The leak is caused specifically by lines 424-426. Layer 7 rescues cases where the tail key is in its credential-key list (`api_key=`, `token=` redact fine), but `db_pass=` / `password2=` are not, so nothing catches them.
+
+Two things make this hard to justify:
+
+**(a) It contradicts the PR's own stated safety direction.** The same diff accepts over-redaction twice as "the safe direction" (`redact_test.go:915-921`, `:927-935`), then adds machinery to avoid over-redaction in a third case at the price of under-redaction. That's the trade running backwards on the one axis the package says is non-negotiable.
+
+**(b) The head-check is load-bearing for exactly one test — the one this PR itself introduced.** I replayed every preserved input in `TestString_BoundedCredentialValueOverRedactionGuards` through `DetectString` and checked which ones are suppressed by the head-check rather than by the whole-secret check. Exactly one hit:
+
+```
+input="password=changeme&amp;sslmode=require" rule=generic-password
+secret="changeme&amp;sslmode=require" head="changeme"
+```
+
+That is the new case added at `redact_test.go:975-981`. No pre-existing guard test depends on `isPlaceholderFinding`'s head branch at all — plain `isPlaceholderSecretValue` covers every other preserved case (`DB_PASSWORD=REDACTED, `=secret_here`, `=placeholder`, `=&lt;password&gt;`, `=*****`, …).
+
+So the head-check exists solely to keep `password=changeme&amp;sslmode=require` intact, and buys that by leaking real secrets that follow a placeholder.
+
+**Suggested fix**, cheapest first:
+
+- **Drop the head-check entirely** (keep `isPlaceholderSecretValue(f.Secret)`) and update the new test to `want: "password=REDACTED"`, matching how the PR already resolved the other two 1.8.0 behavior changes. Losing `&amp;sslmode=require` from a log line is exactly the cost the PR already accepted twice.
+- If preserving that case is genuinely required, don't *suppress* the finding — **narrow the region to the tail** (`secret[i:]`) so the placeholder head stays visible and anything after it is still redacted.
+
+Note this is **not a regression against `main`**: at 1.5.0 the `generic-password` rule didn't exist, so these strings leaked there too. It is a forgone improvement that the bump would otherwise have delivered for free — worth stating plainly in the PR description if the current behavior is kept deliberately.
+
+Secondary point: the head-check is applied to **every** betterleaks rule, not just greedy ones, even though the doc comment justifies it in terms of `generic-password`. `report.Finding` exposes `RuleID` (`betterleaks@v1.8.0/report/finding.go:17`), so scoping the head branch to the greedy rule(s) would stop this from silently weakening the 260+ high-confidence prefix rules. This narrows the blast radius but does **not** fix finding #1, which occurs within `generic-password` itself.
+
+### 2. `providers.go` comment is factually wrong: `sb_secret_` does **not** fire standalone in 1.8.0 (confidence 95)
+
+`/Users/peytonmontei/Documents/entire/devenv/entireio/cli/redact/providers.go:13-17`
+
+The rewritten comment claims the project-url pairing "moved from a `RequiredRules` gate to a validation-only component", so the rule now "fires standalone" and only low-entropy/odd-length secrets slip past. Empirically false — using betterleaks' *own* true-positive fixture:
+
+```
+"SUPABASE_SERVICE_ROLE_KEY=\"REDACTED\""
+  -&gt; 0 findings
+
+with a supabase.co project URL in the same content:
+  -&gt; 1 finding  rule=supabase-project-api-key
+```
+
+Entropy of that key is **4.90**, well above the `entropy &lt;= 4.0` filter, so the filter is not what suppresses it — the `Components: [{RuleID: "supabase-project-url"}]` declaration (`betterleaks@v1.8.0/cmd/generate/config/rules/supabase.go:45-47`) still gates the finding exactly as `RequiredRules` did at 1.5.0. The old comment was correct; the new one inverts it.
+
+This is a comment, but a consequential one: it is explicitly labeled "verified against the upstream betterleaks v1.8.0 rule source", and it tells a future maintainer that the provider layer's `sb_secret_` coverage is mostly redundant. In reality that layer is the **only** thing redacting a standalone `sb_secret_` key at any entropy. Acting on this comment would open a real under-redaction hole.
+
+Fix: restore the substance of the 1.5.0 wording — the rule is composite and only fires when a matching `*.supabase.co` URL appears in the same content, so a secret captured on its own passes through regardless of entropy.
+
+---
+
+## Important (80–89)
+
+### 3. `providers.go` drops the two-digit-minimum detail, which is still accurate at 1.8.0 (confidence 90)
+
+`/Users/peytonmontei/Documents/entire/devenv/entireio/cli/redact/providers.go:18-22`
+
+The diff removed "and a two-digit minimum" and trimmed the "what this layer adds" list from "other lengths, lower entropy, or without two digits" to "other lengths or lower entropy". The filter is still present in 1.8.0 (`supabase.go:24`):
+
+```
+|| !matchesAny(finding["secret"], [`^sbp_[a-z0-9_-]*[0-9][a-z0-9_-]*[0-9][a-z0-9_-]*$`])
+```
+
+Confirmed empirically — 40-char `sbp_` bodies with zero digits and with one digit both yield **0 findings**; the two-digit fixture yields 1. The deletion understates what the provider layer contributes. Restore both mentions.
+
+### 4. `f.Secret == ""` is now dead (confidence 85)
+
+`/Users/peytonmontei/Documents/entire/devenv/entireio/cli/redact/redact.go:215`
+
+`isPlaceholderSecretValue` returns `true` for the empty string (`redact.go:432-434`: `trimmed == ""` → `true`), and `isPlaceholderFinding` delegates to it first. The `f.Secret == "" ||` guard can never be the deciding condition. Harmless but misleading — it reads as if empty secrets were a separate case. Drop it, or keep it and add a one-line note that it's a fast path.
+
+### 5. Comment discipline (confidence 80)
+
+Per CLAUDE.md § Tests and Comments (one-line comments, rationale belongs in the commit message):
+
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/redact/redact.go:211-214` — a 4-line inline justification block inside `detectAllLayers`. The policy rationale duplicates what the `isPlaceholderFinding` doc comment already says; one line pointing at the helper would do.
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/redact/redact_test.go:915-916`, `:927-930`, `:975-977` — multi-line "why the expectation changed" prose in test tables. The `:927-930` block is three lines of upstream-behavior narration; that belongs in the commit body.
+
+The `isPlaceholderFinding` doc comment itself (`redact.go:415-420`) is fine — a doc comment on an exported-shaped helper explaining a non-obvious delimiter set is legitimate Go.
+
+---
+
+## Verified sound — no action
+
+**Dependabot ignore removal** (`.github/dependabot.yml`): the ignore existed for a data race in `internal/exprruntime` under concurrent `DetectString` (betterleaks#224). I ran 64 goroutines × 20 iterations of `DetectString` under `-race` against v1.8.0 across mixed inputs — clean. The go.mod churn corroborates the mechanism: `cel.dev/expr`, `antlr4-go/antlr`, `google/cel-go`, `genproto/*` and `protobuf` are all gone, replaced by `expr-lang/expr` — betterleaks replaced the CEL runtime that hosted the race. Removal is justified.
+
+Worth noting: nothing in the repo pins this. `getDetector()` (`redact.go:119`) hands one shared `*detect.Detector` to every caller, and `redact.String` is called from concurrent paths. If a future bump reintroduces the race, no test catches it. A single `-race` concurrency test over `redact.String` in the existing `redact_test.go` would be cheap insurance — flagging as an option, not a blocker, and it should extend the existing file rather than add a new one.
+
+**Dependency footprint**: dropping cel-go + antlr + protobuf + genproto for a single `expr-lang/expr` is a solid net win for binary size and hook latency.
+
+**Test placement**: the two new cases correctly extend `TestString_BoundedCredentialValueOverRedactionGuards` rather than creating a new file, and added test lines (~18) stay under added prod lines. Both consistent with the project's test discipline.
+
+---
+
+## Bottom line
+
+Mechanics are clean — lint green, full unit suite green, dependency swap is a win, dependabot unpin verified. Two things should be resolved before merge: the `providers.go` `sb_secret_` claim is inverted (#2) and should just be reverted to the 1.5.0 wording, and the head-check (#1) should be reconsidered — it is required by only the test the PR itself added, and it demonstrably leaks real secrets that sit behind a placeholder. Deleting the head branch and letting that one case over-redact would be the smallest change and the one most consistent with how this PR already resolved the other two 1.8.0 behavior changes.</result>
+<usage><subagent_tokens>93478</subagent_tokens><tool_uses>23</tool_uses><duration_ms>403104</duration_ms></usage>
+</task-notification>

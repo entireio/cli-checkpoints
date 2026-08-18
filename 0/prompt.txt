@@ -1,0 +1,34 @@
+please review this url https://entire.io/gh/entireio/cli/trails/992/fix-agent-add-list-remove-now-discover-external-agents-1928
+
+---
+
+<task-notification>
+<task-id>a8b0514e98ea2aeac</task-id>
+<tool-use-id>toolu_01Vavu6WSVoAyPJusDkMrii4</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-pr-reviews/1a105482-f45f-41ee-9aac-2fe06f1de6b3/tasks/a8b0514e98ea2aeac.output</output-file>
+<status>completed</status>
+<summary>Agent "/code-review 1930" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I reviewed the full diff for PR #1930 (`fix/1928-agent-group-external-discovery`) against `origin/main`, including the non-diff context in `setup.go`, `review/cmd.go`, `registry.go`, `external/discovery.go`, and the call graph of every changed function. The `ReportFindings` tool is not available in this session (searched for it; only `Monitor` matched), so findings are reported inline below.
+
+Most of the change checks out: the `--external` opt-in genuinely skips the plugin exec (the `IsExternal` filter runs before `hooksInstalled`), the hint-selection rule matches what each call site actually did about `$PATH` (`enable`'s `DiscoverAndRegisterAlways` really is 14 lines above its `agent.Get`), `agent add` for an external agent really does persist `external_agents: true` (`setup.go:1976`), the `Get` lock-release removes a real nested-`RLock` hazard, and the `review/cmd.go` switch to `ListAvailable` is a production no-op because `launchableReviewerFor` has no vogon adapter — so `entire review --agent vogon` was already rejected and no canary path regresses.
+
+Findings:
+
+- `docs/architecture/external-agent-protocol.md:19` — medium. The new table's `DiscoverAndRegister` row lists `status` as a user, but `status` performs no external discovery: `status.go` has no `external` import, and its agent listing goes through `InstalledAgentDisplayNames` → `agent.List()` with no discovery anywhere on the path. That is exactly the class of stale claim this PR set out to remove ("Discovery runs once during CLI initialization"). The two other rows are also incomplete in ways that matter for the PR's own reasoning: the `…Always` row says "Interactive setup flows and `entire agent list --external`", omitting the two non-interactive users — `entire enable --agent &lt;name&gt;` (`setup.go:892`, the scan the entire "no hint" rule depends on) and `entire configure --summarize-provider` (`setup.go:206`); the `…NamedAlways` row omits `entire dispatch`'s summary-provider lookup (`explain_summary_provider.go:31`).
+
+- `cmd/entire/cli/agent/testing.go:31` — low/medium. `restore` assigns the snapshot map itself (`registry = snapshot`) instead of copying back into a fresh map, so restore is not repeatable. After the first call the package-global `registry` *is* `snapshot`, so any later `Register` mutates the snapshot and a second `restore()` is a no-op. Concrete scenario, and it is the exact shape of the new test `TestSnapshotForTesting_RestoresRegistry` (which registers `restore` with `t.Cleanup` *and* calls it directly): `restore := SnapshotForTesting(); t.Cleanup(restore); … restore(); agent.Register("mock", …)` — the cleanup then leaves `mock` in the registry, and since these mocks are backed by `t.TempDir` binaries, a later test's `GetAgentsWithHooksInstalled` execs a deleted file. The doc comment claims restore returns the registry "to exactly that state", and only calls out concurrent *writers* as the exception. Fix: `registry = maps.Clone(snapshot)` inside the returned closure.
+
+- `cmd/entire/cli/agent/registry.go:97` — low. `ListAvailable` resolves each name with `Get`, whose miss branch calls `StringList()` → `ListAvailable()` → `Get(...)`, i.e. mutual recursion, purely to format an error string that `ListAvailable` immediately discards. When a name does vanish between `List()` and `Get()` — the case the doc comment explicitly anticipates ("a concurrent restore of a testing snapshot") — each vanished name pays a full re-resolution of the whole registry, and nothing bounds the recursion if entries keep disappearing. Since the error is thrown away, this should use a non-erroring lookup (a small unexported `lookup(name) (Factory, bool)` under the lock, or `IsRegistered` + direct map read) rather than `Get`.
+
+- `cmd/entire/cli/agent_group.go:152` — low. `resolveNamedExternalAgent` turns `discoverAndRegisterNamed`'s validation error into a hard command failure, so a mistyped name containing a path separator now bypasses the friendly listing entirely: `entire agent add ./claude-code` (or a shell-completion artifact like `bin/claude-code`) prints the raw `loading external agent "./claude-code": invalid external agent name "./claude-code": contains path separators` instead of `Unknown agent …` plus the available-agents listing and usage line that every other bad name gets. Treating the path-separator case (and `exec.ErrDot`, which `discoverAndRegisterNamed` also propagates as a non-`ErrNotFound` error when `.` is on `$PATH`) as "no plugin by that name" and falling through to `printWrongAgentError` would keep the miss path uniform.</result>
+<usage><subagent_tokens>140238</subagent_tokens><tool_uses>30</tool_uses><duration_ms>342342</duration_ms></usage>
+</task-notification>
+
+---
+
+send #4 to be fix by our fix-agent-list, that session should fix and ship it. Once is done, should report back.
+
+---
+
+how would you fix #3? Lets talk about it

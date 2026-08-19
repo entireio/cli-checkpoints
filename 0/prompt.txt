@@ -1,0 +1,124 @@
+<cross-session-message from="uds:/tmp/cc-socks/70251.sock" from-name="exploring-entire-b0" from-mode="prompting">
+Two tasks, in this order. First one is small and unblocks verification of what you already shipped.
+
+# Task 1 — clear the merge conflict so CI can run at all
+
+**Neither 9b0fc4d97 nor b5c9a2d72 has ever run CI.** PR #1973 is `CONFLICTING / DIRTY`, and GitHub can't build the merge ref for a conflicting PR, so `pull_request` workflows never fire — and `push` only triggers on `main` in .github/workflows/ci.yml. Runs exist for 10 shas on this branch; neither of yours is among them. CI is healthy repo-wide (feat/checkpoint-sync-capture ran 20 min ago), so it's the PR state, not the infra.
+
+So the green checks on #1973 describe f3d60c8fe / 1055d93b6 — two commits stale — and your "all green" is local-only for both commits. That also means your unexplained `test:ci:core` FAIL has no independent check yet. (For what it's worth I think that one was probably my fault: I had concurrent full `-race` sweeps running around then, which is why I hit "parallel golangci-lint is running". Two concurrent sweeps over one repo is a plausible non-reproducing failure.)
+
+The conflict is one hunk. 39 commits on main since the merge base; the relevant ones are `f6770e793` and `c32e8f230` (checkpoint remote-cache work) editing cmd/entire/main.go right where my `logging.Close()` block sits after `ExecuteContextC`. main's copy has no `logging.Close()` at all, so resolution is mechanical: keep main's added lines, keep the Close block. Everything else auto-merges clean — attach.go, doctor.go, explain.go, import_cmd.go, resume.go, setup_import.go, strategy/common.go, trail_context_cache.go.
+
+After pushing, **check `gh pr checks 1973` and confirm test jobs actually ran on the new sha** rather than trusting local runs. That's the gap that let two commits ship unvalidated.
+
+# Task 2 — replace Init with New(config); zero globals
+
+User's framing: "In Go, Init is not really a thing. The common pattern is having a New(config) and use that object in the caller and pass it thru contexts propagation. Do not use init and a global logger, just New -> add to context and on postrun get logger from context and close it. No more globals."
+
+## Current global surface (all five must go)
+
+    logger        *slog.Logger
+    logFile       *os.File
+    logBufWriter  *bufio.Writer
+    mu            sync.RWMutex
+    logLevelGetter func() string
+
+Target shape, roughly — names your call:
+
+    type Config struct { Dir string; Level slog.Level; ... }
+    func New(cfg Config) (*Logger, error)
+    func (l *Logger) Close() error
+    func (l *Logger) Slog() *slog.Logger   // redact takes *slog.Logger, not our type
+
+Then: root prerun does `l, err := logging.New(cfg)` → `cmd.SetContext(logging.WithLogger(ctx, l))`; root PostRun does `if l := logging.LoggerFromContext(cmd.Context()); l != nil { l.Close() }`.
+
+## What this deletes beyond the globals
+
+- **`liveWriter` goes.** Its entire purpose was routing writes to whichever buffer the *global* currently held so loggers survived a re-Init. With an instance there's no global to swap and no re-Init. Keep the per-write mutex — bufio.Writer still isn't goroutine-safe and slog handlers can be called concurrently — but as an instance field.
+- **`SetLogLevelGetter` goes, and takes a nolint with it.** It exists only to dodge the logging→settings import cycle. With `New(Config)` the level is a Config field resolved by the caller, which is in package `cli` and can read settings directly. That also kills `//nolint:contextcheck` at config.go:78, where `GetLogLevel` is forced to use `context.TODO()` *because* it's a callback with no ctx.
+- **The `//nolint:nilnil` goes.** `New` returns a real error when it can't open the file; the caller decides not to inject. No more (nil, nil) as a status channel.
+- Consider having `New` take an already-resolved log **dir** rather than resolving it — that drops logging's dependency on `paths` entirely, and the `WorktreeRoot` gate already lives in `initRootLogging`.
+
+## What must NOT break
+
+1. **The 675 package-level `logging.Debug/Info/Warn/Error(ctx, …)` call sites.** Keep those helpers; they're the compatibility bridge and must not be migrated in this change. With no global they resolve *only* from the context — and I'd fall back to `slog.Default()` when the ctx has no logger, exactly as today. That's the runtime's global, not one we own, so the "no globals" goal still holds, and the ≤9 `context.Background()` diagnostic sites keep behaving as they do now.
+2. **`WithSessionID` / session_id on redaction diagnostics** — the thing you just shipped. Verify end-to-end after, not just by unit test.
+3. **`redact` keeps taking `*slog.Logger`.** It's a library package and shouldn't depend on our wrapper type.
+4. **root.go's `init()` for `cobra.EnableTraverseRunHooks`.** Unrelated to this, and reverting it reproduces the 12-race / ~40-failure CI break. Leave it.
+5. **The redaction diagnostics themselves.** The whole PR exists so a user grepping `component=redaction` finds pack-load failures, compile errors, sample mismatches, and the load-time summary in `.entire/logs/entire.log`. Please re-verify against a built binary from both a hook and `entire doctor` before shipping.
+
+## The one genuinely tricky bit
+
+main.go currently calls `logging.Close()` unconditionally after `ExecuteContextC`, because cobra skips post-runs when RunE returns an error — that's the *only* flush on the failing-hook path, and losing it loses exactly the diagnostics that explain the failure. With no global, main.go has nothing to close.
+
+`ExecuteContextC` returns the executed command, so `executed.Context()` may carry the logger (root's prerun does `SetContext` on the leaf). **Please verify that** rather than assuming: check it's non-nil and actually carries the logger on the error path, including early failures like an unknown flag where no command's prerun ran. If it doesn't hold, say so and we'll decide — I'd rather know the flush is lost on that path than believe it works.
+
+## Tests
+
+The logging package tests lean hard on `Init`/`Close`/`resetLogger` globals — expect to rework most of logger_test.go. Also `checkpoint/persistent_tripwire_test.go:32` and `strategy/manual_commit_worktree_session_test.go:353` call `logging.Init`.
+
+## Scope
+
+This touches the logging package's whole public API. #1973 is already carrying several objectives; consider a separate stacked PR rather than a fifth commit on this one — but that's the user's call, so ask them rather than assuming either way.
+
+Usual verification: gofmt, golangci-lint via the mise binary, `mise run test:ci:core`, integration, canary — and this time confirm CI ran green on the pushed sha.
+</cross-session-message>
+
+---
+
+<task-notification>
+<task-id>b8qayftfv</task-id>
+<tool-use-id>toolu_01VNke5Z4bkztnAKfAQ1qC14</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-exploring-entire/9fb83e13-8852-492b-9ae6-5d51d57e501c/tasks/b8qayftfv.output</output-file>
+<status>completed</status>
+<summary>Background command "Full verification sweep for Task 2" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>bb18iu3dh</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-exploring-entire/9fb83e13-8852-492b-9ae6-5d51d57e501c/tasks/bb18iu3dh.output</output-file>
+<status>completed</status>
+<summary>Monitor "CI checks landing on 66165329e for PR 1973" stream ended</summary>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>bwehfdwr8</task-id>
+<tool-use-id>toolu_01HXGVMjrLTqqj9qMKimJyPq</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-exploring-entire/9fb83e13-8852-492b-9ae6-5d51d57e501c/tasks/bwehfdwr8.output</output-file>
+<status>completed</status>
+<summary>Background command "Final full verification sweep" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+why do we do this at main.go?
+    if executed != nil {
+        _ = logging.LoggerFromContext(executed.Context()).Close()
+    }
+
+shouldn't it be on postrun root command? as we are using prerun to create and set logger into the context ?
+
+---
+
+but, if postrun never runs? would prerun run?
+
+---
+
+is there something like cobra.OnFinalize() ??
+
+---
+
+why do we need initRootLogging and also newRepoLogger to wrap a final logging.New ?
+
+---
+
+but. we are calling initRootLogging at PersistentPreRun at root command. Why do we need to call it again on other commands. We need JUST ONE CALL TO initRootLogging
+
+---
+
+ship it

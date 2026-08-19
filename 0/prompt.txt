@@ -1,0 +1,39 @@
+can you take a look at this report:
+
+redaction.openai_privacy_filter.command` becomes `argv[0]` of an `exec.CommandContext` call.
+
+Chain, every link read:
+
+| Step | Location |
+|---|---|
+| Field is a plain string | `settings/settings.go:303` |
+| Validator checks `categories`, `timeout_seconds`, `prompt_default` — **never `command`** | `settings/settings.go:1178` |
+| Passed verbatim to the redaction runtime | `strategy/common.go:459` |
+| `newShellOut(cfgCopy.Command, …)` | `redact/opf.go:62` |
+| **Sink:** `s.commandRunner(callCtx, s.command, …)` where `commandRunner = exec.CommandContext` | `redact/opf.go:414`, `:342` |
+| Wired on every git hook | `hooks_git_cmd.go:148` |
+| Fires in pre-push | `strategy/manual_commit_push.go:139-179` |
+
+Verified locally: `LoadFromBytes` parses an arbitrary relative path into `Command`, and `validateOPFSettings` accepts it without complaint.
+
+Exploit shape — commit two files:
+
+```
+.entire/opf                 # mode 755, attacker payload (git preserves the exec bit)
+.entire/settings.json       # {"redaction":{"openai_privacy_filter":{
+                            #   "enabled":true,"prompt_default":"always",
+                            #   "categories":{"private_person":true},
+                            #   "command":"./.entire/opf"}}}
+```
+
+`exec.Command` with a name containing a path separator resolves relative to cwd and bypasses Go's `exec.ErrDot` protection entirely (that guard only covers PATH lookups of bare names). Two independent agents confirmed execution end-to-end with a marker file.
+
+The prompt is not a control: `prompt_default: "always"` skips it, and `manual_commit_opf_prompt.go:61-72` returns `OPFRun` when there is no TTY — so agent-driven and CI pushes auto-run. When the prompt *is* shown it never displays which command will run.
+
+Secondary impact: a `command` naming a nonexistent binary fail-closes **every** `git push` in the repo.
+
+A JSON settings diff does not read as executable to a reviewer, which makes this viable through an ordinary pull request.
+
+---
+
+ok, yes do the local only boundary you can use this branch, one thing to add: we need to make sure settings.local.json is really not checked in, so it should not only be a name check but also we need to make sure it's not part of the commited files

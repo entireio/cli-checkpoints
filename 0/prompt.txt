@@ -1,0 +1,49 @@
+ok, two more findings:
+
+1:
+
+Real latent bug: first-match-wins descent (Linux-relevant)
+
+This is the concrete answer to your question. treeHasPathFold descends into the first fold-matching entry and breaks:
+
+for j := range current.Entries {
+    if pathsEqualFold(current.Entries[j].Name, part) {
+        match = &current.Entries[j]
+        break            // first fold-match wins
+    }
+}
+...
+sub, err := current.Tree(match.Name)  // descends into that one only
+
+Git objects are case-sensitive, so a tree can legitimately hold both .Entire/ and .entire/ as distinct entries (and git sorts uppercase before lowercase, so .Entire is visited first). If the first fold-matching entry is the wrong one — a directory lacking the child, or a blob named .Entire (→ current.Tree returns ErrDirectoryNotFound → false) — the walk returns a false negative and never checks the sibling .entire/ that actually contains the file.
+
+This is asymmetric with the index side, which scans all entries and returns true on any match ("any fold-variant is tracked" — the correct semantics). The tree walk instead answers "the first-fold-matching chain contains it."
+
+Severity: low, and not a reachable bypass, because:
+- For PR delivery, the file is always in the index (checkout populatebeLocalSettingsIsVersioned checks the index first and returns true
+there — treeHasPathFold is never consulted.
+- The HEAD/tree path runs only when the file is index-absent-but-HEADed — a state the victim created locally, not one a PR can deliver (the
+PR's own rationale for why HEAD is the belt, not the suspenders).
+
+But it's a genuine correctness inconsistency in a security predicate, and it bites the moment the tree walk is reused somewhere HEAD is authoritative, or if the index
+short-circuit is ever refactored. It affects Linux (and any case-sensws victim) at the git-object level; it can't arise from two on-disksiblings on a case-insensitive FS.
+
+Suggested fix: don't break on the first fold-match. Either collect alach level and DFS into each, or for the terminal component check "anyentry folds," mirroring the index scan's "any match" semantics. A regtaining both .Entire/ (decoy, no child or a blob) and.entire/settings.local.json (real) would fail today.
+
+2: 
+
+NTFS (Windows): yes — plausible, PR-deliverable bypass
+
+Win32 silently strips trailing dots and spaces from filenames. This is a pure-ASCII, non-case equivalence, and it is exactly the class core.protectNTFS exists to defend — but core.protectNTFS only guards .git-family names, not .entire/settings.local.json.
+
+Attack:
+1. PR commits .entire/settings.local.json. (trailing dot) — or ...json  (trailing space) — with a malicious command, plus the payload.
+2. On a Windows clone, git checks the entry out; Win32 strips the trailing dot, so the working-tree file is .entire/settings.local.json (the canonical name).
+3. readConfined("settings.local.json") opens it → the attacker's command becomes the effective local override.
+4. The trust check scans index/HEAD and compares with strings.EqualFold(".entire/settings.local.json.", ".entire/settings.local.json") → false (trailing .). Verdict: untracked → localOwn → command executed. RCE.
+
+Critically, this defeats the index check — the authoritative one for PR delivery — not just the HEAD "belt." So unlike the treeHasPathFold first-match issue, this one is reachable by a pure pull request.
+
+One dependency to confirm with a real Windows repro: the attack requires that git-for-Windows materializes the checked-out file under the canonical (stripped) name (standard CreateFileW behavior — very likely) rather than writing the literal trailing-dot name via a \\?\ extended path. If git wrote the literal name, os.Root.Open("settings.local.json") would miss it and the attack fizzles. Given git-for-Windows's long history with core.protectNTFS precisely because Win32 stripping is the default, I rate this likely reachable — moderate-to-high severity, pending the repro. Trailing space behaves identically.
+
+(Other NTFS tricks I checked and dismissed: ADS ::$DATA is a read-side suffix, not a commit-side name, and readConfined opens the bare base name, so it isn't invoked; 8.3 short names are FS-generated aliases for long names, not the reverse, so committing SETTIN~1.JSO doesn't make settings.local.json resolve to it.)

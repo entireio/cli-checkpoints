@@ -1,0 +1,161 @@
+▎ Body updates are not supported via PATCH; use PUT /trails/{host}/{owner}/{repo}/{number}/body (or /repos/{repo_id}/trails/{number}/body) instead
+
+this is for the entire trail command when updating the body, can you fix this
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>af43697a97484f3cc</task-id>
+<tool-use-id>toolu_01LErnWNGA3oFN4484avKTQQ</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-trail-body-api-fix/7ef9975c-23a7-4291-9160-ebd3f7c5cc85/tasks/af43697a97484f3cc.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review of trail body fix" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Read the diff and the surrounding code (`trail_cmd.go`, `api/trail_types.go`, all 24 `checkTrailResponse` call sites, the `trail*Path` helpers, and the trail test fixtures). Two findings worth acting on; the other two questions come back clean.
+
+## Findings
+
+**1. `cmd/entire/cli/api/trail_types.go:176` — `TrailBodyResponse` is a second Go type for a server entity the package already models: `TrailBodyDocument`.**
+`TrailBodyDocument` (same file, line 89, doc comment: "the trail's description editor document") already models the body document on the read path, keyed on the same `textSnapshot` field, and is reached as `TrailResource.BodyDocument` (line 79) by `fetchTrailDescription` (`trail_cmd.go:435-451`). The PUT `.../body` response is the same document, just fuller. Use instead: either decode the PUT response into `api.TrailBodyDocument`, or extend `TrailBodyDocument` with `ID`/`DocumentKey`/`UpdatedAt` and share it between `TrailResource.BodyDocument` and the write path. Cost of not reusing: one server concept now has two Go types, so a later feature that wants to show the written-back snapshot or `updatedAt` has to pick one, and a server rename of `textSnapshot` (or an added field) needs both edited — with nothing in either doc comment pointing at the other. Note the cheaper alternative the file already contains: `deleteTrailByNumber` (`trail_cmd.go:1879-1887`) ends at `return checkTrailResponse(resp)` when nothing reads the body, which is exactly `sendTrailBody`'s situation — taking that route deletes the new type outright.
+
+**2. `cmd/entire/cli/trail_cmd.go:1646` — `path+"/body"` inlines a subresource route instead of adding the `trail*Path` helper every other trail subresource has.**
+The convention is one named helper per subresource, all built the same way: `trailApprovalsPath` (`trail_approval_cmd.go:16` → `trailNumberPath(...) + "/approvals"`), `trailThreadsPath` / `trailThreadPath` / `trailThreadMessagesPath` (`trail_comment_cmd.go:21-34`). Use instead: add `trailBodyPath(forge, owner, repo string, number int)` next to `trailNumberPath` (`trail_cmd.go:2133-2138`) and pass the finished path into `sendTrailBody`. Cost of not reusing: `sendTrailBody`'s `path` parameter means something different from its sibling `sendTrailPatch`'s (parent trail vs. the actual route written to), so the two adjacent helpers can't be read the same way; and the body route is invisible to a grep over the other trail route helpers — the one place route knowledge is currently centralized, in a change whose whole point is which route the body goes to.
+
+## Checked, nothing to flag
+
+- **`sendTrailBody` vs `sendTrailPatch` (and the wider send/check/decode pattern).** No generic helper exists to call. All 24 `checkTrailResponse` sites (`trail_comment_cmd.go`, `trail_approval_cmd.go`, `trail_review_cmd.go:1020-1435`, `trail_watch_cmd.go`, `trail_cmd.go`) open-code the same four steps; the `api` package offers only the primitives (`DecodeJSON`, `CheckResponse`, `Put`/`Patch`). `sendTrailBody` follows the established pattern rather than inventing one. Collapsing it and `sendTrailPatch` into one generic helper would be a *new* abstraction (they differ in verb, route, and decode target, and `Client` exposes no method-taking JSON call — `doJSON` is private), not reuse of an existing one, so I'm not asking for it. Fixing finding 1 via the `deleteTrailByNumber` shape shrinks the overlap to ~6 lines anyway.
+- **Tests.** The new `record` closure and `trailWrite` struct have no existing counterpart to reuse: `coreRecorder` (`logout_test.go:332`) is entire-core-specific and `trailShowTestServer` (`trail_cmd_test.go:1537`) only serves the show path. The repeated list-response stanza in the update tests predates this diff and no new copy was added. Worth noting only in passing: `TestRunTrailUpdateSendsTitleAsPatchAndBodyAsPut` (line 2035) and `TestRunTrailUpdateReportsAppliedMetadataWhenBodyWriteFails` (line 2166) now each hard-code the same three-route layout, so a future route change is a two-place edit — but their PUT behaviours diverge deliberately (record-and-succeed vs. 503), and a shared fixture would need a parameter for exactly that, so I'd leave it.</result>
+<usage><subagent_tokens>115540</subagent_tokens><tool_uses>20</tool_uses><duration_ms>158274</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ac40359f3ae5c36d3</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-trail-body-api-fix/7ef9975c-23a7-4291-9160-ebd3f7c5cc85/tasks/ac40359f3ae5c36d3.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review of trail body fix" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Verified my main suggestion compiles (scratch test removed; tree clean).
+
+## Findings (simplification only)
+
+**1. `cmd/entire/cli/trail_cmd.go:1550` — the second return value is pure pass-through of state the only caller already holds.**
+`buildTrailUpdateRequest` does not transform the description at all (no trim, no merge — unlike `Type`/`Assignees`); it just copies `inputs.Body` behind a pointer when `inputs.BodyChanged`. At the call site both halves are already in scope: `body` (local, line 1342, re-assigned by the interactive form at 1385) and `inputs.BodyChanged` (recomputed at 1394). Simpler: keep the single return, stop passing `Body`/`BodyChanged` into it, and write
+
+```go
+if inputs.BodyChanged {
+    if err := sendTrailBody(ctx, client, path, body); err != nil { ... }
+}
+```
+
+The `*string` also stops being needed the moment the bool is used directly — absent-vs-empty stays exactly as load-bearing, carried by `BodyChanged` instead of by nil. This deletes the `var newBody *string`, the `body := inputs.Body; newBody = &amp;body` copy at 1561 (inconsistent with `req.Status = &amp;inputs.Status` two lines up, which is safe because `inputs` is a value parameter), the `req, _ :=` churn in three tests, and collapses `TestBuildTrailUpdateRequestCanClearBody` + the body half of `TestBuildTrailUpdateRequestSeparatesBodyFromMetadata` into the flag check they actually assert. Cost of the current form: a maintainer reading `runTrailUpdateWithClient` has to hold two representations of "did the body change" (`inputs.BodyChanged` and `newBody != nil`) and trust they never disagree.
+
+**2. `cmd/entire/cli/trail_cmd.go:1585-1606` — the reflective `trailUpdateRequestHasFields` (plus its 30-line reflective table test) is replaceable by one comparison.** Every field of `api.TrailUpdateRequest` is a pointer, so the struct is comparable: `hasMeta := updateReq != (api.TrailUpdateRequest{})`. I confirmed by compiling and running it against the real type — zero equals zero, and a pointer-to-empty-string counts as set, i.e. byte-identical semantics to the `IsZero` loop. It also keeps the property the long comment is defending, more firmly: a future non-pointer *slice* field makes the struct non-comparable and the line stops compiling, forcing the author to decide, where reflection silently absorbs it. That removes the helper, its two paragraphs of comment, and `TestTrailUpdateRequestCountsEveryFieldAsMetadata` (whose reason to exist — "reflection might get a field wrong" — is gone, including its `require.NotZero` vacuity guard and its `field.Type.Kind() == reflect.Ptr` assertion). Cost today: ~45 lines of reflection across prod and test to compute something the language computes with `!=`.
+
+**3. `cmd/entire/cli/api/trail_types.go:176-181` and `trail_cmd.go:1654` — `TrailBodyResponse`'s four fields are decoded and thrown away, and the comment justifying them is not accurate.** Nothing reads `ID`/`DocumentKey`/`TextSnapshot`/`UpdatedAt` (grep: only the fake server in the test constructs it). The stated job — "distinguishes the documented response from an unrelated 200 (a proxy's HTML, say)" — is done by *any* JSON decode, not by these fields: `json.Unmarshal` neither requires them to be present nor rejects unknown ones, so `{}` and the real document are indistinguishable to this check. Simpler: `var ignored struct{}` (or `api.DecodeJSON(resp, &amp;struct{}{})`) in `sendTrailBody` with a one-line "only checks the 200 really is JSON", and drop the exported type; the test's `api.TrailBodyResponse{...}` literal becomes a plain map like the rejection literals next to it. Cost: a new exported API type plus a 4-line justification a maintainer must re-derive to discover it guarantees nothing.
+
+**4. `cmd/entire/cli/trail_cmd_test.go:1284-1291` — `TestTrailBodyRequestMarshalsAnEmptyMarkdown` earns its place, but not at four statements.** The property (no `omitempty` on `Markdown`) is project-owned, not stdlib, so keep the test; the marshal → unmarshal-into-`map[string]any` → compare-map round trip is the part testing `encoding/json`. Simpler:
+
+```go
+data, err := json.Marshal(api.TrailBodyRequest{Markdown: "", Overwrite: true})
+require.NoError(t, err)
+require.JSONEq(t, `{"markdown":"","overwrite":true}`, string(data))
+```
+
+Cost of the current form: the `map[string]any{...: true}` literal makes the reader reconstruct the wire shape mentally instead of reading it.
+
+**5. `cmd/entire/cli/trail_cmd_test.go:2048` — the `record` closure is worth keeping, but its signature carries two things it does not need.** The `t *testing.T` parameter shadows the `t` the closure already captures (it is defined inside the test), and the `bool` return exists only so both call sites can write `if !ok { return }`. Simpler: `record := func(r *http.Request) map[string]any` returning nil on a decode error, so callers read `got := record(r); if got == nil { return }` — and the PUT branch, which discards the map entirely, becomes `record(r)`. The `trailWrite` struct plus the single `require.Equal` on `[]trailWrite` is the right amount of machinery: it replaces two duplicated decode+lock blocks and pins method, path, and exact body in one readable literal.
+
+**6. `cmd/entire/cli/trail_cmd_test.go:42-45 — `trailBodyField` is now a one-use constant.** The diff removed its second call site, leaving only the `got[trailBodyField]` guard at line 2076. Inline `got["body"]` and move the "this must never appear on the metadata PATCH" sentence to the guard, where the reader is. Cost: a name + three-line comment at the top of the file that a maintainer must jump to in order to learn it means the literal `"body"`.
+
+Nothing else in the diff struck me as over-built: `sendTrailBody` mirrors `sendTrailPatch`'s shape, the `hasMeta`/`newBody` two-request block keeps its original nesting, and the long comments are explanatory rather than restating the code.</result>
+<usage><subagent_tokens>101465</subagent_tokens><tool_uses>11</tool_uses><duration_ms>162902</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a9976f68f0f070e76</task-id>
+<tool-use-id>toolu_014j4KVfuvenQge2qwueMvZe</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-trail-body-api-fix/7ef9975c-23a7-4291-9160-ebd3f7c5cc85/tasks/a9976f68f0f070e76.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review of trail body fix" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Verdict
+
+**No meaningful efficiency waste in this diff.** The change is, if anything, a small net reduction in work: the deleted `splitTrailUpdate` did a full `api.TrailUpdateRequest` struct copy plus two heap allocations (`b := *full.Body`, `&amp;api.TrailUpdateRequest{Body: &amp;b}`) on every invocation; the replacement does one 16-byte allocation. Round-trip count is unchanged for the non-interactive path and unchanged for the interactive path. Everything below is on the theoretical end; I found nothing a user could perceive.
+
+### Findings
+
+**1. `/Users/soph/.herdr/worktrees/cli/soph-trail-body-api-fix/cmd/entire/cli/trail_cmd.go:1654` — `sendTrailBody` decodes `TrailBodyResponse` and discards every field, and `textSnapshot` is the description it just sent, echoed back.**
+Cheaper: skip the `DecodeJSON` and let `defer resp.Body.Close()` handle it, or `io.Copy(io.Discard, resp.Body)` if the drain is what you want. **Theoretical.** `api.DecodeJSON` already reads the body to completion (`io.ReadAll` under a 16 MB limit), so the connection is fully drained exactly as it is at every other write call site in the repo (`trail_approval_cmd.go:81`, `trail_comment_cmd.go:341`, `trail_review_cmd.go:1428`) — the new code matches that convention, and connection reuse is moot anyway since this is the last request of a one-shot process. The only true waste is one `json.Unmarshal` plus four discarded string headers over a few KB, once per `trail update`.
+
+**2. `/Users/soph/.herdr/worktrees/cli/soph-trail-body-api-fix/cmd/entire/cli/trail_cmd.go:1453` and `:1458` — the metadata PATCH and body PUT are strictly sequential but have no data dependency, so they *could* be concurrent.**
+The PUT's path comes from `found.Number` (already in hand at 1442), and because `Overwrite: true` is used instead of `If-Match`, nothing from the PATCH response feeds the PUT. An `errgroup` would save one RTT. **Measurable in wall clock (one RTT, ~50–300 ms) but not worth doing.** The command has already spent one-to-two RTTs before reaching here (`findTrailByBranch`'s list paging, plus the interactive detail GET), so it's a fraction of total latency for a human-invoked command; and the sequence is what makes the deliberate partial-state message at 1459-1461 ("metadata was updated, but the body update failed") true — concurrency would replace one precise message with two possible failures and no ordering guarantee. Keep it sequential.
+
+**3. `/Users/soph/.herdr/worktrees/cli/soph-trail-body-api-fix/cmd/entire/cli/trail_cmd.go:444` — the interactive-only detail GET decodes the full trail resource through `decodeNormalizedTrailJSON`, which is three passes over the document (unmarshal into `any`, reflective map rebuild, re-marshal, unmarshal into `TrailResource`) to extract one string.**
+Pre-existing, not introduced here, but it sits on this command path. If the route the diff establishes also serves `GET .../{number}/body`, fetching that instead would return and decode only the body document (and would bypass `TrailResource.UnmarshalJSON` entirely, since `TrailBodyResponse` has no custom unmarshaler). **Theoretical** — `TrailResource` is flat with no nested collections, so three passes over a few KB is microseconds; and I cannot confirm from this repo that the route serves GET.
+
+Worth stating for the record on the question you raised: **the detail GET does not overlap with anything the body write needs.** It exists only to seed the interactive form (the list resource omits `bodyDocument`), it is skipped entirely when `--body` is passed non-interactively, and the write consumes nothing from it — so there is no round trip to eliminate by reordering or merging the two.
+
+**4. `/Users/soph/.herdr/worktrees/cli/soph-trail-body-api-fix/cmd/entire/cli/trail_cmd.go:1620` — same discarded decode as #1 in `sendTrailPatch`, but strictly more expensive, because `TrailUpdateResponse` embeds `TrailResource` and so routes through the three-pass normalizer.**
+Unchanged by the diff; listed only because #1 was modeled on it and inherited the pattern. **Theoretical**, same magnitude reasoning as #3.
+
+### Explicitly not findings
+
+- **`trail_cmd.go:1561` (`body := inputs.Body; newBody = &amp;body`)** — this copies a 16-byte string header, not character data; Go strings share their backing array. It happens once per command. The alternative `&amp;inputs.Body` is not cheaper — `inputs` already escapes to the heap via `req.Status = &amp;inputs.Status` at 1552.
+- **The `record` closure in `trail_cmd_test.go`** — it captures `mu` and `writes` by reference (they escape to the heap), exactly as the inline handler code it replaces already did, and its lifetime is the `httptest` server's, i.e. one test. It correctly takes `*testing.T` as a parameter rather than capturing it. No cost worth naming.
+- **Startup / hot paths** — nothing added. `sendTrailBody` is reachable only from `trail update`; no package-level state, no `init()`, no new work on any hook path.</result>
+<usage><subagent_tokens>106430</subagent_tokens><tool_uses>14</tool_uses><duration_ms>159105</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aba67e555a699b3cc</task-id>
+<tool-use-id>toolu_015JiumnieBjr1nmSfN9A1dz</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-trail-body-api-fix/7ef9975c-23a7-4291-9160-ebd3f7c5cc85/tasks/aba67e555a699b3cc.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review of trail body fix" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Verdict on the altitude questions
+
+**Command-layer routing is the right depth.** I grepped the whole repo: `api.TrailUpdateRequest` is referenced only in `trail_cmd.go` and `api/trail_types.go`; there are exactly five `client.Patch`/`client.Put` call sites and the other three write review-comment and thread-message bodies, not descriptions. The `api` package deliberately holds no trail write helpers at all — the only trail method on `*api.Client` is the read probe `TrailsEnabled` (`/Users/soph/.herdr/worktrees/cli/soph-trail-body-api-fix/cmd/entire/cli/api/trails.go:13`) — and every trail route in the CLI is spelled at the command layer (`trailNumberPath` at `trail_cmd.go:2130`, `trailThreadPath` in `trail_comment_cmd.go`, `trailReviewCommentPath` at `trail_review_cmd.go:1126`). The one thing that *must* be shared to stop this recurring — the absence of a `Body` field on `api.TrailUpdateRequest` — is in the `api` package, so a future caller cannot re-make the mistake. Right split.
+
+**No second caller, verified against the server.** The only other description write is `trail create`'s POST `body` field (`trail_cmd.go:1200`), and the server does serve it: `resolveTrailCreate` converts it with `editorjson.MarkdownToEditorJSON` and seeds the body document (`~/Work/entire/devenv/entire-api/internal/httpapi/trails_write.go:1198-1206`). `.entire/runners/trail-summary.json` declares `trail_field: "body"`, but that runner executes in entire-api, not this CLI. Nothing in `cmd/entire/cli/review/`, `review_bridge.go`, `trail_review_cmd.go`, `trail_comment_cmd.go`, runner/dispatch/MCP code, integration tests, or e2e writes a trail description.
+
+**Removing `Body` from `TrailUpdateRequest` pushes nothing onto callers.** The single caller already had to know about two requests — `splitTrailUpdate` existed precisely for that — so this swaps two PATCHes for a PATCH plus a PUT and gains a compile-time guard. Correct generalization.
+
+## Findings
+
+**1. `overwrite: true` is hardcoded where no caller can choose it, and it is the only unconditional clobber of a trail body in the platform.** `/Users/soph/.herdr/worktrees/cli/soph-trail-body-api-fix/cmd/entire/cli/trail_cmd.go:1645`
+
+The server built the safe path specifically for this caller: `trailBodyNotEmptyError` attaches the current ETag as a real response header on the 409 because, per its own doc, "this response is the only place they can ever learn it" (`entire-api/internal/httpapi/trails_body_write.go:95-98`), and the route's `If-Match` doc states "a MATCHING If-Match also satisfies the non-empty-document guard on its own — overwrite:true is not needed alongside it" (`trails_body_write.go:58`). So the diff's justification at `trail_cmd.go:1636-1643` ("the route's If-Match alternative cannot be used… its ETag is only ever handed out by this route's own response header") is inverted: the 409 is exactly the handout, engineered for a caller with no platform grant. The platform's *other* body writer takes the opposite policy — entire-api's runner (the one driven by `trail-summary.json`) writes `OnlyIfEmpty: true` (`entire-api/internal/runner/trailbody.go:165`) under the standing rule "an unwritten body stays seedable while a wrongly written one does not — so uncertainty skips."
+
+Deeper place: overwrite/If-Match is per-write policy, so it belongs with the caller — a parameter on `sendTrailBody`, or a small write helper that tries without overwrite and uses the 409's ETag. The explicit `--body` flag can pass unconditional; the interactive path at `trail_cmd.go:1367`, which prefills a form from a read and is a textbook read-modify-write, should not.
+
+Cost of leaving it: every CLI description write is an unconditional clobber with the server's guard disabled and no way for any caller to opt in. A description edited in the web editor while the interactive form is open is destroyed with no error, and the first CLI `--body` write permanently switches the `trail-summary` runner to `document_not_empty` skips for that trail.
+
+**2. Three hand-copied restatements of the server contract that the server's own commit already contradicts.** `cmd/entire/cli/api/trail_types.go:134-140`, `cmd/entire/cli/trail_cmd.go:1636-1643`, `cmd/entire/cli/trail_cmd_test.go:2077`
+
+The PUT `.../body` route this change targets and the 503→400 change landed in the *same* entire-api commit (`7be4c69d`, "feat(httpapi): a trail-body write endpoint a person can actually reach", 2026-08-19, on `main`). `validateUpdateTrailBody` now returns 400 with the message served verbatim, with a comment saying 503 "was wrong twice over… useCompactErrors redacts every 5xx, so the one thing the caller needed… was the one thing it could not see" (`entire-api/internal/httpapi/trails_write.go:355-363`). Consequence: no deployment can serve the PUT and still 503 the PATCH body field, so the new end-to-end test at `trail_cmd_test.go:2077` pins the CLI against a server that cannot exist, and two doc comments state a transient status code as permanent fact.
+
+Deeper place: pin the invariant (the metadata route carries no description; the type has no field) and let the server's actionable message reach the user — `api.CheckResponse` already surfaces it (`cmd/entire/cli/api/client.go:337-347`). Drop the status code and redaction story from the prose and from the fake handler's rejection.
+
+Cost: a doc comment that reads authoritative and is wrong the day it lands, and a test whose name promises "routes trail writes exactly as production does" while encoding the opposite.
+
+**3. The two-route plan is spread across four places in the command instead of being one value.** `cmd/entire/cli/trail_cmd.go:1550` (returns `(api.TrailUpdateRequest, *string)`), `:1444` (reflective `hasMeta`), `:1611` and `:1644` (two send helpers), with the route itself spelled inline as `path+"/body"` while every sibling trail route has a named builder near `:2130`.
+
+A function called `buildTrailUpdateRequest` now returns a request plus a loose out-of-band pointer, and the "is there anything to send / what partially landed" logic lives at the call site as three conditionals.
+
+Deeper place: one `trailUpdatePlan{meta api.TrailUpdateRequest; body *string}` with an `apply` that owns the ordering, the no-op case, and the partial-failure message — plus a `trailBodyPath` builder alongside `trailNumberPath`, which is also where the server's `/repos/{repo_id}/trails/{number}/body` twin would land if the CLI ever needs ID addressing.
+
+Cost is modest but real: a third description-adjacent route, or the `--overwrite` decision from finding 1, means touching build, run, and both send helpers again rather than one plan type.</result>
+<usage><subagent_tokens>150246</subagent_tokens><tool_uses>45</tool_uses><duration_ms>498414</duration_ms></usage>
+</task-notification>

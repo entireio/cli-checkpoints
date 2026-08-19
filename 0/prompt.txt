@@ -1,0 +1,520 @@
+<task-notification>
+<task-id>a093a086a090bd63f</task-id>
+<tool-use-id>toolu_01DxrmAiLHzMdAd3twgMAkEg</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alex-workspace-cli/56234c37-0cc1-40e1-9212-e0276fac59a7/tasks/a093a086a090bd63f.output</output-file>
+<status>completed</status>
+<summary>Agent "Explore coreapi ListRepos and callers" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I now have everything needed for the report.
+
+---
+
+## 1. `ListRepos`, `RepoPrimaries`, `RepoPlacement`
+
+**Method signature** — `internal/coreapi/oas_client_gen.go:5724`
+```go
+func (c *Client) ListRepos(ctx context.Context, params ListReposParams) (*ListReposOutputBody, error)
+```
+
+**Params type** — `internal/coreapi/oas_parameters_gen.go:246-256`
+```go
+type ListReposParams struct {
+	// Maximum entries to return; server may cap further.
+	PageSize OptInt32 `json:",omitempty,omitzero"`
+	// Opaque cursor from a previous response's nextPageToken.
+	PageToken OptString `json:",omitempty,omitzero"`
+	// Onboarded (default): repos in Entire; all: also include onboardable GitHub candidates.
+	Scope OptListReposScope `json:",omitempty,omitzero"`
+	// Optional: exact-match full_name (owner/repo, case-insensitive). Returns that repo's zero-or-one
+	// entries; pagination and scope are ignored.
+	Filter OptString `json:",omitempty,omitzero"`
+}
+```
+Note: there is no separate owner/repo field — `Filter` takes the whole `owner/repo` slug (case-insensitive exact match on `full_name`), not a GitHub-provider-scoped filter like `ListMirrorsParams`.
+
+**Return type** — `internal/coreapi/oas_schemas_gen.go:4650-4658`
+```go
+type ListReposOutputBody struct {
+	Schema          OptURI           `json:"$schema"`
+	NextPageToken   OptString        `json:"nextPageToken"`
+	Repos           []RepoIndexEntry `json:"repos"`
+	Truncated       bool             `json:"truncated"`
+	AdditionalProps ListReposOutputBodyAdditional
+}
+```
+
+**`RepoIndexEntry`** — `internal/coreapi/oas_schemas_gen.go:8141-8157`
+```go
+type RepoIndexEntry struct {
+	Candidate OptRepoCandidate `json:"candidate"`
+	// Deprecated: schema marks this property as deprecated.
+	Cell string `json:"cell"`
+	// Deprecated: schema marks this property as deprecated.
+	ClusterSlug string `json:"clusterSlug"`
+	FullName    string `json:"full_name"`
+	ID          string `json:"id"`
+	// Deprecated: schema marks this property as deprecated.
+	Jurisdiction    string           `json:"jurisdiction"`
+	Name            string           `json:"name"`
+	Placements      []RepoPlacement  `json:"placements"`
+	Primaries       OptRepoPrimaries `json:"primaries"`
+	Stars           OptInt64         `json:"stars"`
+	Visibility      string           `json:"visibility"`
+	AdditionalProps RepoIndexEntryAdditional
+}
+```
+Note the top-level `Cell`/`ClusterSlug`/`Jurisdiction` are deprecated in favor of per-`Placements` entries (confirmed by the `//nolint:staticcheck` comment in `cell_fanout.go:106`).
+
+**`RepoPlacement`** — `internal/coreapi/oas_schemas_gen.go:8291-8299`
+```go
+type RepoPlacement struct {
+	Cell            string              `json:"cell"`
+	ClusterSlug     string              `json:"clusterSlug"`
+	ID              string              `json:"id"`
+	Jurisdiction    string              `json:"jurisdiction"`
+	Mirror          bool                `json:"mirror"`
+	Status          RepoPlacementStatus `json:"status"`
+	AdditionalProps RepoPlacementAdditional
+}
+```
+`RepoPlacementStatus` — `internal/coreapi/oas_schemas_gen.go:8382-8389`
+```go
+type RepoPlacementStatus string
+
+const (
+	RepoPlacementStatusProcessing RepoPlacementStatus = "processing"
+	RepoPlacementStatusReady      RepoPlacementStatus = "ready"
+	RepoPlacementStatusFailed     RepoPlacementStatus = "failed"
+	RepoPlacementStatusSuspended  RepoPlacementStatus = "suspended"
+)
+```
+There is no `IsArchived`/`suspended-at` field on `RepoPlacement` itself (unlike `Mirror`) — health is purely the `Status` enum.
+
+**`RepoPrimaries`** — `internal/coreapi/oas_schemas_gen.go:8438-8442`
+```go
+type RepoPrimaries struct {
+	GitData         string `json:"git_data"`
+	Processing      string `json:"processing"`
+	AdditionalProps RepoPrimariesAdditional
+}
+```
+`Processing` is the placement `ID` (join key) that owns the repo's processing pipeline — i.e., the value to match against `RepoPlacement.ID` to pick the right entry out of `Placements`. It's wrapped as `OptRepoPrimaries` on `RepoIndexEntry.Primaries` (`internal/coreapi/oas_schemas_gen.go:7227-7240`), so it can be absent.
+
+There is no `id`/`cell`/`clusterSlug`/`jurisdiction` on `RepoPrimaries` directly — those live on the matched `RepoPlacement` (join `RepoPrimaries.Processing == RepoPlacement.ID`).
+
+## 2. `Cluster` type (used in `ListClusters`)
+
+`internal/coreapi/oas_schemas_gen.go:816-823`
+```go
+type Cluster struct {
+	ApiUrl          OptString `json:"apiUrl"`
+	IsDefault       bool      `json:"isDefault"`
+	Jurisdiction    string    `json:"jurisdiction"`
+	PublicUrl       string    `json:"publicUrl"`
+	Slug            string    `json:"slug"`
+	AdditionalProps ClusterAdditional
+}
+```
+Important: existing `cell_target.go` code joins on `PublicUrl` host (`matchClusterByHost`, `cell_target.go:259-274`), but the newer `RepoPlacement`/`cellGroup` code (`cell_fanout.go`) joins on **`ClusterSlug` ↔ `Cluster.Slug`** instead, because (per the comment at `cell_fanout.go:32-35`) "the catalog does not expose a cell field, so the slug — not the cell name — is the only reliable join key." This is the pattern to reuse for the new `RepoPlacement`-based resolution, not `matchClusterByHost`.
+
+## 3. Call sites of `resolveRepoCellTarget` / `resolveRepoCellPlacement`
+
+**`resolveRepoCellTarget`** (non-test):
+- `cmd/entire/cli/api_client.go:64`, inside `NewAuthenticatedEntireAPICellClient` (function name itself). This is called by `experts_cmd.go:34` (`newExpertsAPIClient`), i.e., `entire experts` — a **repo-scoped** command.
+  - Behavior on nil: `resolveRepoCellTarget` returning `nil` is explicitly the intended best-effort fallback path — `auth.NewEntireAPICellClient(ctx, insecureHTTP, target)` is called with `target == nil` and falls back to home-jurisdiction routing (per doc comment at `cell_target.go:54-59`). No error is surfaced to the user for this case; it's silent degradation, by design.
+
+**`resolveRepoCellPlacement`** (non-test):
+- `cmd/entire/cli/explain_repo.go:36`, inside `newCrossRepoReader`, called by `runCrossRepoExplain` (`explain_repo.go:167`), which backs `entire explain --repo &lt;owner/name&gt;` — also **repo-scoped** (a cross-repo checkpoint read keyed on a specific placement's `repo_id`).
+  - Behavior on error: `err != nil` is wrapped (`fmt.Errorf("resolve %s: %w", ownerRepo, err)`) and returned up through `newCrossRepoReader` → `runCrossRepoExplain` → to the user as a command failure. This one **propagates errors** (it's the "required" resolver, using `requiredCellResolveTimeout`, not the best-effort one) — it does not silently fall back, per its doc comment (`cell_target.go:122-132`): reusing `resolveRepoCellTarget`'s "fall back to home" behavior here would risk a repo_id/cell mismatch (wrong-cell 404).
+
+**Routing classification** (per `CLAUDE.md`'s "Entire-API Cell Routing" section): both `experts` and `explain --repo` are **repo-scoped → one cell** commands (the `resolveRepoCellTarget`/`resolveRepoCellPlacement` category). This is distinct from **user-scoped `/me`** commands (`activity`, `recap`), which route via `auth.NewEntireAPICellClient(ctx, insecureHTTP, nil)` keyed on the JWT's `home_jurisdiction` claim (see `runAuthenticatedActivityAPI` in `entireapi_client.go`) — those should NOT be touched by this change. `cell_fanout.go`'s `groupReposByCell`/`resolveCellBaseURLs` is a third, separate shape (repo-set fan-out across multiple cells, e.g. `code-search`), also out of scope here — it only references `resolveRepoCellTarget` in comments, doesn't call it.
+
+Test-only call sites are all in `cmd/entire/cli/cell_target_test.go` (lines 158, 169, 185, 199, 209, 221 for `resolveRepoCellTarget`; 239, 263, 289, 300, 318 for `resolveRepoCellPlacement`).
+
+## 4. `mirrorCloneProviderGitHub`, `listMirrorsForRepo`, `coreapi.Mirror`
+
+**`mirrorCloneProviderGitHub`** — `cmd/entire/cli/repo_clone.go:29`
+```go
+const mirrorCloneProviderGitHub = "github"
+```
+Other users besides `cell_target.go`: `entireapi_client.go:59-60` (forge-name normalization), `api_cmd.go:245,252` (the `entire api` passthrough's mirror lookup for `{owner}/{repo}` path templating).
+
+**`listMirrorsForRepo`** — `cmd/entire/cli/repo_clone.go:192-217`
+```go
+// listMirrorsForRepo returns every mirror placement of one upstream repo across
+// clusters. The list API filters by provider+owner server-side but has no repo
+// filter, so the repo match is applied client-side (owner is already lowercased
+// to match what the server persists).
+func listMirrorsForRepo(ctx context.Context, c mirrorLister, provider, owner, repo string) ([]coreapi.Mirror, error) {
+	all, err := fetchAllPages(ctx, func(ctx context.Context, cursor string) ([]coreapi.Mirror, string, error) {
+		params := coreapi.ListMirrorsParams{
+			Provider: coreapi.NewOptString(provider),
+			Owner:    coreapi.NewOptString(owner),
+		}
+		if cursor != "" {
+			params.PageToken = coreapi.NewOptString(cursor)
+		}
+		out, err := c.ListMirrors(ctx, params)
+		if err != nil {
+			return nil, "", fmt.Errorf("list mirrors: %w", err)
+		}
+		return out.Mirrors, out.NextPageToken.Or(""), nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	matched := make([]coreapi.Mirror, 0, len(all))
+	for _, m := range all {
+		if strings.EqualFold(m.Repo, repo) {
+			matched = append(matched, m)
+		}
+	}
+	return matched, nil
+}
+```
+It paginates ALL mirrors for a provider+owner (server-side filter is provider+owner only) then filters by repo client-side — this is exactly the N+1-scan cost `ListRepos` avoids via its exact-match `Filter`.
+
+**`coreapi.Mirror`** — `internal/coreapi/oas_schemas_gen.go:5834-5855`
+```go
+type Mirror struct {
+	// A URL to the JSON Schema for this object.
+	Schema OptURI `json:"$schema"`
+	// Physical cell the mirror's cluster runs in, e.g. aws-us-east-2.
+	Cell OptString `json:"cell"`
+	// Public host of the cluster serving this mirror.
+	ClusterHost    string    `json:"clusterHost"`
+	CreatedAt      time.Time `json:"createdAt"`
+	InstallationId OptInt64  `json:"installationId"`
+	IsArchived     OptBool   `json:"isArchived"`
+	IsPrivate      OptBool   `json:"isPrivate"`
+	Jurisdiction   OptString `json:"jurisdiction"`
+	MirrorId       string    `json:"mirrorId"`
+	Owner          string    `json:"owner"`
+	Provider       string    `json:"provider"`
+	Repo           string    `json:"repo"`
+	// Clone lifecycle: processing (cloning), ready (clonable), failed (initial clone failed), or
+	// suspended.
+	Status          OptMirrorStatus `json:"status"`
+	SuspendedAt     OptDateTime     `json:"suspendedAt"`
+	AdditionalProps MirrorAdditional
+}
+```
+Whether `listMirrorsForRepo`/`mirrorCloneProviderGitHub` stay in use elsewhere after the switch: yes — `repo_clone.go` itself (the `mirror use`/`clone` placement picker) and `api_cmd.go:252` (`entire api`'s path templating) both still call `listMirrorsForRepo` directly and are unrelated to `cell_target.go`'s change, so they should be left alone.
+
+## 5. Existing `ListRepos` usage examples
+
+Real call sites (outside `internal/coreapi`):
+- `cmd/entire/cli/search_cmd.go:506`
+- `cmd/entire/cli/repo_mirror.go:866`, `:910`, `:1101`
+- `cmd/entire/cli/search_v4.go:182`, `:234`
+
+Most relevant exact-match-by-slug example — `cmd/entire/cli/search_v4.go:229-238`:
+```go
+slug := strings.TrimPrefix(filter, "gh/")
+var matched []coreapi.RepoIndexEntry
+if strings.Contains(slug, "/") {
+	lookupCtx, cancel := context.WithTimeout(ctx, semanticSearchControlPlaneTimeout)
+	defer cancel()
+	out, err := s.coreClient.ListRepos(lookupCtx, coreapi.ListReposParams{Filter: coreapi.NewOptString(slug)})
+	if err != nil {
+		return nil, fmt.Errorf("semantic search: resolving repository %q: %w", filter, err)
+	}
+	matched = out.Repos
+} else { ... }
+```
+And `cmd/entire/cli/repo_mirror.go:1099-1105` (`runRepoMirrorGetByName`):
+```go
+func runRepoMirrorGetByName(cmd *cobra.Command, ref string) error {
+	return runCore(cmd, func(ctx context.Context, c *coreapi.Client) error {
+		out, err := c.ListRepos(ctx, coreapi.ListReposParams{Filter: coreapi.NewOptString(ref)})
+		if err != nil {
+			return err
+		}
+		if len(out.Repos) == 0 {
+			return fmt.Errorf("no repo matching %q visible from your login (GitHub repos you could onboard: `entire repo mirror list --available`)", ref)
+		}
+		...
+```
+Both confirm: `Filter` takes the full `owner/repo` slug string (not `gh/`-prefixed — strip that prefix first, as `search_v4.go:229` does), and a zero-length `Repos` result means "no match," not an error.
+
+For the `ULID` form (no slash), `ListRepos`' `Filter` only matches `full_name`, so `GetRepo(ulid)` (already used in `resolveRepoClusterHost`, `cell_target.go:186`) remains the right lookup for that branch — `coreapi.Repo.ClusterHost` is still populated on that path, but note `coreapi.Repo` (`GetRepo`'s return type, `oas_schemas_gen.go:7761-7780`) has no `Primaries`/`Placements` fields, so the ULID path cannot get `primaries.processing` from `GetRepo` — it would need to go through `ListRepos` too, or a different lookup, if placement-aware routing is wanted for ULIDs as well.
+
+## 6. `cell_target_test.go` structure / fake client
+
+The fake control-plane implementation, `fakeCellCore` — `cmd/entire/cli/cell_target_test.go:96-144`:
+```go
+// fakeCellCore is a stub control plane for resolveRepoCellTarget tests.
+type fakeCellCore struct {
+	repo        *coreapi.Repo
+	repoErr     error
+	mirrors     []coreapi.Mirror
+	mirrorsErr  error
+	clusters    []coreapi.Cluster
+	clustersErr error
+	// blockUntilCtxDone makes the lookups hang until the caller's deadline
+	// fires, standing in for a reachable-but-slow control plane. Off by
+	// default, so existing tests are unaffected.
+	blockUntilCtxDone bool
+}
+
+// waitIfBlocking simulates a core that accepts the connection and then stalls.
+func (f *fakeCellCore) waitIfBlocking(ctx context.Context) error {
+	if !f.blockUntilCtxDone {
+		return nil
+	}
+	&lt;-ctx.Done()
+	return ctx.Err()
+}
+
+func (f *fakeCellCore) GetRepo(context.Context, coreapi.GetRepoParams) (*coreapi.Repo, error) {
+	return f.repo, f.repoErr
+}
+
+func (f *fakeCellCore) ListClusters(context.Context) (*coreapi.ListClustersOutputBody, error) {
+	if f.clustersErr != nil {
+		return nil, f.clustersErr
+	}
+	return &amp;coreapi.ListClustersOutputBody{Clusters: f.clusters}, nil
+}
+
+func (f *fakeCellCore) ListMirrors(ctx context.Context, _ coreapi.ListMirrorsParams) (*coreapi.ListMirrorsOutputBody, error) {
+	if err := f.waitIfBlocking(ctx); err != nil {
+		return nil, err
+	}
+	if f.mirrorsErr != nil {
+		return nil, f.mirrorsErr
+	}
+	return &amp;coreapi.ListMirrorsOutputBody{Mirrors: f.mirrors}, nil
+}
+
+func withFakeCellCore(t *testing.T, f *fakeCellCore) {
+	t.Helper()
+	prev := newCellCoreClient
+	newCellCoreClient = func() (cellCoreClient, error) { return f, nil }
+	t.Cleanup(func() { newCellCoreClient = prev })
+}
+```
+Structure/conventions a test-writer should follow:
+- `fakeCellCore` is a plain struct with one `*Err error` field per method it stubs, scriptable per-test via struct literal (no mocking framework). It implements the `cellCoreClient` interface (`GetRepo`, `ListClusters`, `ListMirrors`) declared in `cell_target.go:38-42`. **To add `ListRepos` support, add a `repos *coreapi.ListReposOutputBody` / `reposErr error` pair and a `ListRepos(ctx, params) (*coreapi.ListReposOutputBody, error)` method**, then add `ListRepos` to the `cellCoreClient` interface in `cell_target.go`.
+- `withFakeCellCore(t, &amp;fakeCellCore{...})` swaps the package-level `newCellCoreClient` var (`cell_target.go:46`) for the duration of the test, with `t.Cleanup` restoring it — this is the seam every resolver test uses instead of hitting a real `coreapi.Client`.
+- `blockUntilCtxDone` + `waitIfBlocking` is the pattern for timeout tests (`TestResolveRepoCellPlacement_BoundedByDeadline`); only `ListMirrors` currently honors it since that's the only currently-blocking call in the "required" path — a `ListRepos`-based rewrite would need to move (or duplicate) that hook onto the new `ListRepos` stub for the same deadline test to still exercise it.
+- Helper `euClusters()` (`cell_target_test.go:146-151`) builds a canned 2-cluster catalog (`us`/`eu`) reused across tests — reuse this instead of inlining cluster fixtures.
+- Individual tests are plain top-level `func TestXxx(t *testing.T)` (not table-driven), one fake-core setup + one resolver call + assertions per test, `t.Parallel()` is notably **absent** from the fake-core tests (they mutate the shared package var `newCellCoreClient`, hence not parallel-safe) but **is** used in the pure-function tests (`TestDistinctActiveClusterHosts`, `TestMatchClusterByHost`, `TestClusterHostJoin`, `TestRequiredCellResolveTimeoutIsItsOwnBudget`) that don't touch the fake/global seam.</result>
+<usage><subagent_tokens>113766</subagent_tokens><tool_uses>26</tool_uses><duration_ms>131223</duration_ms></usage>
+</task-notification>
+
+---
+
+Check whether the coder subagent (fix-repo-cell-processing-placement) has completed. If so, review its report against the brief: verify claims (lint/test output, the regression-test before/after check, diff --numstat size, and the live trail list proof), then decide next steps (dispatch review, fix issues, or proceed to PR per pr-followup skill).
+
+---
+
+<task-notification>
+<task-id>afa25e10096351ee9</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alex-workspace-cli/56234c37-0cc1-40e1-9212-e0276fac59a7/tasks/afa25e10096351ee9.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement processing-placement cell resolution fix" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Summary
+
+Implemented the processing-placement fix per the brief, using TDD: wrote the failing tests first (confirmed compile-red), then made them pass, then fixed the two downstream test regressions the redesign caused.
+
+**Files changed** (all in `/Users/alex/workspace/cli/.worktrees/fix-repo-cell-processing-placement`):
+
+- **[cmd/entire/cli/cell_target.go](vscode://file//Users/alex/workspace/cli/.worktrees/fix-repo-cell-processing-placement/cmd/entire/cli/cell_target.go)** — core fix. `resolveRepoCellTarget` now returns `(*auth.CellTarget, error)` and resolves the owner/repo path via a new `resolveProcessingPlacement` (calls `ListRepos` with an exact `Filter`, reads `primaries.processing`, validates the matching placement isn't failed/suspended) joined to the cluster catalog by `ClusterSlug` via new `cellTargetForClusterSlug`/`matchClusterBySlug`. Deleted `resolveRepoClusterHost` and `distinctActiveClusterHosts` (the mirror-scanning code that refused whenever &gt;1 active cluster host existed). `resolveRepoCellPlacement` now shares `resolveProcessingPlacement` instead of "first active mirror." Added `ListRepos` to the `cellCoreClient` interface. `resolveRepoCellTarget` moved from `cellResolveTimeout` (5s, best-effort) to `requiredCellResolveTimeout` (15s) since it no longer degrades silently.
+- **[cmd/entire/cli/api_client.go](vscode://file//Users/alex/workspace/cli/.worktrees/fix-repo-cell-processing-placement/cmd/entire/cli/api_client.go)** — `NewAuthenticatedEntireAPICellClient` propagates the resolution error instead of ever calling `auth.NewEntireAPICellClient` with a nil/fallback target.
+- **[cmd/entire/cli/cell_fanout.go](vscode://file//Users/alex/workspace/cli/.worktrees/fix-repo-cell-processing-placement/cmd/entire/cli/cell_fanout.go)**, **[experts_cmd.go](vscode://file//Users/alex/workspace/cli/.worktrees/fix-repo-cell-processing-placement/cmd/entire/cli/experts_cmd.go)**, **[search_cmd.go](vscode://file//Users/alex/workspace/cli/.worktrees/fix-repo-cell-processing-placement/cmd/entire/cli/search_cmd.go)** — comment-only fixes for now-stale references to the old best-effort/fallback contract.
+- **[cmd/entire/cli/search_v4.go](vscode://file//Users/alex/workspace/cli/.worktrees/fix-repo-cell-processing-placement/cmd/entire/cli/search_v4.go)** — added `ListRepos` delegate to `cachedClusterClient` so it still satisfies `cellCoreClient` after the interface grew a method (compile requirement, not brief-listed but necessary).
+- **[cmd/entire/cli/cell_target_test.go](vscode://file//Users/alex/workspace/cli/.worktrees/fix-repo-cell-processing-placement/cmd/entire/cli/cell_target_test.go)** — rewritten per the brief: new fake `ListRepos`, `matchClusterBySlug` test, the 4-region regression test (`TestResolveRepoCellTarget_OwnerRepo_MultiHomedRepo_ResolvesProcessingCell`), the placement-order test proving id-based (not first-active) selection, and a shared error-case table covering not-found/no-processing/failed/suspended/list-errors/no-cluster-match for both resolvers.
+- **[cmd/entire/cli/lifecycle_test.go](vscode://file//Users/alex/workspace/cli/.worktrees/fix-repo-cell-processing-placement/cmd/entire/cli/lifecycle_test.go)** — `TestRunTrailEnablementRefresh_BoundedByTimeoutAgainstUnresponsiveHost` relied on the old fallback always reaching a live network dial; rewrote it to inject a blocking `cellCoreClient` fake instead, since a resolution failure now short-circuits before any dial.
+- **[cmd/entire/cli/integration_test/trail_resume_test.go](vscode://file//Users/alex/workspace/cli/.worktrees/fix-repo-cell-processing-placement/cmd/entire/cli/integration_test/trail_resume_test.go)** — the fake control-plane server didn't implement `/api/v1/repos`/`/api/v1/clusters`, which the old code never needed (it fell back to loopback home-jurisdiction routing on mirror-lookup failure). Added both endpoints. Also hit and fixed a real footgun: passing ogen-generated response structs by value to `json.Encode` breaks their optional-field omission (their `MarshalJSON` is pointer-receiver only), causing `unexpected end of JSON input`; fixed by passing pointers.
+
+**Verification performed:**
+- `mise run fmt &amp;&amp; mise run lint` — clean, 0 issues, on the final formatted tree.
+- `go test ./cmd/entire/cli/...` — all pass.
+- `go test -tags=integration -race ./cmd/entire/cli/integration_test/...` — all pass (76s).
+- `mise run test:ci` (full suite: unit + integration + E2E vogon/roger-roger canaries) — exit code 0, all green.
+- **Regression proof**: on pre-fix code, `TestResolveRepoCellTarget_MultiRegion_FallsBack` (the old 2-region test) passes asserting `target == nil` — i.e. pre-fix code provably falls back whenever a repo has &gt;1 active mirrored region, exactly the production bug. My new `TestResolveRepoCellTarget_OwnerRepo_MultiHomedRepo_ResolvesProcessingCell` (a 4-placement fixture reproducing the real entirehq/entire.io topology) passes on the fixed code. I could not run the literally-named new test against pre-fix code since it depends on new API shapes (`ListRepos`, `matchClusterBySlug`) that don't exist there — this is a structural redesign, not an additive change.
+- **Live prod proof**: `go run ./cmd/entire trail list --repo gh/entirehq/entire.io` now lists 10 real open trails sourced from the correct cell, instead of the old silent "No open trails found." wrong-region failure.
+
+**Branch size**: `git diff --numstat origin/main` → 9 files, 600 insertions / 331 deletions (churn 931, net +269). This is **over both the ~400 soft and 800 hard PR-sizing ceiling** on raw churn, driven almost entirely by test rewrites (`cell_target_test.go` 442 lines, `lifecycle_test.go` 74, the integration fixture 58) rather than production code — the actual implementation files (`cell_target.go`, `api_client.go`, `cell_fanout.go`, `experts_cmd.go`, `search_cmd.go`, `search_v4.go`) total 357 changed lines. I did not split this because the two follow-on test fixes (lifecycle_test.go, trail_resume_test.go) are direct, inseparable consequences of the same behavioral change and splitting them into a separate PR would leave the first PR failing CI. Flagging this per instructions rather than deciding it silently — worth a size discussion before merge.
+
+No deviations from the brief beyond the two unlisted-but-necessary fixes (search_v4.go's `cachedClusterClient.ListRepos`, and the lifecycle/integration test repairs), which were flagged in the brief's own risk language ("re-verify against the final diff... fix every remaining reference").</result>
+<usage><subagent_tokens>334066</subagent_tokens><tool_uses>136</tool_uses><duration_ms>2020725</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ae666effd0c8c4ed5</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alex-workspace-cli/56234c37-0cc1-40e1-9212-e0276fac59a7/tasks/ae666effd0c8c4ed5.output</output-file>
+<status>completed</status>
+<summary>Agent "Test coverage review of cell placement fix" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Good — clean restore, build/vet clean. Here is the coverage assessment.
+
+## Summary
+
+The rewrite of `cmd/entire/cli/cell_target_test.go` is a substantial improvement over the pre-fix suite: it replaces the old ambiguity-fallback tests with tests that assert loud errors on every failure mode, adds a dedicated regression test for the actual production bug (`entirehq/entire.io`-shaped 4-region topology), and shares a table (`processingResolutionErrorCases`) across both resolvers so their common `resolveProcessingPlacement` failure paths get symmetric coverage. The two downstream fixes (`lifecycle_test.go`, `trail_resume_test.go`) are not mechanical stub patches — each includes a comment explaining *why* the old mechanism (blackholed listener / no repos-index stub) would now pass for the wrong reason, and replaces it with a mechanism that still proves the intended property. That is good test hygiene, not just "make CI green."
+
+However, I found one real coincidence risk in the star regression test, verified by mutation rather than inspection.
+
+## Critical Gap (9/10)
+
+**`TestResolveRepoCellTarget_OwnerRepo_MultiHomedRepo_ResolvesProcessingCell` and `TestResolveRepoCellPlacement_MultiHomedRepo_ResolvesProcessingPlacement` do not actually prove selection-by-ID.** Both rely on the single shared fixture `fourRegionFixture()` (`cmd/entire/cli/cell_target_test.go:203-213`), which always places the processing placement (`mirror-us`) **last** in `entry.Placements`. I mutated `resolveProcessingPlacement` in `cmd/entire/cli/cell_target.go` to ignore `processingID` entirely and just return `entry.Placements[len(entry.Placements)-1]` — both "regression" tests still passed. So today these tests would not catch a bug where the resolver silently fell back to "last placement" (or, symmetrically, "first placement" would have been caught by index-0 but not this). Fix: add a variant of the fixture with the processing placement in a **middle** position (e.g., index 1 of 4), so no positional heuristic — first, last, or otherwise — can satisfy the test.
+
+## Important Improvements (5-7)
+
+1. **(6) No test exercises the "processing ID not in placement list" defensive branch** in `resolveProcessingPlacement` (`cmd/entire/cli/cell_target.go`, the final `return coreapi.RepoPlacement{}, fmt.Errorf("%s's processing placement %q is not in its placement list"...)`). It's explicitly called out in the code comment as a defensive case, but `processingResolutionErrorCases()` never constructs a fixture with `Primaries.Processing` naming an ID absent from `Placements`. Easy to add and would catch an accidental ID-comparison change (e.g. case sensitivity).
+
+2. **(5) `resolveRepoCellTarget`'s own timeout binding is untested.** `TestResolveRepoCellPlacement_BoundedByDeadline` proves `resolveRepoCellPlacement` gives up under `requiredCellResolveTimeout`, but `resolveRepoCellTarget` changed from the aggressive `cellResolveTimeout` (5s, best-effort) to the same patient `requiredCellResolveTimeout` — a significant behavior change now that it "is NOT best-effort" (per its doc comment) — yet no test hangs `fakeCellCore` against `resolveRepoCellTarget` (ULID or owner/repo path) the way `blockUntilCtxDone` does for `resolveRepoCellPlacement`. `TestRequiredCellResolveTimeoutIsItsOwnBudget` only compares the two constants, it never exercises `resolveRepoCellTarget` with a stalled core.
+
+3. **(5) ULID path: two failure branches in `resolveRepoCellTarget` are untested** — `repo.ClusterHost.Or("") == ""` (empty cluster host from `GetRepo`) and a `ListClusters` failure inside `cellTargetForClusterHost` (only the owner/repo path's `ListClusters` failure is covered, via `cellTargetForClusterSlug`). These are cheap to add given `fakeCellCore` already supports `clustersErr`.
+
+## Test Quality Issues (minor)
+
+- **(3) `resolveProcessingPlacement` trusts `out.Repos[0]` without checking `FullName`.** I confirmed this is *not* a bug: `ListReposParams.Filter`'s doc comment (`internal/coreapi/oas_parameters_gen.go:253-255`) guarantees "exact-match full_name..., zero-or-one entries," so relying on index 0 is a documented server contract, not a coincidence. Worth knowing, not worth a test — this is an API contract test would belong on the server side, not here.
+- **(3) `cellTargetFromCluster`'s missing-apiURL/missing-jurisdiction branch has no direct test** for either path (shared by `cellTargetForClusterHost` and `cellTargetForClusterSlug`). Pre-existing gap (confirmed via `git show origin/main:...cell_target_test.go` — it wasn't tested before this PR either), so not a regression, just an opportunity since the function is now shared by two call paths.
+- **`NewAuthenticatedEntireAPICellClient` (`cmd/entire/cli/api_client.go`)** now propagates `resolveRepoCellTarget`'s error instead of swallowing it, but there's no unit test at that layer (none existed before either). Low risk since it's a one-line `if err != nil { return nil, err }`, but it is the one production call site whose behavior actually flipped from silent-fallback to hard-fail, and it's the least-tested part of the change.
+
+## Positive Observations
+
+- The deadline test (`TestResolveRepoCellPlacement_BoundedByDeadline`) correctly moved its blocking point from the old `ListMirrors` fake to `ListRepos`, matching the real code's new first sequential call — verified this is still meaningful (it exercises the actual first blocking RPC in the new code path, and the shared `ctx` means a hang on the second call, `ListClusters`, would be caught by the same deadline without needing a separate test).
+- `lifecycle_test.go`'s `TestRunTrailEnablementRefresh_BoundedByTimeoutAgainstUnresponsiveHost` rewrite is exemplary: it explains in-comment exactly why the old blackholed-TCP-listener mechanism would now produce a false pass (early return before any dial), and replaces it with a `blockingCellCore` fake plus an "attempted ≥ 1" assertion to rule out that false-pass mode — the same discipline the task asked me to check for, already self-applied.
+- `trail_resume_test.go`'s new `/api/v1/repos` + `/api/v1/clusters` stub handlers are realistic (join by `ClusterSlug`, correct pointer-vs-value note for `MarshalJSON`) rather than the minimum needed to unblock compilation.
+- Error-path coverage for the shared `resolveProcessingPlacement` failure modes (not found, no processing primary, failed placement, suspended placement, `ListRepos` error, `ListClusters` error, no cluster match) is symmetric across both `resolveRepoCellTarget` and `resolveRepoCellPlacement` via the shared `processingResolutionErrorCases()` table — good DRY test design that also guarantees the two resolvers don't drift on error semantics.
+
+Files referenced: [cmd/entire/cli/cell_target.go](vscode://file//Users/alex/workspace/cli/.worktrees/fix-repo-cell-processing-placement/cmd/entire/cli/cell_target.go), [cmd/entire/cli/cell_target_test.go](vscode://file//Users/alex/workspace/cli/.worktrees/fix-repo-cell-processing-placement/cmd/entire/cli/cell_target_test.go), [cmd/entire/cli/lifecycle_test.go:2313](vscode://file//Users/alex/workspace/cli/.worktrees/fix-repo-cell-processing-placement/cmd/entire/cli/lifecycle_test.go), [cmd/entire/cli/integration_test/trail_resume_test.go](vscode://file//Users/alex/workspace/cli/.worktrees/fix-repo-cell-processing-placement/cmd/entire/cli/integration_test/trail_resume_test.go), [cmd/entire/cli/api_client.go:66](vscode://file//Users/alex/workspace/cli/.worktrees/fix-repo-cell-processing-placement/cmd/entire/cli/api_client.go).</result>
+<usage><subagent_tokens>137407</subagent_tokens><tool_uses>19</tool_uses><duration_ms>227405</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ae4cc65dbf2f09f4f</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alex-workspace-cli/56234c37-0cc1-40e1-9212-e0276fac59a7/tasks/ae4cc65dbf2f09f4f.output</output-file>
+<status>completed</status>
+<summary>Agent "Slop review of cell placement fix branch" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Comparison
+
+- **Current branch:** `fix-repo-cell-processing-placement`
+- **Base ref:** `main` (resolved as `origin/main`; `gh pr view` failed — remotes point at Entire mirrors, not a known GitHub host, so no open PR could be read)
+- **State:** no commits on the branch; all 9 files are uncommitted working-tree changes. Diff taken as `git diff origin/main` (600+/331-).
+
+Verified: `go build ./...`, `go vet`, `mise run lint` (0 issues), targeted unit tests and the trail-resume integration test under `-race` all pass. The core premise checks out against the source of truth — `internal/coreapi/spec/core.openapi.json` documents `/repos?filter=` as "exact-match full_name (owner/repo, case-insensitive)… zero-or-one entries", `RepoPrimaries.processing` is required, and `RepoPlacement.ID` is the same id `cell_fanout.go` already uses as a per-cell repo_id. The headline regression test is real: `fourRegionFixture` lists the processing placement **last**, so a "first active" resolver fails it.
+
+## Findings
+
+- [cmd/entire/cli/cell_target.go:172](vscode://file//Users/alex/workspace/cli/.worktrees/fix-repo-cell-processing-placement/cmd/entire/cli/cell_target.go:172) — `out.Repos[0]` is taken with no `FullName` check; the only thing making that safe is the exact-match filter, and nothing pins it: the unit fake signature is `ListRepos(ctx, _ coreapi.ListReposParams)` and the integration handler matches on `r.URL.Path == "/api/v1/repos"` while ignoring the query. Drop or widen the filter later and every test still passes while a repo-scoped read routes to another repo's cell. *Severity, Avoidability.*
+- [cmd/entire/cli/api_client.go:66](vscode://file//Users/alex/workspace/cli/.worktrees/fix-repo-cell-processing-placement/cmd/entire/cli/api_client.go:66) — fail-loud is applied at the shared constructor, but one caller is inherently best-effort: `trailRefreshAPIClient` → [trail_context_cache.go:265](vscode://file//Users/alex/workspace/cli/.worktrees/fix-repo-cell-processing-placement/cmd/entire/cli/trail_context_cache.go:265). A repo absent from the repos index can now never build a client, so `refreshTrailsEnabledCacheForScope` is never reached and the cache stays `unknown` — exactly the degraded state `trailRefreshSpawnThrottle`'s own comment describes, with SessionStart forking a refresh child per window indefinitely. The rewritten lifecycle test injects a *blocking* client, never a *failing* one, so nothing covers this. *Severity.*
+- [CLAUDE.md:649](vscode://file//Users/alex/workspace/cli/.worktrees/fix-repo-cell-processing-placement/CLAUDE.md:649) — the canonical routing contract still reads "maps a repo … via mirrors + the cluster catalog. Best-effort: any failure returns nil and the auth layer falls back to home-jurisdiction routing." The branch inverts both halves and rewrote ~10 code comments to say so, but left the doc agents read as truth. *Avoidability, Severity.*
+- [cmd/entire/cli/cell_target.go:41](vscode://file//Users/alex/workspace/cli/.worktrees/fix-repo-cell-processing-placement/cmd/entire/cli/cell_target.go:41) — `ListMirrors` stays in `cellCoreClient` with no remaining caller through the interface (`resolveCellBaseURLs` only calls `ListClusters`), and the fake's new comment asserts the opposite: *"cellCoreClient still declares it for other callers (e.g. cell_fanout.go's resolveCellBaseURLs)"*. Keeping it forced three method bodies to be carried along (`search_v4.go:297`, `blockingCellCore`, the fake). *Avoidability.*
+- [cmd/entire/cli/cell_target.go:211](vscode://file//Users/alex/workspace/cli/.worktrees/fix-repo-cell-processing-placement/cmd/entire/cli/cell_target.go:211) — a 4-line comment justifying a 4-line duplication. After the refactor both resolvers run the identical `newCellCoreClient` → `resolveProcessingPlacement` → `cellTargetForClusterSlug` sequence; one helper returning `(placement, target)` removes the duplication and the comment. *Avoidability.*
+- [cmd/entire/cli/integration_test/trail_resume_test.go:137](vscode://file//Users/alex/workspace/cli/.worktrees/fix-repo-cell-processing-placement/cmd/entire/cli/integration_test/trail_resume_test.go:137) — bespoke captured `var serverURL string` assigned after `NewServer` and read from handler goroutines, with a 5-line ordering justification, when the same package already has `serverURLWithPath(r, path)` ([login_test.go:420](vscode://file//Users/alex/workspace/cli/.worktrees/fix-repo-cell-processing-placement/cmd/entire/cli/integration_test/login_test.go:420)) deriving the base URL from `r.Host` with no shared state. *Avoidability.*
+- [cmd/entire/cli/cell_target.go:187](vscode://file//Users/alex/workspace/cli/.worktrees/fix-repo-cell-processing-placement/cmd/entire/cli/cell_target.go:187) — the "processing placement not in its placement list" branch is not in `processingResolutionErrorCases()`, and status `processing` (mid-onboarding, per the spec enum) is silently accepted with no test either way. *Prevalence (low).*
+- [cmd/entire/cli/cell_target.go:170](vscode://file//Users/alex/workspace/cli/.worktrees/fix-repo-cell-processing-placement/cmd/entire/cli/cell_target.go:170) — `"%s is not onboarded to Entire"` is also the message a caller without read access on an onboarded repo gets, since `ListRepos` scopes to readable repos. *Severity (low).*
+
+Not slop: the mirrors→repos-index switch, the slug-vs-host join split, and the lifecycle-test rewrite (the old `accepted &gt; 0` assertion genuinely can no longer hold, since `resolveRepoCellTarget` errors before any data-API dial). Comment density (~37% in `cell_target.go`, 28% of added lines) matches the pre-existing norm in `cell_fanout.go` and mostly carries real rationale, so it isn't the driver here.
+
+{"value": "medium", "rationale": "The routing fix itself is correct and spec-verified, but its two load-bearing assumptions are unpinned: resolveProcessingPlacement takes out.Repos[0] with no FullName check while both the unit fake and the integration handler ignore the filter param, and the best-effort→fail-loud flip was applied at the shared client constructor without accounting for the background trail-enablement caller, leaving that path untested and unable to ever reach a cached answer. Compounding avoidable work: CLAUDE.md:649 still documents the exact contract this branch inverts, a dead ListMirrors interface method is kept alive by a comment that misstates who needs it, and two bespoke patterns (self-justified duplication, a captured serverURL var) ignore precedent already in the same packages."}</result>
+<usage><subagent_tokens>144699</subagent_tokens><tool_uses>33</tool_uses><duration_ms>366672</duration_ms></usage>
+</task-notification>
+
+---
+
+Check whether the fixup coder subagent (fix-repo-cell-processing-placement, 8-item review-findings brief) has completed. If so, verify its claims independently (rerun fmt/lint/test myself as before), check the Fix 1 and Fix 4 proofs, review the diff for the specific fixes, then decide next steps: if clean, re-run slop-reviewer (required since original rating was "medium" per pr-followup), and if that comes back small/medium-addressed, commit and open the PR with the sizing note, then dispatch a review-steward per CLAUDE.md's PR workflow. If new issues turn up, triage and address before proceeding.
+
+---
+
+<task-notification>
+<task-id>ae493470537bbc85b</task-id>
+<output-file>/private/tmp/claude-501/-Users-alex-workspace-cli/56234c37-0cc1-40e1-9212-e0276fac59a7/tasks/ae493470537bbc85b.output</output-file>
+<status>completed</status>
+<summary>Agent "Fix review findings on cell placement fix" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>That's just a stale comment noting historical context (correctly updated to say the blocking is now on ListRepos, not ListMirrors) — not a leftover stub. Confirms the `ListMirrors` method removal is clean. Spot-checks line up with the report. Here's the confirmed restatement:
+
+## Final report — fix-up pass on `fix-repo-cell-processing-placement`
+
+All 8 fixes from the brief were applied in the existing worktree, uncommitted, as instructed. I independently spot-checked (`git status`, `git diff --numstat`, and direct diffs of `authcmd.go` and the `errRepoNotOnboarded` sentinel) — they match the subagent's claims exactly.
+
+**Fix 1 (critical, verified)** — `renderDataAPIAuthError` now takes `ctx` and only silences on `ctx.Err() != nil &amp;&amp; errors.Is(...)`, not on the wrapped error alone. All three call sites (`authcmd.go`, `trail_context_cache.go:488`, `trail_cmd.go:1010`) updated. New test `TestRenderDataAPIAuthError_DistinguishesCallerContextFromWrappedDeadline` in `cmd/entire/cli/authcmd_test.go` (verified this file exists, 1834 bytes). **Unplanned but correct fix found along the way**: `TestRunActivity_SilencesContextCanceled` in `activity_cmd_test.go` had been mocking a Canceled error without actually cancelling its context — only passed under the old buggy logic — and was corrected to actually cancel, matching real Ctrl+C behavior.
+
+**Fix 2** — identity check (`strings.EqualFold` on `entry.FullName`) added in `resolveProcessingPlacement`; new mismatched-repo test case; `fakeCellCore` now records `lastListReposParams` with a `Filter` assertion.
+
+**Fix 3** — `errRepoNotOnboarded` sentinel added and wrapped via `%w` (confirmed at `cell_target.go:161`, used at `trail_context_cache.go:300`); `runTrailEnablementRefresh` now saves `enabled=false` on that sentinel instead of leaving the cache unresolved forever. Timeout test left passing unmodified per instructions.
+
+**Fix 4** — `fourRegionFixtureProcessingInMiddle()` added; both multi-homed tests parametrized over both fixtures. Mutation-proof performed as requested: reintroducing "pick last placement" failed the new middle-position case while the old last-position case kept passing (exactly the gap being closed); reverted and confirmed byte-identical, full suite green again.
+
+**Fix 5** — `resolveRepoCellTarget`'s owner/repo path now delegates to `resolveRepoCellPlacement`; timeout wrap scoped to the ULID branch only; optional "mirror"→"cell" wording polish in `cellPlacementError` was done.
+
+**Fix 6 (verified)** — `ListMirrors` removed from `cellCoreClient` and its three stub implementations. Confirmed no leftover implementation exists — the one remaining hit in `cell_target_test.go:519` is a comment correctly describing history ("blocking now happens on ListRepos... not ListMirrors"), not a stub.
+
+**Fix 7** — CLAUDE.md's "Repo-scoped → one cell" bullet rewritten to describe PROCESSING-placement resolution and fail-loud behavior.
+
+**Fix 8** — all four cleanups done (`trail_resume_test.go` now uses `serverURLWithPath`, timeout comment reworded path-neutral, safety comment added on `Repos[0]`, `mirrorLister` doc comment renamed to its real callers).
+
+**Verification**: `mise run fmt &amp;&amp; lint` clean, `go build`/`vet` clean, `go test ./cmd/entire/cli/... -count=1` all pass, integration tests pass with `-race`, `mise run test:ci` full pass (56/56 + 4/4 e2e canary), live `entire trail list --repo gh/entirehq/entire.io` returned 10 real trails.
+
+**`git diff --numstat origin/main`** (I re-ran this myself, matches exactly):
+```
+13    4   CLAUDE.md
+12    1   cmd/entire/cli/activity_cmd_test.go
+14    8   cmd/entire/cli/api_client.go
+11    3   cmd/entire/cli/authcmd.go
+ 5    4   cmd/entire/cli/cell_fanout.go
+187 152   cmd/entire/cli/cell_target.go
+353 144   cmd/entire/cli/cell_target_test.go
+ 1    1   cmd/entire/cli/experts_cmd.go
+50    1   cmd/entire/cli/integration_test/trail_resume_test.go
+72   27   cmd/entire/cli/lifecycle_test.go
+ 3    2   cmd/entire/cli/repo_clone.go
+ 2    3   cmd/entire/cli/search_cmd.go
+ 2    2   cmd/entire/cli/search_v4.go
+ 1    1   cmd/entire/cli/trail_cmd.go
+11    1   cmd/entire/cli/trail_context_cache.go
+```
+plus new untracked `cmd/entire/cli/authcmd_test.go` (53 lines). That's ~730 net changed lines across 15 tracked files + 1 new file — over the ~400-line soft ceiling but this is a fix-up pass on already-reviewed work, not a fresh slice, so I'd treat "ship as one PR" as reasonable here rather than re-splitting.
+
+**Known follow-up, correctly left untouched**: `api_cmd.go`'s `resolveCurrentRepoID` and `entireapi_client.go`'s `firstActiveRepoID` still have the "any active placement" assumption — out of scope per the brief.
+
+Everything remains uncommitted in the worktree for your independent verification.</result>
+<usage><subagent_tokens>113079</subagent_tokens><tool_uses>4</tool_uses><duration_ms>1744776</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a2f0d7420b5909ed3</task-id>
+<tool-use-id>toolu_01N1u3G5WbC5U58xBrAdEbPf</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alex-workspace-cli/56234c37-0cc1-40e1-9212-e0276fac59a7/tasks/a2f0d7420b5909ed3.output</output-file>
+<status>completed</status>
+<summary>Agent "Re-run slop review after fixup pass" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Comparison
+
+- Current branch: `fix-repo-cell-processing-placement` (uncommitted working tree; `HEAD == origin/main == f3c9f1428`, no commits yet)
+- Base ref: `main` (`gh pr view` fails — no GitHub remote configured, so no open PR to read a base from)
+- Diffed: `git diff origin/main` + untracked `/Users/alex/workspace/cli/cmd/entire/cli/authcmd_test.go`
+
+Verified independently: `go build ./...`, `go vet`, full `go test ./cmd/entire/cli/` (111s, ok), `mise run lint` (0 issues). I also read the coreapi OpenAPI spec (`internal/coreapi/spec/core.openapi.json`) for `listRepos`, `RepoIndexEntry`, `RepoPlacement`, `RepoPrimaries` to check the resolver's assumptions rather than trusting the comments.
+
+## Findings
+
+- `cmd/entire/cli/cell_target.go:174` — the not-onboarded classification is narrower than the bug it was added for. `errRepoNotOnboarded` fires **only on zero rows**, but `filter` is specified as "pagination and **scope** are ignored", and `RepoIndexEntry` carries a `candidate` field precisely for GitHub repos that exist but are not onboarded. A candidate row has `FullName` set, empty `Placements` and unset `Primaries`, so it lands on the plain `"%s has no processing placement"` error at line 190 — not the sentinel — and `runTrailEnablementRefresh` falls into the generic "client unavailable" branch that never writes the cache. That is the original finding #2 unresolved for what is likely its most common real trigger (an un-onboarded repo), leaving one detached refresh child per throttle window indefinitely. Nothing in the resolver or its tests acknowledges `entry.Candidate`. *Severity, Avoidability* (the discriminator is a field on the struct already being read).
+- `cmd/entire/cli/cell_target_test.go:371` + `cmd/entire/cli/lifecycle_test.go:2393` — the sentinel's survival through the production error chain is untested. The lifecycle test fabricates `fmt.Errorf("...: %w", errRepoNotOnboarded)` at the `trailRefreshAPIClient` seam, and the "repo not found" table case asserts only `err == nil` failure, never `errors.Is(err, errRepoNotOnboarded)`. The real chain passes through three wraps including `cellPlacementError`, which *substitutes* a different error when `ctx.Err() != nil` — so a wrap changed to `%v`, or a reordering there, silently restores the cache-never-written regression with all tests green. *Severity (weak check on the exact behavior the fix exists to guarantee)*.
+- `cmd/entire/cli/cell_target.go:212` (`repoCellPlacement.RepoID`) — `explain --repo`'s `repo_id` silently switches ID space from `Mirror.MirrorId` to `RepoPlacement.ID`. Neither the spec nor any code in the repo documents these as the same identifier, and `entireapi_client.go:101` (`firstActiveRepoID`) still asserts the opposite invariant ("the repo id is stable across a repo's placements"). If the two ids differ, cross-repo explain 404s with no test able to catch it. Worth a one-line justification in the PR body rather than a comment claiming it as settled. *Severity*.
+- `cmd/entire/cli/cell_target.go:55-65` and `:222-228` — the same meta-paragraph ("the two functions exist separately only because their callers need different return shapes… not because the resolution logic differs") is written twice, once in each direction. Combined with `cell_fanout.go:128`'s "Unlike resolveRepoCellTarget, which **now** fails loudly" (a temporal reference that reads stale the moment this lands), this is commentary about the diff rather than about the code. The file's comment:code ratio went 0.58 → 0.67 in an already narrative-heavy file. *Prevalence (mild — a few spots, not pervasive)*.
+- `cmd/entire/cli/cell_target.go:190,199,238,241` — error strings nest the repo name 2–3 times, so a user sees `resolve processing placement for acme/widget: acme/widget has no processing placement`. Cosmetic. *Severity (low)*.
+
+## What the re-review confirms as genuinely fixed
+
+The identity check (`entry.FullName` EqualFold) is present with a table case *and* a `lastListReposParams.Filter` assertion, so the fake can't pass by returning the right fixture for the wrong query. `renderDataAPIAuthError`'s `ctx.Err()` gate is correct and both directions are tested, including `activity_cmd_test.go` being upgraded to cancel a real ctx instead of mocking `context.Canceled`. The middle-position fixture closes the positional-heuristic mutation gap for both resolvers. `ListMirrors` is off the `cellCoreClient` interface with no orphaned stubs (`isActiveMirror`/`listMirrorsForRepo` still have live non-mirror callers). `resolveRepoCellTarget`'s owner/repo body really does delegate now. The integration server's new `/api/v1/repos` + `/api/v1/clusters` handlers are the correct consequence of the routing change, and the `*ListReposOutputBody` pointer-receiver note there is a genuinely non-obvious hazard worth its comment.
+
+{"value": "small", "rationale": "The core change — routing repo-scoped reads to the control plane's processing placement and failing loudly instead of silently reading the wrong region — is correct, matches the BFF, collapses two duplicated resolvers into one, and is covered by mutation-resistant regression tests plus an updated integration fixture; lint and the full package suite pass. Residual issues are isolated: the not-onboarded sentinel only recognizes zero-row responses and so misses the `RepoIndexEntry.Candidate` shape the trail cache fix targeted, and no test proves that sentinel survives the real three-layer wrap chain."}</result>
+<usage><subagent_tokens>133459</subagent_tokens><tool_uses>35</tool_uses><duration_ms>434345</duration_ms></usage>
+</task-notification>

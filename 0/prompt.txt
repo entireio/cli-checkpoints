@@ -1,0 +1,147 @@
+/simplify
+
+---
+
+<task-notification>
+<task-id>a5a52bcbd624cc9c5</task-id>
+<tool-use-id>toolu_013f1VaKfamY44p25tPZt3Rh</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-fix-opf-safety-guard/8a318b37-9959-44b6-aab4-5e133a2514f6/tasks/a5a52bcbd624cc9c5.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## REUSE review — findings
+
+### 1. `pathIsVersioned` / `probePathIsVersioned` — nothing to reuse (verified)
+
+`cmd/entire/cli/settings/opf_command_trust.go:150,178`
+
+No tracked-path helper exists anywhere reachable:
+- `cmd/entire/cli/gitrepo` exports exactly three symbols: `OpenCurrent(ctx)`, `OpenPath(root)`, `Status(ctx, repo)`. Nothing index- or HEAD-related.
+- `cmd/entire/cli/paths` exports no git-object API at all (only worktree-root/relpath string work).
+- `checkpoint` and `strategy` both transitively depend on `settings` — confirmed with `go list -deps ./cmd/entire/cli/checkpoint | grep -c cli/settings` → 1, same for `strategy`. Unreachable regardless of what they contain.
+
+Closest existing thing is `strategy.isCheckpointRemoteCommitted` (`cmd/entire/cli/strategy/push_common.go:308`), which answers a HEAD-presence question by shelling out `git show HEAD:.entire/settings.json`. Unreachable, and worse (subprocess + no index tier).
+
+**Anti-recommendation worth recording in the PR:** a reviewer will be tempted to say "use `gitrepo.Status`, untracked files show up there." Don't. CLAUDE.md documents `Worktree.Status()` as the most expensive git read on the hook paths (cost scales with working-set size, not with the question), and this probe runs from `settings.Load` on every hook.
+
+**Optional placement note (low priority, not reuse):** `probePathIsVersioned` is now the only raw `repo.Storer.Index()` + `tree.FindEntry` in the codebase outside `strategy`/`checkpoint`, in a package whose job is config parsing. `gitrepo` is documented as the single source of truth for repository access, and moving it there as `gitrepo.PathIsVersioned(worktreeRoot, relPath string) (bool, error)` is cycle-free (`go list -deps ./cmd/entire/cli/gitrepo` → `paths`, `gitrepo` only). That also puts the reftable/alternates-aware open and the index/HEAD read in the same package that documents why they're needed.
+
+### 2. Index/tree lookup wrapper — nothing to reuse (verified)
+
+Only two other `Storer.Index()` / `FindEntry` sites exist:
+- `cmd/entire/cli/checkpoint/fetching_tree.go:110` — wraps `FindEntry` solely to trigger lazy blob fetch on checkpoint trees. Wrong shape, and unreachable.
+- `cmd/entire/cli/strategy/content_overlap.go:225-238` — inlines `repo.Storer.Index()` and hand-builds `map[string]plumbing.Hash`. Unreachable.
+
+Genuinely nothing.
+
+### 3. `rawObject` — nothing in `jsonutil`, but two real consolidations inside reach
+
+`cmd/entire/cli/settings/opf_command_trust.go:112`
+
+`jsonutil` exports only `MarshalIndentWithNewline`, `MarshalWithNoHTMLEscape`, `WriteFileAtomic` — no navigation helper. Confirmed `strategy.readSubObject` is unreachable (strategy → settings).
+
+**3a. `CheckpointRemoteIsLocalOnly` duplicates `rawObject` verbatim.** `cmd/entire/cli/settings/settings.go:1518-1526`:
+
+```go
+optionsRaw, ok := raw["strategy_options"]
+if !ok { return false }
+var options map[string]json.RawMessage
+if err := json.Unmarshal(optionsRaw, &amp;options); err != nil { return false }
+_, ok = options["checkpoint_remote"]
+return ok
+```
+
+Cost: 8 lines, same-file, same-package, added in this diff's neighbourhood. Replace with `_, ok := rawObject(raw, "strategy_options")["checkpoint_remote"]; return ok`.
+
+**3b. Better: both call sites want "is this nested key present?".** Add next to `rawObject`:
+
+```go
+func rawHasKey(parent map[string]json.RawMessage, path ...string) bool
+```
+
+`localSetsOPFCommand`'s body becomes `rawHasKey(raw, "redaction", "openai_privacy_filter", "command")`; `CheckpointRemoteIsLocalOnly`'s tail becomes `rawHasKey(raw, "strategy_options", "checkpoint_remote")`. Both functions are now *exactly* "verified-untracked local file sets key X", so the shared name should reflect the key-presence question, not the object walk.
+
+**3c. Cross-package (medium value, optional):** `strategy.readSubObject` (`cmd/entire/cli/strategy/manual_commit_opf_prompt.go:185-199`) is the write-path twin — same walk, different miss policy (fresh map + warn, because the caller then overwrites the slot). strategy → settings is the legal direction. Export one primitive and derive both:
+
+```go
+// settings
+func RawSubObject(parent map[string]json.RawMessage, key string) (map[string]json.RawMessage, bool)
+```
+`rawObject` = discard the bool; `readSubObject` = `if !ok { log; return map[string]json.RawMessage{} }`.
+
+**Do not fold in** `mergeRedaction` / `mergeOPFSettings` / `mergePIISettings` / `mergeSummaryGeneration` (settings.go:1194, 1260, 1303, 1130). They decode the same shape but *propagate* parse errors via `unmarshalField`; `rawObject` swallows them. Merging those would silently downgrade config validation.
+
+### 4. Memoization — nothing generic to reuse; one concrete thing to copy
+
+`cmd/entire/cli/settings/opf_command_trust.go:138-141`
+
+No memo utility exists. Every cache is hand-rolled with the same map+mutex shape: `paths.worktreeRootCache` (`paths/paths.go:56`), `checkpoint.commonDirCache` (`checkpoint/git_common_dir.go:26`), `session`'s git-common-dir cache, `strategy/git_remote_cache.go`, `strategy.protectedDirsOnce` (`strategy/common.go:390`). No `sync.OnceValue`/`OnceValues` anywhere in the tree. The new code's "cache successes only, a failure may be transient" rationale is word-for-word the `commonDirCache` doc comment — that's convergent, not copyable.
+
+**The one thing to borrow:** every precedent ships a test reset hook — `paths.ClearWorktreeRootCache()` (`paths/paths.go:102`), `session.ClearGitCommonDirCache()` (`session/state.go:799`), `strategy.resetProtectedDirsForTest()` (`strategy/common.go` — its doc comment explicitly explains why an unresettable process-wide cache is a testing hazard). `versionedPaths` has none, and the tests work around it by relying on distinct `t.TempDir()` keys. Add `ClearVersionedPathCache()` mirroring `paths.ClearWorktreeRootCache`.
+
+### 5. Two rejection mechanisms → should be one; no existing pattern to adopt
+
+`cmd/entire/cli/settings/settings.go:73` (`localLayerRejection`), `:320-321` (`rejectedCommand`/`rejectionReason`), `:335` (`CommandRejection`), `:482` (`LocalLayerRejection`); consumers at `cmd/entire/cli/strategy/common.go:411-425` and `:473-490`.
+
+There is no deferred-diagnostic pattern to reuse. `doctor` is a flat list of hand-written `check*(cmd *cobra.Command)` functions (`doctor.go:533`, `:599`, `:640`) with no registry and no diagnostic type; the only `Warnings []string` fields in the tree (`plugin_deps.go:43`, `search/search.go:503`) are unrelated command-local结构. So: build one small mechanism, don't hunt for one.
+
+**Concrete:** collapse three unexported fields + two accessors + two warning blocks into one slice on `EntireSettings`:
+
+```go
+type LoadRejection struct{ Subject, Value, Reason, Remediation string }
+func (s *EntireSettings) LoadRejections() []LoadRejection
+```
+
+Cost of not doing it: the two consumer blocks in `common.go` are near-identical 14-line stanzas differing only in strings, and the next setting the loader has to drop needs a third field, a third accessor, and a third block. Bonus fix it forces: `LocalLayerRejection` returns a bare reason while its remediation string (`git rm --cached …`) is stranded in `strategy/common.go:417`, whereas `CommandRejection` keeps value+reason in `settings` — the struct makes both packages agree on where that knowledge lives.
+
+Follow-on this unlocks: `doctor` already calls `strategy.EnsureRedactionConfigured()` (`doctor.go:66`), so today it only inherits the TTY stderr line. With `LoadRejections()` it can report both rejections as a first-class check alongside `checkCodexHookTrust`.
+
+### 6. Test helpers — real gap in `testutil`, and `testutil` already pays for it
+
+`cmd/entire/cli/integration_test/opf_command_trust_test.go:18` (`forceGitAdd`), `cmd/entire/cli/settings/opf_command_trust_test.go:51` (`runGit`)
+
+`testutil` has **no** force-add and **no** raw-git runner. `testutil.GitAdd` (`testutil/testutil.go:84`) goes through go-git `worktree.Add`, which genuinely has no force option — the new comment is accurate.
+
+But `testutil.go` itself inlines the identical 6-line `exec.Command("git", …) + cmd.Env = GitIsolatedEnv() + CombinedOutput + t.Fatalf` body **four** times: `CreateBranch:164`, `AddRemote:175`, `GitUpdateRef:194`, `GitReset:205`. `TestEnv.GitRm` (`integration_test/testenv.go:1240`) is a fifth copy. The two new helpers are copies six and seven.
+
+**Concrete — add to `cmd/entire/cli/testutil/testutil.go`:**
+
+```go
+func RunGit(t *testing.T, dir string, args ...string) string
+func GitAddForce(t *testing.T, repoDir string, paths ...string) // RunGit(t, repoDir, append([]string{"add", "-f"}, paths...)...)
+```
+
+Then delete `forceGitAdd` → `testutil.GitAddForce`, and delete the settings-test `runGit` → `testutil.RunGit` (that test needs the generic form: it runs `commit`, `rm --cached`, `worktree add`, `config`). Cycle-free: `go list -deps ./cmd/entire/cli/testutil` → `paths`, `gitrepo` only, and `settings/opf_command_trust_test.go:13` already imports it.
+
+Free fix it drags along: `testutil.GitCheckoutNewBranch:134` is the one exec helper that **omits** `cmd.Env = GitIsolatedEnv()`. Routing everything through `RunGit` makes that inconsistency impossible.
+
+### 7. Three-way log+stderr duplication in `EnsureRedactionConfigured` — name it `warnUser`
+
+`cmd/entire/cli/strategy/common.go:421` (local-layer, new), `:461` (redactor packs, pre-existing), `:487` (OPF command, new)
+
+Verified there is no existing helper: those three are the *only* `interactive.IsTerminalWriter(os.Stderr)` call sites in the whole non-test tree, and `logging` exports only `Debug/Info/Warn/Error` + `WithComponent/WithAgent`. Each block re-derives `logging.WithComponent(ctx, …)`, calls `logging.Warn`, re-tests the terminal, and `Fprintf`s a `[entire] …` line.
+
+**Concrete — add to `strategy/common.go` beside `EnsureRedactionConfigured`:**
+
+```go
+// warnUser logs a warning and, on a real terminal, echoes a one-line
+// breadcrumb to stderr. Hooks log to .entire/logs/entire.log, where most
+// users never look.
+func warnUser(ctx context.Context, component, logMsg, userMsg string, attrs ...any) {
+	logging.Warn(logging.WithComponent(ctx, component), logMsg, attrs...)
+	if interactive.IsTerminalWriter(os.Stderr) {
+		fmt.Fprint(os.Stderr, userMsg)
+	}
+}
+```
+
+All three collapse to one call each (the packs one included — folding the pre-existing case is what makes this worth doing rather than just deduping the two new blocks). `os`, `fmt`, `slog`, `interactive`, `logging` are all already imported.
+
+---
+
+### Two mechanical notes outside the reuse brief
+
+- **`cmd/entire/cli/settings/settings.go:475-486`** — `LocalLayerRejection` was inserted *between* `InvestigateConfig`'s doc comment and its `func`. Godoc now attributes "returns the configured investigate config…" to `LocalLayerRejection`, and `InvestigateConfig` (settings.go:488) is undocumented. Move the method below `InvestigateConfig`.
+- **Working tree ≠ reviewed commits:** `opf_command_trust.go` currently carries uncommitted debug scaffolding (`ProbeCount`/`LoadCount` atomics, `DumpCounters()` reading `ENTIRE_PERF_COUNT`, imports of `log`/`os`/`sync/atomic`, plus an out-of-order import block that won't survive `mise run fmt`). Not part of `main...HEAD`; flagging only so it doesn't get committed by accident.</result>
+<usage><subagent_tokens>154718</subagent_tokens><tool_uses>55</tool_uses><duration_ms>452663</duration_ms></usage>
+</task-notification>

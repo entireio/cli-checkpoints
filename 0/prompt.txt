@@ -1,0 +1,105 @@
+can you review the PR / Trail for this branch
+
+---
+
+what does that mean: I'd want the silent-drop path given some channel before merge;
+
+---
+
+ok, but it's fine approving this and doing 1 in a new PR, right?
+
+---
+
+<task-notification>
+<task-id>ae3c41fd072482e34</task-id>
+<tool-use-id>toolu_0135VeBb982Jx1TLhC9JFbLb</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-fix-redact-log-routing/08f4dc99-2223-4c44-9982-deb25d8b9923/tasks/ae3c41fd072482e34.output</output-file>
+<status>completed</status>
+<summary>Agent "/code-review 1973 high" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have enough to produce findings. Here they are.
+
+```json
+[
+  {
+    "file": "cmd/entire/cli/agent/opencode/opencode.go",
+    "line": 200,
+    "summary": "Removing the process-global logger silently re-routes every `logging.*` call whose context is not descended from the command context back to stderr — `OpenCodeAgent.ReadSession`'s WARN is one of them, on a live hook path.",
+    "failure_scenario": "An OpenCode session whose JSON has an unparseable file list: `ReadSession` calls `logging.Warn(context.Background(), \"failed to extract modified files…\")`. Before this PR that reached `.entire/logs/entire.log` via the package-global logger set by `initHookLogging`. Now `LoggerFromContext(context.Background())` is nil, so `log()` falls back to `slog.Default()` and the line is printed on the hook's stderr (agent-visible noise) and is absent from the log file — exactly the failure mode this PR exists to fix. `factoryaidroid/transcript.go:315` was converted to take a ctx; the equivalent sites in opencode were not."
+  },
+  {
+    "file": "cmd/entire/cli/root.go",
+    "line": 108,
+    "summary": "`Logger.Close()` is documented as the only reporter of a failed log-file open, but every production call site discards its error, and `ensureLogger` discards `newLogger`'s error too — so an unwritable `.entire/logs` drops every diagnostic with no signal at all.",
+    "failure_scenario": "`.entire/logs` is root-owned / read-only / occupied by a regular file (or the repo is on a read-only mount). `logging.New` succeeds, `open()` fails on first write and stores `openErr`, every line is dropped returning `(len(p), nil)`, and the error is surfaced only by `Close()` — which is `_ =`-discarded here and again at `cmd/entire/main.go:99`. `ensureLogger` (config.go:110) likewise `return`s on `newLogger` error without a word. Net effect: the user greps `.entire/logs/entire.log` for `component=redaction`, finds nothing, and concludes their rules never ran — the original support report, reproduced by the fix."
+  },
+  {
+    "file": "redact/pii.go",
+    "line": 159,
+    "summary": "Injecting a file-backed logger into `PIIConfig` turns the lazily-recomputed custom-pattern compile warning into per-call log-file spam, because `detectPII` re-runs `compilePIIPatterns` on every string whenever the compiled list came back nil.",
+    "failure_scenario": "Settings with `redaction.pii.enabled: true`, `email: false`, `phone: false`, `address` absent, and one invalid `custom_patterns` entry (e.g. `\"bad\": \"PII_[unclosed\"`). `compilePIIPatterns` returns nil (no builtins enabled, the only custom pattern dropped), so `cfg.patterns == nil` and line 159 recompiles on *every* `detectPII` call, emitting one `\"skipping invalid custom PII pattern\"` WARN per redacted string. Redacting a multi-megabyte transcript at Stop/post-commit writes tens of thousands of identical WARN lines into `.entire/logs/entire.log` (and into `doctor bundle`). Previously the same loop warned to stderr, which was noisy but not persisted."
+  },
+  {
+    "file": "cmd/entire/cli/investigate/cmd.go",
+    "line": 326,
+    "summary": "`runInvestigate` used to call `logging.Init` unconditionally precisely so slog lines could not corrupt the TUI frame; that protection is now conditional on `settings.IsSetUpAny`, a gate investigate itself does not require.",
+    "failure_scenario": "A git repo where Entire was never enabled (no `.entire/settings.json` and no `.entire/settings.local.json`). `entire investigate` runs — it only checks `paths.WorktreeRoot` — so the root `PersistentPreRun` returns before `ensureLogger` and the command's context carries no logger. Any per-turn `logging.Info`/`Warn` during the run falls through to `slog.Default()`, i.e. stderr, interleaving with the Bubble Tea dashboard and corrupting the display. The deleted comment (`\"stderr during a TUI run would interleave with the dashboard frame\"`) named this exact failure; nothing in the new design re-establishes the guarantee for a not-yet-set-up repo."
+  },
+  {
+    "file": "cmd/entire/cli/config.go",
+    "line": 94,
+    "summary": "The invalid-log-level stderr warning moved into `resolveLogLevel`, which the root pre-run now runs for *every* command in a set-up repo, so one typo in the version-controlled `.entire/settings.json` prints a warning before every `entire` invocation for every developer in the repo.",
+    "failure_scenario": "Someone commits `.entire/settings.json` with `\"log_level\": \"verbose\"`. `ParseLevel` returns `ok == false`, so `[entire] Warning: invalid log level \"verbose\", defaulting to INFO` is written to stderr from the root `PersistentPreRun` — on `entire status`, `entire session list --json`, and on every git/agent hook invocation (once per commit, once per turn). Previously only the handful of commands that called `logging.Init` paid it. Scripts that capture stderr, and agents that see hook stderr, now get the line on every call."
+  },
+  {
+    "file": "cmd/entire/cli/logging/logger.go",
+    "line": 65,
+    "summary": "The buffered writer is flushed only by `Close()`, and `Close()` only happens at command exit — so a long-running command (`entire mcp`, an interactive `investigate`/`review` TUI) holds up to 8KB of diagnostics invisible for its whole lifetime and loses them if the host kills it.",
+    "failure_scenario": "`entire mcp` is a hidden long-lived stdio server (`mcp.go:43`, `runMCPServer` loops on stdin). The root pre-run now builds a `Logger` for it, so `entire_status` tool calls — which run `finalizeExitedSessions`, whose phase-transition and condense lines log — write into an 8KB `bufio.Writer` that is flushed only when the server exits. `tail -f .entire/logs/entire.log` shows nothing while the host session is live, and an MCP host that SIGKILLs the server on shutdown loses the buffer entirely. Before this PR `mcp` called no `Init`, so those lines went to stderr where the host captured them immediately."
+  },
+  {
+    "file": "cmd/entire/cli/logging/logger.go",
+    "line": 239,
+    "summary": "`hasSessionIDAttr` treats a dangling final `\"session_id\"` key as a real session attribute, so the context's session_id is dropped while slog emits `!BADKEY` — the line ends up with no session at all; and the whole scan is a per-line band-aid for call sites that should simply stop passing session_id.",
+    "failure_scenario": "A caller writes `logging.Warn(ctx, \"msg\", \"session_id\")` (odd-length varargs — a trivially easy typo when editing one of the ~100 sites that pass session_id by hand). `hasSessionIDAttr` returns true at line 249, so `dropSessionID` suppresses the context's `session_id` in the loop at line 224, while slog's `argsToAttr` turns the dangling key into `\"!BADKEY\":\"session_id\"`. The emitted line carries neither the caller's nor the context's session, silently breaking `jq 'select(.session_id == …)'` filtering for that line. The added test table covers the Attr, loose-pair, and value-collides cases but not this one. Altitude: rather than removing the duplicated attrs, every log line now pays a scan of the caller's varargs to reconcile them."
+  },
+  {
+    "file": "cmd/entire/cli/config.go",
+    "line": 99,
+    "summary": "Mis-merged doc comment: the block above `ensureLogger` opens by documenting `newLogger` and asserts \"It CREATES the log directory\", which is no longer true, while `newLogger` itself is left undocumented.",
+    "failure_scenario": "Lines 99-108 read as one comment that starts `// newLogger opens .entire/logs/entire.log …` / `// It CREATES the log directory, so every caller must already have decided …` and then abruptly continues `// ensureLogger attaches a logger to cmd's context …`. Two comments were merged into one. Worse, the surviving claim is false: `logging.New` no longer touches the filesystem — creation is deferred to `logWriter.Write` → `open()`. A reader reasoning about `entire enable`'s placement invariant (\"a rejected enable leaves an untouched repo untouched\") will derive it from a premise that no longer holds, and `newLogger` at line 122 has no comment of its own."
+  },
+  {
+    "file": "cmd/entire/cli/context_flag.go",
+    "line": 11,
+    "summary": "`cobra.EnableTraverseRunHooks = true` (root.go:63) invalidates the documented invariant that `contextFlagValue` exists to work around, but that comment was not updated.",
+    "failure_scenario": "The comment states: \"Binding through a pflag.Value rather than a PersistentPreRun is deliberate: Cobra runs only the CLOSEST PersistentPreRun in the chain, and subtrees here define their own (agent_group.go, the per-agent hooks commands), so a root hook would be silently skipped for exactly the commands that inherited the flag.\" After this PR that is no longer how the binary behaves — this same PR relies on the opposite. The next person touching `--context` will either re-derive a constraint that no longer exists or, believing the comment, conclude the new root pre-run is broken. Two files now document mutually contradictory cobra semantics."
+  },
+  {
+    "file": "docs/architecture/logging.md",
+    "line": 212,
+    "summary": "The architecture doc for the package this PR rewrites still describes the deleted API and the removed process-global behavior, and its component table omits `redaction` — the very component the PR adds.",
+    "failure_scenario": "Line 212 says \"The buffer is flushed on `logging.Close()`\" — a function that no longer exists. Line 5 and the tracing table say `session_id` is \"auto-added to all log entries\", which is now only true for contexts stamped with `WithSessionID`. The Files table still lists `context.go` as \"Context helpers (WithComponent, WithSession)\" with no mention of `WithLogger`/`LoggerFromContext`/`SessionLoggerFromContext`, and the Components table lists only `hooks` and `checkpoint`, so a user following the docs to grep for `component=redaction` (the PR's headline feature) still has no pointer to it."
+  },
+  {
+    "file": "cmd/entire/cli/root.go",
+    "line": 98,
+    "summary": "The root pre-run adds a `settings.IsSetUpAny` probe plus a full uncached `settings.Load` (via `resolveLogLevel`) and a `paths.WorktreeRoot` resolve to *every* command invocation, including the per-commit and per-turn hook paths that were just optimized.",
+    "failure_scenario": "`entire hooks git post-commit` now pays: `IsSetUpAny` (IsSetUp + `paths.AbsPath` + Lstat) → `newLogger` → `paths.WorktreeRoot` → `resolveLogLevel` → full `settings.Load` (which per CLAUDE.md is uncached and, with a `settings.local.json` present, runs the memoized OPF-trust go-git probe) → then `hooks git`'s own `IsSetUpAndEnabled` (another `settings.Load`) → then `withHookSession`'s `EnsureRedactionConfigured` (another `settings.Load`). This lands two commits after `perf(hooks): gate once per hook instead of twice`. It is also pure waste on commands with nothing to log: `entire version` and `entire help &lt;cmd&gt;` now resolve the worktree root and load settings before doing anything."
+  },
+  {
+    "file": "cmd/entire/cli/hooks_git_cmd_test.go",
+    "line": 62,
+    "summary": "The rewrite dropped the only assertions that `.entire/logs/` is never created in a repo where Entire is not set up or is disabled; the replacement test checks only that the context object is unchanged.",
+    "failure_scenario": "`TestInitHookLogging_SkipsWhenNotSetUp` and `TestInitHookLogging_SkipsWhenDisabled` both ended with `os.Stat(.entire/logs)` / `!os.IsNotExist`. `TestHookPreRuns_GateSkipsRepo` replaces them with `hookCmd.Context() != base`, which passes even if a file were created. The no-file-creation property now depends on two unrelated things — the root pre-run's `IsSetUpAny` gate (which is *true* for a set-up-but-disabled repo, so it does build a Logger) and lazy `open()` — and only `TestInitRootLogging_SkipsRepoThatNeverEnabledEntire` covers the never-set-up half. Nothing pins the disabled-repo half: set `log_level: DEBUG` with `enabled: false` and any Debug line emitted before a `gitHooksDisabled` check would materialize `.entire/logs/` in a repo that opted out."
+  },
+  {
+    "file": "cmd/entire/cli/review/tui_sink.go",
+    "line": 323,
+    "summary": "`logging.Debug(context.Background(), …)` sites are now permanently unloggable at any configured level, because the fallback is `slog.Default()` whose level is INFO and which `ENTIRE_LOG_LEVEL`/`log_level` no longer influences.",
+    "failure_scenario": "With `ENTIRE_LOG_LEVEL=debug`, `\"tui sink dropped messages under backpressure\"` (tui_sink.go:323), `\"copilot-cli: session.shutdown data unmarshal failed\"` (copilotcli/transcript.go:273), `\"codex parser: unknown envelope type\"` (codex/reviewer.go:236) and the `recap/render_static.go` parse-failure lines used to land in `.entire/logs/entire.log` via the level-configured package logger. Now they resolve to `slog.Default()`, which is fixed at INFO and unaffected by either the env var or `log_level`, so they are discarded unconditionally — a debug knob that silently stopped working for these diagnostics."
+  }
+]
+```</result>
+<usage><subagent_tokens>232620</subagent_tokens><tool_uses>51</tool_uses><duration_ms>889761</duration_ms></usage>
+</task-notification>

@@ -1,0 +1,765 @@
+<task-notification>
+<task-id>a202218a32a941448</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-claude-hooks/0153df40-cf3f-429a-bd42-56a3f8dc0a0b/tasks/a202218a32a941448.output</output-file>
+<status>completed</status>
+<summary>Agent "Resolve main merge conflicts" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>**DONE** — merge committed as `bfe53dc12` and pushed to `feat/subagent-stop-capture`. Tree clean.
+
+## How the 4 conflicts resolved
+
+**`agent/event.go`** — Unified the duplicated field onto main's `SubagentTranscriptPath`, extended its doc to note Claude Code's SubagentStop also declares it. Kept our `Final bool` with its full doc. Deleted our `SubagentTranscript`.
+
+**`lifecycle.go`** (5 hunks, not 1 — the merge left more than the brief anticipated) — Kept our `event.Final` dispatch, `recordInFlightTaskLaunch`, `completeSubagentTaskRecord`, and record machinery; adopted main's `declaredSubagentTranscript` as the single resolution path. Two hunks were *not* in the brief and needed judgment:
+- Main added `logStatusDegrade` + an `UntrackedScanSkipped` new-file guard inside the block our branch had wrapped in `if !opts.analyzerFilesOnly`. **Carried both into our wrapper** — dropping them would have regressed main's degradation handling.
+- Main added `recordCaptureDegraded` next to a function our branch deleted. It has two live callers in auto-merged code (lines 932, 1027), so I kept it; our deletion of the now-uncalled `parseTranscriptForCheckpointUUID` stands.
+
+**`checkpoint/persistent.go`** — Ours; dead `writeFinalTaskCheckpoint`/`writeIncrementalTaskCheckpoint` route stays deleted, `writeTaskRecordEntries` stays. `subagent_transcript.go` survives with its `ephemeral.go:447` caller intact.
+
+**`lifecycle_test.go`** — Import union.
+
+## Codex/Cursor declarations confirmed flowing
+All three producers now set the unified field: `claudecode/lifecycle.go:245`, `cursor/lifecycle.go:227`, `codex/lifecycle.go:168`. Zero bare `SubagentTranscript` references remain; `SubagentTranscriptPath`, `CreateSubagentTranscript`, `writeSubagentTranscriptTo`, `prepareSubagentTranscript` all intact.
+
+## Size cap
+`prepareTaskTranscriptForStorage` now measures **sanitized** bytes against `agent.MaxChunkSize`, mirroring `prepareSubagentTranscript`'s shape (warn in-place, return `tooLarge bool`). New `taskTranscriptReasonTooLarge = "transcript too large"`; the warn carries `raw_bytes`/`sanitized_bytes`/`cap`/`path`, the stored reason stays path-free. `readFirstTranscript` now also returns the path it read (logging only). Test: third table case **`"declared path exceeds the blob size cap"`** in `TestCondenseSession_TaskRecordMissingTranscriptPath_RecordsUnavailableReason`.
+
+## Two deviations worth flagging
+1. **`lifecycle_test.go` had a silent auto-merge break**: both branches independently added a `mockAnalyzerAgent` helper to the same file in different regions, so git merged *both* copies — a redeclaration that only surfaced at build. Unified on our superset (pointer embed, `analyzerFiles`/`analyzerErr`/`onExtract`) and converted main's 4 construction sites.
+2. **`integration_test/codex_subagent_test.go` (main's new test) genuinely failed**, and the fix was not mechanical. It asserted the subagent rollout appears on the **shadow branch** at subagent-stop — the write path #2058 deliberately removed. I re-pointed it at the completed `TaskRecord`'s `DeclaredTranscriptPath`, matching our own `subagent_transcript_layout_test.go`. Main's actual intent is preserved: the rollout path is flat, matching neither fallback candidate, so it still only passes if the declared path is honoured. Flagging in case you'd rather it assert post-condensation checkpoint contents instead.
+
+## Gate tails
+- `git diff --name-only --diff-filter=U` → empty; `gofmt -s -l cmd/` → empty; `go build ./...` → clean
+- Scoped tests: all `ok`, zero failures (`strategy 57.5s`, `checkpoint 5.6s`, all `agent/*`, `session`, `cli`)
+- `mise run lint` → `[lint:go] 0 issues.` (the earlier `lint:gomod` failure was only staged-uncommitted merge content — `go mod tidy` verified a no-op — and clears post-commit)
+- `mise run test:integration` → `DONE 522 tests, 3 skipped in 73.952s`</result>
+<usage><subagent_tokens>145893</subagent_tokens><tool_uses>99</tool_uses><duration_ms>1252492</duration_ms></usage>
+</task-notification>
+
+---
+
+did you do work with the rework from the issue?
+
+---
+
+if the user has opf on and we have subagent transcript, it shoudl redact it, i would think - do you agree?
+
+---
+
+yes
+
+---
+
+yes fix pr wording nad also scope the refs into the stack too, or just add where makes sense if we want to add it in
+
+---
+
+i told you to just fix it, not creaete new issue
+
+---
+
+<task-notification>
+<task-id>a05b3ca271244d563</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-claude-hooks/0153df40-cf3f-429a-bd42-56a3f8dc0a0b/tasks/a05b3ca271244d563.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement OPF for git-refs backend" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>**DONE_WITH_CONCERNS**
+
+**SHA:** `48f063f25` on `feat/subagent-stop-capture` (pushed; PR #2032)
+
+## What shipped
+
+`RewriteQueuedCheckpointRefsWithOPF(ctx, repo)` in the new `cmd/entire/cli/strategy/manual_commit_opf_refs.go` (159 lines), wired into `prePushCheckpointRefs` before the flush.
+
+**Reused as-is, not duplicated:** `collectTreeBlobs`, `rebuildTreeWithCachedRedaction`, `rebuildCheckpointCommit`, `resolveBatchLimit`/`scaleBatchLimit`/`rawByteCapMultiplier`, `partitionLocalRefs`, the whole error taxonomy, and both up-front fail-closed gates (`OPFMisconfiguredNoCategories` → `OPFNoCategoriesError`, `OPFBreakerTripped` → `OPFRuntimeFailedError`), in the same order as the v1 path.
+
+## How it differs from the v1 path
+
+| | git-branch v1 | git-refs |
+|---|---|---|
+| Discovery | fetch remote tip → merge-base → divergence check → `listUnpushedV1Commits`, bootstrap cap | `PushQueue.Peek()` (never `Drain`), filtered through `partitionLocalRefs`; no merge-base, no divergence, no bootstrap cap, no network |
+| Rebuild parent | rewritten predecessor (re-parents the chain onto `remoteTip`) | the commit's **own** original first parent (zero if none) — refs are standalone |
+| Ref update | one CAS on `refs/heads/entire/checkpoints/v1` | all commits rebuilt first, then one `CheckAndSetReference` per ref (CAS against the observed old hash, so a concurrent checkpoint write isn't clobbered) |
+
+Stale queue entries are skipped, never pruned — the flush owns the queue. A ref that resolves but whose commit/tree won't load errors out (fail closed) rather than being silently pushed un-OPF'd.
+
+Passes 2 and 3 are byte-for-byte the same policy as v1: one `BatchBytesWithPrivacyFilter` call for the whole flush, same leaf-byte cap, same `ErrOPFNoEnabledCategories` → `OPFNoCategoriesError` / everything-else → `OPFRuntimeFailedError` mapping.
+
+## Failure semantics
+
+Both backends fail closed; only the *mechanism* differs. `runOPFForCheckpointRefs` returns a bool and the call site is `if redact.OPFEnabled() &amp;&amp; !runOPFForCheckpointRefs(ctx, repo) { return nil }`:
+
+- **OPF failure or `OPFAbort`** → flush skipped entirely, `return nil`. Nothing un-OPF'd ships, refs stay queued, the user's `git push` succeeds.
+- **`OPFSkip`** → unchanged: flush as-is, 8-layer, no trailer.
+- **Where the user sees it:** `logging.Warn("OPF pre-push failed; skipping checkpoint ref push, refs left queued")` **and** a stderr line via the package's `stderrWriter` (the local convention — `checkpoint_policy.go`, `refs_push_destination.go`, `checkpoint_sync_capture.go` all use it): `[entire] OPF did not run, so checkpoint refs were not pushed and stay queued for your next push: &lt;err&gt;`.
+- The divergence is documented in a comment at the call site.
+
+Decision resolution was factored into `opfPrePushDecision(ctx)`; the git-branch path now calls it and is otherwise untouched (all pre-existing OPF tests pass unmodified).
+
+## Tests
+
+Added to `manual_commit_opf_rewrite_test.go` (166 test lines vs 229 prod lines):
+
+- `TestRewriteQueuedCheckpointRefsWithOPF_RewritesThenIsIdempotent` — two real refs written through `checkpoint.Open` on the git-refs backend; asserts both refs moved, trailer stamped, sentinel gone from tree blobs, exactly one batch call; then re-runs and asserts **byte-identical hashes** and still one batch call.
+- `REDACTED` — `OPFRuntimeFailedError`, both refs unmoved.
+- `TestPrePushCheckpointRefs_OPFFailureWithholdsFlush` — real `PrePushFromGitHook` against a bare remote: returns nil, stderr warning present, refs still queued, **nothing on the remote**.
+- `TestPrePushCheckpointRefs_OPFDisabledFlushesUnchanged` — OPF off: no rewrite, ref reaches remote at its original hash, queue drained.
+
+Reused the existing `fakeOPFForRewrite` / `fakeRuntimeAlwaysFails` / `configureFakeOPF` stubs and `writeGitRefsBackendSetting`, `mustRefName`, `remoteRefHash`.
+
+**TDD verification:** I confirmed the tests catch the actual bug by temporarily removing the wiring — `TestPrePushCheckpointRefs_OPFFailureWithholdsFlush` fails with `"…refs/entire/checkpoints/f6/a1b2c3d4e5f6" should not contain …`, i.e. the un-OPF'd ref reaching the remote.
+
+## Gate tails
+
+- `gofmt -s -l cmd/` → empty
+- `go build ./...` → clean
+- `go test ./cmd/entire/cli/strategy/ ./cmd/entire/cli/checkpoint/... -count=1` → all `ok` (strategy 57.6s, checkpoint 5.8s, fsstore, id, remote)
+- `mise run test:integration` → `DONE 522 tests, 3 skipped in 61.903s`
+- `mise run lint` → `0 issues.`
+
+## Look hardest at this
+
+**Only each queued ref's *tip* commit is rewritten.** This follows the spec ("each checkpoint ref is standalone, keep the ORIGINAL parent"), but I verified in `refs_store.go` that checkpoint refs genuinely do chain: `refBase` parents each write on the prior tip, and `setRef` re-enqueues. So a checkpoint that gets a session write and then a summary/attribution/transcript backfill before the next push has **two unpushed commits on one ref**. We rewrite the tip; the ancestor is still pushed with the ref and still carries un-OPF'd blobs. The tip's tree is cumulative so the *content* is all present in redacted form at the tip, but the unredacted originals remain reachable from the parent commit.
+
+Closing it needs a per-ref unpushed boundary. The tempting version — walk back until the first commit carrying the OPF trailer — is a clean boundary in steady state but rewrites all history on a repo that enables OPF late, forcing non-fast-forward pushes through the fetch+replay recovery path on every ref. That's exactly the bootstrap hazard the v1 path caps, and the queue records no push watermark to bound it. I did **not** build it; I documented the gap in the commit message's "Known gap" paragraph. Worth a decision before this reaches OPF users on git-refs.
+
+Two smaller things:
+- I used `CheckAndSetReference` per ref rather than plain `SetReference`. A CAS conflict mid-loop leaves earlier refs updated — which I believe is safe (each rewritten ref is independently valid and trailer-stamped, the error withholds the flush, and the next push skips the applied ones and retries the rest), but it is a deliberate deviation from "all-or-nothing" that only holds because refs are standalone.
+- The `FailureLeavesEveryRefUnmoved` test exercises a **batch-level** OPF failure, not a rebuild failing after a sibling rebuild succeeded. The deferred-update structure is what guarantees the latter; I couldn't construct a genuine mid-batch rebuild failure without contriving storage corruption, so that specific ordering is covered by construction rather than by test.</result>
+<usage><subagent_tokens>164205</subagent_tokens><tool_uses>43</tool_uses><duration_ms>628893</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a05b3ca271244d563</task-id>
+<tool-use-id>toolu_013BGCdWNtrWY1siJkN5MGGM</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-claude-hooks/0153df40-cf3f-429a-bd42-56a3f8dc0a0b/tasks/a05b3ca271244d563.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement OPF for git-refs backend" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>**DONE**
+
+**SHAs on `feat/subagent-stop-capture`** (both pushed, PR #2032):
+- `48f063f25` — `feat(checkpoint): run OPF on the git-refs backend, not just the v1 branch`
+- `975f79705` — `fix(checkpoint): OPF every unpushed commit on a checkpoint ref, not just its tip`
+
+## The walk
+
+`unappliedAncestry(repo, tip) ([]*object.Commit, plumbing.Hash, error)` walks first parents from a queued ref's tip, appending every commit lacking `Entire-OPF-Applied` and stopping at the first commit that carries it. It returns the chain reversed to **ancestor-first** plus `base` — the hash it stopped at, or `plumbing.ZeroHash` at a root. Checkpoint refs are a single-parent chain, so the first parent is the whole history.
+
+Per ref in pass 1: walk → `len(chain) == 0` means the tip is already applied, skip → `len(chain) &gt; bootstrapLimit` returns `BootstrapTooLargeError{Count, Limit}` → otherwise collect tree blobs for **every** commit in the chain. `resolveBootstrapLimit()` is hoisted out of the loop and applied per ref (a single ref's ancestry is the thing that can run deep). The raw-bytes cap keeps accumulating across the whole flush — all refs, all commits — as before.
+
+## Reparenting
+
+Pass 3 replays each ref's chain ancestor→tip:
+
+```go
+parent := pr.base
+for _, pc := range pr.commits {
+    newHash, _ := rebuildCheckpointCommit(ctx, repo, pc.commit, parent, redactedByPath)
+    parent = newHash
+}
+rebuilt[i] = parent // new tip
+```
+
+So the deepest rewritten commit keeps `pr.base` (the trailered ancestor, or zero at a root) and each rewritten parent carries into its child. Every commit across every ref is still rebuilt before any ref moves; ref updates are still the per-ref `CheckAndSetReference` (left as-is per your call).
+
+## Steady-state confirmation
+
+Confirmed by test, not just by reading. `TestRewriteQueuedCheckpointRefsWithOPF_StopsAtTrailedParent` rewrites once (stamping the tip), adds a session on top, rewrites again, and asserts `batchCallCount() == 2` — one scan per push, no re-scan of applied history — and that `chain[1].Hash` still equals the hash the first rewrite produced. The already-applied parent is neither re-scanned nor rewritten, so the walk stops at the first parent and the steady-state cost is unchanged from tip-only.
+
+## Tests added (all in `manual_commit_opf_rewrite_test.go`)
+
+- `..._RewritesEveryUnpushedAncestor` — the regression. Fixture asserts two unpushed commits up front, then asserts both carry the trailer, both trees are sentinel-free, and the chain length survives.
+- `..._StopsAtTrailedParent` — above.
+- `..._AncestryOverBootstrapLimit` — `ENTIRE_OPF_BOOTSTRAP_LIMIT=1` over a 2-commit ancestry → `BootstrapTooLargeError{Count: 2, Limit: 1}`, no ref moved.
+
+Plus the four from the first commit (`..._RewritesThenIsIdempotent`, `..._FailureLeavesEveryRefUnmoved`, `TestPrePushCheckpointRefs_OPFFailureWithholdsFlush`, `..._OPFDisabledFlushesUnchanged`).
+
+**Regression verified by construction**, both commits: I temporarily swapped `unappliedAncestry` for a tip-only stub and `..._RewritesEveryUnpushedAncestor` fails on `HasOPFApplied` for the ancestor; earlier I removed the prePush wiring and `..._OPFFailureWithholdsFlush` fails with the un-OPF'd ref reaching the remote.
+
+Line budget for this commit: 94 prod added (88 refs + 6 rewrite), 94 test added — at the cap, not over.
+
+## Gate tails
+
+- `gofmt -s -l cmd/` → empty
+- `go build ./...` → `BUILD_OK`
+- strategy + checkpoint tests → all `ok` (strategy 59.4s, checkpoint 6.9s, fsstore, id, remote)
+- `mise run test:integration` → `DONE 522 tests, 3 skipped in 61.827s`
+- `mise run lint` → `0 issues.`
+
+## One judgment call worth a reviewer's eye
+
+I changed `BootstrapTooLargeError`'s message from "would rewrite %d **entire/checkpoints/v1** commits" to "%d **checkpoint** commits", and generalized its doc comment. The error is now shared across both backends, and the old wording would have named the v1 branch to a git-refs user who has no v1 branch. The remediation (`ENTIRE_OPF_BOOTSTRAP_LIMIT`, `ENTIRE_OPF=no git push`) is identical for both, and no test asserts the message text — only `Count`/`Limit`. Flagging it because it's user-visible copy on the v1 path, which was otherwise untouched.</result>
+<usage><subagent_tokens>192156</subagent_tokens><tool_uses>17</tool_uses><duration_ms>412255</duration_ms></usage>
+</task-notification>
+
+---
+
+do you need to update pr/trail or aything after this
+
+---
+
+is there aything else we need to do per the issue details and part of our plan?
+
+---
+
+is there aything else we need to do per the issue details and part of our prs?
+
+---
+
+do not merge the stack, sorry proceed
+
+---
+
+unless you think we shoudl just merge it now
+
+---
+
+unless you think we shoudl just merge it now - before you do you need to review the agent comments on the pr
+
+---
+
+you didn't resolve hte coments
+
+---
+
+did you run /pr-review-toolkit:review-pr on 2034
+
+---
+
+<task-notification>
+<task-id>a88d27737de73996c</task-id>
+<tool-use-id>toolu_018BBkpjmQDkGGoyFKjNti4a</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-claude-hooks/0153df40-cf3f-429a-bd42-56a3f8dc0a0b/tasks/a88d27737de73996c.output</output-file>
+<status>completed</status>
+<summary>Agent "Error handling review PR 2034" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Findings — PR #2034 silent-failure audit
+
+All of this sits in `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/claude-hooks/cmd/entire/cli/strategy/manual_commit_hooks.go` unless noted. I verified the surrounding machinery (`session/phase.go` transition table, `manual_commit_condensation.go` skip gates, `session/state.go` record model) to check whether the two decisions can actually diverge, not just whether they look like they can.
+
+**Headline:** the new eligibility rule itself is sound and correctly shared — `idleWithTaskContent` (line 884) is used by both sides, `sessionHasNewContent` already short-circuits true on `HasTaskContent()` (line 1645), and `skipIfNothingToCondense` / `skipIfPostRedactionEmpty` (condensation lines 724, 744) both honor `HasTaskContent()`, so a record-only session does write a checkpoint. The `materializeTaskRecords` contract ("a record whose transcript cannot be resolved still produces a payload with `TranscriptUnavailableReason`") means the checkpoint is non-empty even when the subagent transcript is gone. Fail-soft is correct throughout. **The problem is observability, and one structural gap that would cover all of it at once.**
+
+---
+
+### CRITICAL — 1. No signal anywhere that a trailer was minted and nothing condensed
+
+**Location:** PostCommit loop, lines 1030–1051 (contrast the warn at 965–971).
+
+`handler.condensed` is a per-session field (line 686) consumed entirely inside `postCommitProcessSessionLocked` (lines 1339, 1349, 1380, 1395, 1408). It is never returned to PostCommit's loop. So PostCommit warns loudly when a trailer exists and *zero sessions* were found (line 966), but is completely silent when sessions were found and *none of them condensed* — which is the exact end state of every divergence between `tryAgentCommitFastPath` and `shouldCondenseWithOverlapCheck`.
+
+**What becomes invisible:** the dangling trailer itself. The commit ships with `Entire-Checkpoint: &lt;id&gt;` pointing at a checkpoint that was never written, and `.entire/logs/` contains no line at any level saying so.
+
+**Scenario a maintainer can't explain:** user reports "this commit links to a checkpoint that 404s on the web." Logs show `prepare-commit-msg: agent commit trailer added` (Info, line 2204) with the checkpoint ID, then a handful of per-session Debug decision lines, then nothing. To find out why, you have to reconstruct each session's `should_condense` by hand and know that no one aggregated them.
+
+**Recommendation:** this is one line of state and one Warn, and it subsumes findings 2, 3, and every future divergence. Have `postCommitProcessSessionLocked` report back whether it condensed, and after the loop:
+
+```go
+if !anyCondensed {
+    logging.Warn(logCtx, "post-commit: trailer present but no session condensed into it",
+        slog.String("checkpoint_id", checkpointID.String()),
+        slog.Int("sessions", len(sessions)),
+        slog.Any("session_phases", phases),
+        slog.Int("task_records", totalTaskRecords),
+    )
+}
+```
+
+Warn (not Debug) is right here: unlike "not eligible", this outcome is never routine — it is always either a bug or a race, and it is the one the user notices.
+
+---
+
+### HIGH — 2. The IDLE→ENDED race drops the session with a log that mentions no records
+
+**Locations:** `HandleDiscardIfNoFiles` lines 896–904; the pre-loop skip at line 1032.
+
+`idleWithTaskContent` requires `PhaseIdle`, so the fast path can mint a trailer for an IDLE session that is ENDED by the time post-commit runs. The window is small but the scenario is precisely this PR's target: a background subagent commits while the parent Claude Code session is exiting. Two independent things can flip the phase in that window — the parent's SessionStop hook, and `finalizeExitedSessions` running inside a concurrent `entire status` (e.g. a statusline).
+
+Once ENDED, `phase.go:249-258` routes on `HasFilesTouched`. A read-only subagent's record contributes **no** `FilesTouched` by definition, so it lands on `ActionDiscardIfNoFiles` → `HandleDiscardIfNoFiles`, which never consults `TaskRecords` at all. The only evidence is:
+
+```
+post-commit: skipping empty ended session (no files to condense)   session_id=…
+```
+
+which is actively misleading — the session was not empty, it held unmaterialized task records that this very commit's trailer was minted against.
+
+Worse variant: if the parent's `endSessionNow` condensed eagerly on the way out, the session arrives `FullyCondensed &amp;&amp; Ended` and is skipped by the bare `continue` at line 1032 with **no log line whatsoever** — note that the equivalent filter on the prepare side *does* log (line 1595).
+
+**Fail-soft correct?** Yes — nothing should block the commit. But the log must be honest.
+
+**Recommendation:** add `slog.Int("task_records", len(state.TaskRecords))` to the line 898 Debug, and log the line-1032 skip the way line 1595 does. The finding-1 Warn then makes the consequence visible without needing to spot either.
+
+---
+
+### HIGH — 3. `slog.Bool("idle_with_task_content", hasTaskContent)` is provably constant `false`
+
+**Location:** lines 787–792.
+
+```go
+if !hasTaskContent &amp;&amp; h.sessionsWithCommittedFiles &gt; 0 &amp;&amp; len(h.filesTouchedBefore) == 0 {
+    logging.Debug(h.ctx, "post-commit: skipping read-only session (…)",
+        slog.Bool("is_active", isActive),
+        slog.Bool("idle_with_task_content", hasTaskContent),   // always false
+```
+
+The branch is guarded on `!hasTaskContent`, so the field can only ever print `false`. A maintainer reading `.entire/logs/` reasonably concludes the flag varies and that a `true` case exists on this path — it does not. This is worse than omitting it: it manufactures a false negative when someone greps for the new signal.
+
+Also on this same line, note it uses `h.ctx` rather than the component-tagged `logCtx` its sibling lines use, so this record lands without `component=checkpoint` and drops out of a filtered log read. The PR rewrote this call; it was the moment to fix that.
+
+**Recommendation:** drop the constant field, use `logCtx`. If the intent was "show that the new rule was considered," that belongs on the decision log — see finding 4.
+
+---
+
+### HIGH — 4. The condense side logs strictly less than the trailer side, for the same decision
+
+**Locations:** `HandleCondense` lines 699–707; `HandleCondenseIfFilesTouched` lines 727–736.
+
+`idleWithTaskContent(state, time.Now())` is computed inline at the call site and then thrown away. The decision log records `session_id, phase, has_new, should_condense, shadow_branch` — the one new input is absent. Meanwhile `tryAgentCommitFastPath` logs eligibility counts. So for the pair that must agree, the side that mints the trailer is instrumented and the side that fills it is not.
+
+**What becomes invisible:** for an IDLE session with `should_condense=true`, you cannot tell whether it condensed via the new record bypass or via file overlap. For `should_condense=false` with `has_new=true` (task records force `has_new` true unconditionally at line 1645), you cannot distinguish "the record was &gt;24h stale so the bypass declined" from "the bypass applied but the overlap check found nothing" — and those have opposite fixes.
+
+**Recommendation:** hoist the value to a variable and log it alongside `task_records` and the freshest record's age:
+
+```go
+hasTaskContent := idleWithTaskContent(state, time.Now())
+shouldCondense := h.shouldCondenseWithOverlapCheck(state.Phase.IsActive(), state.LastInteractionTime, hasTaskContent)
+logging.Debug(logCtx, "post-commit: HandleCondense decision",
+    …,
+    slog.Bool("idle_with_task_content", hasTaskContent),
+    slog.Int("task_records", len(state.TaskRecords)),
+)
+```
+
+Debug is the right level for all of it — this fires on every commit.
+
+---
+
+### MEDIUM — 5. `task_records` is summed across all sessions, so it cannot answer the question it was added for
+
+**Location:** lines 2154–2173.
+
+The comment claims `task_records` makes "records present but ineligible" distinguishable from "no records." That holds only when there is exactly one session. With `sessions=[IDLE with 0 records, ENDED with 3 records]` the log reads `task_records=3, eligible_sessions=0, session_phases=[IDLE, ENDED]` — a reader concludes the IDLE session had stale records when in fact it had none, and the ENDED session's records were rejected on phase, not freshness.
+
+**Scenario:** a subagent that has been running &gt;24h (a long background task — plausible for exactly the workload this PR serves) commits. `idleWithTaskContent` returns false on the `StartedAt` bound at line 889, no trailer is minted, and this aggregate log cannot tell the maintainer that staleness was the reason. The failure the user reports — a missing trailer — is the one the diagnostics are weakest on.
+
+Two related notes on the bound itself, both worth a sentence in the PR rather than a code change:
+- It is keyed on `StartedAt`, never on `CompletedAt`, so freshness tracks when the subagent *launched*, not when it produced work. A 25h-old still-running subagent is permanently unlinkable.
+- The 24h threshold is evaluated twice against two independent clocks (line 2127 in prepare-commit-msg, `time.Now()` at lines 699/727 in post-commit). A record sitting on the boundary produces a trailer from one hook and a decline from the other — the pure dangling-trailer shape, invisible today, covered by finding 1.
+
+**Recommendation:** add `stale_task_record_sessions` (records present, all outside the window) and `eligible_by_task_record` counters, or log per-session `{phase, records, freshest_age}` tuples instead of a scalar sum.
+
+---
+
+### MEDIUM — 6. `HandleCondenseIfFilesTouched`'s new third argument is dead on every reachable path
+
+**Location:** line 727.
+
+`postCommitActionHandler` only ever services `EventGitCommit`. Per `phase.go:245-258`, `ActionCondenseIfFilesTouched` is reachable from that event only from `PhaseEnded` — and `idleWithTaskContent` returns false for anything that is not `PhaseIdle` (line 885). So the argument is always `false` here. Doubly so: even if a future transition routed IDLE to this action, the `len(state.FilesTouched) &gt; 0 &amp;&amp;` prefix short-circuits before the call, and a record-only session has no `FilesTouched` by construction.
+
+Not a silent failure, but it reads as though ENDED-with-records sessions get the bypass — which is exactly the wrong mental model given finding 2, where that's the case that silently drops. Either drop the argument with a comment naming the ENDED-only dispatch, or leave it and say so in the doc comment.
+
+---
+
+### MEDIUM — 7. `addTrailerForAgentCommit` swallows three real errors, and the caller reports success anyway
+
+**Location:** lines 2184–2214 (the `_ =` discard at line 2151).
+
+```go
+cpID, err := checkpoint.GenerateCheckpointID(logCtx)
+if err != nil { return nil }          // no log
+content, err := os.ReadFile(commitMsgFile)
+if err != nil { return nil }          // no log
+…
+if err := os.WriteFile(commitMsgFile, …); err != nil { return nil }  // no log
+```
+
+Each returns nil silently, and `tryAgentCommitFastPath` then `return true` (line 2152) — "the fast path was taken" — so `PrepareCommitMsg` returns at line 426 and never falls through to normal content detection. Net effect of a full-disk or read-only-`.git` condition: no trailer, no fallback, and not one line in `.entire/logs/`. The only signal is the *absence* of the Info at line 2204, which nobody greps for.
+
+The PR touched this function's doc comment (rewriting it to describe the widened eligibility) without touching the silent returns, and it widens the population of commits that reach them.
+
+**Fail-soft correct?** Yes, absolutely — a hook must never fail a commit over a trailer. But "silent" and "fail-soft" are not the same thing.
+
+**Recommendation:** `logging.Warn` on each of the three, with `session_id` and the error. The `//nolint:errcheck // always returns nil` at the call site then becomes true *and* diagnosable.
+
+---
+
+### MEDIUM — 8. The fast path's own precondition failure is entirely unlogged
+
+**Location:** lines 2114–2123.
+
+```go
+if stngs, err := settings.Load(ctx); err == nil {
+    skipContentDetection = stngs.GetCommitLinking() == settings.CommitLinkingAlways
+}
+if !skipContentDetection {
+    return false   // no log — the diagnostic Debug at 2166 is downstream of this
+}
+```
+
+A `settings.Load` error is reduced to "commit_linking is not always." So a user who set `commit_linking: "always"` and has a malformed `.entire/settings.local.json` gets no trailers on TTY commits, and the summarizing Debug at 2166 — the one place that would say why — is never reached.
+
+**Scenario:** the Gemini-subagent case the doc comment at 2105–2107 exists for. Gemini has a `/dev/tty`, so it depends entirely on `commit_linking=always`; a settings parse error silently reverts it to content detection, which the comment itself says "fails since the shadow branch doesn't exist yet." Missing trailers, zero logs, and the user's settings file looks fine to them.
+
+**Recommendation:** log the `settings.Load` error at Debug with the error string, and emit a one-line Debug on the `!skipContentDetection` return (`no_tty=false, commit_linking=&lt;value&gt;`). Both are pre-existing, but this PR's new eligibility rule is unreachable when they fire.
+
+---
+
+### LOW — 9. The comment justifying the read-only-gate bypass relies on an invariant that isn't universal
+
+**Location:** lines 766–768 and 782–786.
+
+&gt; "tryAgentCommitFastPath already vetted the trailer" / "tryAgentCommitFastPath already minted this commit's trailer on exactly that basis"
+
+The fast path only runs when `skipContentDetection` is true (no TTY, or `commit_linking=always`). On an ordinary human TTY commit the trailer comes from the interactive path instead — and `filterSessionsWithNewContent` → `sessionHasNewContent` returns true for any session with task records (line 1645), so a record-only IDLE session reaches that path too. The new `hasTaskContent` bypass then also fires for human commits, waiving the read-only gate for a commit the fast path never touched.
+
+The behavior is arguably intended (the record *is* genuine pending content), and it is not a silent failure. But the stated justification doesn't cover it, which means a future reader tightening the fast path will assume the bypass is safe when it isn't. Worth one clause: "…or, on TTY commits, the interactive path minted it after `sessionHasNewContent` accepted the same records."
+
+---
+
+### Done well, for the record
+
+- Sharing one predicate between the trigger and the condensation trust (line 881-883's rationale) is the right structural call — most trailer/condense drift bugs come from two copies of a rule, and this PR deliberately avoids that.
+- Bounding record trust by age at all, rather than trusting `HasTaskContent()` unbounded the way `sessionHasNewContent` does, prevents a stale record from making every later no-TTY commit a trailer candidate forever.
+- The `emptyEligibleSessions == eligibleSessions` distinct message (line 2163) genuinely separates "nothing eligible" from "eligible but empty" — that's the right instinct, just applied to only one of the three cases that matter (see finding 5).
+- Renaming the log message and fields from `active_*` to `eligible_*` rather than leaving stale "ACTIVE" wording is the kind of thing that usually rots; it didn't here.</result>
+<usage><subagent_tokens>126612</subagent_tokens><tool_uses>24</tool_uses><duration_ms>296570</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a70102ccaad4fa520</task-id>
+<tool-use-id>toolu_0122WA92TBd6FoYAT9Dac4ST</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-claude-hooks/0153df40-cf3f-429a-bd42-56a3f8dc0a0b/tasks/a70102ccaad4fa520.output</output-file>
+<status>completed</status>
+<summary>Agent "Comment review PR 2034" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Summary
+
+Scope reviewed: the full `5fcc09e57...708362a86` diff — one production file (`cmd/entire/cli/strategy/manual_commit_hooks.go`), the `sessions-and-checkpoints.md` addition, and the three test files (comments only). I cross-checked every factual claim against `manual_commit_git.go`, `session/state.go`, `session/phase.go`, and `manual_commit_condensation.go`.
+
+Good news on the reshape: **no rot from the deleted commit-snapshot machinery survives in production code**. `captureInFlightTaskCommitSnapshot`, `captureInFlightTasksForCommit`, `headHasCheckpointTrailer`, and `LastCapturedTranscriptBytes` appear nowhere; the only `snapshot` in the prod file (line 2517) is pre-existing and unrelated. The rot that did survive is vocabulary-level ("live", "marker") and, more seriously, three factual claims that are wrong against the code they sit on — two of them introduced by the *last* commit on the branch (`1d4341a62`), which amended the inline comment but not the function doc above it.
+
+---
+
+## Critical Issues
+
+**1. Function doc contradicts the code it documents (stale after `1d4341a62`)**
+- Location: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/claude-hooks/cmd/entire/cli/strategy/manual_commit_hooks.go:754-761`
+- Issue: the doc says *"Active sessions with recent interaction, **and IDLE (not ENDED) sessions with a fresh task record**, condense **unless** they have no tracked files and another session claims the committed files (read-only gate)."* Line 787 does the opposite: `if !hasTaskContent &amp;&amp; h.sessionsWithCommittedFiles &gt; 0 &amp;&amp; ...` — the read-only gate explicitly **does not** apply to task-content sessions. The whole point of the final commit was to exempt them, and the doc still describes the pre-fix behavior. This is the single most misleading comment in the diff: a maintainer reading the doc would "fix" the code back into the bug.
+- Suggestion: `// … Active sessions with recent interaction condense unless the read-only gate fires (no tracked files of their own while another session claims the committed files). IDLE sessions with a fresh task record condense unconditionally — the record is the evidence, so the read-only gate is skipped for them.`
+
+**2. Cross-reference points at an explanation that does not exist**
+- Location: `manual_commit_hooks.go:759-760` — *"(including ENDED sessions — see `idleWithTaskContent`'s doc for why ENDED is excluded even though it can carry lingering records)"*
+- Issue: `idleWithTaskContent`'s doc (873-883) never mentions ENDED. The reason is real and non-obvious, but it currently lives **only in a test comment** (`condense_skip_test.go`, `DeclinesEndedSessionWithTaskRecord`: *"An ENDED session's records belong to its own final condensation, not this fast path"*) and in the `TestPostCommit_EndedSessionWithLingeringRecord…` doc. A dangling "see X" is worse than no pointer.
+- Suggestion: move that one sentence into `idleWithTaskContent`'s doc (it is exactly the kind of non-obvious invariant that earns a doc comment), then the cross-reference becomes true.
+
+**3. Asserted invariant is factually false**
+- Location: `manual_commit_hooks.go:766-768` — *"records never reach FilesTouched, so overlap is unsatisfiable for them."*
+- Issue: completed task records **do** reach `FilesTouched`. `applyTaskRecordCompletion` (`manual_commit_git.go:382`) runs `state.FilesTouched = mergeFilesTouched(state.FilesTouched, rec.Files)`, and `session/state.go:430-431` documents the field as *"the set of files touched by this subagent, **merged into the session's FilesTouched at completion time**."* The claim is only true of in-flight records and of read-only (zero-file) completions — which is precisely what the *other* comment 15 lines below (783-784) says. The two comments in the same function disagree.
+- Suggestion: delete the false generalization; the narrow, true version already exists at 783-784.
+
+**4. Narrowing an accurate claim made it inaccurate**
+- Location: `manual_commit_hooks.go:767` and `784` — *"`tryAgentCommitFastPath` already vetted the trailer" / "`tryAgentCommitFastPath` already minted this commit's trailer."*
+- Issue: the base branch said *"PrepareCommitMsg already validated this commit is session-related (added trailer)"*, which is true on every path. `tryAgentCommitFastPath` only runs when `skipContentDetection` (no TTY, or `commit_linking="always"`) — see 2114-2123. On a TTY with default settings the trailer comes from the content-detection path instead, and it can also arrive by amend, rebase, cherry-pick, or by hand (this PR's own `TestPostCommit_EndedSessionWithLingeringRecord…` hand-writes one). The same file still carries the correct wording at lines 1258-1263 (*"In both cases, PrepareCommitMsg already validated this commit"*), so the file now contradicts itself.
+- Suggestion: restore "PrepareCommitMsg" as the subject; name `tryAgentCommitFastPath` only where the no-TTY path is actually meant.
+
+**5. `live` is stale marker-era vocabulary and is now wrong**
+- Location: `manual_commit_hooks.go:2180-2181` — *"the eligible session — ACTIVE, or IDLE with a **live** fresh task record — is trusted unconditionally"*
+- Issue: "live" has a precise meaning in this codebase — `State.LiveTaskRecords()` returns records with `CompletedAt` zero (`session/state.go:522-535`). `idleWithTaskContent` iterates *all* `TaskRecords`, so a completed-unmaterialized record qualifies. This is leftover `idleWithLiveMarker` vocabulary.
+- Suggestion: drop "live"; "a fresh task record" is both shorter and correct.
+
+**6. Doc sentence is false for the most common case**
+- Location: `manual_commit_hooks.go:758` — *"Stale ACTIVE sessions **and any session with no fresh record** … require file overlap evidence."*
+- Issue: an ACTIVE session with recent interaction and no task record does **not** require overlap evidence — it is the first disjunct at line 781 and the majority path. "Any session with no fresh record" swallows it.
+- Suggestion: `// Stale ACTIVE sessions, and IDLE/ENDED sessions with no fresh record, require file overlap evidence.`
+
+**7. Debug field that is provably always `false`**
+- Location: `manual_commit_hooks.go:790` — `slog.Bool("idle_with_task_content", hasTaskContent)` inside a branch guarded by `!hasTaskContent`.
+- Issue: not a comment, but the same class of defect — a diagnostic that documents something untrue. Anyone reading logs will conclude the flag is never set anywhere.
+- Suggestion: drop the field (or move it to the `HandleCondense` decision log at 701-707, where it varies).
+
+---
+
+## Improvement Opportunities
+
+**8. Docs: causal connector is backwards**
+- Location: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/claude-hooks/docs/architecture/sessions-and-checkpoints.md:335-340`
+- Current: *"An IDLE session with a fresh task record (…bounded by its `StartedAt` age…) is now linkable too, **so** a subagent that dies without a completion signal doesn't leave the session trusted forever."*
+- Issue: the "so" clause is the consequence of the **freshness bound**, not of widening to IDLE. As written it reads as "widening the trust prevents over-trust."
+- Suggestion: split — "…is now linkable too. The bound is what keeps a subagent that dies without a completion signal from leaving the session trusted forever: an in-flight record persists until it completes, so without the 24h cap it would make every later commit a trailer candidate."
+
+**9. Docs: the surprising half of the behavior is missing**
+- Location: `sessions-and-checkpoints.md:340-342`
+- Current: *"The same predicate feeds `shouldCondenseWithOverlapCheck`'s overlap-check bypass, so the trigger and the condensation trust share one rule."*
+- Issue: accurate but incomplete — it omits that the predicate *also* exempts the session from the read-only skip. That exemption is the load-bearing part (a read-only subagent has no files by definition, so without it every read-only mid-task commit would ship a dangling trailer), and it is exactly what the code comment at 782-786 exists to explain. The doc is where that belongs.
+- Suggestion: add one clause — "…and exempts it from the read-only skip, which would otherwise fire on precisely the shape a read-only subagent's record has (no tracked files)."
+
+**10. Docs: the no-TTY precondition is never stated**
+- Location: `sessions-and-checkpoints.md:331-346`
+- Issue: a reader could conclude any IDLE session with a fresh record links every commit. The fast path only fires when there is no TTY or `commit_linking="always"` — and the widened trust window means a *human* commit from a non-TTY shell during that 24h window now links too. The code comment calls this "an accepted trade-off — see PR #2034"; the doc is the right place for it, and a PR number is not a substitute.
+- Suggestion: state the precondition in the doc; drop the PR pointer from the code (finding 15).
+
+**11. Uncommented non-obvious invariant: `StartedAt`, not `CompletedAt`**
+- Location: `manual_commit_hooks.go:888-891`
+- Issue: freshness is measured from `StartedAt` for *every* record, including completed ones. A subagent that started 25h ago and finished five minutes ago is stale, and its commit goes unlinked. The doc says "Bounded per record's `StartedAt`" but never says why that clock rather than `CompletedAt` or "most recent record activity". This is the kind of choice a future maintainer will "correct" without realizing it widens the trust window for long-running tasks.
+- Suggestion: one line — `// StartedAt, not CompletedAt: the bound must cap how long an in-flight record can confer trust, and an in-flight record has no CompletedAt.`
+
+**12. Line-number reference in a comment**
+- Location: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/claude-hooks/cmd/entire/cli/strategy/phase_postcommit_test.go:2577` — *"PostCommit's own no-trailer early bail (~line 947)"*
+- Issue: correct today (the bail is at 945-949) and guaranteed to rot on the next edit above it.
+- Suggestion: reference the behavior, not the line — "PostCommit's `trailers.ParseCheckpoint` early bail".
+
+**13. Test names still carry the renamed vocabulary**
+- Locations: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/claude-hooks/cmd/entire/cli/integration_test/subagent_commit_in_turn_test.go:153` (`TestSubagentCheckpoints_CommitWhileIdleWithLiveMarker_LinksAndCondensesContent`), `:291` (`TestSubagentCheckpoints_IdleCommitNoMarkers_NoTrailer`), `:317` (*"minus the marker"*), and `phase_postcommit_test.go:2596` (*"a stale ended session's lingering marker"*).
+- Issue: the trigger was renamed from `idleWithLiveMarker` to `idleWithTaskContent`; these names are the pre-rename vocabulary. Worse, "LiveMarker" actively misdescribes the predicate, which accepts completed-unmaterialized records too. (Note: the base branch uses "in-flight marker" informally throughout `subagent_checkpoints_test.go` — out of scope, but it means the new names read as consistent with the *old* design rather than the shipped one.)
+- Suggestion: `…_CommitWhileIdleWithTaskRecord_…` / `…_IdleCommitNoTaskRecords_NoTrailer`; "marker" → "record" in the two prose spots.
+
+**14. Undocumented dead bypass in `HandleCondenseIfFilesTouched`**
+- Location: `manual_commit_hooks.go:727`
+- Issue: `idleWithTaskContent(...)` is passed, but the `len(state.FilesTouched) &gt; 0 &amp;&amp;` short-circuit runs first — so for the read-only-subagent shape (the case the bypass exists for) the argument can never change the outcome. It is only reachable from IDLE via `EventCompaction` (`session/phase.go:185`); IDLE + `EventGitCommit` routes to `ActionCondense` (`phase.go:171`), which is the path that matters. Harmless today, but the symmetry with line 699 invites a reader to assume the bypass works here too.
+- Suggestion: either a one-line note (`// FilesTouched gate runs first, so the task-content bypass is inert here; kept for parity with HandleCondense`) or drop the argument.
+
+---
+
+## Recommended Removals
+
+**15. Multi-line rationale blocks that the house style puts in commit messages**
+- `manual_commit_hooks.go:782-786` — a 5-line block justifying `!hasTaskContent`. Three of its five lines are rationale already captured in the commit message of `1d4341a62` and in the test doc at `phase_postcommit_test.go:2617-2622`. Reduce to one line: `// Task content is the evidence — the read-only skip must not fire for it (a read-only record has no files by definition).`
+- `manual_commit_hooks.go:766-786` as a whole is now ~21 lines of comment above a single `if`, on top of an 8-line function doc. Per the PR #2030 bar (one-line inline comments, rationale in the commit message), this is over budget even before the accuracy fixes.
+
+**16. Doc comment that restates its caller**
+- `manual_commit_hooks.go:2177-2183`. The added sentence explains what `tryAgentCommitFastPath` already checked — duplicating that function's own doc at 2103-2112 and rotting the moment a second call site appears (there is exactly one today). The pre-existing three-line version was accurate and sufficient.
+- Suggestion: revert to the original wording with one substitution — "(eligible session + no TTY)" instead of "(ACTIVE session + no TTY)".
+
+**17. Inline comment that restates the next line**
+- `manual_commit_hooks.go:2129-2130` — *"ACTIVE, or IDLE with a fresh task record whose content the commit's own condensation materializes (see `idleWithTaskContent`)"* sits directly above `eligible := state.Phase.IsActive() || idleWithTaskContent(state, now)`. This is the *third* place the eligibility rule is spelled out (function doc 2110-2112, this comment, `idleWithTaskContent`'s own doc). It explains *what* the next line does.
+- Suggestion: delete; the identifier is self-documenting and the doc is one screen up.
+
+**18. `— see PR #2034`**
+- `manual_commit_hooks.go:2112`. A PR pointer for "the widened no-TTY trust window is an accepted trade-off" conveys nothing at the call site and requires network access to resolve. The trade-off itself belongs in `sessions-and-checkpoints.md` (finding 10).
+
+---
+
+## Positive Findings
+
+- `manual_commit_hooks.go:881-883` — *"Shared by `tryAgentCommitFastPath`'s eligibility check and `shouldCondenseWithOverlapCheck`'s overlap-check bypass so the trigger and the condensation trust can never drift apart into two different rules."* This is a genuine why-comment pinning a real coupling invariant; it is the best comment in the diff.
+- `manual_commit_hooks.go:2154-2155` — *"`task_records` spans ALL sessions so 'records present but ineligible' is distinguishable from 'no records'."* Explains why the second loop exists rather than what it does, and is accurate.
+- `sessions-and-checkpoints.md:331-346` — correctly placed (directly after **Shadow-branch task checkpoints**, before **Committed Checkpoints**), matches the surrounding bold-lead-in convention, and its central factual claim is verified: `materializeTaskRecords` (`manual_commit_condensation.go:294-300`) does store every record's transcript-so-far on every condensation, and `sessionHasNewContent` (`manual_commit_hooks.go:1644-1651`) does make `hasNew` true on task content alone. Density and voice are a good match for the document.
+- `condense_skip_test.go:451-455` and the per-case one-liners in the table — concise, each states the behavioral rule rather than the mechanics.</result>
+<usage><subagent_tokens>114903</subagent_tokens><tool_uses>27</tool_uses><duration_ms>320654</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a554c70f29352aee4</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-claude-hooks/0153df40-cf3f-429a-bd42-56a3f8dc0a0b/tasks/a554c70f29352aee4.output</output-file>
+<status>completed</status>
+<summary>Agent "Code review PR 2034" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## What I reviewed
+
+`git diff 5fcc09e57...708362a86` — one production file (`/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/claude-hooks/cmd/entire/cli/strategy/manual_commit_hooks.go`, +83/−34), four test files (+484), and a doc block (+17). Base PR #2032 treated as out of scope.
+
+**Evidence run:** `go build ./...` clean; `go vet -tags integration` clean on both packages; `golangci-lint run --new-from-rev=5fcc09e57 ./cmd/entire/cli/strategy/...` → 0 issues; the four new strategy tests pass. I also ran two mutation/probe experiments through `go test -overlay=` so nothing in the tree was modified.
+
+---
+
+## Direct answers to your four focus questions
+
+**1. Phase/staleness gating — no leak, and the ENDED test is not vacuous.** `idleWithTaskContent` (`manual_commit_hooks.go:884`) hard-gates on `state.Phase != session.PhaseIdle`, so ACTIVE and ENDED can't reach it. I verified the ENDED exclusion by mutation: overlaying a copy of the file with the phase check deleted makes **both** guard tests fail —
+
+```
+--- FAIL: TestTryAgentCommitFastPath_IdleTaskRecordEligibility/DeclinesEndedSessionWithTaskRecord
+    expected: false / actual: true   "should not contain Entire-Checkpoint"
+--- FAIL: TestPostCommit_EndedSessionWithLingeringRecord_UnrelatedCommitNotCondensed
+    INFO session condensed session_id=test-postcommit-ended-lingering-record checkpoint_id=c1c1c1c1c1c1
+```
+
+That test is doing real work. One nit: a stale phase value read from disk is `""` rather than normalized (`session.PhaseFromString` normalizes `""` → idle, but the raw field is compared here), so legacy state files fail closed — safe direction, worth a one-liner if you care.
+
+**The 24h bound is real for the two call sites this PR touches, but not for the sibling trailer route** — see Important 3.
+
+**2. Trailer/condense symmetry holds for the paths this PR opens.** I traced it: IDLE + `EventGitCommit` routes to `ActionCondense` unconditionally in `session/phase.go:165-170` (not `CondenseIfFilesTouched`), so a read-only subagent's empty `FilesTouched` can't block the condense; `hasNew` is true via `sessionHasNewContent`'s `HasTaskContent()` early return; and the fast path's empty-session guard can't reject a session that `idleWithTaskContent` accepted (the former is a superset). `PrepareCommitMsg` already bails on `isGitSequenceOperation` at line 364, so the widened set can't mint trailers during a cherry-pick that `PostCommit` would then decline — that closes the asymmetry I most expected to find.
+
+**3. Mis-attribution in the other direction:** bounded, but see Important 2 — the read-only skip is now disabled in exactly the multi-session case it was written for.
+
+**4. CLAUDE.md:** no `worktree.Status()`, no `git.PlainOpen` in production code, no `fmt.Print*` for operational output, `logging.Debug` used correctly with metadata-only attrs, `t.Parallel()` correct everywhere (the three new tests that omit it all use `t.Chdir`, which is the documented exception), tests extend existing files rather than creating niche ones, dupl clean. The two `git.PlainOpen` calls in the new tests join 37 pre-existing ones in the same file, so they're consistent with local convention rather than a new violation. Ratio and comment volume are the real issues — Important 4.
+
+---
+
+## Important (80-89)
+
+### 1. The comment justifying the bypass is factually wrong about `FilesTouched` — confidence 95
+
+`manual_commit_hooks.go:768`:
+
+&gt; `// records never reach FilesTouched, so overlap is unsatisfiable for them.`
+
+Completed task records **do** reach `FilesTouched`. `applyTaskRecordCompletion` in `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/claude-hooks/cmd/entire/cli/strategy/manual_commit_git.go:382`:
+
+```go
+state.FilesTouched = mergeFilesTouched(state.FilesTouched, rec.Files)
+```
+
+This is load-bearing, not cosmetic: it's the stated reason overlap evidence is "unsatisfiable," which is the premise for skipping the overlap check entirely. The true statement is narrower — *in-flight* records, and completed *read-only* records, have no files; a completed writing subagent's files are merged in and would have satisfied overlap on their own. Suggest rewording to "an in-flight or read-only record contributes no files, so overlap is unsatisfiable for exactly the shape the fast path trusts."
+
+### 2. `!hasTaskContent` disables the read-only skip only in the multi-session case — and the justification doesn't hold there — confidence 85
+
+`manual_commit_hooks.go:787`. The skip fires only when `sessionsWithCommittedFiles &gt; 0 &amp;&amp; len(filesTouchedBefore) == 0` — i.e. **only when a different session's tracked files are in this commit**. In the single-session subagent scenario the PR targets, `sessionsWithCommittedFiles` is 0 and the skip never fires, so the new exemption changes nothing. The exemption's entire behavioral footprint is the case where another session claims the commit.
+
+The inline justification (`:782-786`) says skipping "would leave it dangling over a checkpoint the materializer never filled" — but `tryAgentCommitFastPath` returns after the **first** eligible session (`:2131-2152`), so when another session owns the committed files, that other session is very likely the one the trailer was minted for, and it will fill the checkpoint. Skipping the record-bearing session there does not dangle anything.
+
+Net effect: an IDLE session carrying any fresh record now gets condensed into a commit produced by a *different* session, which is the precise contamination the read-only gate was added to prevent ("codex exec from tools like summarize"). Your own new test encodes this shape and asserts the new behavior — `phase_postcommit_test.go`, case `"task content survives the read-only skip"` with `sessionsWithCommittedFiles: 1  // another session claims the committed files`. Practical exposure is low (a summarize-style read-only session won't carry Task records), and the failure mode is "content lands in a shared multi-session checkpoint" rather than data loss, so this is a scoping call rather than a bug. But the comment should say what's actually true, and it's worth deciding whether the exemption should be conditioned on this session being the one the fast path selected.
+
+### 3. The 24h freshness bound is bypassable through the editor-flow trailer route (inherited from base, but it undercuts this PR's documented claim) — confidence 90
+
+`docs/architecture/sessions-and-checkpoints.md` now states the bound exists "so a subagent that dies without a completion signal doesn't leave the session trusted forever." That's true of `tryAgentCommitFastPath` and `shouldCondenseWithOverlapCheck`. It is not true of `PrepareCommitMsg`'s slow path: `sessionHasNewContent` returns true for **any** record-bearing session regardless of phase or age (`manual_commit_hooks.go:1645`), and for `source == ""` (plain `git commit` with an editor) the trailer is added unconditionally with no TTY check and no prompt (`manual_commit_hooks.go:537-539`).
+
+Reproduced end-to-end via overlay — IDLE session, **30h-old** record, no tracked files, no transcript:
+
+```
+PROBE editor-flow message after PrepareCommitMsg: "...\n\nEntire-Checkpoint: e6a4332943b6\n# Remove the Entire-Checkpoint trailer above..."
+PROBE committed message -&gt; ParseCheckpoint found=true id=e6a4332943b6
+PROBE metadata branch after PostCommit (nil == condensed): reference not found
+```
+
+Trailer present and parseable, `PostCommit` runs, no checkpoint created — a dangling trailer, the exact failure mode Important 2's exemption exists to avoid. I re-ran the identical probe against base `5fcc09e57` and got the same result, so **this is pre-existing, not introduced here.** Flagging it because this PR is where the bound and the "no dangling trailer" invariant are established and documented; either tighten `sessionHasNewContent`'s task-record branch with the same freshness/phase predicate, or scope the doc claim to the fast path so the next reader doesn't over-trust it.
+
+### 4. Test volume: 484 added test lines vs 83 added prod lines, of which 48 are comments — confidence 85
+
+Against your stated bar (added test lines ≤ added prod lines) this is ~5.8:1, or ~14:1 measured against the 35 lines of actual new code. Comment density is the compounding factor: 58% of the prod diff and 25% of the test diff are comment lines (integration test 63/199, `phase_postcommit_test.go` 43/187).
+
+The concrete accretion is duplication between layers: `TestPostCommit_IdleSessionWithTaskRecord_CondensesMaterializedContent` (`phase_postcommit_test.go`, ~60 lines) and `TestSubagentCheckpoints_CommitWhileIdleWithLiveMarker_LinksAndCondensesContent` (`subagent_commit_in_turn_test.go`, ~150 lines) assert the same guarantee — trailer backed by a materialized `tasks/` subtree — one at unit level, one through the real hook chain. Per your own rule that the integration test is what anchors pipeline behavior, the unit-level twin is the one to drop. That alone takes ~60 lines off; trimming the 20-line doc-comment preambles to one line each (rationale belongs in the commit message) takes off ~100 more and brings this into a defensible range.
+
+Keepers, for what it's worth: the ENDED regression test (unique, mutation-proven), `ReadOnlySkipSparesTaskContent` (cheap pure-function table), the eligibility table, and `IdleCommitNoMarkers_NoTrailer`.
+
+---
+
+## Suggestions
+
+- **Freshness should key on `CompletedAt` for completed records** (`manual_commit_hooks.go:888`). A subagent that started 30h ago and completed 5 minutes ago has an unmaterialized record that is stale by `StartedAt` and fresh by any useful measure — it loses linkage on the very commit that should carry it. `now.Sub(task.StartedAt)` is the right bound for in-flight records only.
+- **Consider `state.OwnerExited()` as a cheap tightening** of `idleWithTaskContent`. A crashed agent's IDLE session with a fresh record currently links every no-TTY commit for up to 24h; if the owner process is provably gone, no background subagent is still running, so the in-flight-record premise is false. `proclive.Check` already backs this and degrades to Unknown on Windows/cross-host, which would fall back to today's behavior.
+- **`addTrailerForAgentCommit`'s doc (`:2181`) says the session "is trusted unconditionally."** It isn't quite — the caller's empty-session guard rejects sessions with nothing condensable. Minor, but this doc is now the load-bearing explanation of the trust boundary.
+
+---
+
+## Genuinely well done
+
+- **Sharing one predicate between the trigger and the condensation trust** is the right call and is what makes the invariant auditable at all. Both call sites pass `time.Now()` explicitly, so the function stays testable without a clock injection.
+- **The integration test asserts content, not the trailer.** `TestSubagentCheckpoints_CommitWhileIdleWithLiveMarker` drives the real prepare-commit-msg + post-commit chain and then reads the subagent transcript back out of the checkpoint's `tasks/` subtree. For a "no dangling trailer" invariant that is exactly the assertion that proves the thing; a trailer-presence check would have been theater.
+- **The negative companions are the ones most PRs skip.** `IdleCommitNoMarkers_NoTrailer` guards against the widening degenerating into "any IDLE session links every commit," and the ENDED regression test encodes a scoping bug that a previous iteration actually had — and I confirmed it fails when the gate is removed.
+- **Diagnostic logging was upgraded alongside the predicate**, not after the fact: `task_records` is summed across *all* sessions so "records present but ineligible" is distinguishable from "no records" in the field. That's the log line you'd want during the next incident.
+- The doc block in `sessions-and-checkpoints.md` is accurate about mechanism (modulo the over-broad "trusted forever" claim in Important 3) and keeps CLAUDE.md's requirement that strategy behavior changes land in the architecture docs.</result>
+<usage><subagent_tokens>143843</subagent_tokens><tool_uses>43</tool_uses><duration_ms>575396</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ac7b091829018a73f</task-id>
+<tool-use-id>toolu_017HUE21UReJzL1uZ1WHDqEG</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-claude-hooks/0153df40-cf3f-429a-bd42-56a3f8dc0a0b/tasks/ac7b091829018a73f.output</output-file>
+<status>completed</status>
+<summary>Agent "Test review PR 2034" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Method
+
+I copied the tree to scratch and ran a mutation matrix against the 7 behaviors the ~34 lines of new prod *code* implement (83 added prod lines, 49 of them comments). Working tree untouched (`git status` clean). Mutants:
+
+| # | Mutation (reverting one guarantee) | Killed by |
+|---|---|---|
+| M1 | drop `state.Phase != PhaseIdle` in `idleWithTaskContent` | fast-path table (`DeclinesEndedSessionWithTaskRecord`) **+** `TestPostCommit_EndedSessionWithLingeringRecord…` |
+| M2 | drop the 24h freshness bound | fast-path table (`DeclinesIdleSessionWithStaleTaskRecord`) only |
+| M3 | drop `\|\| hasTaskContent` from the condense gate | `TestPostCommit_IdleSessionWithTaskRecord…`, `TestShouldCondense…SparesTaskContent`, **and** the integration test |
+| M4 | drop the `!hasTaskContent &amp;&amp;` read-only exemption | `TestShouldCondense…SparesTaskContent` **only** |
+| M5 | fast path back to ACTIVE-only (**the PR's headline change**) | fast-path table only — **integration test survives** |
+| M6 | condense-side bypass unscoped from phase (fast path left scoped) | `TestPostCommit_EndedSessionWithLingeringRecord…` **only** |
+| M7 | any IDLE session eligible, record not required | fast-path table only — **integration test survives** |
+
+Every mutant dies somewhere, so nothing here is dead weight in the "tests nothing" sense. But the *distribution* of kills is the whole story: all 7 die at the unit level, and the 171 integration lines contribute **zero unique kills**.
+
+---
+
+## 1. Consolidation plan (~235 lines removable)
+
+Current: 484 added test lines / 83 added prod lines (~5.8:1; ~14:1 against the 34 lines of real code).
+
+**C1 — Delete `TestSubagentCheckpoints_IdleCommitNoMarkers_NoTrailer` (41 lines).** `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/claude-hooks/cmd/entire/cli/integration_test/subagent_commit_in_turn_test.go:285-325`. It is vacuous — see §2(d). Guarantee (d) is already pinned by the unit case `DeclinesIdleSessionWithoutTaskRecords`, which kills M7 that this test survives. **Saves 41.**
+
+**C2 — Cut or shrink `TestSubagentCheckpoints_CommitWhileIdleWithLiveMarker_LinksAndCondensesContent` (154 lines + the 17-line `requireSessionState` helper it is the sole user of).** Same file, `:131-284`, helper at `subagent_checkpoints_test.go:388-404`. It kills only M3, which two unit tests already kill; it survives M5, M1, M2, M4, M7. If you keep it as the pipeline anchor (house rule), cut:
+- the SubagentStop epilogue and the "committed file not re-added to FilesTouched" loop (`:255-284`, ~30 lines) — that is #2032 base-branch behavior, already covered in `subagent_checkpoints_test.go`;
+- the `env.ValidateCheckpoint(...)` block (~9 lines) — the `tasks/` assertion above it plus the unit test already prove it;
+- the 22-line doc header down to ~5 (it also makes a false claim — §3).
+- inline the nil-guard and drop `requireSessionState` (17).
+
+**Saves ~100 trimmed, or ~171 if deleted.**
+
+**C3 — Table-ize the two `PostCommit` tests into one `TestPostCommit_TaskRecordCondensationScope` (`phase_postcommit_test.go:2463-2609`, 147 lines).** They are not duplicates (M3 vs M6 unique kills), but they are the same shape: build repo → seed session with phase+records → commit → `PostCommit` → assert condensed / not. Two cases (`idle+fresh → v1 branch exists + `tasks/&lt;id&gt;/agent-&lt;id&gt;.jsonl` contains the subagent text`; `ended+lingering → no v1 branch, shadow survives, records untouched`). **Saves ~55.**
+
+**C4 — Trim prose.** 13 + 11 + 6 + 22 lines of doc comments across the four new tests down to ~4 each. **Saves ~35** (overlaps partly with C2/C3; net new ~20).
+
+**C5 — Micro:** drop the `stepCount` field from the fast-path table (`condense_skip_test.go`) — it is set in one case only and is redundant with `TranscriptPath` already being non-empty, so it reads as a knob that matters when it does not. **Saves ~4.**
+
+Landing C1+C2(trim)+C3+C5 → **~250 test lines vs 83 prod**. Deleting the integration test entirely → **~180**. Getting under 1:1 is not achievable while pinning 6 distinct mutants; ~200 is the honest floor, and the rule is doing its job as a smell-detector here (the smell is the integration test, not the unit tests).
+
+Note the prod diff itself is 49/83 comment lines — several of those paragraphs restate the PR description and would read better in the commit message.
+
+---
+
+## 2. Are the four guarantees actually pinned?
+
+**(a) idle + fresh record → trailer AND materialized `tasks/&lt;id&gt;/agent-&lt;id&gt;.jsonl` — YES, at unit level.** Trailer half: fast-path table `AcceptsIdleSessionWithTaskRecord` (sole killer of M5). Content half: `TestPostCommit_IdleSessionWithTaskRecord_CondensesMaterializedContent` asserts the blob contains `"background widget progress"` and dies under M3. Solid. The integration test asserts the same thing a second time and adds nothing.
+
+**(b) stale (&gt;24h) record → nothing — PINNED AT THE WRONG LEVEL; the guarantee does not hold end-to-end.** `DeclinesIdleSessionWithStaleTaskRecord` passes and kills M2, but it only exercises `tryAgentCommitFastPath`. I ran the full `PrepareCommitMsg` → commit → `PostCommit` chain against an IDLE session whose only content is a 30h-old record:
+
+```
+prepare-commit-msg: trailer added  checkpoint_id=94774794b9f8
+metadata branch after PostCommit: err=reference not found
+```
+
+The fast path correctly declines, then the slow path stamps the trailer anyway — `sessionHasNewContent` returns true on `state.HasTaskContent()` (`manual_commit_hooks.go:1645`) with **no freshness bound** (base-branch #2032 behavior; pinned by `mid_turn_commit_test.go:112-114`). `PostCommit` then refuses to condense, because `idleWithTaskContent` *does* apply the bound. Result: a **dangling `Entire-Checkpoint` trailer on an unrelated human commit** — exactly the hazard the read-only-exemption comment says must not happen. This also contradicts `idleWithTaskContent`'s doc claim that trigger and condensation trust "can never drift apart into two different rules": there is a third trigger (the slow path) with a different rule. This is the most important thing to fix, and no test would catch it.
+
+**(c) ENDED + lingering record must not swallow an unrelated human commit — YES, genuinely.** Sole killer of M6, and it is explicitly *not* vacuous: the author put a real trailer on the unrelated commit so `PostCommit`'s no-trailer early bail (`manual_commit_hooks.go:947`) can't short-circuit it, and asserts four things (no v1 branch, shadow survives, `BaseCommit` unmoved, records untouched). Good test.
+
+**(d) idle, no records → unlinked — pinned by the unit case, VACUOUS at the integration level.** `TestSubagentCheckpoints_IdleCommitNoMarkers_NoTrailer` survives M7 (all IDLE sessions eligible). I instrumented it:
+
+```
+PROBE state: transcript="" stepCount=0 files=[] phase=active
+```
+
+Because it uses `SimulateUserPromptSubmit` (not `…WithTranscriptPath`), the session is empty by every measure, so it never reaches the record gate — it passes through the *empty-session* guard. It cannot be repaired either: give it a transcript and it would fail against unmutated prod, because a normal idle session with transcript content is *supposed* to link. The guarantee belongs at the unit level, where it already is.
+
+---
+
+## 3. Genuine gaps
+
+1. **The (b) asymmetry above** — the freshness bound exists on `idleWithTaskContent` but not on the `HasTaskContent()` trigger in `sessionHasNewContent`. Product bug + zero coverage.
+2. **The integration test's premise is false on this base.** Its header says pre-PR "the commit shipped with no `Entire-Checkpoint` trailer at all." Reverting the fast-path widening (M5), the test still passes — the slow path links it via `HasTaskContent()`. On top of #2032, the fast-path widening buys *prompt-avoidance and detection cost* (and the `commit_linking="always"` + TTY case), not linkage. Worth correcting in the comment and in the PR description; a reviewer reading "six of seven commits went unlinked" will assume the integration test reproduces that, and it does not.
+3. **`HandleCondenseIfFilesTouched`'s new argument (`manual_commit_hooks.go:727`) is untested and half-inert.** Per `session/phase.go`, that handler is reached from ENDED+commit (where `idleWithTaskContent` is always false, so the arg does nothing) and from `EventCompaction` on IDLE/ACTIVE. A compaction on an IDLE session with a fresh record now bypasses the overlap check — new behavior, no test.
+4. **Completed-but-unmaterialized records.** `idleWithTaskContent`'s doc says it trusts both HasTaskContent shapes, but every test uses live records (`CompletedAt` zero); the integration test explicitly asserts liveness at commit time. One table row (`CompletedAt: time.Now()`) closes it — 2 lines.
+5. **24h boundary** — nothing at exactly `activeSessionInteractionThreshold`. One row, 2 lines. Low value but free inside the existing table.
+6. **Multi-session precedence.** `tryAgentCommitFastPath` returns on the *first* eligible session in slice order, so an ACTIVE session and an IDLE record-bearing session in the same worktree now race for the trailer. `TestTryAgentCommitFastPath_SkipsEmptyButAcceptsContentSession` covers empty-then-content but not this. Misattribution is user-visible; worth one case (~10 lines) — and worth deciding deliberately which should win.
+
+---
+
+## What is well covered
+
+- All four fast-path eligibility axes in one 82-line table (`condense_skip_test.go:450-532`) — sole killer of M2, M5, M7 and half of M1. Excellent value per line; the table-ization commit (`b7ae494c3`) was the right call.
+- The read-only-skip exemption: `TestShouldCondenseWithOverlapCheck_ReadOnlySkipSparesTaskContent` (38 lines) is the *only* thing standing between you and M4, i.e. the dangling-trailer regression the exemption exists to prevent. Cheapest, highest-leverage test in the diff — keep it exactly as is.
+- The ENDED-scoping regression test is a model of non-vacuity: it names the trap it avoids (the no-trailer early bail) and pins four separate post-conditions.
+
+Files: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/claude-hooks/cmd/entire/cli/strategy/manual_commit_hooks.go`, `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/claude-hooks/cmd/entire/cli/strategy/condense_skip_test.go`, `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/claude-hooks/cmd/entire/cli/strategy/phase_postcommit_test.go`, `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/claude-hooks/cmd/entire/cli/integration_test/subagent_commit_in_turn_test.go`, `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/claude-hooks/cmd/entire/cli/integration_test/subagent_checkpoints_test.go`.</result>
+<usage><subagent_tokens>130219</subagent_tokens><tool_uses>39</tool_uses><duration_ms>1047683</duration_ms></usage>
+</task-notification>
+
+---
+
+yes fix this

@@ -1,0 +1,384 @@
+BUG: `entire trail create` pushes the trail branch to a hardcoded remote named
+`origin`. If `origin` has been repointed at an Entire mirror, the branch is
+pushed into a one-way mirror: the trail never appears and nothing warns.
+
+VERIFIED FACTS (read from source, not executed):
+- main:cmd/entire/cli/trail_cmd.go:2317 `pushBranchToOrigin` runs
+  `git push --no-verify -u origin <branch>`. One caller, in trail create.
+- Same file, `branchExistsOnOrigin` has the identical hardcode.
+- main:cmd/entire/cli/repo_mirror_use.go:25 `const defaultMirrorRemote = "origin"`.
+  `entire repo mirror use` repoints origin at the mirror URL, preserving the
+  original forge URL under a separate remote (default name `upstream`).
+- The mirror is one-way. cmd/entire/cli/configure_onboarding.go:1108-1110 states
+  it outright: "config commits must land on GitHub, never in the one-way Entire
+  mirror."
+- That file ALREADY solves this problem for its own commit path: it resolves a
+  separate `forgeRemote` (see configureExistingForgeRemote / configureUseMirror)
+  and pushes there, never to origin. Trail creation has no equivalent.
+
+SCOPE — do NOT file this against PR #1979:
+- Both ingredients are on main. `git diff main...feat/interactive-configure-onboarding
+  -- cmd/entire/cli/trail_cmd.go` is EMPTY — the PR does not touch trail code.
+- What the PR changes is exposure, not the defect: on main, repointing origin
+  requires deliberately running `entire repo mirror use`. In the PR, it happens
+  inside the default `entire configure` onboarding as a side effect of picking an
+  upstream from a radio list. Population goes from "people who ran a mirror
+  command on purpose" to "everyone who onboards".
+
+REPRO (derived from code; NOT executed — verify before asserting it):
+  1. Repo with a GitHub origin, Entire enabled, trails available.
+  2. `entire repo mirror use`  (or, on the PR branch, `entire configure`)
+     -> origin now `entire://<cluster>/gh/<owner>/<repo>`, GitHub under another remote
+  3. `entire trail create`  -> pushes to origin, i.e. the mirror
+
+FIX SHAPE:
+- `pushBranchToOrigin` and `branchExistsOnOrigin` must resolve the pushable forge
+  remote instead of assuming `origin`. Reuse the resolution
+  configure_onboarding.go already performs rather than adding a third copy.
+- Consider the shared primitive: `strategy_options.checkpoint_push_remote`
+  (settings/settings.go:1477) already expresses "which remote is the real one" for
+  checkpoints. Trails need the same answer; check whether one resolver can serve both.
+- Related, same root cause, larger: SEVEN call sites derive repo identity from a
+  remote literally named "origin" —
+  api_cmd.go:223, entireapi_client.go:78, experts_cmd.go:364, explain_repo.go:138,
+  recap.go:269, recap.go:282, trail_cmd.go:2271.
+  A single `repoidentity.Resolve()` chokepoint would fix this class. Also
+  gitremote/gitremote.go: `hostToForge` maps only "github.com", so non-GitHub and
+  native (`et`) forges are rejected despite the doc comment implying otherwise.
+
+---
+
+we have logic for checkpoint pushing already, can you check?
+
+---
+
+yes
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>a4659968c4dcb135a</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-silver-stone-eb77/1e9d9e4c-117e-4fe3-acb4-dd9743b4e8d6/tasks/a4659968c4dcb135a.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Read the diff and both files, plus the neighbouring conventions (`ResolveCheckpointSyncRemote`'s doc comment, `initTrailCleanupRepo`, `defaultBaseBranch`, `validateGitRemoteName`).
+
+## Findings (most significant first)
+
+**1. `trailCreateBranchState.Remote` is echoed-back input on an otherwise output-only struct — resolve once in the caller instead**
+- `cmd/entire/cli/trail_cmd.go:1032-1035` (field), `:1109-1113` (set), `:1055` + `:1130` (reads)
+- Cost: the struct's other three fields are all *outputs* of `prepareTrailCreateBranch` (what it did); `Remote` is an *input* stored so a second caller can see it. That forces the defensive doc comment about git config changing underneath, plus a new `ctx` parameter on `prepareTrailCreateBranch` that exists solely to reach `resolveTrailPushRemote`, plus the invariant "`state.Remote` is non-empty on every path that reaches `cleanupCreatedTrailBranch`" for a reader to re-derive.
+- Simpler form: hoist the resolve into `runTrailCreate` and pass it down as a parameter, exactly like the four wrappers now take it:
+  ```go
+  remote, err := resolveTrailPushRemote(ctx, branch)   // branch=="" → "origin", zero git calls, no error path
+  if err != nil { return err }
+  branchState, err := prepareTrailCreateBranch(w, errW, repo, remote, branch, currentBranch, noBranch)
+  ...
+  cleanupCreatedTrailBranch(repo, remote, branch, branchState.LocalCreated, branchState.RemotePushed, errW)
+  ```
+  Net: field + 3-line comment gone, `ctx` param gone from `prepareTrailCreateBranch` (nothing else in it uses ctx), the "config changed underneath" concern is structurally impossible rather than argued, param count unchanged at 7, and the test churn at `trail_cmd_test.go:86` (`context.Background()` threaded into a branchless-path test) disappears. Both cleanup call sites then read the same local. Verified safe: `noBranch` always implies `branch == ""` (`validateTrailCreateFlagCombos` + `resolveTrailCreateFields`), so hoisting adds no failure mode for branchless trails.
+
+**2. The same "this is not the checkpoint-sync election" argument is now written three times**
+- `cmd/entire/cli/strategy/checkpoint_sync_capture.go:238-248` and `cmd/entire/cli/trail_cmd.go:2204-2208`
+- Cost: `ResolveCheckpointSyncRemote` (`checkpoint_sync_remote.go:52-72`) already carries this rationale in full, with the `git clone -o base` / `remote.pushDefault` examples and the regression-test name. The diff adds a paragraph restating it in `DeclaredPushRemoteForBranch` ("that election exists to contain session data to one remote, defaults to origin outright, and is latched by past pushes"), then a near-verbatim third copy in `resolveTrailPushRemote` ("elects which single remote may carry checkpoint data … defaults to origin outright and is latched by past pushes") — which then points the reader *back* at copy two. ~20 of the ~35 added comment lines are this restatement. Long comments are the house style, but three copies of one argument means two of them go stale.
+- Simpler form: keep the argument once where the two functions live side by side (`DeclaredPushRemoteForBranch`), and reduce `resolveTrailPushRemote`'s third paragraph to a pointer: `// Not ResolveCheckpointSyncRemote — see strategy.DeclaredPushRemoteForBranch for why the two questions differ.` Likewise `DeclaredPushRemoteForBranch`'s last three lines already say "see ResolveCheckpointSyncRemote's doc comment for why" and then say why anyway — drop the parenthetical summary and keep the pointer.
+
+**3. `resolveTrailPushRemote`'s comment paragraphs 2–3 describe the diff, not the code**
+- `cmd/entire/cli/trail_cmd.go:2193-2202`
+- Cost: "Hardcoding "origin" — **as the four git wrappers below did until this was threaded through them** — pushed the branch to the wrong remote" and "…which is why **this is a fix and not a behavior change**" are PR-description sentences. Six months from now "until this was threaded through them" has no referent, and the second paragraph's job (reassure a reviewer nothing changes for the common case) is done and gone once merged.
+- Simpler form: keep the *durable* half — the precedence, and one clause naming who breaks under a hardcoded origin (`git clone -o base`, fork-as-origin, `remote.pushDefault`) — and drop the "until this was threaded through" and "fix, not a behavior change" framing. That's ~10 lines down to ~4.
+
+**4. `TestPrepareTrailCreateBranchPushesToDeclaredRemote` re-inlines `initTrailCleanupRepo` verbatim**
+- `cmd/entire/cli/trail_cmd_test.go:2362-2374` vs the existing helper at `:342-356`
+- Cost: 11 of the 13 setup lines (tmp/local/origin.git layout, `MkdirAll`, bare init, `initOpenedTestRepo`, README write/add/commit, `remote add origin`) are a character-for-character copy of the helper the sibling test uses; only the fork bare repo, the second `remote add`, and the `config` line are new. `mise run dup` at threshold 50 is likely to see it.
+- Simpler form:
+  ```go
+  localDir, originDir, repo := initTrailCleanupRepo(t)
+  defer repo.Close()
+  forkDir := filepath.Join(filepath.Dir(localDir), "fork.git")
+  runGitTrailTest(t, localDir, "init", "--bare", forkDir)
+  runGitTrailTest(t, localDir, "remote", "add", "fork", forkDir)
+  runGitTrailTest(t, localDir, "config", "remote.pushDefault", "fork")
+  t.Chdir(localDir)
+  ```
+  6 lines instead of 14, and it also drops the local `os`/`filepath` setup noise.
+
+**5. `TestResolveTrailPushRemoteRejectsUnusableName` is a seventh row of the table above it**
+- `cmd/entire/cli/trail_cmd_test.go:2341-2355`
+- Cost: 15 lines (separate func, doc comment, its own `t.TempDir`/`InitRepo`/`Chdir`) to exercise the same call with the same setup as `TestResolveTrailPushRemote`, differing only in the assertion.
+- Simpler form: add `wantErr string` to the table struct and one row `{name: "unusable declared name fails loudly", config: [][]string{{"remote.pushDefault", "--upload-pack=touched"}}, branch: "feature/x", wantErr: "not a usable remote name"}`, with three lines in the body:
+  ```go
+  if tc.wantErr != "" { require.ErrorContains(t, err, tc.wantErr); return }
+  ```
+  Net ~-11 lines. (The six precedence rows themselves are six genuinely distinct tiers — nothing to collapse there.)
+
+**6. Minor: `defaultTrailPushRemote` is a single-use constant**
+- `cmd/entire/cli/trail_cmd.go:2186-2188`
+- Cost: 3 lines (const + 2-line doc) for one reference, inside a function whose own doc comment already says "before falling back to "origin"". `defaultBaseBranch` earns its const by being used in four files; this one is not.
+- Simpler form: `return "origin", nil`. Promote to a const only if a second call site appears.
+
+## Considered and *not* findings
+
+- **Threading `remote` through the four git wrappers**: correct and simplest as-is. Each wrapper is a thin `exec` shim with exactly one call site, `(remote, branchName)` reads naturally, and no origin-named leftovers remain (`grep` for `*Origin` in `cmd/` is clean). A struct or receiver here would be more machinery, not less.
+- **`ensureTrailCreateBranchExists` at 7 params**: it went 6→7. Still readable, and every argument is genuinely independent; a params struct would cost more than it saves.
+- **The `declaredPushDestination` / `DeclaredPushRemoteForBranch` split**: clean, not a trivial wrapper. `declaredPushDestination` still owns the HEAD resolution and has two callers (`checkpoint_sync_capture.go:170`, `checkpoint_sync_remote.go:183`); the extracted function is the reusable half. Its doc comment correctly moved the precedence list to the new owner rather than duplicating it.
+- **Dead code**: none. No unused wrapper, const, or field left behind.
+
+One stray observation, pre-existing rather than added: all four wrappers still build their own `context.WithTimeout(context.Background(), …)`, so the `ctx` the diff threads into `prepareTrailCreateBranch` dies there and never reaches the git subprocesses. If finding 1 is applied the inconsistency disappears from `prepare` entirely; plumbing ctx into the wrappers is a separate change and out of this diff's scope.</result>
+<usage><subagent_tokens>106323</subagent_tokens><tool_uses>15</tool_uses><duration_ms>173196</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aefb9c6602c798e3f</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-silver-stone-eb77/1e9d9e4c-117e-4fe3-acb4-dd9743b4e8d6/tasks/aefb9c6602c798e3f.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have everything I need. Here are my findings.
+
+## EFFICIENCY REVIEW — `trail create` push remote resolution
+
+### 1. VERIFIED CLEAN: the pre-push hook path gained zero subprocesses
+`cmd/entire/cli/strategy/checkpoint_sync_capture.go:223-259`
+
+The extraction is byte-for-byte cost-neutral. Before: `declaredPushDestination` did `git symbolic-ref` → trim → `if branch == ""` → up to 3 short-circuiting `gitConfigValue`. After: `git symbolic-ref` → trim → `DeclaredPushRemoteForBranch`, which contains the identical `if branch == ""` guard and the same three `gitConfigValue` calls in the same order with the same short-circuit.
+
+**Subprocess count per `declaredPushDestination`, before and after: 1 `git symbolic-ref` + 1–3 `git config --get`.** The only delta is one Go function call and one string copy. Nothing to flag.
+
+### 2. NOT WORTH OPTIMIZING: the 3 `git config --get` spawns in `trail create`
+`cmd/entire/cli/trail_cmd.go:2209-2222`
+
+Measured on this machine: ~9.6ms per `git config --get` spawn (100 iterations, 0.962s — and that's the sandboxed upper bound; a bare fork+exec is closer to 3–5ms). Worst case for the resolver is ~29ms, **once** per `trail create`.
+
+That command already pays, in sequence: `gitremote.ResolveRemoteRepo` (line 2157), `newTrailAPIClient` (auth, possibly a token refresh), `branchExistsOnRemote` (network `ls-remote`), `git push` (network), and `postTrailCreate` (HTTP POST). The config reads are well under 1% of wall time and are dwarfed by a single TCP handshake.
+
+Do **not** wire this into `git_remote_cache.go`. That cache exists for a measured 9-subprocess-per-command problem on a repeated election (see its own header comment on `entire checkpoint list`), and it deliberately memoizes only two questions — "which remotes exist" and "does remote X exist". Adding a third category (arbitrary config values) for a one-shot interactive command would buy ~20ms and cost a new invalidation surface: config values are mutated *by this very code path* (`git push -u` writes `branch.&lt;name&gt;.remote`), which is exactly the class of staleness the cache's doc comment warns about for settings and the captured-election file.
+
+### 3. NOT WORTH IT: replacing the three `--get` calls with one `--get-regexp`
+Technically possible — I confirmed `git config --get-regexp "^(branch\.feature/x\.(pushRemote|remote)|remote\.pushDefault)$"` matches — but it's a net loss:
+
+- **It rarely saves 3 calls.** The calls short-circuit. A repo with `branch.&lt;name&gt;.pushRemote` set costs 1 call today; `--get-regexp` always costs 1. The full 3-call cost only lands on the "nothing declared" path, i.e. saving 2 spawns (~20ms) in the case that matters least.
+- **The branch name must be regex-escaped.** Refnames permit `.`, `+`, `(`, `)`, `{`, `}`, `|`, `$` — a branch named `feature+x` or `fix(a)` silently mismatches or over-matches. That's a new correctness hazard bought with 20ms.
+- **Output lowercases keys** (`remote.pushdefault fork`), so matching needs to be case-insensitive.
+- **Precedence moves out of git and into Go.** `--get-regexp` returns matches in file order, so the three-tier precedence would become hand-written ordering logic instead of being expressed by three short-circuiting calls. That is the part of this function most worth keeping obvious.
+
+For completeness: the one genuine single-call form is `git rev-parse --abbrev-ref '@{push}'`, which asks git the whole question directly. It doesn't fit — it needs an existing upstream, and the dominant case here is a **branch being newly created**, which has none. Correctly not used.
+
+### 4. NO redundant recomputation in the new trail code
+- `resolveTrailPushRemote` is called **exactly once** per create (`trail_cmd.go:1109`), before any network work, and is skipped entirely for branchless trails by the early return at 1104.
+- The answer is threaded through `state.Remote` (`trail_cmd.go:74`) into `cleanupCreatedTrailBranch`, so the failure path does **not** re-resolve. The doc comment frames that as a correctness choice; it's also the efficient one.
+- `validateGitRemoteName` (`repo_mirror_use.go:45`) is pure regex + string checks — no subprocess.
+- `branchExistsOnRemote` count is **unchanged**: one `ls-remote`, exactly where `branchExistsOnOrigin` was. No new network calls anywhere in the diff.
+- Nothing re-resolves downstream: `maybeCheckoutTrailCreateBranch` takes no remote, and the remaining `"origin"` at line 2157 is a different question (the forge/owner/repo for the API path), not a second computation of the same value.
+
+### 5. PRE-EXISTING, not introduced — noting it so it isn't mistaken for diff fallout
+`checkpoint_sync_capture.go:170` and `checkpoint_sync_remote.go:183`
+
+Per pre-push, `declaredPushDestination` runs **twice**: once via `pendingCaptureCheckpointSyncRemote` → `captureEligible` (`manual_commit_push.go:95`), then again via either `hintGatedCheckpointSync` (line 99) or `commitCapturedSyncRemote` (lines 221/350) — the two are mutually exclusive branches. That's up to 8 subprocesses (~30–80ms) on **every `git push`**, which is the only place in this code where memoizing a config read would actually pay, and the hook already carries an installed cache (`main.go:36` calls `strategy.WithGitRemoteCache`).
+
+This is unchanged by the diff — same call sites, same counts, same order. Flagging it only as a separate follow-up candidate, not as something to fix here; folding it in would put a caching decision for the hot path inside a trail-create bugfix.
+
+### 6. Tests: nothing real
+`trail_cmd_test.go:2307-2431`
+
+- `testutil.InitRepo` is **in-process go-git** (`git.PlainInit` + `SetConfig`), not a subprocess, so the 6-case setup in `TestResolveTrailPushRemote` costs 6 temp dirs plus 0–3 `git config` spawns per case. Cheap, and per-case repos are required since each case needs different config.
+- `t.Parallel()` is correctly omitted on both the subtests and the parent: every case calls `t.Chdir`, which is process-global (CLAUDE.md), and a parallel *parent* would let those chdirs race unrelated top-level tests. The in-file precedent is consistent — `TestPrepareTrailCreateBranchSkipsBranchlessTrail` subtests *are* parallel precisely because they pass a nil repo and never chdir.
+- `TestPrepareTrailCreateBranchPushesToDeclaredRemote` spawns ~8 git subprocesses and two bare repos. Both bare repos are load-bearing (the assertion is "landed on fork, absent from origin"), and the two local pushes are filesystem-only. Justified.
+
+**Bottom line:** the diff introduces no wasted work. The one thing worth saying out loud is that the three config spawns should be left alone — this is a one-shot interactive command sitting behind three network round trips, and both available "optimizations" (a new cache category, or `--get-regexp`) cost correctness surface to save ~20ms.</result>
+<usage><subagent_tokens>117873</subagent_tokens><tool_uses>23</tool_uses><duration_ms>223645</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a27e5e661ed09c228</task-id>
+<tool-use-id>toolu_01Nvp3mbSujVfdQrknu5Htnv</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-silver-stone-eb77/1e9d9e4c-117e-4fe3-acb4-dd9743b4e8d6/tasks/a27e5e661ed09c228.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Read the diff and traced every candidate helper. Findings, most significant first.
+
+## 1. `cmd/entire/cli/trail_cmd.go:2380` — `branchExistsOnRemote` now collides with the package's existing `BranchExistsOnRemote`
+
+The rename put two functions in package `cli` whose names differ only in the case of the first letter:
+
+- `BranchExistsOnRemote(ctx, branchName)` — `cmd/entire/cli/git_operations.go:228`, exported, hardcodes `origin`, 4 callers (`resume.go:121`, `checkpoint_resume.go:151`, `trail_checkout_worktree.go:502`, `review_target.go:126`)
+- `branchExistsOnRemote(remote, branchName)` — new signature, trail-only
+
+Before the diff these were `BranchExistsOnRemote` vs `branchExistsOnOrigin` — distinguishable. Cost: the same "does this branch exist on a remote" ls-remote query is implemented twice in one package under one name, with silently different contracts (the exported one also consults local tracking refs and swallows ls-remote failure as "not found"; the new one returns the error). Autocomplete or a reviewer skim picks the wrong one with no compile error. Worse, `trail_checkout_worktree.go:502` is the *trail feature's other* remote-branch path and still calls the origin-hardcoded version, so after this change `trail create` honours the declared remote while `trail checkout` does not.
+
+Existing helper to use instead: **`BranchExistsOnRemote`** (`git_operations.go:228`) — add the `remote` parameter there (it already runs exactly `git ls-remote --heads &lt;remote&gt; refs/heads/&lt;branch&gt;`), pass `"origin"` at the four existing call sites, and delete the trail-local copy. If the differing error semantics must be kept, at minimum give the trail one a non-colliding name.
+
+## 2. `cmd/entire/cli/trail_cmd_test.go:2361` — `TestPrepareTrailCreateBranchPushesToDeclaredRemote` re-implements `initTrailCleanupRepo`
+
+Lines 2362–2374 are a line-for-line copy of `initTrailCleanupRepo` (`trail_cmd_test.go:342`): same `tmp`/`local`/`origin.git` layout, same `os.MkdirAll(localDir, 0o755)`, same `init --bare`, same `initOpenedTestRepo`, same `README.md` + `add` + `commit -m initial`, same `remote add origin`. The only genuine delta is two extra lines (`fork.git` bare init, `remote add fork`) plus the `config remote.pushDefault`.
+
+Cost: the trail branch fixture (bare origin + local repo with one commit + wired remote) now lives in two places 2000 lines apart in the same file. Anything that has to change in it — an `--initial-branch` pin, a `testutil.InitRepo` config addition, GPG/autocrlf handling — has to be found twice, and the second site is the one a future author will miss.
+
+Existing helper to use instead: **`initTrailCleanupRepo`** (`trail_cmd_test.go:342`). It returns `(localDir, originDir, repo)` but not `tmp`, so either return `tmp` as a fourth value or give it a variadic `extraRemotes ...string`; the new test then reduces to the helper call plus the fork remote and the `remote.pushDefault` config.
+
+## 3. `cmd/entire/cli/trail_cmd_test.go:2270`, `:2345`, `:2361` — new git-config tests skip `testutil.IsolateGitConfigEnv`
+
+All three new tests assert on values resolved through `git config --get`, and none isolates global/system git config. `runGitTrailTest` (line 358) does not set `cmd.Env`, and `resolveTrailPushRemote` execs `git` with the inherited environment, so `testutil.InitRepo` (which only writes repo-local config) is not enough. The strategy tests covering this exact three-tier precedence do isolate — `checkpoint_sync_remote_test.go:612` calls `testutil.IsolateGitConfigEnv(t)` as the first statement.
+
+Cost: on any machine with a global `remote.pushDefault` (a normal fork-workflow setting, and precisely the population this fix targets), the `"nothing declared falls back to origin"` case fails, and `TestResolveTrailPushRemoteRejectsUnusableName` can resolve a different tier than intended. It reads as a CI flake rather than as missing isolation.
+
+Existing helper to use instead: **`testutil.IsolateGitConfigEnv(t)`** (`cmd/entire/cli/testutil/testutil.go:363`).
+
+## 4. `cmd/entire/cli/trail_cmd.go:2219` — `validateGitRemoteName` is the write-direction validator; the fitting existing check is remote *existence*
+
+`validateGitRemoteName` (`repo_mirror_use.go:45`) exists to vet names **Entire is about to write** into `.git/config` section headers, and its doc says so. Its regex is deliberately stricter than git: `^[A-Za-z0-9][A-Za-z0-9._/-]*$`. Here the name is being *read back out* of the user's own config, so a legitimate, already-configured remote whose name git accepts but the regex does not (e.g. `_private`) turns `entire trail create` into a hard failure with the message "not a usable remote name" — for a remote that is perfectly usable.
+
+The question the code actually wants answered is "is this a remote I can push to", and the codebase already has that check, cached per-process and used by every other remote election: `isConfiguredRemote` (`strategy/manual_commit_push.go:278`, backed by `strategy/git_remote_cache.go`). It runs `git remote get-url &lt;name&gt;`, which both rejects a `--upload-pack=` style name (git errors) and accepts any name git really has.
+
+Existing helper to use instead: **`strategy.isConfiguredRemote`** — needs an exported wrapper (`strategy.IsConfiguredRemote`), which the diff is already exporting a sibling function from that same subsystem for. Keep `validateGitRemoteName` only if you want the charset guard *in addition*.
+
+## 5. `cmd/entire/cli/trail_cmd.go:2351` — `fetchBranchFromRemote` raw-execs `git fetch` where two sibling helpers use `remote.Fetch` (lower confidence)
+
+The same "fetch a user branch straight into `refs/heads/&lt;name&gt;`" operation exists twice more in this package, both via `checkpoint/remote.Fetch`, both with the identical `refs/heads/%s:refs/heads/%s` refspec and identical 2-minute timeout: `FetchAndCheckoutRemoteBranch` (`git_operations.go:309`) and `fetchTrailWorktreeBranch` (`trail_checkout_worktree.go:529`). The diff was threading a remote name into this function — exactly the field `remote.FetchOptions.Remote` already carries — which is the natural moment to converge them. Doing so would also pick up `remote.Fetch`'s non-interactive-SSH handling and `GIT_TERMINAL_PROMPT=0`, which the raw exec lacks.
+
+Existing helper: **`remote.Fetch`** with `FetchOptions{Remote: remote, RefSpecs: […], NoFilter: true, NoTags: true}`. Caveat that makes this optional rather than clear-cut: `remote.Fetch` goes through `newCommand`, which injects `ENTIRE_CHECKPOINT_TOKEN` when set — arguably unwanted for a user's own branch, though both sibling helpers already accept that. Do not apply the same argument to `pushBranchToRemote`/`deleteBranchFromRemote`: `remote.Push` also adds `--porcelain` and rewrites SSH→HTTPS under a checkpoint token, which is a genuine behavior change for a user branch push.
+
+## 6. `cmd/entire/cli/trail_cmd_test.go:2270` — precedence table now has two homes (low)
+
+Two of the six cases (`branch.&lt;name&gt;.pushRemote` outranking `branch.&lt;name&gt;.remote`, and `remote.pushDefault` applying with no tracking) are already asserted against the same code in `strategy/checkpoint_sync_remote_test.go:709` and `:721`. A change to the tier order now needs both files updated. Since the tiers are `DeclaredPushRemoteForBranch`'s contract, the table belongs beside it as a direct `TestDeclaredPushRemoteForBranch` in `strategy` — which also covers `declaredPushDestination`'s consumer for free — leaving the `cli` test to assert only the pieces it owns: the `"origin"` fallback, the rejection, and target-branch-not-HEAD.
+
+## Checked and clean (no finding)
+
+- **No pre-existing push-remote resolver was missed.** The only other one is `resolveMigratePushRemote` (`doctor_migrate.go:131`), which answers the checkpoint-sync-election question; the diff's doc comments correctly explain why that is not substitutable.
+- `gitexec.Run` (`gitexec/gitexec.go:19`) is not a fit for the four wrappers — it documents that it deliberately does *not* combine stderr, while push/fetch report everything useful there.
+- The new tests correctly reuse the file-local `runGitTrailTest`, `gitBranchExistsTrailTest`, and `initOpenedTestRepo`. Those three do duplicate `testutil.RunGit` (`testutil.go:167`) and `testutil.BranchExists` (`testutil.go:239`), but that predates this diff and reusing the local ones was the right call here.
+- Exporting `DeclaredPushRemoteForBranch` from `strategy` rather than a neutral package is forced: `strategy` cannot import `cli`, and `gitremote` is scoped to remote *URL* utilities. The one alternative worth a thought is moving it to `gitremote` (which explicitly disclaims dependencies on checkpoint/strategy/settings) so a forge command need not reach into the session-strategy package for a git-config read — that would also make most of the 18-line disclaimer comment unnecessary.</result>
+<usage><subagent_tokens>139376</subagent_tokens><tool_uses>35</tool_uses><duration_ms>281248</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a353ac6e8599c6c96</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-silver-stone-eb77/1e9d9e4c-117e-4fe3-acb4-dd9743b4e8d6/tasks/a353ac6e8599c6c96.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## ALTITUDE review — `entire trail create` push-remote resolution
+
+### Findings, most significant first
+
+---
+
+**1. `trail create` now holds two disagreeing notions of "which remote", resolved by two different mechanisms**
+`/Users/soph/.herdr/worktrees/cli/worktree-silver-stone-eb77/cmd/entire/cli/trail_cmd.go:1109` (delivery) vs `:2157` (`resolveTrailRemote` → `gitremote.ResolveRemoteRepo(ctx, "origin")`, identity)
+
+Repo **identity** — the `forge/owner/repo` the trail is created against and bound to — still comes from hardcoded `origin`. **Delivery** now comes from the branch's declared push remote. In the fork workflow the diff cites (origin = upstream, `fork` = mine), `runTrailCreate` creates the trail on `upstream/repo` and pushes the branch to `fork` — the trail binds a branch that does not exist on the repo the trail lives on. Worse, the *first* scenario the new doc comment names, `git clone -o base`, is not fixed at all: `resolveTrailRemote` errors out at `GetRemoteURL(ctx, "origin")` long before any push, so `trail create` remains non-functional there regardless of this change.
+
+Maintenance cost: the fix's headline justification is only half-true, and the two halves can now diverge silently. Any future work on either half has to rediscover that the other exists.
+
+DEEPER FIX: the missing abstraction is *the trail's forge remote (a name)*, resolved once. Resolve one remote name, then derive identity from **that** name (`gitremote.ResolveRemoteRepo(ctx, name)` / `GetPushURLs(ctx, name)` — which already exists precisely for "where a push actually goes") and push to the same name. Identity and delivery then cannot disagree by construction.
+
+---
+
+**2. The fetch half of the same round trip still hardcodes `origin`**
+`/Users/soph/.herdr/worktrees/cli/worktree-silver-stone-eb77/cmd/entire/cli/trail_checkout_worktree.go:537`, `/Users/soph/.herdr/worktrees/cli/worktree-silver-stone-eb77/cmd/entire/cli/git_operations.go:236,248,309`
+
+`trail create` delivers the branch to `fork`; `trail checkout` (`fetchTrailWorktreeBranch`, and `BranchExistsOnRemote` before it) looks for it on `origin` and reports `branch %q not found locally or on origin`. Same feature, same branch, opposite direction. `resume`/`checkpoint_resume`/`review_target` share those two helpers, whose names already promise "remote" while their bodies mean "origin".
+
+I judge the **push-side scope defensible**: after this diff, `trail create` is the only non-`origin`-owning push in `cmd/entire/cli`. The two remaining pushes are correct hardcodes — `setup_github.go:1053` pushes to an origin it just created with `--remote=origin`, and `plugin_index.go:252` fetches inside an Entire-managed clone. So the boundary is "pushes", not "arbitrary". But the round trip is now asymmetric, and the asymmetry lives in two files that don't reference each other.
+
+DEEPER FIX: one resolver serving delivery *and* retrieval for a trail branch, with `BranchExistsOnRemote` / `FetchAndCheckoutRemoteBranch` / `fetchTrailWorktreeBranch` taking the remote as a parameter (their names already imply it). At minimum, the PR should say why the fetch side is out of scope.
+
+---
+
+**3. The fallback is a literal, not a resolution — so the undeclared case is still wrong**
+`/Users/soph/.herdr/worktrees/cli/worktree-silver-stone-eb77/cmd/entire/cli/trail_cmd.go:2188,2212`
+
+`defaultTrailPushRemote = "origin"` reproduces git's own no-declaration default, but this function's job is "deliver the branch to the forge the trail is bound to", not "behave like bare `git push`". A freshly created branch in a `git clone -o base` repo has no `branch.&lt;n&gt;.*` config and no `remote.pushDefault`, so it resolves to a remote that does not exist. The ladder that answers this properly already lives two files away: `ResolveCheckpointSyncRemote`'s tail (`origin` if configured → sole remote → first in config order, over `configuredRemotesInConfigOrder`).
+
+DEEPER FIX: fall back through that ladder (extract the tail, or use `isConfiguredRemote` + sole-remote) instead of a bare literal. This is also the strongest argument for finding 4 — the shared piece wants a shared home.
+
+---
+
+**4. `strategy` is the wrong home for `DeclaredPushRemoteForBranch`; `gitremote` has already claimed that job in its package doc**
+`/Users/soph/.herdr/worktrees/cli/worktree-silver-stone-eb77/cmd/entire/cli/strategy/checkpoint_sync_capture.go:249`
+
+`gitremote`'s package comment reads: *"general-purpose git remote URL utilities: parsing, resolving, and redacting remote URLs. It has no dependency on checkpoint, strategy, or settings packages"* — and it already exports `GetPushURLs`, documented as *"where a push actually goes"*. The new function is ten lines of `git config --get` with zero strategy/session/checkpoint state. There is no cycle risk: `gitremote` imports only stdlib, so `strategy → gitremote` is legal, and `declaredPushDestination` stays as a thin wrapper. Cost of moving: ~2 functions.
+
+Fair mitigation: precedent already exists — `cli` calls `strategy.OpenRepository`, `strategy.IsOnDefaultBranch`, `strategy.GetDefaultBranchName`, `strategy.IsEmptyRepository`. So this is *drift*, not a new violation. But every such export makes `strategy` more of a general git grab-bag and raises the `cli`→`strategy` coupling that the package split exists to bound.
+
+DEEPER FIX: move `DeclaredPushRemoteForBranch` + `gitConfigValue` to `gitremote`; keep `declaredPushDestination` in `strategy` as the hook-path wrapper.
+
+---
+
+**5. Two exported "which remote" resolvers in one package, separated only by ~30 lines of prose**
+`/Users/soph/.herdr/worktrees/cli/worktree-silver-stone-eb77/cmd/entire/cli/strategy/checkpoint_sync_capture.go:230-248` and `checkpoint_sync_remote.go:44-72`
+
+The **reasoning is sound** and I'd keep it: `ResolveCheckpointSyncRemote` is a containment gate compared against the remote of a push *already in flight*, so electing from config at rest makes the pre-push hook a silent no-op (the `TestAlternates_RelativeObjectAlternate_CheckpointSync` regression). A command issuing its own push has no such constraint. The diff's claim that trails must not use that election is correct on both counts (it defaults to `origin` outright and latches on past pushes).
+
+The hazard is structural, not logical: two exported resolvers with confusable names in one package, each with a paragraph pointing at the other, and the distinction enforced only by comments. The next caller (`trail checkout`, `resume`, `review`) has to re-litigate it from prose.
+
+DEEPER FIX: same as 4 — moving the general question out of `strategy` leaves the package with exactly one exported "which remote" answer, and the prose distinction becomes a package boundary.
+
+---
+
+**6. `validateGitRemoteName` is a whitelist for names Entire *writes*, now applied to config the user already has**
+`/Users/soph/.herdr/worktrees/cli/worktree-silver-stone-eb77/cmd/entire/cli/trail_cmd.go:2219`
+
+The validator's own doc (`repo_mirror_use.go:35-44`) states its premise: *"Git itself is laxer, but these names are written into `.git/config` section headers and passed as argv to `git remote`"* — a deliberately narrow policy for names `mirror use` creates. Its five existing call sites all validate user-supplied flag/prompt input **before writing**. Applying `^[A-Za-z0-9][A-Za-z0-9._/-]*$` to a value read *out of* git config hard-fails legal git setups: `branch.&lt;n&gt;.remote = .` (a documented git value meaning the local repo) and a URL in `remote.pushDefault` / `branch.&lt;n&gt;.remote` (git accepts a URL wherever `&lt;repository&gt;` goes) both fail the leading-alphanumeric rule, turning a working `trail create` into an error.
+
+Altitude: the hazard being defended against — an argv element git reads as a flag — is a property of the **four exec sites**, not of one caller's resolver, and the fetch/ls-remote sites in finding 2 have the same exposure with no guard. Note the checkpoint path's precedent: it gates its (also externally supplied, also version-controlled) `checkpoint_push_remote` with `isConfiguredRemote` — membership, not shape.
+
+DEEPER FIX: defend at the exec boundary (or verify membership in `git remote`) rather than in one resolver. Per this repo's own "flag it; don't decide it" rule, hard-failing a whole command on a config shape Entire didn't create is a policy call that belongs in the PR description for a human to move.
+
+---
+
+**7. `trailCreateBranchState.Remote` is a symptom of the resolution sitting too deep**
+`/Users/soph/.herdr/worktrees/cli/worktree-silver-stone-eb77/cmd/entire/cli/trail_cmd.go:1028-1036`
+
+The remote is a property of the *invocation*, not of what happened to the branch. The struct now mixes three "what I did" booleans with one "what I decided" string, and the field's doc has to warn about a re-resolution race that exists **only because** resolution is nested inside `prepareTrailCreateBranch`. `runTrailCreate` already resolves the sibling decision (`resolveTrailRemote`) at the top. `cleanupCreatedTrailBranch` can also now be reached with `remote == ""` (branchless / early-error paths) — unreachable today only by invariant, not by type.
+
+DEEPER FIX: resolve once in `runTrailCreate` next to `resolveTrailRemote`, pass `remote` into prepare and cleanup. The field disappears, the `ctx` threading into `prepareTrailCreateBranch` becomes unnecessary, the empty-remote path becomes unrepresentable, and finding 1's disagreement becomes visible in a single function.
+
+---
+
+**8. `ctx` was threaded for a `git config` read while the network calls stayed uncancellable**
+`/Users/soph/.herdr/worktrees/cli/worktree-silver-stone-eb77/cmd/entire/cli/trail_cmd.go:2351,2367,2380,2391`
+
+All four wrappers were re-signatured here, yet each still opens `context.WithTimeout(context.Background(), …)`, discarding the command ctx; the new `ctx` parameter reaches only `git config`. A Ctrl-C during a 2-minute push is still ignored. Pre-existing, but taking `ctx` as the first parameter was free while the signatures were already changing.
+
+DEEPER FIX: `func pushBranchToRemote(ctx context.Context, remote, branch string)` etc., deriving timeouts from the caller's ctx.
+
+---
+
+**9. The newly exported helper reads git config from process CWD, while its in-file siblings pin the worktree root**
+`/Users/soph/.herdr/worktrees/cli/worktree-silver-stone-eb77/cmd/entire/cli/strategy/checkpoint_sync_capture.go:264` (`gitConfigValue`)
+
+`readRemotesInConfigOrder` and `isConfiguredRemote` both set `cmd.Dir = settings.WorktreeRoot(ctx)`; `gitConfigValue` does not. Acceptable as one package's private hook-path helper; as a cross-package API it now inherits CLAUDE.md's explicit "always use repo root, not `os.Getwd()`" hazard, and the asymmetry with its two neighbours is unexplained.
+
+DEEPER FIX: pin `cmd.Dir` the same way (or take a `repoRoot`), in whichever package it lands.
+
+---
+
+### Where I judge the altitude CORRECT
+
+- **Threading a remote parameter through the four git wrappers** rather than a package-level var, a settings key, or a `--remote` flag. The wrappers are the exec boundary, their names already promised a parameter, and the answer is derivable from git config — a new knob would be a second source of truth.
+- **Not reusing `ResolveCheckpointSyncRemote`**, for exactly the stated reason (see finding 5). This is the right call and the right rationale.
+- **Push-side scope is complete, not half-done.** The two remaining hardcoded pushes in `cmd/entire/cli` are correct: `setup_github.go:1053` pushes to an origin it created with `--remote=origin`, and `plugin_index.go:252` fetches in an Entire-owned clone.
+- **Identity-only `"origin"` sites correctly left alone**: `experts_cmd.go:372`, `entireapi_client.go:78`, `explain_repo.go:140`, `api_cmd.go:223`, `recap.go:269,282`, `setup.go:1007`, `trail_context_cache.go:96`. These read a URL to name a repo; a push-remote fix has no business there. (Separately and outside this angle: `search_cmd.go:199`, `dispatch_wizard.go:534`, `dispatch/mode_local.go:478` resolve identity via `search.ParseGitHubRemote` rather than `gitremote.ParseURL`, so they miss `entire://` mirror URLs — unrelated to this diff.)
+- **Test altitude is right**: `TestResolveTrailPushRemote` tests the tier table where the tiers are decided, and `TestPrepareTrailCreateBranchPushesToDeclaredRemote` covers the end-to-end shape including the cleanup round trip with two real bare remotes. `t.Chdir` without `t.Parallel()` matches the repo's rule.</result>
+<usage><subagent_tokens>130428</subagent_tokens><tool_uses>27</tool_uses><duration_ms>345298</duration_ms></usage>
+</task-notification>
+
+---
+
+ok, let's do meaningful commits and open a PR

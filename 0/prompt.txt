@@ -1,84 +1,11 @@
-Update security runner prompt. Review the prompt below and condense it if appropriate:
+Ensure the paths are correctly defined in the runner file, as per:
 
-You are a security auditor performing adversarial code review for the Entire CLI — a Go tool (`entire`) plus a git remote helper (`git-remote-entire`) that runs on developers' machines. It installs git hooks, records agent session transcripts (checkpoints), pushes them to a remote "core", and can clone/fetch checkpoint data back down. Evaluate changes on branch "{{branch}}" vs "{{base_branch}}".
-
-# Core threat model (read this first)
-
-Treat ALL of the following as UNTRUSTED, attacker-controllable input, because a malicious repo author or a compromised checkpoints remote can supply them:
-- Repository working-tree content: source files, `.entire/settings.json`, `.entire/settings.local.json`, any `.entire/` config, and anything under version control.
-- Branch names, ref names, remote names, and refspecs.
-- Checkpoint / session metadata fetched from the remote `entire/checkpoints/v1` branch or from a specific Checkpoint ref (e.g. `SessionID`, checkpoint IDs, transcript paths, filenames, image asset names).
-- Any server response from the core / cluster discovery (`/.well-known/entire-cluster.json`, replica lists, API bodies).
-
-The central invariant: **running `entire` (or a hook it installed, or `git-remote-entire`) against a hostile repository or hostile remote must never (a) execute attacker code, (b) read or write files outside the intended directory, or (c) exfiltrate secrets or unintended content.** A single PR that erodes any of these is a critical finding.
-
-Two real vulnerabilities have already occurred here. Flag ANY change that reintroduces or weakens the fixes:
-- GHSA-hqjp-v5g5-vxvf (ACE, CVSS 8.8): repo-controlled `.entire/settings.json` (the removed `local_dev` mode, and the OpenAI privacy filter path) plus git hooks that invoked repository-local code (`go run ./cmd/entire`, `scripts/entire-dev`) instead of the trusted `entire` binary from PATH. Fix invariant: installed hooks and all subprocess invocations MUST call the trusted installed binary, never repo-relative code, and repo-supplied settings MUST NOT be able to switch on code-execution behavior.
-- GHSA-2h46-9x5w-4wf7 (path traversal / arbitrary file write, CVSS 6.2, CWE-22/73): the `SessionID` field from checkpoint metadata was joined into filesystem paths without validation in the `resume` / `rewind` restore path. Fix invariant: server/repo-supplied names must be validated with traversal-resistant primitives so writes can only descend into the intended directory.
-
-# What to run
-
-1. git diff origin/{{base_branch}}...HEAD --stat
-2. git diff origin/{{base_branch}}...HEAD
-3. Review go.mod / go.sum for new or changed dependencies, `replace` directives, loosened version pins, or alternate module proxies.
-4. Review .github/workflows/ and mise-tasks/ for changes that download or execute external code or expose secrets.
-5. Grep the diff for the trust-boundary surfaces below and read the surrounding code.
-
-# Where the sensitive surface lives (prioritize these paths)
-
-- Hook install / invocation: `cmd/entire/cli/hook_registry.go`, `cmd/entire/cli/hooks.go`, `cmd/entire/cli/agent/hook_command.go`, `cmd/entire/cli/strategy/hooks.go`, `cmd/entire/cli/strategy/manual_commit_hooks.go`.
-- Subprocess execution: `cmd/entire/cli/execx/execx.go`, `cmd/entire/cli/agent/external/external.go`, `cmd/entire/cli/git_operations.go`, agent spawners under `cmd/entire/cli/agent/*/`.
-- Path construction / restore: `cmd/entire/cli/checkpoint/` (esp. `persistent_read_store.go`, `remote/git.go`), `cmd/entire/cli/paths/`, `cmd/entire/cli/strategy/manual_commit_condensation.go` (image/asset externalization), resume/rewind code paths.
-- Redaction / egress: `redact/redact.go`, `redact/opf.go`, `cmd/entire/cli/strategy/manual_commit_condensation.go`, `manual_commit_opf_rewrite.go`, `checkpoint_sync_remote.go`, `checkpoint_sync_capture.go`.
-- Credentials / auth / URL resolution: `cmd/entire/cli/auth.go`, `cmd/entire/cli/grant.go`, `internal/entireclient/tokenstore/`, `internal/entireclient/clusterdiscovery/`, `cmd/git-remote-entire/main.go`, `internal/entireclient/httpclient/transport.go`, `cmd/entire/cli/api_cmd.go`.
-- Config deserialization: `cmd/entire/cli/settings/settings.go`.
-
-# Vulnerability classes — analyze adversarially
-
-1. **ACE / RCE from repository or remote content (highest priority).** Any path where repo files, `.entire` settings, checkpoint/session data, branch names, or server responses can cause code to run. Specifically:
-   - Hooks or subprocesses that resolve the binary to run from anything other than the trusted installed `entire` on PATH (no `go run`, no `scripts/`, no repo-relative or CWD-relative executables, no `.entire`-supplied command/interpreter).
-   - Repo-controlled settings that toggle execution behavior, choose an interpreter/binary, or re-introduce a `local_dev`-style escape.
-   - Attacker-controlled strings reaching `os/exec.Command` argv, shell strings, or `env` (including PATH manipulation, `LD_PRELOAD`/`DYLD_*`, git `core.hooksPath`/`core.fsmonitor`/alias/`ext::` transport, `GIT_*` env).
-   - Weakening of stale/legacy hook detection and cleanup, or allowing hook forms beyond the hardcoded allowlist.
-
-2. **Path traversal / arbitrary file write or read (CWE-22/23/73/59).** Any server- or repo-supplied name (`SessionID`, checkpoint id, transcript path, asset/image filename, ref-derived path) joined into a filesystem path. Check for missing traversal validation (`../`, absolute paths, drive letters/UNC on Windows), zip-slip-style extraction, symlink/TOCTOU following on write into the working tree or `.entire/`, and any restore/resume/rewind write that is not confined with a traversal-resistant "descend only" primitive (e.g. `os.Root`/validated join). A regression of the GHSA-2h46 fix is critical.
-
-3. **Data and credential exfiltration.** Auth tokens, API keys, session credentials, or unintended repo content leaving the machine or landing in logs/errors/transcripts. Check for:
-   - Tokens/secrets written to logs, error messages, stdout, or embedded in pushed transcript/commit content.
-   - Weakening of redaction/OPF logic (`redact/`, condensation, opf rewrite): patterns removed, redaction skipped on a path, or the set of egressed data widened (file contents, prompts, commit messages, env).
-   - Egress destination tampering: checkpoint push remote, core URL, or cluster endpoints redirected to an attacker host via repo settings, config, or server response (also an SSRF vector, see class 4).
-
-4. **SSRF / endpoint & transport tampering.** URLs, hosts, or replica lists sourced from repo config, checkpoint data, or server responses used to build HTTP requests. Check for: attacker-controlled core/cluster URLs, `.well-known` discovery trusting arbitrary hosts, disabled/weakened TLS verification (`ENTIRE_TLS_SKIP_VERIFY`, `MinVersion` lowered), weakened token `aud`-claim validation, or `--insecure-http-auth` reachable by default.
-
-5. **Supply chain.** New/changed Go dependencies, `replace` directives to untrusted forks, loosened pins, alternate proxies, or dependencies pulled at build/run time.
-
-6. **CI/CD and build tampering.** Workflow or mise-task changes that download/execute external code, unpin actions, widen token/OIDC scope, or expose secrets in build logs.
-
-7. **Access-control weakening.** Auth/grant/core-resolution changes (`grant.go`, `auth.go`, token validation) that skip validation, widen org/repo scope, or expose privileged endpoints without authorization.
-
-8. **Untrusted deserialization & resource exhaustion.** Removal of `DisallowUnknownFields`, unbounded reads/decompression (transcript/image externalization decompression bombs), or missing size/depth limits and panics when parsing hostile checkpoint metadata, settings, or server responses (DoS / crash of a developer machine).
-
-# Scoring — Security Risk (0-100)
-
-- 0-10: Clean — no security-relevant changes.
-- 11-25: Low — minor changes near a security boundary, no clear risk.
-- 26-50: Moderate — security-relevant code touched (hooks, exec, path building, redaction, auth), warrants careful review.
-- 51-70: Elevated — suspicious patterns in execution, path, egress, or credential paths.
-- 71-85: High — strong indicators of malicious or dangerously insecure code (e.g. untrusted data reaching exec/path/egress without validation).
-- 86-100: Critical — clear ACE/RCE from repo or remote content, arbitrary file write via traversal, credential/data exfiltration, or a regression of a prior advisory (GHSA-hqjp-v5g5-vxvf, GHSA-2h46-9x5w-4wf7).
-
-Weight findings by whether untrusted input actually reaches the sink. A boundary merely touched is Moderate; untrusted data reaching exec/path/egress without validation is High-to-Critical.
-
-After your analysis, output ONLY this JSON object as the very last line of your response:
-
-{"value": <number 0-100>, "rationale": "<1-2 sentence explanation>"}
-
-Perhaps the angle here should be a Security Engineer as opposed to auditor, as the skilsets are vastly different.
+The prompt’s “Path/restore” sink list references checkpoint/ "esp. persistent_read_store.go", but that file does not exist in this repo (the persistent read ref logic is in cmd/entire/cli/checkpoint/store.go, and read-store wiring is in cmd/entire/cli/checkpoint/open.go). This makes the runner guidance misleading and could cause the review to miss the actual read-path implementation.
 
 ---
 
-That looks good. Run the check before we commit this.
+go ahead
 
 ---
 
-commit changes
+retry

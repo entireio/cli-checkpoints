@@ -1,0 +1,239 @@
+close the finding then
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>ac2dc8949f46a05d7</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-cli/2b2134ea-a3fb-448d-8b2e-18b23398b021/tasks/ac2dc8949f46a05d7.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review of note diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Read-only review complete. Findings below, ordered by how much simplification they buy.
+
+## Findings
+
+**1. `cmd/entire/cli/status.go:259-262` — the `checkpointSyncInfo` struct doc is now stale and duplicates the new function doc verbatim.**
+It still says "is the single shared computation behind both the text and JSON checkpoint-sync sections of `entire status`, so the two outputs cannot drift" — but (a) it is a result type, not a computation, and the computation doc now lives on `computeCheckpointSyncInfo` (line ~347) using that *same* sentence, and (b) "both … sections of `entire status`" is no longer the audience: `remote_topology.go` is a third consumer, which is the whole point of the commit.
+Simpler form: cut the struct doc to what the type is — "checkpointSyncInfo is where checkpoints go, plus the unpushed count the `entire status` sections add. Local reads only — status must stay network-free." Leave the "single shared computation" claim on `computeCheckpointSyncInfo`/`resolveCheckpointSyncDestination`, which is where it is true.
+Cost of keeping: the one comment that names the consumers names the wrong set, which is exactly the drift this commit was fixing.
+
+**2. `cmd/entire/cli/remote_topology.go:196-220` — the loop iterates every remote to print at most one block.**
+After `d.name != t.sync.Remote` was added to the guard, the body can run for at most one destination, so the loop plus three-part `continue` is a lookup written as a scan.
+Simpler form: a small `electedDestination() *remoteDestination` (mirroring the existing `pinnedNames`/`unpinnedNames` accessors) and then `if d := t.electedDestination(); d != nil &amp;&amp; d.fansOut() &amp;&amp; !t.dedicated() { … }` — one nesting level and one negated compound condition gone, and the comment above it reads as a statement about *the* elected remote rather than about a filter.
+Cost of keeping: readers must reconstruct "at most one iteration does anything" from the guard; the `!d.fansOut() || … || d.name != …` triple is the least readable line in the function.
+
+**3. `cmd/entire/cli/remote_topology.go:225` — the three-part guard mixes two ideas the comment above it already separates.**
+The comment says it in two parts ("already done in both states where one exists, and off-target when … nothing is syncing"), but the code says it in three.
+Simpler form: one predicate on `checkpointSyncInfo` next to `dedicated()` — `func (i checkpointSyncInfo) storeConfigured() bool { return i.dedicated() || i.IgnoredStore != "" }` — making the guard `if t.sync.storeConfigured() || t.sync.Err != "" { return }`, a one-to-one match with the comment. It also names the real invariant (`dedicated` and `IgnoredStore` are the in-effect / not-in-effect halves of "a checkpoint_remote exists"), which nothing currently states.
+Cost of keeping: the two-vs-three mismatch, and the "a store exists" concept staying implicit in a disjunction.
+
+**4. `cmd/entire/cli/remote_topology.go:234` — `remoteTopology.dedicated()` is not earning the indirection.**
+Three call sites (201, 225, 289), all inside this one file, all with `t.sync` in hand. `t.sync.dedicated()` is two characters longer and removes a method plus a two-line doc comment that restates `checkpointSyncInfo.dedicated`'s doc.
+Simpler form: delete it; call `t.sync.dedicated()` directly. (If finding 3 lands, the 225 site disappears anyway, leaving two.)
+Cost of keeping: one redundant forwarder and a duplicated doc comment; low, but it is pure surface.
+
+**5. `cmd/entire/cli/remote_topology.go:182-190` — `unpinnedNames()` is called for its length while the printed list is rebuilt inline.**
+`names` is bound and then never used; the inline `all` loop is a third copy of the `pinnedNames`/`unpinnedNames` shape, and `ambiguous()` (line 157) already counts unpinned remotes.
+Simpler form: `if len(t.unpinnedNames()) &gt; 1 {` (no binding) and an `allNames()` accessor beside the other two, so the three name lists read identically: `fmt.Fprintf(w, "  This repo has %d remotes (%s).\n", len(t.destinations), strings.Join(t.allNames(), ", "))`.
+Cost of keeping: a bound-and-discarded variable whose name misleads (it suggests the list being printed), plus a hand-rolled loop where two accessors already exist.
+
+**6. `cmd/entire/cli/status.go:347-364` — the `switch` is one early return plus a two-way branch.**
+The first arm returns while the other two mutate `info` and fall through to a shared `return info`, so the three arms are not parallel and the switch shape implies they are.
+Simpler form:
+```go
+info := resolveCheckpointSyncDestination(ctx, s)
+if info.Err != "" || info.Remote == "" {
+    return info
+}
+if info.dedicated() { … } else { info.Unpushed = countUnpushedCheckpointsForStatus(ctx, info.Remote) }
+return info
+```
+Cost of keeping: minor — but `default:` for "the ordinary elected-remote case" is the least descriptive label available for the common path.
+
+**7. `cmd/entire/cli/remote_topology.go:357-370` — `quoteNames` is a near-duplicate of `formatTokenClassList` (`checkpoint_tokens.go:450`).**
+Same switch-on-length prose joiner; the only differences are `%q` quoting and the Oxford comma (`", and "` there vs `" and "` here). Neither is long enough to trip `dupl` at 75, so it will just quietly become the third copy next time.
+Simpler form: one unexported joiner (e.g. `joinProse(items []string) string`) with the quoting done by the caller — `quoteNames` becomes a map plus a call. If the Oxford-comma difference is deliberate, keeping two is defensible; then say so in a comment, because right now nothing marks it as a choice.
+Cost of keeping: two copies of the same three-arm joiner, diverging on punctuation for no stated reason.
+
+**8. `cmd/entire/cli/remote_topology_test.go:95-111, 234-256, 268-276` — the want/absent assertion loop is written three times verbatim.**
+The new table's runner is the old runner plus a `silent` early-out, and `TestInspectRemoteTopology_DedicatedStore` open-codes the `want` half a third time.
+Simpler form: one helper — `func assertNote(t *testing.T, out string, want, absent []string)` — used by both tables and the repo-backed test. The `silent` case stays in the table runner (`if tt.silent { … return }`), so the helper only absorbs the duplicated part.
+Cost of keeping: three places to update if the failure message or matching rule changes, and the repo-backed test's assertions can drift from the table row asserting the same wording.
+
+**9. `cmd/entire/cli/remote_topology_test.go:12-16 — `syncTopology` barely pays for itself (low confidence).**
+It wraps a single-field struct literal, saves ~12 characters, and two rows in the same table bypass it with a full `remoteTopology{…}` literal anyway — so the table now has two spellings of the same thing.
+Simpler form: drop it and write `remoteTopology{sync: checkpointSyncInfo{…}}` uniformly; the table then reads consistently and one indirection disappears.
+Cost of keeping: two literal styles in one table. Genuinely marginal — flagging only because consistency inside a table is what makes a table scannable.
+
+## Structural note (not a simplification, flagging because the reorder caused it)
+
+`remote_topology.go:194` — `describeIgnoredStore` is called *outside* the `len(unpinnedNames) &gt; 1` block, unlike `describeSyncRemote` (191), yet it writes at the four-space "sub-detail" indent (247-250). In an ambiguous-by-fan-out repo with a single remote, that paragraph prints with no two-space parent line above it. Either nest it beside `describeSyncRemote` or write it at two spaces.
+
+## Checked and clean
+
+- `describeSyncRemote`'s "stays to three lines at most" doc is **not** stale: the new dedicated branch prints exactly three lines (290-293).
+- The `strategy.CheckpointSyncRemoteSource(t.sync.Source)` conversion at line 311 is the cheapest shape that keeps `exhaustive` on the tier switch; I have no alternative that preserves that property, so per your instruction I am not flagging it.
+- No dead or unreachable code left by the reorder — the removed `syncRemote`/`syncSource`/`syncErr` fields have no remaining readers, and `logging`/`strategy` imports are both still used.</result>
+<usage><subagent_tokens>91321</subagent_tokens><tool_uses>9</tool_uses><duration_ms>118483</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a6f24a804dfd6899f</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-cli/2b2134ea-a3fb-448d-8b2e-18b23398b021/tasks/a6f24a804dfd6899f.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review of note diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Read the diff and traced every callee. Findings, efficiency only.
+
+## What the diff adds, counted
+
+`inspectRemoteTopology` runs once per `entire enable` / `entire doctor`.
+
+**Cost of the primitives** (verified in source, all uncached):
+- `settings.Load` (`cmd/entire/cli/settings/settings.go:462` → `loadMergedSettings:531`) has **no cache at any level**. Each call = 3 file reads + up to 3 JSON parses: `.entire/settings.json`, the clone-preferences file in the git common dir, `.entire/settings.local.json`. The only memoized part is `session.getGitCommonDir` (`session/state.go:819`, process-wide cache), so no subprocess after the first call.
+- `settings.LoadCheckpointsConfig` (`settings/checkpoints.go:66`) separately reads both settings files raw — 2 more reads/parses, also uncached.
+- `remote.PushURL` (`checkpoint/remote/util.go:194`) = 1 `settings.Load` **plus** `gitremote.GetRemoteURL(origin)` and, only when a `checkpoint_remote` is configured, `gitremote.GetPushURLs(name)`. Both are bare `exec.CommandContext("git", "remote", "get-url", …)` (`gitremote/gitremote.go:98,120`) with **no cache** — `strategy/git_remote_cache.go` memoizes only `configuredRemotesInConfigOrder` and `isConfiguredRemote`, a different pair of git questions in a different package. So PushURL costs 1 settings load + 1–2 forks every call.
+- `strategy.ResolveCheckpointSyncRemote` (`strategy/checkpoint_sync_remote.go:73`) = 1 `settings.Load` + the captured-election file read + cached git reads.
+
+**Delta introduced by the diff:**
+
+1. **`LoadEntireSettings(ctx)` — +1 full settings load, unconditionally, on every invocation** (3 file reads / up to 3 JSON parses). It is used for exactly one field, `s.GetCheckpointRemote()`, and it sits immediately before `resolveCheckpointSyncDestination` → `ResolveCheckpointSyncRemote`, which loads the very same two files again with nothing mutating in between. Two back-to-back loads of the same files for one boolean question. For a 2-remote repo without a `checkpoint_remote` the function goes from 3 full loads + 1 checkpoints load (≈11 file reads) to 4 loads (≈14) — about +30% file reads, all page-cache hits, sub-millisecond. **No new subprocess in this common case**, because the new `PushURL` call is gated behind `cr != nil`.
+
+2. **`checkpointremote.PushURL(ctx, elected.Name)` in the new helper is an exact duplicate** of the call the topology loop already made for that same remote. The loop does `remote.PushURL(ctx, name)` for every remote and keeps only the `enabled` bool as `dest.pinned` (`remote_topology.go:100-102`) — which is precisely the bool the new helper needs. Same ctx, same remote name, no mutation between them, deterministic. In a repo that *has* a `checkpoint_remote`, the redundant call costs **+1 settings load and +2 `git remote get-url` forks** (~+40% of this function's forks, roughly two process spawns, a few ms).
+
+3. **No new eager work of the expensive kind.** `resolveCheckpointSyncDestination` deliberately skips `countUnpushedCheckpointsForStatus` and `LoadCheckpointsConfig`, so no ref walk, no push-queue read, no network. That split is the right call and is what keeps this from being a real regression. `quoteNames` and the `all := make(...)` loop are once-per-command string work — not worth flagging, as expected.
+
+## Ranking and cheaper alternatives
+
+**Rank: low.** Once-per-command advisory path, everything in page cache, worst case ~2 extra forks and one extra JSON parse of small files. Nothing here justifies a blocking change.
+
+If it is touched anyway, in order of value:
+
+- **Reuse the loop's answer instead of re-probing.** The loop already holds `enabled` for the elected remote. Give `resolveCheckpointSyncDestination` an optional injected prober (or accept a precomputed `map[string]bool` of PushURL-enabled answers) so the topology caller feeds its own loop result in and `status` keeps the direct call. That removes the duplicate load + 2 forks without reintroducing the local re-derivation the diff was fixing — the shared election stays shared; only the *probe* is reused.
+- **Thread the loaded settings into the resolver.** A `ResolveCheckpointSyncRemoteWithSettings(ctx, s)` variant (or having `resolveCheckpointSyncDestination` load once and pass down) collapses the new `LoadEntireSettings` and the resolver's internal `settings.Load` into one, removing 3 file reads per invocation. Callee change, so lower priority.
+- **Bigger pre-existing cost, not the diff's:** the topology loop already pays N × `settings.Load` + N forks via `remote.PushURL` (N = number of remotes). A context-scoped memo for `remote.PushURL` (mirroring `strategy/git_remote_cache.go`, or extending `gitremote` to cache `get-url` answers per repo) would dominate anything the diff added. Worth noting only because that is where the actual N-scaling work in this function lives.
+
+Relevant files: `/Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/remote_topology.go:108-127`, `/Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/status.go:300-343`, `/Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/settings/settings.go:462`, `/Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/checkpoint/remote/util.go:194`, `/Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/gitremote/gitremote.go:98`, `/Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/strategy/git_remote_cache.go`.</result>
+<usage><subagent_tokens>105603</subagent_tokens><tool_uses>19</tool_uses><duration_ms>145783</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a05f468dbcc079d15</task-id>
+<tool-use-id>toolu_01CdePJfk5AamrGUMouMNt21</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-cli/2b2134ea-a3fb-448d-8b2e-18b23398b021/tasks/a05f468dbcc079d15.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review of note diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Altitude review — bd53c7cef
+
+Verdict up front: the core move in this diff (splitting `resolveCheckpointSyncDestination` out of `computeCheckpointSyncInfo` and having the note call it) is at the **right depth**. It removes a duplicated election rather than papering over its output, and the new real-repo test (`TestInspectRemoteTopology_DedicatedStore`) asserts the sharing rather than the wording. Four things around it sit at debatable depths; two are worth acting on, two are not.
+
+---
+
+### 1. The store-rejection reason: hedged wording is a bandaid, and the deeper fix is genuinely small
+
+Current depth: the *reason* is discarded at the `remote` package boundary, and the display layer compensates with prose — `"most often because it looks like it belongs to another owner"` (`remote_topology.go:~295`) and the flat `"is not in effect"` in `status.go:~405`.
+
+The reason already exists in presentable form. `checkpointRemoteIsInherited` (`cmd/entire/cli/checkpoint/remote/util.go:405`) returns `(bool, string)` and its strings are already user-grade:
+
+- `"no remote to establish ownership"`
+- `"origin URL owner could not be determined"`
+- `fmt.Sprintf("%s owner %q differs from checkpoint owner %q", id.source, info.Owner, checkpointOwner)`
+
+And every *other* `enabled=false` branch in `PushURL` already constructs an equivalent reason for `logFallback` (`"load settings"`, `"get push remote URL"`, `"parse push remote URL"`, `"derive push checkpoint URL"` — util.go:199–312). So the information is fully assembled at every exit; it is thrown away only at the `return`.
+
+Blast radius, measured: `PushURL` has **4 non-test call sites** — `checkpoint/remote/git.go:731`, `strategy/checkpoint_remote.go:93`, `remote_topology.go:101`, `status.go:327` — plus 21 test references across two files. A sibling accessor keeps that at zero forced churn:
+
+```go
+func PushDestination(ctx context.Context, pushRemoteName string) (url string, enabled bool, reason string, err error)
+func PushURL(ctx, n) (string, bool, error) { u, e, _, err := PushDestination(ctx, n); return u, e, err }
+```
+
+Only `status.go:327` would switch over, and only `describeIgnoredStore` + `writeCheckpointSyncLines` would consume the string. That is a **small change**, not a wide refactor: one new signature, six `return` sites threaded, no call-site migration, no test churn.
+
+There is a second reason to want it that the diff's comment understates. `IgnoredStore` is currently set for *any* `err == nil &amp;&amp; !enabled` on the elected remote — which includes the transient failures (`settings.Load` failed inside `PushURL`, `GetPushURLs` failed). So the note can say "not in effect… looks like it belongs to another owner" about a repo whose config read merely hiccuped. The hedge isn't just imprecise prose; it is the only thing keeping a wrong claim from being asserted. That's the signature of a fix applied one layer too high.
+
+**Recommendation: follow-up, soon.** Not in this commit — this commit's objective is "make three surfaces share one election", and reason plumbing is a different objective in a different package (per your isolated-PRs rule). But it should be the next one, and the follow-up should also decide whether transient-failure reasons suppress the report entirely rather than merely rewording it.
+
+---
+
+### 2. `pinned` vs `dedicated()`: legitimately different questions — but `Source` is the wrong shape
+
+They are the *same predicate at different arguments*: `pinned` is `PushURL(remote_i).enabled`; `dedicated()` is `PushURL(elected).enabled` (guarded by `cr != nil`). "Is the store in effect for remote X" evaluated per-remote vs. for the elected remote. Nothing to unify at the domain level, and the `pinned` doc comment already gives the right justification (ask the resolver, never re-derive from settings — the `CoreOrigin()` rule).
+
+The real altitude problem is adjacent: **`checkpointSyncInfo` encodes two orthogonal facts in one stringly field.**
+
+- `Remote` is documented as "the elected git remote name, **or** the org/repo slug in dedicated mode" (status.go:265).
+- `Source` is "resolver values **or** `"dedicated"`" — a synthesized member stuffed into a slot whose other values come from `strategy.CheckpointSyncRemoteSource`.
+
+Three consequences visible in this diff, all of them hedges:
+
+- `d.name != t.sync.Remote` compares a remote name against a field that may hold `org/checkpoints`. It works only because the `t.dedicated() ||` guard runs first — the guard is load-bearing for *type* reasons, not just display reasons.
+- `strategy.CheckpointSyncRemoteSource(t.sync.Source)` — a cast back into the enum, in a switch that by construction never sees `"dedicated"`. The comment defends `exhaustive` coverage; the cast is what made the defense necessary.
+- `dedicated()` exists as a method to hide a string comparison that shouldn't be a string comparison.
+
+Deeper fix: `Dedicated bool` (or better, a separate `Store string` alongside `Remote string`), with `Source` narrowed to the resolver's typed enum. Blast radius: **one file** — `status.go` (struct, `resolveCheckpointSyncDestination`, the two `dedicated()` readers, one JSON field mapping) plus `remote_topology.go`'s three readers and the test literals in both test files. Roughly 20 lines, no package boundary crossed. It deletes the cast, makes the fan-out guard provable instead of incidental, and makes the `Remote` doc comment stop describing a union.
+
+**Recommendation: worth doing now-ish**, as a small cleanup on top. It is entirely inside the layer this commit already touched, and it is what makes question 3's answer clean.
+
+Minor, non-blocking: `inspectRemoteTopology` now performs N+1 `PushURL` calls (one per remote, plus one inside `resolveCheckpointSyncDestination`) and `settings.Load` is an uncached file read per call, plus `LoadEntireSettings` on top. On an advisory path in a 3-remote repo that's fine; it just means the "must stay cheap" comment on the `sync` field is doing less work than it claims.
+
+---
+
+### 3. The fan-out condition: the display layer legitimately owns this. Don't export the push-side predicate.
+
+`checkpointSyncAllowedForRemote` (`strategy/checkpoint_sync_remote.go`) is not a reusable predicate — it is a push-time decision procedure:
+
+- it **re-resolves the election itself** (`ResolveCheckpointSyncRemote(ctx)`), which is precisely the duplication this commit removes;
+- it takes `pendingCapture`, a parameter that only has meaning inside a pre-push hook mid-capture;
+- it **logs as a side effect** (`logging.Warn` on election failure, `logging.Debug` on the gated case), so calling it from `entire enable` would emit push-side log lines from a command that isn't pushing.
+
+Exporting or mirroring it would be a depth *regression*. The display layer already holds the resolved election and is asking a strictly simpler question — "is this remote the elected one" — which is one comparison.
+
+If you want a shared predicate, the right shape is a method on the already-resolved value, not on the resolver:
+
+```go
+func (r CheckpointSyncRemote) Carries(pushRemote string) bool { return r.Name != "" &amp;&amp; r.Name == pushRemote }
+```
+
+with `checkpointSyncAllowedForRemote` calling it after resolving. But the display layer can't reach it today because it holds a `checkpointSyncInfo` with an overloaded `Remote`, not a `CheckpointSyncRemote` — so this is a by-product of fixing #2, and only worth it if #2 lands. Low value on its own.
+
+**Recommendation: no change.** The name comparison is at the right altitude. The comment already points at `checkpointSyncAllowedForRemote` for the "why", which is the correct amount of coupling.
+
+---
+
+### 4. `IgnoredStore` on the status struct is the right home — not a doctor check
+
+Doctor's checks are a distinct shape, and the new fact doesn't fit it. Every existing check is an imperative `checkX(cmd, force)` that **detects and offers a fix**, is enumerated in the numbered list in doctor's `Long` (`doctor.go:33–52`), and returns an error that becomes part of doctor's exit status: `checkDisconnectedMetadata` (cherry-picks), `checkGitHooks` (reinstalls), `checkCodexHookTrust` (points at `/hooks`), `checkHookDrift` (points at `enable --force`).
+
+An ignored `checkpoint_remote` has **no automatic fix**. The resolution is a human judgment ("is this store mine?") followed by writing `settings.local.json`. That is advisory, which is exactly the category `printCheckpointDestinationNote` already occupies — note that it is deliberately *not* one of doctor's numbered checks, is silent on the ordinary repo, and is shared with `entire enable`.
+
+Decisive argument: the fact has to appear on **`status --json`**. A doctor check reaches one surface, and the one an agent is least likely to invoke; per the agent-safe-fallbacks rule in CLAUDE.md, a silently-ignored setting that only surfaces in an interactive doctor run is the failure mode, not the fix. Putting it on `checkpointSyncInfo` gets all three surfaces from one computation, which is the whole thesis of this commit.
+
+**Recommendation: keep it where it is.** Revisit only if the reason plumbing from #1 turns up a rejection cause that is both machine-diagnosable and machine-fixable — ownership isn't.
+
+---
+
+### Where the shallow version is simply correct
+
+- Degrading a settings-load failure to `s = nil` instead of an `Err` (inspectRemoteTopology) is the right call and the comment says why: `Err` renders as "Checkpoints are NOT syncing", which a transient read failure is not. Resisting the temptation to thread a third state through is good restraint.
+- Suppressing the closing "set checkpoint_remote" advice on `dedicated() || IgnoredStore != "" || Err != ""` is display logic about display text. It belongs in the display layer and nowhere else.
+- `quoteNames` is prose formatting in the file that writes the prose. Correct home.
+
+Net: one small follow-up worth doing (reason plumbing through a `PushURL` sibling — 4 call sites, no churn), one small cleanup worth folding in (`Dedicated bool` / separate `Store`, one-file blast radius), and two questions where the shallow answer is the right one.</result>
+<usage><subagent_tokens>109167</subagent_tokens><tool_uses>20</tool_uses><duration_ms>154429</duration_ms></usage>
+</task-notification>
+
+---
+
+ship it

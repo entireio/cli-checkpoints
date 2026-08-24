@@ -1,0 +1,171 @@
+push
+
+---
+
+<cross-session-message from="uds:/tmp/cc-socks/40815.sock" from-name="uninstall-ext-a9" from-mode="prompting">
+Review of `fix/uninstall-external-agent-hooks` (trail 1110) came back with 5 points. #3 was a question, answered below, no code change. Please implement 1, 2, 4, 5. All in `cmd/entire/cli/setup.go`, `cmd/entire/cli/config.go`, `cmd/entire/cli/agent/`, `cmd/entire/cli/agent/external/`, plus tests.
+
+Context: I verified `go test ./cmd/entire/cli/` passes (also `-shuffle=on`), `golangci-lint --new-from-rev=main` is clean, and the core fix is correct. These are follow-ups, not a rewrite.
+
+---
+
+## 1. Do not change the current contract for built-in agents
+
+`setup.go:2506` gates the new "uninstalled, but some agent hooks could not be removed" message + `SilentError` (non-zero exit) on `agentHooksErr != nil`. But `errs` in `removeAgentHooks` collects failures from **built-in** agents too, so a built-in `UninstallHooks` failure now flips exit status where it used to be a warning + `uninstalled successfully` + exit 0.
+
+The justification written into that comment — unreachable from a re-run once `.entire/` is gone — is only true for external agents. A built-in is perfectly reachable on a re-run: leftover hooks keep the installed set non-empty, so the `Entire is not installed in this repository.` early return does not fire.
+
+Gate the new message and the non-zero exit on `len(failedExternal) > 0`, not on `agentHooksErr != nil`. Built-in failures keep exactly the old behaviour: `Warning: failed to remove agent hooks: ...` on stderr, `uninstalled successfully` on stdout, exit 0. Update the comment so it stops claiming the re-run argument for built-ins.
+
+## 2. Track probe failure separately from "no hooks installed", and say so
+
+`external.Agent.AreHooksInstalled` (`agent/external/external.go`) collapses subprocess failure, timeout, and malformed JSON into `false`. So an external plugin that *does* have hooks but cannot answer is skipped by the `!wasInstalled[name] && external.IsExternal(ag)` guard, and the run still prints `uninstalled successfully`. Today the only trace is a `logging.Debug`, which the user never sees — and this run is their last chance, which is the whole argument the failure path already makes.
+
+Plumb the error through so a failed probe is distinguishable, then act on it:
+
+- **agent package**: add an optional, error-aware probe capability alongside `HookSupport`, e.g.
+  ```go
+  // HookInstallProbe reports hooks-installed state with a failed probe
+  // distinguished from a clean "no". HookSupport.AreHooksInstalled collapses
+  // both into false, which is fine for display but not for deciding whether to
+  // skip a plugin during uninstall.
+  type HookInstallProbe interface {
+      ProbeHooksInstalled(ctx context.Context) (bool, error)
+  }
+  ```
+  with an `AsHookInstallProbe(ag Agent) (HookInstallProbe, bool)` accessor. Plain type assertion — no `DeclaredCaps` gate; it is a refinement of an already-declared `Hooks` capability, so follow the `AsHookFreshness` doc-comment style and explain why no declaration is needed. Built-in agents simply do not implement it and keep going through `AreHooksInstalled`.
+
+- **external package**: implement `ProbeHooksInstalled` on `*Agent` as the error-returning form of the existing method, and refactor `AreHooksInstalled` to call it and swallow the error, so there is one code path. Forward it from `wrappedAgent` / `wrappedAgentWithProtectedFiles` next to the existing `AreHooksInstalled` forwarders in `capabilities.go`.
+
+- **config.go**: one sweep must yield both answers, since detect-once is the property this branch already committed to. Add
+  ```go
+  // AgentHookState is the result of one hooks-installed sweep.
+  type AgentHookState struct {
+      Installed   []types.AgentName // reported hooks installed
+      ProbeFailed []types.AgentName // could not answer; installed state unknown
+  }
+  func GetAgentHookState(ctx context.Context) AgentHookState
+  ```
+  and reduce `GetAgentsWithHooksInstalled` to `return GetAgentHookState(ctx).Installed` so its seven existing callers are untouched. Populate `ProbeFailed` only from `AsHookInstallProbe` agents whose probe errored.
+
+- **runUninstall**: take `GetAgentHookState(ctx)` once. Use `.Installed` everywhere the current `agentsWithInstalledHooks` is used, and add a summary line naming the unknowns, e.g.
+  `  - Agent hooks that could not be checked (<names>)`.
+  Include `ProbeFailed` in the "anything to uninstall" emptiness check — an unknown is not a known-empty.
+
+- **removeAgentHooks**: skip an external agent only when it *cleanly* reported no hooks: skip if `!installed[name] && !probeFailed[name] && external.IsExternal(ag)`. A probe-failed external gets `UninstallHooks` attempted, so the existing recovery path names it if that also fails. Print the `Removed %s hooks` line for anything in installed ∪ probeFailed. This keeps the "don't run a mutating subprocess against a plugin the user never enabled" property intact — a plugin that answers cleanly with `false` is still left alone — while closing the silent hole.
+
+## 3. Answered, no change — why the guard is `!installed && external` and not just "remove from installed"
+
+Because "remove only from those reported installed" would change built-in behaviour, which is what point 1 says not to do. Before this branch, `removeAgentHooks` called `UninstallHooks` on *every* hook-supporting agent unconditionally; `wasInstalled` only decided whether to print the `Removed ... hooks` line. Narrowing that to installed-only would stop cleaning up a built-in whose hook config is partial or stale in a way `AreHooksInstalled` does not recognise as installed — a real case for the built-ins, since the check compares against an embedded template.
+
+So the guard is deliberately narrow: the new, stricter rule applies only to the new, expensive, mutating-subprocess case (external plugins, where discovery registers every `entire-agent-*` on `$PATH`, not just the one the user enabled). For built-ins the call stays unconditional because it is in-process, idempotent, and cheap.
+
+Nothing pins that asymmetry today — every new test exercises the external side. Please add one small test: a built-in hook-supporting agent absent from the installed set still gets `UninstallHooks` called. Item 4 makes this easy to register without leaking.
+
+## 4. Fix the registry leak in tests
+
+`agent/registry.go` has no unregister, so each of the four new tests permanently adds an entry to the process-global registry; every later test walking `agent.List()` then execs a deleted binary per leaked entry. Shuffled runs pass today, so this is hygiene, not a live bug — but this diff takes it from ~3 leaks to ~7.
+
+Add a snapshot/restore seam to the `agent` package following the local convention (`internal/entireclient/tokenstore/testing.go`, `agent.SetWindowsHookProbeForTesting`): a `ForTesting` function returning a restore `func()`, so no `testing` import in production code.
+
+```go
+// SnapshotRegistryForTesting captures the registry and returns a func that
+// restores it. External-agent discovery registers plugins into the
+// process-global registry, so a test that triggers it otherwise leaks entries
+// into every later test that walks List().
+func SnapshotRegistryForTesting() func()
+```
+
+Take `registryMu` for both the clone and the restore. Call it from `installExternalAgentPluginForUninstall` via `t.Cleanup`, and drop the paragraph in that helper's doc comment that explains the leak — it stops being true. Same seam registers the fake built-in agent for the tests in 1 and 3.
+
+## 5. Cosmetics
+
+- The `for _, name := range failedExternal` loop followed by a separate `if len(failedExternal) > 0` says the same condition twice. One `if len(failedExternal) > 0 { ... }` wrapping the loop and the trailing line.
+- The summary names an agent by `ag.Type()` (`ext-uninstall-test Agent`), the leftover-hooks warning by registry name, so one agent is described two ways. Use the display name for the prose and keep the registry name for the command: `%s hooks are still installed. Remove them with \`entire-agent-%s uninstall-hooks\`.` Extract a single-name `agentDisplayName(name)` and rewrite the existing `agentDisplayNames` to call it, rather than adding a second lookup.
+
+---
+
+## Tests
+
+Alongside the two above (built-in unconditional; built-in failure keeps exit 0 and `uninstalled successfully`), add: an external plugin whose `are-hooks-installed` exits non-zero still gets `uninstall-hooks` invoked, and the summary names it as could-not-be-checked. Extend the mock in `writeExternalAgentBinaryEx` with an env switch for that, matching the existing `ENTIRE_TEST_FAIL_UNINSTALL_HOOKS` pattern.
+
+Keep the existing comment style — the tests in this branch explain what breaks if the assertion is removed, which is right; do not narrate the change history.
+
+When done: `mise run fmt && mise run lint` (note: `mise run lint` fails locally from a stale golangci-lint v1 on PATH — run `/Users/gtrrz-victor/.local/share/mise/installs/golangci-lint/2.11.3/golangci-lint-2.11.3-darwin-arm64/golangci-lint run` directly), then `go test ./cmd/entire/cli/... -count=1` and once with `-shuffle=on`. Report back what you changed and anything in the spec you disagreed with — do not commit.
+</cross-session-message>
+
+---
+
+wait wait, do not change the agents interface. If the current interface does not support to know if the hooks are installed or not in case of error, this pr is not the scope for it
+
+---
+
+ship it
+
+---
+
+fix PR body and close/resolve/fix trail findings
+
+---
+
+can you fetch trail findings
+
+---
+
+y
+
+---
+
+commit it
+
+---
+
+push + close finding
+
+---
+
+is the fix adding the .exe in case of windows?
+
+---
+
+no
+
+---
+
+there is a new finding after last fix
+
+---
+
+y
+
+---
+
+y
+
+---
+
+quick one.. about the failing uninstalling. are at the end calling the binary aren't we? the plugin binary?
+
+---
+
+so, we know if the binary call failed, like exit non 0 ?
+
+---
+
+plan this change, we don't need to change the interface, we just need to track that error and print the final outcome for each plugin uninstallation
+
+---
+
+why do we need an extra ProbeHooksInstalled interface ? existing AreHooksInstalled is where the change just has to be, return boolean plus error, not need of another extra internface. there is no need for it, keep it simple please
+
+---
+
+checking built in agents, it also throws errors we swallow.. make them also throw error up with false, same as externals
+
+---
+
+I notice that we have deleted logs like the one at copilotcli/hooks.go ln 245 ->     if !errors.Is(err, os.ErrNotExist) {
+            logging.Warn(ctx, "copilot-cli: failed to read hooks file", "path", hooksPath, "err", err)
+        } 
+
+We can't loose those traces, even more, let's add those traces on the other built-in agents AreHooksInstalled methods

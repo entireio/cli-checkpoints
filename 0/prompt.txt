@@ -1,0 +1,211 @@
+I know he is 0.10.2
+
+---
+
+/simplify 2107
+
+---
+
+<task-notification>
+<task-id>ac9b71e0f8fb55583</task-id>
+<tool-use-id>toolu_011onNLWJxwvxjtp1HsianBR</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-slow-entire-hook/494613eb-2fb9-404c-b7b6-587999007d63/tasks/ac9b71e0f8fb55583.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review of PR 2107" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Read the diff and verified against current file contents. Findings, ordered by payoff:
+
+---
+
+**1. `TranscriptScope` is a one-valued enum in production — `ShadowScope` is dead outside a test**
+`/Users/soph/.herdr/worktrees/cli/soph-slow-entire-hook/cmd/entire/cli/checkpoint/redact_cache.go:328-349` (type, consts, key builder) and `:370` (the `scope` param).
+
+Both production callers pass `CommittedScope` (`manual_commit_condensation.go:854`, `manual_commit_hooks.go:2840`). The shadow write never reaches `RedactTranscriptIncremental` at all — it calls `redactIncrementally` directly from `persistent.go:2547` with the real tree path (`.entire/metadata/&lt;session&gt;/full.jsonl`), so it never passes a scope. `ShadowScope`'s only reference in the whole repo is `redact_cache_scope_test.go:97,102`, i.e. it exists so a test can assert that two keys differ.
+
+Simpler: delete the type, both constants, and the `scope` parameter; make the key `sessionID + "/" + paths.TranscriptFileName`. Real tree paths can't collide with it (different strings → different SHA-256 → different cache files), which is the same argument the current code relies on anyway.
+
+Cost today: type + doc + const block + param ≈ 14 lines, the 6-line header paragraph at `:54-59` explaining a distinction nothing exercises, and the 27-line `TestRedactTranscriptIncremental_ScopesAreIsolated`. ~45 lines, plus every reader of the exported signature has to decide which scope they are and go read two paragraphs to find out there's only one answer.
+
+---
+
+**2. The `full` closure is used once, and the miss path re-implements it inline**
+`redact_cache.go:375-381` (declared) vs `:393` (only use) vs `:397-403` (miss path calls `redactor` + `.Bytes()` by hand).
+
+`persistent.go:2547-2559` has the identical shape: build a closure over `RedactBlobBytes(ctx, b, treePath, false)`, then spell that same expression out again for the `result.Redacted == nil` branch.
+
+Note this half-defeats the invariant the diff's own comment at `:213-216` claims to establish ("passing one redactor for both is what makes it impossible to splice a prefix produced by one pipeline onto a suffix produced by another") — the *fallback* pipeline is not the passed-in redactor at either call site, it's a hand-copied duplicate that happens to match.
+
+Simplest form: move the fallback inside `redactIncrementally`, which already holds both `redactor` and `content`, so `redactResult.Redacted` is never nil:
+
+```go
+res, err := reusePrefix(ctx, repo, cache, content, treePath, redactor) // current body
+if err != nil || res.Redacted != nil { return res, err }
+res.Redacted, err = redactor(ctx, content)
+return res, err
+```
+
+That deletes the 6-line nil-check at both call sites, makes `full` the single adaptation point, and matches what `redactIncrementally`'s own doc comment already promises ("redacts content, reusing a previously redacted prefix when one is available"). Net ~-8 lines and one fewer per-call-site invariant to remember. Failing that, minimally: `result.Redacted, err = full(ctx, content)` at `:398`, which drops the `.Bytes()` unwrap/`AlreadyRedacted` re-wrap dance.
+
+---
+
+**3. `full` is allocated before the guard that makes it unnecessary**
+`redact_cache.go:375-381` sits above the `repo == nil || sessionID == ""` early return at `:386-388`. On the opt-out path the adapter is built and discarded. Move it below the guard — a reader currently has to hold "why are we adapting a redactor before we know we'll use it?" for 11 lines.
+
+---
+
+**4. Same two facts restated 3-5x across the new comments**
+- Perf motivation ("65/70MB Codex rollout, 30s hook timeout"): pre-existing header `redact_cache.go:24-28`, then restated at `:356-360`, `manual_commit_hooks.go:2818-2822`, and `manual_commit_condensation.go:834-838`. Three new copies.
+- Scope rationale ("shadow is sanitized, committed is sanitized + image-externalized"): `redact_cache.go:54-59`, `:328-330`, `:334-340`, `manual_commit_hooks.go:2824-2825`, `redact_cache_scope_test.go:77-80`. Five copies.
+
+~65 lines of new comment for ~90 lines of new non-test code. Keep the canonical statement in the file header and have the others say "see redact_cache.go header". (Finding 1 removes the scope one entirely.)
+
+---
+
+**5. Test: `counting` closure duplicated verbatim 3x, `failing` 2x**
+`redact_cache_scope_test.go:61-65`, `:92-96`, `:116-120` are byte-identical; `:160-162` and `:180-182` likewise. The file already hoists `jsonlRedactor` to package scope at `:14-16`, so the precedent exists.
+
+```go
+func countingRedactor(saw *int) func(context.Context, []byte) (redact.RedactedBytes, error) {
+	return func(_ context.Context, b []byte) (redact.RedactedBytes, error) {
+		*saw += len(b)
+		return redact.JSONLBytes(b)
+	}
+}
+func failingRedactor(context.Context, []byte) (redact.RedactedBytes, error) {
+	return redact.RedactedBytes{}, redact.ErrScannerDegraded
+}
+```
+
+Saves ~11 lines and names the concept. I would *not* push these into a table: `ScopesAreIsolated` / `SessionsAreIsolated` / `ActuallyReusesPrefix` share a shape but assert genuinely different things (key inequality vs. output equality vs. suffix-only byte count), and a table would bury that. Helper extraction is the whole win here.
+
+---
+
+**6. `redactFinalizedTranscript` takes `*SessionState` to read one field**
+`manual_commit_hooks.go:2832-2862` — all three uses of `state` are `state.SessionID` (`:2840`, `:2851`, `:2858`). Narrow the param to `sessionID string`; the caller at `:3011` becomes `redactFinalizedTranscript(logCtx, repo, state.SessionID, fullTranscript)` and the helper loses a dependency on the strategy package's session type.
+
+---
+
+**Judged acceptable, reporting as no-finding so you don't get it twice:**
+
+- **`redactSessionTranscript`'s `repo, sessionID` nil-sentinel** (`manual_commit_condensation.go:839-844`). Two functions or an options struct would both be *more* code than one 4-param function with a documented opt-out, and the subagent caller genuinely wants the empty-check + perf span + error wrap that live inside it. Two nits only: `prepareTaskTranscriptForStorage:255` passes `nil, ""` when either sentinel alone suffices (`RedactTranscriptIncremental:386` ORs them), so one of the two is decoration; and the param order flipped between `redactOrDrop(…, repo, transcript, sessionID, …)` and `redactSessionTranscript(…, repo, sessionID, transcript)` for no reason.
+- **`transcriptRedactor`** (`redact_cache.go:217`) is genuinely used in `redactIncrementally`'s signature at `:227` — not declared-and-bypassed. It is a one-use type, and its exported twin at `:373` spells the analogous type out inline instead, but that asymmetry is inherent (`[]byte` vs `redact.RedactedBytes`), not gratuitous. Its 4-line doc comment is the part worth trimming (see finding 4).
+- **No deep nesting, no unused params, no dead branches** introduced in `RedactTranscriptIncremental` — the control flow is flat and every branch is reachable.</result>
+<usage><subagent_tokens>73129</subagent_tokens><tool_uses>17</tool_uses><duration_ms>191480</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a958209363f0f5917</task-id>
+<tool-use-id>toolu_01PHeZH8Dq8K7ss3o2cfmYmK</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-slow-entire-hook/494613eb-2fb9-404c-b7b6-587999007d63/tasks/a958209363f0f5917.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review of PR 2107" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>**1. `ShadowScope` has no production caller — the "namespace" mechanism is only half-installed** — `cmd/entire/cli/checkpoint/redact_cache.go:333-341`
+The shadow write still keys on its real tree path (`.entire/metadata/&lt;session&gt;/full.jsonl`, via `ephemeral.go:845` → `createRedactedBlobFromFile`); `ShadowScope` is referenced only by `redact_cache_scope_test.go` and comments. So shadow/committed isolation is a byproduct of path shape, not of the enum, and the header comment (`redact_cache.go:54-59`) plus `CLAUDE.md:10` claim "entries are namespaced by `TranscriptScope`" for all three paths, which the code does not do.
+Deeper fix: one key builder for all three — thread a scope (or a key value) into the metadata walk so `createRedactedBlobFromFile` also keys through `transcriptCacheKey`; or delete `ShadowScope` and state that the shadow path is keyed by its actual tree path.
+Cost of leaving: an exported constant with no live use, and the next person "adds a scope" believing scoping is the mechanism when the path they're mirroring doesn't use it.
+
+**2. Scope is caller identity, not pipeline identity — nothing binds the constant to the redactor** — `redact_cache.go:331,347`; call sites `strategy/manual_commit_condensation.go:853-854` and `strategy/manual_commit_hooks.go:2839-2840`
+The two `CommittedScope` callers pass *different* redactor values (condensation uses the swappable package var `redactSessionJSONLBytes`; finalize an inline `redact.JSONLBytes` closure) and share a namespace purely by assertion. `RedactTranscriptIncremental` already takes the pipeline as a parameter — the key should be derived from it.
+Deeper fix: bundle identity with behaviour, e.g. `type TranscriptPipeline struct { ID string; Redact func(ctx, []byte) (redact.RedactedBytes, error) }`, and build the key from `ID`. Then a 4th pipeline cannot exist without a key component, and no caller can pair pipeline A with namespace B.
+Cost of leaving: a 4th path picks `CommittedScope` because it is the closest-looking constant and gets a permanent 0% hit rate *plus* mutual thrash — each write invalidates the other two callers' prefix, so all three degrade to full redaction while additionally paying a blob write and a JSON write per checkpoint. The only signal is one Debug log ("redaction prefix changed"); there is no hit-rate counter. Cheap mitigation regardless: attach `reused_bytes`/`redacted_bytes` to the existing `redact_transcript` perf span so thrash shows in hook traces. Same exposure applies today between condensation and finalize: sharing a namespace is a bet on byte-identical output that no test or assertion pins, only a comment (`manual_commit_hooks.go:2824`).
+
+**3. Cache-record protocol is now duplicated, and the new path writes a blob solely for the cache** — `redact_cache.go:405-411` vs `persistent.go:2566-2568`
+"Create a blob, then `storePrefix(treePath, SourceHash, len(content), blob)` only when `StorePrefix`" is maintained by two callers. Worse, the in-memory path calls `CreateBlobFromContent` purely for the cache (its own comment concedes the store writes the same bytes again); `CreateBlobFromContent` (`persistent.go:2411-2435`) unconditionally zlib-encodes and `SetEncodedObject`s with no existence check.
+Deeper fix: make the cache own its own persistence — either let `redactIncrementally` record the result itself (pass a `blobFor func([]byte) (plumbing.Hash, error)`, or store prefix bytes as a file next to the `.json` entry), or have `RedactTranscriptIncremental` return the blob hash so the checkpoint store reuses it.
+Cost of leaving: on the exact 65MB transcript this PR exists to speed up, the redacted output is compressed and written to the object store twice per checkpoint on both new paths; and a third entry point must re-derive the record protocol by reading two call sites.
+
+**4. `nil` repo + `""` sessionID as the opt-out — two sentinels for one policy, on a function that doesn't mention caching** — `manual_commit_condensation.go:253-255`, `:839-844`, `redact_cache.go:386-388`
+The task caller passes both sentinels; `redactSessionTranscript` now requires every caller to reason about a `*git.Repository` in order to redact bytes.
+Deeper fix: name the eligibility. Either split the task path (`redactTaskTranscript(ctx, bytes)` — it shares nothing with the session path but the redactor) or make it one explicit argument (`cacheKey *TranscriptCacheKey`, nil = no reuse; or `noPrefixReuse bool`).
+Cost of leaving: a future caller that happens to hold a repo and sessionID opts in by accident (e.g. redacting a compact transcript or any non-append-only stream), lands on the shared `CommittedScope` key, and thrashes condensation's prefix — the same invisible degradation as #2, arrived at by omission rather than choice.
+
+**5. Synthetic tree path to satisfy a basename gate** — `redact_cache.go:343-349` against the gate at `redact_cache.go:207-211`
+Yes, a smell: the in-memory callers *know* they hold an append-only session transcript, but the only way to say so is to invent a path ending in `full.jsonl`. The gate conflates two separate policies (append-only-ness, inferred from filename; splice-safety, checked properly via `redact.IsLineDelimited`).
+Deeper fix: make the append-only claim an explicit input (a kind/bool on the request) and keep basename matching inside the file-walk adapter, which is the only caller with a real path. Keys then become `committed/&lt;session&gt;` and stop naming files that do not exist.
+Cost of leaving: `paths.TranscriptFileName` becomes load-bearing for paths that never touch a file; the gate can no longer be tightened with real path semantics (e.g. requiring an `.entire/metadata/` prefix, which the docs' framing invites) without disabling both new paths — `TestRedactTranscriptIncremental_ActuallyReusesPrefix` would catch that, so the concrete cost is coupling and debug-log confusion rather than a silent break.
+
+**6. Exported API name over-promises and leaks cache config into the signature** — `redact_cache.go:367-374`
+`RedactTranscriptIncremental` is not always incremental, does more than redact (writes a git blob + a cache file), and takes 6 parameters of which 3 (`repo`, `scope`, `sessionID`) are cache configuration; the scope constants are exported while `transcriptCacheKey` and `redactCache` are not, so a caller chooses a namespace it cannot inspect.
+Deeper fix: name it for the guarantee ("byte-identical to a full redaction, cached when possible" → `RedactTranscriptCached`) and/or make the config a value: `checkpoint.TranscriptRedactor{Repo, Scope, SessionID}.Redact(ctx, content)`, which also gives #2's pipeline ID a home.
+Cost of leaving: mild — callers read "Incremental" as an O(appended) promise and are surprised by full-redaction latency; each new caller re-threads three fields.
+
+**7. Where the factoring is genuinely right (no change wanted)**
+`redactIncrementally` (`redact_cache.go:221-300`) remains the single general core and both entry points are thin adapters over it; injecting `transcriptRedactor` instead of the hardcoded `RedactBlobBytes` call is the correct generalization and is what makes the pipeline the caller's business. Expressing `createRedactedBlobFromFile` in terms of `RedactTranscriptIncremental` would be wrong — it handles arbitrary files, binary skip, file mode, blob-hash return, and path-driven redactor dispatch. The cache-ownership asymmetry is also mostly principled (the walker hoists one cache across N files at `ephemeral.go:845`; single-shot callers resolve once per checkpoint) — it just isn't stated: one line in `repoRedactCache` (`redact_cache.go:112-124`) recording that split would make it intentional. The accidental part is only that `redactIncrementally` takes both `repo` and `cache` when `cache` is derivable from `repo`; collapsing those into one prefix-store parameter (blob read + entry read/write) would also resolve #3.</result>
+<usage><subagent_tokens>73388</subagent_tokens><tool_uses>19</tool_uses><duration_ms>212645</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a0a43fa9f6da7e4e0</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-slow-entire-hook/494613eb-2fb9-404c-b7b6-587999007d63/tasks/a0a43fa9f6da7e4e0.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review of PR 2107" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>**1. HIGH — `redactFinalizedTranscript` re-implements `redactSessionTranscript` (same package)**
+`cmd/entire/cli/strategy/manual_commit_hooks.go:2838-2844` duplicates the body of `redactSessionTranscript` (`cmd/entire/cli/strategy/manual_commit_condensation.go:839-860`): same `perf.Start(ctx, "redact_transcript")` span name, same `RedactTranscriptIncremental(ctx, repo, CommittedScope, sessionID, …)` call, same pipeline. Call `redactSessionTranscript(logCtx, repo, state.SessionID, fullTranscript)` and keep only the degraded/drop branching (~8 lines saved; `errors.Is(err, redact.ErrScannerDegraded)` still works through its `fmt.Errorf(…%w…)` wrap, and you get the duration finalize currently doesn't log).
+Concrete drift cost: the pipeline in condensation is the injectable var `redactSessionJSONLBytes` (`manual_commit_condensation.go:132`), whose doc says it exists "so tests can inject deterministic success/error returns … re-wired to `JSONLBytesWithPrivacyFilter`". Finalize's inline closure calls `redact.JSONLBytes` directly, so (a) the two existing seam tests (`manual_commit_test.go:4059`, `condense_skip_test.go:155`) can never reach finalize, and (b) if that var is ever re-pointed, condensation and finalize emit different bytes *under the same cache namespace* (`CommittedScope` + same sessionID) — the cross-pipeline prefix/suffix splice that `redact_cache.go:213-217` claims is impossible by construction. Minor: `checkpoint` is aliased `cpkg` in the condensation file, plain in the hooks file, so the two copies don't even look alike.
+
+**2. MEDIUM — `RedactTranscriptIncremental` tail duplicates `createRedactedBlobFromFile` tail**
+`cmd/entire/cli/checkpoint/redact_cache.go:393-411` vs `cmd/entire/cli/checkpoint/persistent.go:2547-2568`: identical 5-step protocol (redactIncrementally → `Redacted == nil` fallback → `CreateBlobFromContent` → `if StorePrefix { cache.storePrefix(…, result.SourceHash, len(content), blob) }`), ~12 lines each. Now that `redactIncrementally` takes a `redactor`, the "nil Redacted means the caller redacts everything" protocol is redundant — do the fallback inside `redactIncrementally` and both call sites lose their fallback branch, plus the `full` adapter (redact_cache.go:375-381) disappears. Cost as written: the storePrefix contract (SourceHash = whole-content digest, sourceBytes = `len(content)`, blob = full redacted output) is now written down twice, and the copies have *already* diverged — `persistent.go:2562` treats a blob-write error as fatal, `redact_cache.go:408` silently skips caching. Test to adjust: `redact_cache_test.go:206-209` asserts the nil-Redacted protocol.
+
+**3. LOW — fallback re-types the redactor closure it just passed**
+`cmd/entire/cli/checkpoint/persistent.go:2555` (`RedactBlobBytes(ctx, content, treePath, false)`) is a verbatim copy of the closure passed at `2548-2550`; hoist it to a local `redactor` and call `redactor(ctx, content)`. Same shape at `redact_cache.go:398-402`, which redoes what `full` (375-381) already does. 3 lines each — worth fixing because the "one redactor for suffix and whole content" invariant asserted in the new `transcriptRedactor` doc comment is currently upheld by hand at both sites rather than structurally.
+
+**4. MEDIUM — new test hand-rolls a fixture `openCodeExport` already provides**
+`cmd/entire/cli/checkpoint/redact_cache_scope_test.go:194-203` builds a single-JSON-value OpenCode-shaped transcript inline; `openCodeExport(t, minBytes)` (`cmd/entire/cli/checkpoint/redact_cache_test.go:272-297`, same package) already returns exactly that shape (single JSON object, past the size gate, newline-terminated). Drop-in: `content := openCodeExport(t, redactCacheMinBytes+1024)`, deleting 10 lines. Cost: two independent definitions of "what an OpenCode export looks like" that must stay in sync with `redact.IsLineDelimited`/`isSingleJSONValue`; if that routing changes, one fixture can stop being a single JSON value while the other still is, and the corresponding test silently stops guarding. (I ran the new test: 0.23s, so `openCodeExport`'s documented leaf-count perf caveat does not actually bite here — no perf claim.)
+
+**5. LOW — five near-identical redactor stubs inside the new test file**
+`redact_cache_scope_test.go`: byte-counting stub repeated verbatim at 61-65, 92-96, 116-120; failing stub at 160-162 and 180-182; and the `want, wantErr := redact.JSONLBytes(…)` + `require.Equal(string(want.Bytes()), string(got.Bytes()))` assertion at 37-40, 72-74, 125-127, 137-143. No existing helper (grep: `sawBytes` appears only in this file), so this is self-inflicted: one `countingRedactor(*int)`, one `failingRedactor`, one `requireEqualsFullRedaction(t, content, got)` would remove ~20 lines.
+
+**6. LOW — `jsonlRedactor` vs `testRedactor`**
+`redact_cache_scope_test.go:14-16` and `redact_cache_test.go:215-221` (the latter added by this diff) are the same wrapper over `redact.JSONLBytes` in the same test package, differing only in the `.Bytes()` adaptation. `testRedactor` should be expressed as `jsonlRedactor` + `.Bytes()` (or both should live in one file); 7 lines, and both files now import `redact` for the same reason.
+
+**7. Clean — item 4 of the brief**
+No hand-rolled hashing, blob reading, or JSON writing in the new code: `hashBytes`, `readBlobBytes`, `jsonutil.WriteFileAtomic`, `CreateBlobFromContent`, `paths.TranscriptFileName`, `redact.AlreadyRedacted` are all reused correctly. `transcriptCacheKey`'s `"/"` concat instead of `path.Join` is intentional (git tree-path slashes) and not worth changing. The new scope test also correctly reuses `transcriptLines`, `padPastCacheThreshold` and `newTestRepoForCache` rather than re-declaring them — only the fixture in finding 4 slipped.</result>
+<usage><subagent_tokens>91507</subagent_tokens><tool_uses>28</tool_uses><duration_ms>259034</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a7bc823f65d3b3e09</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-slow-entire-hook/494613eb-2fb9-404c-b7b6-587999007d63/tasks/a7bc823f65d3b3e09.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review of PR 2107" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Findings (efficiency only, verified against code)
+
+**1. `cmd/entire/cli/checkpoint/redact_cache.go:405-411` — the cache blob write is a genuine second full compression, not a free dedup; and for the PR's own 65MB example it is not deduped at all.**
+
+Traced `CreateBlobFromContent` (`persistent.go:2411`) into go-git v6 (the pinned `v6.0.0-alpha.5.0.20260812155443`):
+- `MemoryObject.Write` is `o.cont = append(o.cont, p...)` (`plumbing/memory.go:74`) → one 65MB alloc + memcpy.
+- `ObjectStorage.SetEncodedObject` (`storage/filesystem/object.go:489`) has **no** pre-existence check: it opens a temp objfile writer and `CopyBufferPool`s the payload through `objfile.Writer`, which zlib-deflates while hashing (`plumbing/format/objfile/writer.go:82`), then returns `o.Hash()`, which hashes `o.cont` a **second** time (`plumbing/memory.go:28`).
+- Dedup happens in `dotgit.ObjectWriter.save()` (`storage/filesystem/dotgit/writers.go:405-420`): `Lstat` the final path *after* the temp file is fully written, then `Remove` the temp. Dedup saves the rename, **not** the deflate. So the inline comment "git dedups it to the same object" is true about disk, false about CPU.
+
+Cost per invocation over 65MB: 1×65MB copy, 2 full hash passes, 1 full zlib deflate (Go flate default on JSON ≈ 30-60 MB/s → **~1-2s CPU**), plus a ~10-20MB temp write + unlink. The store then deflates the same bytes again for its own blobs. This happens twice per commit-turn (condensation process at `manual_commit_condensation.go:854`, finalize process at `manual_commit_hooks.go:2839`). After this PR the redaction is O(appended) (tens of ms), so this duplicate write becomes a dominant share of what is left.
+
+Worse at exactly 65MB: `agent.MaxChunkSize = 50MB` (`cmd/entire/cli/agent/chunking.go:16`), so the store writes **two chunk blobs**; the whole-transcript cache blob matches nothing → never deduped → a permanent unreachable ~65MB loose object per checkpoint (also prunable by `git gc`, after which every cache entry silently reverts to a full redaction; `entire clean` reclaims the JSON entries but not these blobs).
+
+Cheaper alternatives, in order of preference:
+- Mirror what the file path already does: `createRedactedBlobFromFile` (`persistent.go:2561-2568`) writes the blob **once** and hands that same hash to `storePrefix`. For finalize the hash already exists downstream — `PrecomputeTranscriptBlobs` (`persistent.go:2096-2111`) chunks the *unsanitized* `transcript.Bytes()`, so for a single chunk `ChunkHashes[0]` is bit-for-bit this hash. Record the prefix after the store write instead of before it. (`HasEncodedObject`-then-skip does not help, because the cache write is always the first one.)
+- Or store the redacted prefix as a plain file in the cache dir (`RedactCacheDirName`, already outside `.entire/` and already `entire clean`-able): turns ~1-2s of deflate into a raw 65MB write, and removes the gc-prune fragility and the 2 hash passes.
+
+**2. `redact_cache.go:290-292` — one avoidable full 65MB copy on every hit-path checkpoint.** `out := make([]byte, 0, len(prefix)+len(redactedSuffix)); append(out, prefix...)` copies the whole reused prefix, on top of the exact-size buffer `readBlobBytes` already allocated (`:321`). The line predates the diff, but the diff routes two more paths through it. Cheaper: redact the (small) suffix first, then read the blob into a buffer with `cap = blob.Size + len(redactedSuffix)` and append in place — saves 1 alloc + 1 memcpy of 65MB per checkpoint. Only downside: a blob-read failure after the suffix redaction wastes work proportional to the appended bytes only.
+
+**3. `redact_cache.go:308-326` (`readBlobBytes`) — hit path now peaks around 5×transcript and thrashes the process-wide object cache, in two more processes.** go-git's `getFromUnpacked` (`storage/filesystem/object.go:715-765`) inflates the loose object into a `MemoryObject` and then does `s.objectCache.Put(obj)`. `LargeObjectThreshold` is not set (`cmd/entire/cli/gitrepo/repository.go:119-125`), and the LRU is the shared 96MB `cache.NewObjectLRUDefault()` (`repository.go:26`) — so a 65MB cached prefix evicts nearly everything else and is pinned for the process lifetime. Simultaneously live on a hit: source content + go-git MemoryObject + `readBlobBytes` buffer + joined `out` + `CreateBlobFromContent` MemoryObject ≈ **325MB** for a 65MB transcript. Cheaper: set `gitfilesystem.Options.LargeObjectThreshold` (e.g. 8MB) so big blobs stream and skip the LRU, or read the prefix from a plain cache file per 1(b), which removes the go-git copy and the LRU put outright.
+
+**4. `repoRedactCache` per invocation — already cheap; one small ordering nit.** Verified `resolveGitCommonDir` memoizes process-wide keyed by worktree root (`git_common_dir.go:26-50`); only the first call per process forks `git rev-parse --git-common-dir` (~10ms). `newRedactCache`'s `os.MkdirAll` costs exactly 1 `stat` when the dir exists (stdlib returns after `Stat`) → ~µs, 2-3 per turn. Not worth changing. Nit: `RedactTranscriptIncremental` calls `repoRedactCache` (`:391`) *before* `redactIncrementally` checks `incrementalRedactionCandidate`, so a non-candidate payload (&lt;1MiB, or a single-JSON OpenCode export) pays the resolution — and possibly that ~10ms fork, since in the post-commit process `redactOrDrop` runs before `getPersistentStore`/pushqueue — for nothing. Hoisting a candidacy pre-check above the cache resolution makes it free.
+
+**5. Closures — clean, no retention.** `full` (`:375`) captures only `redactor` (1 word); the finalize literal (`manual_commit_hooks.go:2841`) captures nothing; condensation passes the package-level var `redactSessionJSONLBytes` (`manual_commit_condensation.go:132`). `transcriptRedactor` is a parameter only — nothing stores it, so no big transcript is kept alive. Nit: `full` is built above the `repo == nil || sessionID == ""` guard at `:386`, so the deliberate nil-repo subagent path allocates a closure it never uses; move it below the guard.
+
+**6. Repeated hashing — the source-side hashing is already optimal; the only redundancy is inside the blob write.** `redactIncrementally:249-253` hashes prefix+remainder in one pass via the `Sum` snapshot, and a miss redacts exactly once (`redactIncrementally` returns nil, caller redacts, no double pass). The redundant passes are all in finding 1: 2 git-hash passes per `CreateBlobFromContent`, repeated again by the store's chunk blobs plus its own `sha256.Sum256` content hash (`persistent.go:1072`, `:2113`) — 6 full-payload hash passes per finalize, of which caching contributes 3 (its SHA-256 of the source is unavoidable and cannot be shared, since the store hashes the *redacted* output).
+
+**Also verified as free, no action:** the `redact.RedactedBytes` boundary in the new code adds zero copies — `Bytes()` returns the slice and `AlreadyRedacted` just wraps it (`redact/redact.go:99-113`). `redact.JSONLBytes` internally does `string(b)` + `[]byte(redacted)` (up to 2 full copies, `redact/redact.go:527-544`), but after this PR that is paid on the appended suffix on a hit — which is the whole point of the change — and it is unchanged on a miss.</result>
+<usage><subagent_tokens>107930</subagent_tokens><tool_uses>43</tool_uses><duration_ms>408011</duration_ms></usage>
+</task-notification>

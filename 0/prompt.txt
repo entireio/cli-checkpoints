@@ -1,0 +1,219 @@
+fetch the finding from the trail
+
+---
+
+y
+
+---
+
+is the finding really fixed? what if hashooksinstalled fail, we don't count those to be uninstalled and we just ignorethem. we endup telling the uninstall ok when it is not really ok. I'm just checking the code how to address it properly. Ideas ?
+
+---
+
+I have coded manually the gap 1
+gap 2 -> do not print Entire CLI uninstalled .... if any internal unchecked agent. Print message that following agents might or might not be installed, entire could not check its status, see warning above, and then return an error so uninstall exits with nonzero value, return success only if there is no unchecked internals or, there is no unchecked at all if --strict flag is set
+
+---
+
+One deliberate leftover, per your spec: a built-in whose check succeeded but whose removal failed (e.g. write error on a
+ readable config) still warns and exits 0 — TestRunUninstall_BuiltinHookFailureStillSucceeds continues to pin that. Say the
+ word if you want that to fail too. 
+
+wrong, it should fail.
+
+strict -> false => external errors warn but not fail, internal agent error make it fail
+strict -> true => any agent error make it fail
+
+---
+
+okey, I'm doing some manual changes I want you to do very small improvements, just what I tell you, smallest change as possible. first read my changes
+
+---
+
+let's focus later on making test work and fix them
+
+---
+
+focus just on:
+    failedExternal, failedBuiltin, agentHooksErr := removeAgentHooks(ctx, w, agHookState.installed) 
+
+I want that to return one object, all the agentHooksErrors which is a list of something with the same struct as uncheckedAgent, it returns the agent name, if its external and the error trying to uninstalling it. Only this change
+
+---
+
+now:
+    for _, f := range failedAgents {
+        fmt.Fprintf(errW, "Warning: failed to remove agent hooks: %s: %v\n", agentDisplayName(f.name), f.err)
+        if f.external {
+            failedExternal = append(failedExternal, f.name)
+        } else {
+            failedBuiltin = append(failedBuiltin, f.name)
+        }
+    } 
+
+print in the warning if the agent is external, only if it is external
+
+---
+
+failedAgents := removeAgentHooks(ctx, w, agHookState.installed)
+    var failedExternal, failedBuiltin []types.AgentName
+    for _, f := range failedAgents {
+        externalMark := ""
+        if f.external {
+            externalMark = " (external)"
+        }
+        fmt.Fprintf(errW, "Warning: failed to remove agent hooks: %s%s: %v\n", agentDisplayName(f.name), externalMark, f.err)
+        if f.external {
+            failedExternal = append(failedExternal, f.name)
+        } else {
+            failedBuiltin = append(failedBuiltin, f.name)
+        }
+    }
+    // Step 4 below deletes .entire/, and with it the external_agents setting that
+    // gates discovery — so once this returns, a re-run cannot even see these
+    // plugins, let alone retry them. Name the command that still works, while the
+    // hooks are still reachable, rather than leaving the user with a warning they
+    // cannot act on. A built-in needs none of this: it is always reachable on a
+    // re-run, since its leftover hooks keep the installed set non-empty.
+    for _, name := range failedExternal {
+        fmt.Fprintf(errW, "  %s hooks are still installed. Remove them with:\n", agentDisplayName(name))
+        fmt.Fprintf(errW, "    %s\n", pluginUninstallCommand(repoRoot, name))
+    }
+    // "may": we never found out whether this plugin has hooks, and we did not ask
+    // it to remove them — asking a plugin that cannot answer to mutate state is
+    // not something to do on the user's behalf. Only plugins appear here: a
+    // built-in we could not check still had its removal attempted in-process
+    // above, so there is no command for the user to go run — its unverified state
+    // is reported (and fails the command) at the end instead.
+    uncheckedPlugins := agHookState.uncheckedExternal()
+    for _, u := range uncheckedPlugins {
+        fmt.Fprintf(errW, "  %s hooks may still be installed. Remove them with:\n", agentDisplayName(u.name))
+        fmt.Fprintf(errW, "    %s\n", pluginUninstallCommand(repoRoot, u.name))
+    }
+    if len(failedExternal) > 0 || len(uncheckedPlugins) > 0 {
+        fmt.Fprintln(errW, "  Re-running `entire disable --uninstall` will not reach these plugins once .entire/ is gone.")
+    }
+
+
+all this has to go away from that method, this should be done inside reportUninstallOutcome. So lets pass down just the failedAgents plus uncheckedPlugins, so this one should know what to print as warning and suggestion.
+
+---
+
+reportUninstallOutcome(w, errW, repoRoot, agHookState, failedAgents, agHookState.uncheckedExternal(), strict)
+
+---
+
+why sending agHookState.uncheckedExternal() and agHookState is the same
+
+---
+
+how can we easly apply same pattern here?
+
+
+    // 2. Remove git hooks
+    removed, err := strategy.RemoveGitHook(ctx)
+    if err != nil {
+        fmt.Fprintf(errW, "Warning: failed to remove git hooks: %v\n", err)
+    } else if removed > 0 {
+        fmt.Fprintf(w, "  Removed git hooks (%d)\n", removed)
+    }
+
+    // 3. Remove session state files
+    statesRemoved, err := removeAllSessionStates(ctx)
+    if err != nil {
+        fmt.Fprintf(errW, "Warning: failed to remove session states: %v\n", err)
+    } else if statesRemoved > 0 {
+        fmt.Fprintf(w, "  Removed session states (%d)\n", statesRemoved)
+    }
+
+    // 4. Remove .entire/ directory
+    if err := removeEntireDirectory(ctx); err != nil {
+        fmt.Fprintf(errW, "Warning: failed to remove .entire directory: %v\n", err)
+    } else if entireDirExists {
+        fmt.Fprintln(w, "  Removed .entire directory")
+    }
+
+    // 5. Remove shadow branches
+    branchesRemoved, err := removeAllShadowBranches(ctx)
+    if err != nil {
+        fmt.Fprintf(errW, "Warning: failed to remove shadow branches: %v\n", err)
+    } else if branchesRemoved > 0 {
+        fmt.Fprintf(w, "  Removed %d shadow branches\n", branchesRemoved)
+    }
+
+
+this should not report warnings neither succeess that is reportUninstallOutcome matter
+
+---
+
+I like the concept of steps to send to report. I want those steps to have:
+- message to disply on success
+- message to display on error
+- boolean if this step is optional
+
+all steps are not optional only external agetns in case strict is not set. So, remove agent hooks shoudl also return a list of these steps and reportUninstallOutcome would just iterate over that list and return error or nor in case any step is not optional an has errors.
+
+---
+
+it would be cleaner if the step has failed, add a boolean as failed, so the report does not have to check failure string empty
+
+---
+
+does it make sense to have a constructor of a step? newFailedStep(text), newOptionalFailedStep(text), newSuceessStep(text),
+
+---
+
+is this true?
+
+    if externalProblem {
+        // A note, not a failure of its own — always optional so it can never be
+        // the reason the uninstall fails; it only rides along with the external
+        // problems that made it relevant.
+        steps = append(steps, newOptionalFailedStep(
+            "  Re-running `entire disable --uninstall` will not reach these plugins once .entire/ is gone."))
+    }
+
+if we run again entire disable --uninstall --strict, this should look for external plugins ?
+
+---
+
+func removeAgentHooks(ctx context.Context, repoRoot string, hookState agentHookState, strict bool) []removalStep {
+    wasInstalled := make(map[types.AgentName]bool, len(hookState.installed))
+    for _, name := range hookState.installed {
+        wasInstalled[name] = true
+    }
+
+    // External problems are optional without --strict: third-party code Entire
+    // cannot fix does not get to fail Entire's own uninstall unless asked.
+    newExternalProblemStep := newOptionalFailedStep
+    if strict {
+        newExternalProblemStep = newFailedStep
+    }
+
+    var steps []removalStep
+    failedBuiltin := make(map[types.AgentName]bool)
+    externalProblem := false
+    for _, name := range agent.List() {
+
+
+why do we need to iterate over agent.List if hookState gives us the agents to uninstall, it would simplify it
+
+---
+
+how agentHookState is created ?
+
+---
+
+again, is it duplicated /
+
+---
+
+stop that, revert what you just did
+
+---
+
+I did change the code, check if it is working
+
+---
+
+y

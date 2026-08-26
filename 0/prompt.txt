@@ -1,0 +1,743 @@
+user report: I have a bunch of repos where the git remote I push to isn't called origin.  It looks like this means I no longer push checkpoints.  Is that intentional?
+
+---
+
+would you see this in entire doctor?
+
+---
+
+do it
+
+---
+
+is this a real example: 
+
+`git push` goes to "fork", but checkpoints sync only to "origin" (the default),
+    so a push to "fork" carries none.
+
+I wonder how you could get in this state or how we would detect it?
+
+---
+
+can we find any evidence why push destination logic was reverted? can you check the corresponding checkpoint/session
+
+---
+
+ok, can you summarize me where we add in general with these changes and the open PRs, there is also now https://entire.io/gh/entireio/cli/trails/1043/fix-strategy-hint-on-gated-pre-push-when-checkpoints-are new from tonight and have we looked at https://github.com/entireio/cli/pull/1956 yet
+
+---
+
+can you review the stack and then I can get those merged
+
+---
+
+but merge 1956 now, right?
+
+---
+
+I approved and merged 1956, so now what's the next step
+
+---
+
+ok, can you fix the conflict
+
+---
+
+I've just noticed fmt.Sprintf("+refs/heads/%s:refs/remotes/%s/%s", branchName, remoteName, branchName)
+[4:04 PM]The force fetch seems pre-existing
+[4:05 PM]Any reason why we need force fetch? We probably want to want the user at times depending on what has been force-fetched.
+[4:06 PM]As we are going against all heads, we could actually override things from the user without them noticing.
+
+---
+
+add 1 + 2
+
+---
+
+[4:07 PM]Some additional pointers from Claude:
+- Perf: CheckpointReadRemotes is un-memoized (~2 git subprocesses + settings.Load) and called at nearly every checkpoint.Open, including per-turn hooks — a documented tradeoff worth watching.
+- Perf: Per-candidate timeouts (commit 08, a real fix) multiply worst-case latency — blob hydration is now 2m per target and the old whole-function cap is gone; a fully-stalled read can hang notably longer.
+
+can you also look at these? don't do anything yet, just let me know if still relevant
+
+---
+
+let's fix both?
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>a4886955af700edf5</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-origin-push/0748193f-846c-4d9f-a445-e275636e66b0/tasks/a4886955af700edf5.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Findings
+
+**1. `/private/tmp/.../scratchpad/wt/cmd/entire/cli/doctor.go:362` — the new function was inserted between `checkDisconnectedMetadata`'s doc comment and its declaration**
+`// checkDisconnectedMetadata detects and optionally repairs disconnected local/remote metadata branches (the "empty-orphan bug").` now sits at the top of `reportMetadataDivergence`'s comment block, and `checkDisconnectedMetadata` (line 411) has no doc at all. Cost: godoc and every reader now attribute the wrong summary to the new helper, and the function that actually repairs refs is undocumented. Fix: move those two lines back above `func checkDisconnectedMetadata`.
+
+**2. `/private/tmp/.../scratchpad/wt/cmd/entire/cli/strategy/metadata_reconcile.go:81` — `MetadataDivergenceFromRemote` is a copy of `IsMetadataDisconnected` with a different last line, and doctor now runs both**
+Lines 81–104 duplicate lines 31–57 verbatim in shape (resolve refs → read local ref, `ErrReferenceNotFound`→false → read remote ref, same → equal-hash short-circuit → `getRepoPath`), ~25 lines. And the classification is the *same git call*: `isDisconnected` (line 301) is `git merge-base` exit-1, i.e. exactly `errors.Is(getMergeBase(...), errNoMergeBase)`. So `checkDisconnectedMetadata` now does 4 ref reads, 2 `getRepoPath`, and 2 `git merge-base` subprocesses to answer one question. Cost: two bodies to keep in sync (a future change to ref resolution or the not-found policy must land in both), and the repo's `dupl` threshold is 75 tokens. Simpler form: one classifier that returns the merge-base verdict — disconnected (`errNoMergeBase`) / fast-forward (`base == one tip`) / diverged — with `IsMetadataDisconnected` reduced to a wrapper for its one remaining caller (`WarnIfMetadataDisconnected`, line 165), and doctor branching on a single result.
+
+**3. `/Users/soph/.herdr/worktrees/cli/soph-origin-push/cmd/entire/cli/remote_topology.go:209` — `destinationPinned`'s loop half can never affect either call site**
+Both call sites (lines 251 and 346) are guarded by `len(t.unpinnedNames()) &gt; 1`, which means ≥2 destinations have `pinned == false`, so the `for` loop always returns `false` at the first one, and the `return len(t.destinations) &gt; 0` tail is never reached. The method is effectively `t.electedSource == strategy.SyncRemoteSourceConfig`. Cost: 11 lines and a name ("pinned") implying a second, all-remotes-pinned condition that no output path can observe — a reader who wants to change pinning semantics will edit dead branches. Simpler form: `func (t remoteTopology) destinationChosen() bool { return t.electedSource == strategy.SyncRemoteSourceConfig }`.
+
+**4. `remote_topology.go:172` — `resolveGitPushRemote` shells out to `listGitRemotes` for a fact its only caller already has**
+`inspectRemoteTopology` builds `pushURLs` (line 100) from one `git remote -v` — with a comment celebrating collapsing N+1 subprocesses into one — then calls `resolveGitPushRemote`, which spends another subprocess to ask whether `origin` exists. Cost: an extra process on every `enable`/`doctor`, plus two independent answers to "which remotes exist" (`git remote -v` push lines vs `git remote`) that can disagree for a pushurl-only remote. Simpler form: `resolveGitPushRemote(ctx, repoRoot, pushURLs)` and test `pushURLs[originRemoteName] != nil`.
+
+**5. `remote_topology.go:251` and `:346` — the composite "several remotes and nothing chosen" condition is written twice**
+`len(t.unpinnedNames()) &gt; 1 &amp;&amp; !t.destinationPinned()` appears in `worthReporting`, then again at line 346 with `&amp;&amp; !t.severe()` appended — and `unpinnedNames()` allocates on both passes. Cost: the two must be kept in agreement or the header prints with no body under it. Simpler form: one `unsettledChoice()` predicate; then `worthReporting() { return t.severe() || t.fansOutSomewhere() || t.unsettledChoice() }` and the print guard is `if t.unsettledChoice() &amp;&amp; !t.severe()`. That also removes the need for the reader to re-derive why one site has the `!severe()` term and the other does not.
+
+**6. `remote_topology.go:149-163` — dead assignment plus a slice built twice**
+`gitRunner` (repo_mirror_use.go:77) returns `""` on error, so `if err != nil { branch = "" }` is a no-op; `branch, _ := gitRunner(...)` plus the existing comment says the same thing in one line. Immediately below, `keys` is allocated as a 1-element slice and then thrown away and reallocated, duplicating the `"remote.pushDefault"` literal. Cost: two spellings of the same precedence list to keep aligned. Simpler form: build once with `append`, or (since the branch-scoped keys are simply absent when `branch == ""`) guard only the two `branch.` entries.
+
+**7. `/private/tmp/.../scratchpad/wtperf/cmd/entire/cli/strategy/git_remote_cache.go:73` — `cacheFromContext` is five lines doing what two do**
+A two-value type assertion already yields `nil` for a pointer type on failure: `c, _ := ctx.Value(gitRemoteCacheKey{}).(*gitRemoteCache); return c`. Cost: trivial, but it is the shape a reader checks first when reasoning about the opt-in property.
+
+**8. `remote_topology.go:254-257` and `:341-345` (plus `CLAUDE.md:687-696`) — the same historical anecdote is told three times**
+"This note used to claim checkpoints follow whichever remote you push to, which the single-remote gate made false" appears in the `checkpointNoteStyle` doc, in the inline comment above the multi-remote block, and again in CLAUDE.md — where the first added sentence also restates the immediately preceding bullet's "electing the tracking remote silently drops checkpoint sync on every push to a different remote … any repo with `remote.pushDefault`". Cost: three copies of one story drift apart, and the CLAUDE.md paragraph makes an already-long bullet longer without adding a rule. Keep the telling in the file-header comment (lines 27-33), which is the natural home, and cut the other two to a pointer. (The other rationale comments in this file — `pinned`'s `PushURL` explanation, the origin read-path note, the mismatch-ordering note — are non-obvious and should stay.)
+
+**9. `/private/tmp/.../scratchpad/wt/cmd/entire/cli/doctor.go:381,385` — `"✓ Metadata branches: OK"` printed from two adjacent branches**
+The error path and the not-diverged path differ only in a `logging.Debug` call. Cost: two places to edit when the line changes (it already exists in two more variants at 422/430). Simpler form: log on error, then one `if err != nil || !divergence.Diverged { print OK; return }`.
+
+**10. `/private/tmp/.../scratchpad/wtperf/cmd/entire/cli/strategy/checkpoint_sync_remote.go:119` — the wrapper's closure is avoidable**
+`return cachedRemotesInConfigOrder(ctx, func() []string { return readRemotesInConfigOrder(ctx) })` exists only because the callback type is `func() []string`. Make it `func(context.Context) []string` and pass `readRemotesInConfigOrder` directly. The wrapper/reader *split* itself is fine and needed; the closure is noise. (`orderedSet` is fine as-is — a presence bool is the idiomatic marker for "zero value is a real answer", and it is tested. The `member`/`ordered` separation is justified by its comment.)
+
+**11. `/private/tmp/.../scratchpad/wt/cmd/entire/cli/strategy/common.go:239` — `logLocalRefReplay` is placed one level too high**
+Six parameters, two call sites, and both callers immediately delegate to the same `replayLocalCommits` (line 249) — which already receives `repo`, `localRefName`, `targetHash` and `localCommits`. Cost: a future third caller of `replayLocalCommits` silently skips the trace the long comment says must never be missing, and the rationale lives away from the code that does the rewrite. Simpler form: log inside `replayLocalCommits`, adding only `reason` and `localHash` to its signature, and delete the helper.
+
+**12. `/private/tmp/.../scratchpad/wtperf/cmd/entire/cli/git_operations.go:697` — a derived constant pair split across packages, half of it a literal**
+`ReadChainBudget` is defined as `2 * readFetchTimeout` in the `remote` package, but `FetchBlobsByHash` passes its per-target budget as a bare `2*time.Minute` — the same value as the unexported `readFetchTimeout`. Cost: retuning one half silently breaks the documented "chain fits two full candidate windows" relationship. Simpler form: export the per-attempt budget alongside `ReadChainBudget` and use it here.
+
+**13. `remote_topology.go:69-81` — `elected`/`electedSource` re-flatten a struct that already exists**
+`strategy.ResolveCheckpointSyncRemote` returns `CheckpointSyncRemote{Name, Source}`; storing one field of it plus the other loses nothing but adds a pair to keep consistent. `elected CheckpointSyncRemote` (then `t.elected.Name` / `t.elected.Source`) is 3 fields → 2. `electionErr string` and `pushDest` both earn their place. (`MetadataDivergence`'s three fields are all read by callers and tests — that struct is fine, though its `Diverged` rule is stated three times across the type doc, the field doc, and the function doc; one of them is enough.)
+
+**14. `/private/tmp/.../scratchpad/wtperf/cmd/entire/main.go:19` — unrelated import-group split** inserting a blank line before `"github.com/spf13/cobra"` is churn in a diff that otherwise only adds one line to this file.</result>
+<usage><subagent_tokens>141542</subagent_tokens><tool_uses>20</tool_uses><duration_ms>304439</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a9a5584ba508e1758</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-origin-push/0748193f-846c-4d9f-a445-e275636e66b0/tasks/a9a5584ba508e1758.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Findings (ranked)
+
+**1. `cmd/entire/cli/strategy/metadata_reconcile.go:82-112` + `cmd/entire/cli/doctor.go:433-439` (Set B) — `git merge-base` runs twice on the same two hashes, and both refs are read twice**
+`IsMetadataDisconnected` (line 31) reads `refs.Primary` and `remoteRefName`, then runs `git merge-base &lt;local&gt; &lt;remote&gt;` via `isDisconnected` (line 301) purely for its exit code. When it returns false, `reportMetadataDivergence` immediately calls `MetadataDivergenceFromRemote`, which re-reads the *same two refs* and runs `git merge-base` on the *same two hashes* again via `getMergeBase` (`push_common.go:591`) — whose captured output already answers both questions (exit 1 → disconnected; base == either tip → fast-forward; else diverged). Cost per `entire doctor`: 1 redundant `git merge-base`, plus 2 redundant `repo.Reference` calls — and on a reftable repo each of those is up to 2 git subprocesses (`gitrepo/reftable.go:259` shells out `symbolic-ref` then `rev-parse`), so ~5 wasted subprocesses. It also re-derives `getRepoPath`, and re-resolves `checkpoint.ResolveRefs` even though the caller passes `refs.Primary` in as a parameter (that one is free — `persistent_refs.go:51` is a constant).
+Cheaper: one classifier over a single `getMergeBase` — e.g. `MetadataRelation(ctx, repo, remoteRefName) (local, remote, base plumbing.Hash, rel relation, err)` returning disconnected / fast-forward / aligned / diverged, with `IsMetadataDisconnected` reduced to `rel == relDisconnected`. Doctor calls it once and branches on `rel`. Bonus: the two calls can no longer disagree.
+
+**2. `cmd/entire/main.go:35` + `cmd/entire/cli/strategy/git_remote_cache.go` (Set C) — the "one invocation" cache outlives one invocation in `entire mcp`**
+The cache is installed on main's root context, and `entire mcp` (`cmd/entire/cli/mcp.go:79` `runMCPServer`) serves JSON-RPC on that same context until stdin EOF — the whole agent session. Its `entire_status` tool goes through `runStatusJSON` → `computeCheckpointSyncInfo` (`status.go:278-279`) → `ResolveCheckpointSyncRemote`, so the memoized remote list is served for hours and a remote added meanwhile is never observed. `repo mirror use`'s `InvalidateGitRemoteCache` can't help — it runs in a different process. This is a staleness consequence of a perf change rather than wasted work, but it comes straight from where the cache is installed.
+Cheaper/safer: install it in the root command's `PersistentPreRun` (or wrap each MCP request's ctx with a fresh cache) instead of `main()`. Short-lived commands keep the full win; the long-lived server gets a per-request window.
+
+**3. `cmd/entire/cli/remote_topology.go:172` (Set A) — `listGitRemotes` re-asks git for the remote list `inspectRemoteTopology` already parsed**
+`pushURLsByRemote` at line 100 already ran `git remote -v` and built a map of every remote name (and `t.destinations` is built from it at 112-118). The origin-fallback branch then spawns `git remote` again to ask whether `origin` exists. One wasted subprocess per `entire doctor` / `entire enable` on every repo that reaches the fallback (nothing tracked, or detached HEAD).
+Cheaper: pass the known set — `resolveGitPushRemote(ctx, repoRoot, pushURLs)` — or leave the fallback out of the helper and, in `inspectRemoteTopology`, substitute `originRemoteName` when `pushDest == ""` and `pushURLs[originRemoteName] != nil`.
+
+**4. `cmd/entire/cli/remote_topology.go:148-168` (Set A) — 4-5 sequential `git config --get` / `symbolic-ref` calls where 2 suffice**
+Added per call to `inspectRemoteTopology`: `symbolic-ref --short HEAD` (1), up to 3 × `git config --get` (ordinary single-origin repo whose branch tracks origin hits all three: 3), the `git remote` fallback (finding 3), plus 1 for `ResolveCheckpointSyncRemote`'s `git config --local --get-regexp`. So ~5-6 new subprocesses, all sequential. Callers are only `doctor.go:113` and `setup.go:1382/1393` — **no hook or per-turn path calls it** (verified: `printCheckpointDestinationNote` has exactly three call sites), so this is tens of ms on interactive commands, not per-turn cost. That's why I rank it below the above.
+Cheaper: one `git config --get-regexp '^(remote\.pushdefault$|branch\..*\.(pushremote|remote)$)'` and pick by precedence in Go — note **no `--local`**, since today's plain `git config --get` reads global/system scope too, which is exactly where `remote.pushDefault` usually lives. Takes 4 subprocesses to 2. Parallelising `resolveGitPushRemote` with the election would be the wrong fix here — collapsing the calls beats overlapping them.
+
+**5. `cmd/entire/cli/strategy/git_remote_cache.go:83-110` (Set C) — the mutex is held across the git subprocess**
+`cachedRemotesInConfigOrder` and `cachedIsConfiguredRemote` hold `c.mu` while `read()`/`probe()` fork git. If the fan-out the comment cites ever materialises, a goroutine asking about remote `A` blocks for a full subprocess on an unrelated in-flight probe for `B`. I found no concurrent caller today (no `errgroup`/`go func` in `cmd/entire/cli/checkpoint`), so this currently costs nothing and the mutex is cheap insurance.
+Cheaper if fan-out appears: hold the lock only around map access and dedupe per key with a `sync.Once` (or singleflight) per remote name.
+
+## Checked and clean — not findings
+
+- **No closure-lifetime leak in Set C.** `configuredRemotesInConfigOrder` / `isConfiguredRemote` pass callbacks that capture `ctx`, but only the *results* are stored; `gitRemoteCache` holds a `[]string`, a `bool`, and a `map[string]bool` — no ctx, no repo, no enclosing scope. The closures die at return. One tiny alloc per call.
+- **Cache install adds no startup work.** `WithGitRemoteCache` is one `context.WithValue` plus two allocations, no git call, no file read — nothing measurable added to hook invocations.
+- **No redundant `context.WithTimeout` in a loop.** The chain ceiling is created once per operation before the loop (`checkpoint_ref.go:~219`, `git_operations.go:~417`, `~707`); the per-candidate `WithTimeout` was already there. Worth knowing: with today's 2 candidates × 2 min == the 4-min `ReadChainBudget`, the ceiling shortens nothing yet — it only caps growth, which is the stated intent.
+- **Set A's predicates do no I/O.** `severe()`, `pushMismatch()`, `destinationPinned()`, `fansOutSomewhere()` read only fields materialised once in `inspectRemoteTopology` (`pinned` comes from the single `remote.PushURL` call per remote at line 114). Repeated work is two small slice allocations (`unpinnedNames()` in `worthReporting` and again at the print gate) and a ≤N loop. Not worth changing.
+- **Pre-existing, dwarfs everything the diff adds:** `remote.PushURL` per remote (`remote_topology.go:114`) — each call does `GetRemoteURL(origin)` + `settings.Load` + `GetPushURL`, i.e. O(remotes) subprocesses *and* up to 3 file reads each. The diff doesn't make it worse, but this is the line to look at if `inspectRemoteTopology` is ever called from a hot path.
+- **`settings.Load` is not memoized**, so each election still costs up to 3 file opens + JSON parse; Set C deliberately caches only the git reads. At ~4 elections per command that's ~12 file opens — microseconds against the ~10ms subprocess the cache removed. Not worth caching.</result>
+<usage><subagent_tokens>163703</subagent_tokens><tool_uses>29</tool_uses><duration_ms>352936</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a72a5bc202ee9adb3</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-origin-push/0748193f-846c-4d9f-a445-e275636e66b0/tasks/a72a5bc202ee9adb3.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Findings (ranked)
+
+**1. `cmd/entire/cli/remote_topology.go:148` — `resolveGitPushRemote` duplicates `declaredPushDestination` from your own open PR #1991**
+Both resolve git's push-destination precedence (`branch.&lt;n&gt;.pushRemote` → `remote.pushDefault` → `branch.&lt;n&gt;.remote`); set A adds an `origin` fallback on top. Two pending branches by the same author will land two implementations of the same git rule, in two packages, with no shared test. The cost is exactly the failure mode set A's own header comment describes: doctor's "your pushes go to X" and 1991's capture gate ("this push agrees with the declared destination") can drift apart and disagree about the same repo, and one of them will be wrong. **`strategy` should own it** — it already owns election (`ResolveCheckpointSyncRemote`) and the capture gate that consumes the answer. Export 1991's version as `strategy.DeclaredPushDestination(ctx, dir)` (add the `dir` arg; set A deliberately runs everything in `repoRoot`), have `remote_topology.go` call it and keep only the `origin` fallback locally, since only the note needs that tier.
+
+**2. `cmd/entire/cli/strategy/metadata_reconcile.go:82` — `MetadataDivergenceFromRemote` re-implements `IsMetadataDisconnected`'s entire prologue, 20 lines above it**
+`ResolveRefs` → read `refs.Primary` → `ErrReferenceNotFound` → read `remoteRefName` → `ErrReferenceNotFound` → equal-hash short-circuit → `getRepoPath` is line-for-line identical in both functions; only the last step differs (`getMergeBase` vs `isDisconnected`, which are themselves two spellings of `git merge-base`). And `doctor.go:439` now calls both in sequence, so `entire doctor` reads four refs and spawns **two `git merge-base` subprocesses on the same hash pair** to get one verdict. Third copy of the same triage: `SafelyAdvanceLocalRef` (`common.go:177-198`) classifies the identical pair as no-op / fast-forward / diverged / disconnected — and `reportMetadataDivergence` promises "the next fetch replays your local checkpoints" by re-deriving that classification, so it silently lies if `SafelyAdvanceLocalRef`'s rules move (e.g. its reachable-shallow-boundary refusal, which the doctor message does not know about). Extract one classifier in `metadata_reconcile.go` — merge base computed once, returning `{Local, Remote, MergeBase, Disconnected, Diverged}` — and have `IsMetadataDisconnected`, `MetadataDivergenceFromRemote`, and `SafelyAdvanceLocalRef`'s triage all read it.
+
+**3. `cmd/entire/cli/git_operations.go:697` — `ReadChainBudget` was exported but the per-candidate window it is defined against was left as a literal**
+`ReadChainBudget = 2 * readFetchTimeout` (`checkpoint_ref.go:44`) documents "twice the per-candidate window", but `readFetchTimeout` stays unexported, so both cli-side read paths hardcode `2*time.Minute` instead (`git_operations.go:697` for blob hydration, `:457` inside `fetchMetadataFromRemote`). The invariant now holds only inside the `remote` package: changing `readFetchTimeout` silently makes the ceiling no longer fit two tiers on the two paths that motivated it. Export it as `remote.ReadFetchTimeout` and pass that from both call sites.
+
+**4. `cmd/entire/cli/doctor_test.go:686` — `writeMetadataCommitWithParent` is a copy of `writeRootlessMetadataCommit` (same file, line 311)**
+Identical 19 lines (empty tree encode, signature, commit encode, `SetEncodedObject`) with one added field. Two copies of the go-git plumbing dance to keep in step, and near `dupl`'s 75-token threshold. Give the existing helper `parents ...plumbing.Hash` and append `ParentHashes` when non-empty — its four existing call sites are unchanged.
+
+**5. `cmd/entire/cli/doctor_test.go:723` — `runCheckDisconnectedMetadata` re-implements `newTestCmd`, which is in the same file at line 28 with seven callers**
+The four lines it inlines (`&amp;cobra.Command{}`, `SetContext`, two buffers, `SetOut`/`SetErr`) are exactly `newTestCmd(t)`'s body — the helper that exists for this. Should be `cmd, stdout := newTestCmd(t)`. Note the pre-existing `TestCheckDisconnectedMetadata_NonElectedRemote_ReportOnly` (`doctor_test.go:~405`) inlines the same block and can move onto the new helper in the same pass.
+
+**6. `cmd/entire/cli/strategy/metadata_divergence_test.go:23` — `gitOut` is the fifth "run git in dir, return trimmed stdout" helper in package `strategy`'s tests**
+Existing siblings, all same package: `electionRevParse` (`checkpoint_read_confinement_test.go:29`), `currentBranchName` (`checkpoint_sync_remote_test.go:19`), `checkpointRemoteRevParse` and `checkpointRemoteCurrentBranch` (`checkpoint_remote_test.go:1415`/`1424`), plus a local `runGit` closure (`refs_push_test.go:139`). `gitOut` is the right general shape — but land it in `common_test.go` next to `cloneWithConfig` and delete the four specialized copies, rather than leaving five. Minimum: the new file's `gitOut(t, dir, "rev-parse", "HEAD")` calls can use `electionRevParse(t, dir, "HEAD")` today.
+
+**7. `cmd/entire/cli/remote_topology.go:168` — `resolveGitPushRemote` re-reads the remote list `inspectRemoteTopology` already parsed**
+`inspectRemoteTopology` calls `pushURLsByRemote` at line 100 (one `git remote -v`, explicitly chosen to collapse N+1 subprocesses into one), then hands only `repoRoot` to `resolveGitPushRemote`, which spawns `listGitRemotes` for the origin-existence check. Extra subprocess, and two sources of truth for "does this repo have an origin" inside one function. Pass the `pushURLs` map (or the sorted `names`) in and test `pushURLs[originRemoteName]`.
+
+**8. `cmd/entire/cli/remote_topology.go:165` — `getGitConfigValue` already exists in package `cli`**
+`git_operations.go:94` is the same primitive with the same contract ("empty on unset or error"); the new code hand-rolls it via `gitRunner(ctx, dir, "config", "--get", key)`, and PR #1991 hand-rolls a third (`gitConfigValue` in `checkpoint_sync_capture.go`). The only real gap is that the existing one is cwd-based — add a dir-aware variant (or a `dir` parameter) once and use it from both pending changes instead of shipping three.
+
+**9. `cmd/entire/cli/integration_test/testenv.go:1774` — `TestEnv.SetGitConfig` collides with PR #1991's `setBranchTrackingRemote`, same package**
+Both exec `git config` in `env.RepoDir` with `testutil.GitIsolatedEnv()` and then re-baseline the `.git/config` guard via `env.setGitConfigBaseline()` — the non-obvious half. Whichever lands second should call the other: `setBranchTrackingRemote` reduces to `env.SetGitConfig("branch."+branch+".remote", remoteName)`.
+
+**10. `cmd/entire/cli/git_operations.go:420` and `:713` — the chain-ceiling wrapper is now hand-written in three read paths**
+`fetchCheckpointRefFrom` (`checkpoint_ref.go:222`), `fetchMetadataFromReadRemotes`, and `fetchBlobsByHash` each carry their own `context.WithTimeout(ctx, ReadChainBudget)` + `defer cancel` + explanatory comment. Nothing makes a fourth candidate chain acquire one. A one-line `remote.WithReadChainBudget(ctx) (context.Context, context.CancelFunc)` puts the rule and its rationale in one place.
+
+Also noted, low value: `commitOnMetadataBranch` (`metadata_divergence_test.go:52`) overlaps `commitCheckpointRemoteMetadata` (`checkpoint_remote_test.go:1435`, same package) and the ~6 inline copies of that pattern in `metadata_reconcile_test.go`; `originRemoteName` (`remote_topology.go:39`) is the second `"origin"` constant in package `cli` after `defaultMirrorRemote` (`repo_mirror_use.go:24`); and `strategy/git_remote_cache.go` is a third git-read memoization mechanism alongside `checkpoint.commonDirCache` (`checkpoint/git_common_dir.go:27`) and `session.getGitCommonDir` — its context-scoped opt-in design is defensible (remote lists mutate within a root, unlike a common dir), so this is a consistency note rather than a change request.</result>
+<usage><subagent_tokens>212390</subagent_tokens><tool_uses>48</tool_uses><duration_ms>510478</duration_ms></usage>
+</task-notification>
+
+---
+
+they are on top of 1951?
+
+---
+
+let's fold B+C into 1951, or would you advise against that?
+
+---
+
+do 1+2 as you suggested
+
+---
+
+ok, 1951 has now conflicts
+
+---
+
+there is another finding
+
+---
+
+what PR changed this in main?
+
+---
+
+whats your recommendation
+
+---
+
+ok, do it, make commits as fit
+
+---
+
+can you updat the PR description of 1951
+
+---
+
+can you look at the trail findings for 1951, are they still relevant
+
+---
+
+what's the state here
+
+---
+
+yes, do all three
+
+---
+
+so can you review 1951 again, or do we know it's mergeable already?
+
+---
+
+yes
+
+---
+
+<task-notification>
+<task-id>a435d53c92ba772ee</task-id>
+<tool-use-id>toolu_011MigiwhLTK4wAeiH6jbuQi</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-origin-push/0748193f-846c-4d9f-a445-e275636e66b0/tasks/a435d53c92ba772ee.output</output-file>
+<status>completed</status>
+<summary>Agent "/code-review 1951 high" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I've completed my analysis. Here are the findings.
+
+```json
+[
+  {
+    "file": "cmd/entire/cli/checkpoint/persistent.go",
+    "line": 2315,
+    "summary": "resolveSessionsBranchTrees now appends every candidate's remote-tracking tree unconditionally (not only when the local Read ref is missing), which defeats attach's deliberate \"local presence only\" gate and reopens the data-loss path that gate exists to close.",
+    "failure_scenario": "Repo on the git-branch backend where refs/heads/entire/checkpoints/v1 exists as an empty orphan (created by EnsurePrimaryRef) while refs/remotes/origin/entire/checkpoints/v1 holds checkpoint C with 3 sessions. `entire session attach &lt;id&gt;` on a commit trailing C: ensureCheckpointAvailable -&gt; checkpointPresentLocally (attach.go:585) passes its `repo.Reference(refs.Primary)` gate because the local ref exists, then store.Read() now finds C in origin's tracking tree and returns present=true. attach skips the refuse/refresh path and writes; writeSession uses getSessionsBranchRef() (local-only, parse_tree.go:466), finds no C subtree in the orphan, and creates session 0 — so the pushed v1 replaces C's 3 sessions with 1. The doc comment on ensureCheckpointAvailable states this exact hazard (\"Only local presence counts — remote-tracking presence is not enough … would clobber the remote on push\"), and checkpointHasSessionMetadata (attach.go:461) carries the same now-broken contract (\"this guard must reflect what the next write would target\")."
+  },
+  {
+    "file": "cmd/entire/cli/checkpoint/remote/checkpoint_ref.go",
+    "line": 266,
+    "summary": "The guard that stopped the read chain on a transport failure was removed (transport errors now advance to the legacy origin tier), so origin can force-write a stale tip into the canonical local checkpoint ref — and because resolveRefMaybeFetch only fetches when the local ref is absent, that stale tip is never corrected.",
+    "failure_scenario": "git-refs backend, checkpoint_push_remote=upstream. Checkpoint X's ref was pushed to origin pre-election, then advanced by a transcript/summary/attribution backfill and pushed to upstream (newer tip). On a machine without the local ref, upstream is unreachable (VPN off). fetchCheckpointRefFrom's candidate 1 fails at transport, and instead of aborting it advances to origin and runs `git fetch origin +refs/entire/checkpoints/XX/X:refs/entire/checkpoints/XX/X`, force-installing origin's older tip as the canonical local ref. Every later read resolves locally (resolveRefMaybeFetch, refs_store.go:396) so upstream's newer tip is never fetched again, and refBase() parents new backfill commits on the stale tip, diverging the ref. The deleted test TestFetchCheckpointRefFrom_FailureSemantics asserted exactly this must not happen (\"legacy origin must not seed the canonical ref after an elected remote failure\") and was removed with the guard, leaving nothing pinning it."
+  },
+  {
+    "file": "cmd/entire/cli/strategy/common.go",
+    "line": 562,
+    "summary": "EnsurePrimaryRef now requires a successful election to seed the local primary from a tracking ref, so any election error makes it fall through to createOrphanMetadataRef — reintroducing the empty-orphan divergence it was written to prevent.",
+    "failure_scenario": "`.entire/settings.json` (committed, shared) sets strategy_options.checkpoint_push_remote: \"myfork\". A teammate clones: only `origin` exists, so ResolveCheckpointSyncRemote fails closed (\"is not a configured git remote\"), electedName stays \"\", remoteRef stays nil, and the missing local v1 is created as a fresh empty orphan instead of being seeded from refs/remotes/origin/entire/checkpoints/v1 (which holds the real history). Every condensation then commits onto the orphan; pre-push to origin is a non-fast-forward and `entire doctor` reports DISCONNECTED. Same outcome for a transiently unreadable settings file, on a path (EnsureSetup) that runs on every hook. Fail-open (seed from origin when it is the only candidate) is the read-side rule this PR adopts everywhere else."
+  },
+  {
+    "file": "cmd/entire/cli/strategy/git_remote_cache.go",
+    "line": 183,
+    "summary": "The new per-invocation cache memoizes the error-erased return values of readRemotesInConfigOrder (nil on failure) and isConfiguredRemote (false on failure), so one transient git failure becomes a sticky wrong answer for the whole process instead of self-healing on the next call.",
+    "failure_scenario": "readRemotesInConfigOrder (checkpoint_sync_remote.go:128) returns nil for any `git config --get-regexp` failure — fork/EAGAIN under load, ctx cancellation, a transient .git/config lock. cachedRemotesInConfigOrder stores that nil as a legitimately-empty list (TestGitRemoteCache_EmptyListIsCached pins exactly this), so every later election in the same `entire` process returns CheckpointSyncRemote{} with a nil error: CheckpointReadRemotes yields an empty chain, FetchCheckpointRefFrom takes the len==0 branch, and checkpointSyncAllowedForRemote skips checkpoint sync on the pre-push — all silently, in a repo that does have remotes. Symmetrically, one failed `git remote get-url myfork` memoizes false and ResolveCheckpointSyncRemote hard-fails with \"checkpoint_push_remote \\\"myfork\\\" is not a configured git remote; checkpoint sync disabled until fixed\" for the remainder of the command. Fix: have the read/probe return (value, error) and cache only successes."
+  },
+  {
+    "file": "cmd/entire/cli/attach.go",
+    "line": 67,
+    "summary": "openAttachStore is the one remaining CLI read path that never receives ReadRemotes, so `entire session attach` still reads origin-only and cannot see checkpoints on the elected sync remote.",
+    "failure_scenario": "Repo with checkpoint_push_remote: \"upstream\"; checkpoint C for HEAD lives on upstream and is absent from origin. `entire session attach &lt;session-id&gt;`: checkpointPresentLocally opens the store with OpenOptions{Refs: &amp;refs} (no ReadRemotes), so resolveSessionsBranchTrees falls back to the hardcoded []string{\"origin\"} (persistent.go:2311) and never consults refs/remotes/upstream/entire/checkpoints/v1. Read returns nil, refreshCheckpoint's getMetadataTree cannot produce it either for git-branch, and attach aborts with \"checkpoint &lt;id&gt; referenced by HEAD is missing from the local entire/checkpoints/v1 branch\" — the precise \"checkpoints that cannot be read back\" failure this PR set out to remove."
+  },
+  {
+    "file": "cmd/entire/cli/checkpoint_policy.go",
+    "line": 153,
+    "summary": "SkipLocalUpdate is computed as `name != resolution.ElectedName`, so when the election fails ElectedName is \"\" and the sole fail-open origin candidate is marked read-only — the local policy ref silently stops syncing while SyncFrom still reports Source=remote.",
+    "failure_scenario": "checkpoint_push_remote names a missing remote (or settings are briefly unreadable). CheckpointReadRemotesWithElection fail-opens to Candidates=[\"origin\"] with ElectedName==\"\", so readTargets[0].SkipLocalUpdate is true. `entire checkpoint policy` then runs SyncFrom: findRemoteBaseline fetches origin's policy, setLocal (checkpointpolicy/remote.go:101) no-ops, and the function still returns baseline with Source=SourceRemote and the remote's checkpoint_version. The command prints the remote policy as effective while refs/entire/policies/checkpoint remains at zero, so checkpointPolicyAllowsGitHook -&gt; readLocalCheckpointPolicy keeps enforcing the default policy. Previously the single-target Sync advanced the ref. Reporting a policy the CLI does not enforce is worse than reporting nothing."
+  },
+  {
+    "file": "cmd/entire/cli/git_operations.go",
+    "line": 426,
+    "summary": "fetchMetadataFromReadRemotes keeps fetching every candidate after one already succeeded (it `continue`s instead of returning), multiplying full metadata-branch transfers on interactive read paths.",
+    "failure_scenario": "Two-tier repo (elected upstream + legacy origin). `entire resume` calls getMetadataTree, which invokes FetchMetadataTreeOnly and then FetchMetadataBranch; each now performs a `--depth=1000000000` fetch of entire/checkpoints/v1 against BOTH remotes — four full metadata-branch fetches per resume, where the pre-PR code did at most two against one remote. The justification in the doc comment (branch existence does not prove the checkpoint is there) only requires fetching the remaining candidates when the requested checkpoint was not found, not unconditionally; a cheap ls-remote-then-fetch, or deferring the second candidate until the store's per-checkpoint lookup misses, would keep the recovery property at one transfer."
+  },
+  {
+    "file": "cmd/entire/cli/checkpoint/persistent.go",
+    "line": 1625,
+    "summary": "GitStore.List now runs WalkCheckpointShards once per candidate tree, and resolveSessionsBranchTrees dedupes only by commit hash — so the overwhelmingly common \"local v1 is ahead of origin's tracking ref\" case pays a second full shard walk whose results are a strict subset.",
+    "failure_scenario": "Default single-remote repo with any unpushed checkpoint: refs/heads/entire/checkpoints/v1 != refs/remotes/origin/entire/checkpoints/v1, both resolve, neither is deduped, so List walks the whole sharded tree twice on every `entire checkpoint list`, `entire session list`, `entire dispatch`, and — via ManualCommitStrategy.getCheckpointStores, which now also passes ReadRemotes — the post-commit condensation and stop-hook paths. Origin's tree is an ancestor of local's, so the second walk yields nothing new (the `seen` map discards it all). Cheap fixes: also dedupe on commit.TreeHash, and/or skip a candidate whose commit is an ancestor of one already walked."
+  },
+  {
+    "file": "cmd/entire/cli/git_operations.go",
+    "line": 482,
+    "summary": "fetchMetadataFromRemote reports a hardcoded \"fetch timed out after 2 minutes\" for any DeadlineExceeded, but later candidates are bounded by the ReadChainBudget remainder, not by ReadFetchTimeout.",
+    "failure_scenario": "Two-candidate chain where the elected remote hangs: candidate 1 burns its full 2-minute ReadFetchTimeout out of the 3-minute chainCtx, leaving candidate 2 with ~1 minute. When candidate 2's fetch is cut off by the inherited chain deadline, ctx.Err() is DeadlineExceeded and the user/log sees \"fetch timed out after 2 minutes\" for an operation that was actually capped at one — a misleading diagnostic on exactly the path (unreachable elected remote) this PR is meant to make debuggable. Derive the message from the actual deadline, or distinguish the chain ceiling from the per-candidate window."
+  },
+  {
+    "file": "cmd/entire/cli/repo_mirror_use.go",
+    "line": 187,
+    "summary": "applyMirrorRemotePlan invalidates the remote cache only on the success path, so a failure in the second git write leaves the first (a real `git remote add`) uninvalidated — contradicting the comment that claims it \"runs once after the last of them\".",
+    "failure_scenario": "`entire repo mirror use` with --upstream: `git remote add &lt;upstream&gt; &lt;oldURL&gt;` succeeds (line 173), then `git remote set-url &lt;remote&gt; &lt;mirrorURL&gt;` fails (bad URL, config lock). The function returns early at line 185 without calling InvalidateGitRemoteCache, so the invocation's memoized configuredRemotesInConfigOrder/isConfiguredRemote answers still omit the remote that was just created. Any election in the remainder of that process (error-path reporting, a retry, or future code that continues past the error) answers from pre-mutation config. Move the invalidation into a `defer` covering both writes."
+  },
+  {
+    "file": "cmd/entire/cli/agentimport/agentimport.go",
+    "line": 195,
+    "summary": "The import path still opens the store with cp.OpenOptions{} (no ReadRemotes), so its idempotency List dedupes against origin only while also now counting origin-tracking-only checkpoints as \"already imported\".",
+    "failure_scenario": "Repo with checkpoint_push_remote: \"upstream\". `entire import` computes `existing` from Persistent.List, which falls back to the hardcoded origin tier: turns whose deterministic DeriveCheckpointID already exists on upstream are not seen and get re-imported (extra checkpoint commits on v1). Conversely, on a repo whose local v1 diverged from origin, a turn whose checkpoint exists only in refs/remotes/origin/entire/checkpoints/v1 is now marked existing and skipped, so it is never written into the local branch — a silently dropped import that the pre-PR local-tree-only List would have performed."
+  },
+  {
+    "file": "cmd/entire/cli/checkpoint/persistent.go",
+    "line": 2833,
+    "summary": "GitStore.GetCheckpointAuthor still reads a single ref (s.refs.Read) and was not converted to the candidate chain, so it is a read path that silently returns nothing for checkpoints served from a candidate tracking ref.",
+    "failure_scenario": "Legacy checkpoint C readable only through refs/remotes/origin/entire/checkpoints/v1 (the scenario TestCheckpointReadRemotes_LegacyOriginTierServed covers). `entire checkpoint explain --checkpoint C` succeeds via getCheckpointFetchingTree, but explain.go:870 calls authorReader.GetCheckpointAuthor, which routes to getCheckpointAuthorFromRef(ctx, s.repo, s.refs.Read, C) — the local orphan v1 that lacks C — and returns an error that is discarded (`_`), so the explain output shows an empty author for a checkpoint whose metadata was found. Inconsistent with the PR's stated invariant that every checkpoint-data read iterates the chain."
+  },
+  {
+    "file": "cmd/entire/cli/strategy/git_remote_cache.go",
+    "line": 152,
+    "summary": "snapshotFor's doc comment states the inverse of its actual locking contract — \"Callers hold c.mu\" — while the method itself acquires c.mu.",
+    "failure_scenario": "A future caller that trusts the comment and takes c.mu before calling snapshotFor self-deadlocks on the non-reentrant sync.Mutex, hanging the process (and, since main() installs this cache on the root context, hanging every command). The file's other locking commentary is unusually careful and load-bearing (two-level locking to avoid serializing cross-repo git reads), which makes this one inverted sentence more likely to be believed. Reword to \"Acquires c.mu; callers must not hold it.\""
+  },
+  {
+    "file": "cmd/entire/cli/strategy/git_remote_cache_test.go",
+    "line": 37,
+    "summary": "The memoization assertions install the cache on a bare context.Background() with no settings.WithWorktreeRoot, so whether caching happens at all depends on the test process's cwd being inside a git repository.",
+    "failure_scenario": "cachedIsConfiguredRemote -&gt; snapshotFor -&gt; gitReadRepo finds no ctx-scoped root and falls back to paths.WorktreeRoot(ctx), i.e. `git rev-parse --show-toplevel` from the test binary's cwd. Run the package's tests where that is not a git worktree (a vendored/extracted source tree, a sandbox that strips .git, a `go test` run against a module cache copy) and gitReadRepo returns false, snapshotFor returns nil, every call reaches the probe, and `assert.Equal(t, 1, calls)` in TestGitRemoteCache_OnlyMemoizesWhenInstalled (lines 37, 51), TestGitRemoteCache_EmptyListIsCached (144) and TestGitRemoteCache_Invalidate (157) fail with no relation to the cache logic. The partition tests in the same file already do the right thing by wrapping with settings.WithWorktreeRoot(ctx, t.TempDir())."
+  },
+  {
+    "file": "cmd/entire/cli/checkpoint/open.go",
+    "line": 76,
+    "summary": "The read chain is propagated by hand-writing `ReadRemotes: strategy.CheckpointReadRemotes(ctx)` at ~15 checkpoint.Open call sites, with a silent origin-only fallback for any site that forgets — a design that guarantees the class of miss this PR already contains twice.",
+    "failure_scenario": "OpenOptions.ReadRemotes documents \"nil keeps the legacy origin-only fallback\", so omitting the field compiles, passes every test, and quietly reverts a read path to origin — which is what happened at attach.go:67 and agentimport.go:195, and what will happen to the next Open site added. The chain is derivable inside the checkpoint package boundary from a single injected resolver (the same shape RefFetcher/BlobFetcher already use, set once per process or resolved lazily in Open from an injected func), which removes the per-call-site obligation entirely. Alternatively make the field explicit-or-fail (an ExplicitlyOriginOnly sentinel) so a missing chain is a compile-visible decision rather than a silent default."
+  }
+]
+```</result>
+<usage><subagent_tokens>317120</subagent_tokens><tool_uses>65</tool_uses><duration_ms>1029916</duration_ms></usage>
+</task-notification>
+
+---
+
+fix mine now, and then give me the write up
+
+---
+
+you can call trail write apis by prefixing the command with ENTIRE_TRAILS_BACKEND=entire-api
+
+---
+
+can you give me the write up again
+
+---
+
+can you take a look at 1951 again
+
+---
+
+question: how can the findings be addressed in 1951 when I'm still the last committer?
+
+---
+
+ok, 1951 is merged, what now
+
+---
+
+ok, let's get 1991 in a healthy state
+
+---
+
+push it
+
+---
+
+on the wording in 1991: are we using "capture" as a term in what the cli outputs too? like I think the wording is not that great/correct in what it actually does, right?
+
+---
+
+but isn't captured introduced in the enum with this PR?
+
+---
+
+before we start, a report from a coworker:
+
+1. Capture persists on push intent, fully decoupled from delivery. (New — most significant.)
+Capture runs at the top of the gate block, before the policy gate (checkpointPolicyAllowsGitHook), the OPF decision, the empty-remote deferAutomaticCheckpointPush, and the actual transfer — and none of those roll it back. For git-refs the flush is explicitly fail-soft ("refs left queued"). So a push to a declared remote that then delivers nothing — policy diverged, OPF abort, empty-remote defer, or a rejected/failed transfer — still permanently flips the election off origin. The queued checkpoints can now only drain to the newly-captured remote; if that remote is why delivery failed, they're stranded there until it works, even though origin was fine a moment ago.
+
+2. A stale branch.<name>.remote reroutes sync off origin on a single push, permanently.
+git push -u fork (even long ago) sets branch.X.remote=fork forever. The next checkpoint-carrying push to fork captures it, and first-capture-sticks makes the origin-sync loss permanent without manual config. Not exotic — the PR's own integration helper relies on push -u to establish exactly this declaration.
+
+3. git remote rename/removal of a captured remote silently relocates sync and locks out re-capture.
+Fail-soft falls through to origin (good — sync isn't disabled), but the stale entry keeps len(loadCapturedSyncRemotes) > 0, so the renamed remote can never be re-captured. Checkpoints stop reaching the remote the user actually pushes to, with no status hint. (This is the stale-capture-lockout I raised as a question; it's worth re-classing as a concrete "stops pushing where you push" path.)
+
+4. declaredPushDestination reads HEAD's branch, not the pushed refspec.
+git push fork side:side while on main evaluates main's declaration. A mismatch mis-captures based on the wrong branch, and that mis-capture then gates the correct remote's future pushes. Documented phase-1 simplification, but the failure mode is "wrong remote elected → the right remote's checkpoints stop."
+
+5. (Restating, distinct) The merge gate is about readability, not pushing. Capturing fork before #1956/#1951 land means checkpoints are pushed to fork but can't be read back (resume/explain resolve via origin). Different axis from the above.
+
+Net: none of these harm the push in front of them, and overall sync fail-softs rather than fail-closes — but #1 and #2 mean the election can move off a working remote based on a single push that carried nothing, and #3 means it can then get stuck there. The mitigation that would close most of it: persist capture only after a checkpoint actually reaches the remote, and self-heal the state file by dropping entries whose remote is no longer configured.
+
+and
+
+let's change tmp := path + ".tmp" to use os.CreateTemp instead.
+
+---
+
+I like "observed"
+
+---
+
+yes commit and push
+
+---
+
+What do we think about this finding?
+The two rules disagree about what a non-configured captured remote means:
+
+// resolver — skips it, falls through (fail-soft)
+for _, name := range loadCapturedSyncRemotes(ctx) {
+    if isConfiguredRemote(ctx, name) { return ... }
+}
+
+// capture — only checks non-empty
+if len(loadCapturedSyncRemotes(ctx)) > 0 { return }
+
+git remote rename fork myfork and you're stuck: the election falls back to origin (source: default), but capture returns early forever because the file is still non-empty. myfork can never be captured, checkpoints route to origin silently, and nothing tells you. I confirmed nothing else writes or clears that file — saveCapturedSyncRemotes has exactly one caller — and the PR body notes entire clean deliberately leaves it, so the only recovery is rm by hand. Fix is to apply the resolver's isConfiguredRemote filter to the sticky check too.In other words if we:
+
+add new remote
+push for the first time to that remote
+we track that remote to push checkpoints there
+we rename/delete that remote
+we don't push anymore checkpoints
+is it something we want to track ? (edited)
+
+---
+
+yxes, do it
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>aed8349273bbc6637</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-origin-push/0748193f-846c-4d9f-a445-e275636e66b0/tasks/aed8349273bbc6637.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Findings
+
+### 1. `saveCapturedSyncRemotes` re-implements `jsonutil.WriteFileAtomic`
+**file** `/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-origin-push/0748193f-846c-4d9f-a445-e275636e66b0/scratchpad/wctx/cmd/entire/cli/strategy/checkpoint_sync_capture.go`
+**line** 85–112 (`os.CreateTemp` at :89)
+**summary** The new temp+chmod+write+close+rename+cleanup block is a hand-rolled copy of the repo's sanctioned atomic writer — down to the identical temp pattern `filepath.Base(path)+".*.tmp"`.
+
+**Existing helper**: `jsonutil.WriteFileAtomic(filePath string, data []byte, perm fs.FileMode) error` in `cmd/entire/cli/jsonutil/write.go:31`. The whole block collapses to:
+
+```go
+if err := jsonutil.WriteFileAtomic(path, data, 0o600); err != nil {
+    return fmt.Errorf("write captured sync remotes: %w", err)
+}
+```
+
+**Cost**: 28 lines replacing 5, and it silently opts out of two durability guarantees the shared helper documents and the sibling state writers get for free — `tmp.Sync()` before rename (without it ext4 with non-default mount options can surface the rename while the file is still empty after a hard crash) and the best-effort parent-directory fsync after rename. It also duplicates cleanup logic that `WriteFileAtomic` already has 6 dedicated tests for (`jsonutil/write_test.go`: perm application, no temp left on success, temp cleaned on rename failure). This is a 5th copy of the pattern in-tree — `checkpoint/pushqueue.go:230`, `session/state.go:651`, `internal/entireclient/discovery/cache.go:159`, `internal/entireclient/tokenstore/file.go:105` — so every future fix to the write recipe now has one more place to miss.
+
+No import-cycle obstacle: `jsonutil` is stdlib-only, and `agent/architecture_test.go:49` already whitelists it as a shared utility package. `strategy` doesn't import it yet; adding it is consistent with `settings`, `checkpointpolicy`, `investigate`, and `checkpoint/fsstore`, which all call `jsonutil.WriteFileAtomic`.
+
+---
+
+### 2. `capturedElectionStillValid` duplicates the resolver's captured tier — and the answer is already in hand 10 lines below
+**file** `.../cmd/entire/cli/strategy/checkpoint_sync_capture.go`
+**line** 57–72 (helper), called at :133
+**summary** The new helper re-walks `loadCapturedSyncRemotes` + `isConfiguredRemote`, which is exactly `ResolveCheckpointSyncRemote`'s captured tier (`checkpoint_sync_remote.go:95–101`) — and `maybeCaptureCheckpointSyncRemote` already calls that resolver at :143.
+
+**Existing helper**: `ResolveCheckpointSyncRemote(ctx)`, whose `CheckpointSyncRemote.Source` field is precisely the "which tier won" answer. Delete the helper and fold the gate into the existing resolve call:
+
+```go
+elected, err := ResolveCheckpointSyncRemote(ctx)
+if err != nil || elected.Name == pushRemote || elected.Source == SyncRemoteSourceObserved {
+    return
+}
+```
+
+**Cost**: the commit message for `4d82559b8` says the bug was "two rules read the same state and disagreed about what it means," and the fix restates the resolver's rule in a second function plus a 9-line comment asserting the two agree. A shared/deleted implementation makes that agreement structural instead of comment-enforced; phase 2's stated multi-remote membership change (`capturedSyncRemotesFileName` doc at :17–20) would otherwise have to land in both loops or re-open the same divergence. It also drops one redundant state-file read plus one `git remote get-url` probe per pre-push (`isConfiguredRemote` is memoized per invocation, but the file read is not).
+
+I checked the 13 existing capture subtests against this shape: "existing capture sticks" (live `fork` captured, push to `work` → resolver yields `Source=Observed`, gate returns), "corrupt capture state falls through", and the renamed-remote scenario the commit fixes (dead `fork` → resolver elects `origin` with `Source=Default`, gate falls through, `myfork` captures) all behave identically. Ordering is unchanged — only the deletion of the early return at :133.
+
+If you'd rather keep two call sites than reorder anything, the minimum shared form is a `capturedSyncRemote(ctx) string` returning the first still-configured captured name (empty when absent or dead), owning the existing `logging.Debug` fall-through line; the resolver becomes `if name := capturedSyncRemote(ctx); name != ""` and the gate `!= ""`. Return the name, not a bool — the resolver needs it.
+
+---
+
+## Questions with no finding
+
+- **"First configured remote from a list" helper**: none exists. The resolver's captured loop and the new helper are the only two instances of that shape, which is finding 2; no third caller justifies a generic utility.
+- **Election-source constants**: the type is already there (`CheckpointSyncRemoteSource`) and the production rename went through it correctly — `status.go:356,358` compare `string(strategy.SyncRemoteSource*)`, not literals. The `"observed"` literal at `integration_test/checkpoint_sync_remote_test.go:275` matches that file's own convention for every other source (`"config"` at :190, `"default"` at :404) and is asserting the JSON wire contract, so leave it. The `config|observed|...` value lists in `status.go:268` and `:749` are doc comments that shadow the const block, but that's pre-existing shape the diff merely kept current.</result>
+<usage><subagent_tokens>108179</subagent_tokens><tool_uses>21</tool_uses><duration_ms>182487</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a7a0b112861938c0b</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-origin-push/0748193f-846c-4d9f-a445-e275636e66b0/tasks/a7a0b112861938c0b.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>All paths below are under the context copy root `/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-origin-push/0748193f-846c-4d9f-a445-e275636e66b0/scratchpad/wctx/` (same layout as the repo).
+
+## 1. The new validity helper is a *fourth* re-derivation on a path that already calls the resolver
+
+**file** `.../wctx/cmd/entire/cli/strategy/checkpoint_sync_capture.go`
+**line** 65-72 (helper), 133-148 (call site)
+**summary** `capturedElectionStillValid` duplicates the resolver's captured-tier loop ten lines before `maybeCaptureCheckpointSyncRemote` calls the resolver itself, whose `Source` already answers the question.
+
+`maybeCaptureCheckpointSyncRemote` currently runs four gates over the same state:
+
+```go
+if capturedElectionStillValid(ctx) { return }                        // 133 — new
+s, err := settings.Load(ctx)
+if err != nil || s.GetCheckpointPushRemote() != "" { return }        // 139-141
+elected, err := ResolveCheckpointSyncRemote(ctx)                     // 143
+if err != nil || elected.Name == pushRemote { return }
+```
+
+`ResolveCheckpointSyncRemote` already computes all three: unreadable settings → `err`; `checkpoint_push_remote` set → `Source == SyncRemoteSourceConfig` (or the fail-closed `err`); a live capture → `Source == SyncRemoteSourceObserved`. So the diff cures a disagreement between two predicates by adding a *second copy* of the resolver's loop (`checkpoint_sync_remote.go:95-101`) — two copies to keep in sync instead of zero. The next tier added to the resolver has to remember to update the helper too, which is exactly the failure mode commit 3 is fixing.
+
+**Deeper fix:** hoist the single resolve to the top and gate on its result — `if err != nil || elected.Source == SyncRemoteSourceConfig || elected.Source == SyncRemoteSourceObserved || elected.Name == pushRemote { return }`. Four predicates collapse into one call to the accessor that already owns the precedence, and disagreement becomes unrepresentable. Precedent is in this same package: `CheckpointReadRemotesWithElection` (`cmd/entire/cli/strategy/checkpoint_read_remotes.go:52-58`) exists verbatim so callers "make ONE election call instead of two that could disagree."
+
+**On filtering inside `loadCapturedSyncRemotes`** (your question): don't. It would couple a pure file read to `git remote get-url` subprocesses, and it would delete the resolver's fall-through debug log at `checkpoint_sync_remote.go:99-100`. The single accessor you want already exists — it's the resolver's `Source`, not the loader.
+
+## 2. Unique temp name hardens the wrong half; the repo's flock pattern is one directory away
+
+**file** `.../wctx/cmd/entire/cli/strategy/checkpoint_sync_capture.go`
+**line** 85-89 (temp file), 129-160 (unserialized read-decide-write)
+**summary** The commit's own comment names concurrent cross-worktree pre-push hooks as the hazard, but a unique temp name only stops scratch-path collision — two hooks can still both observe "nothing captured" and both write.
+
+Concrete damage, and it lands on the feature's consent story specifically: both hooks print `[entire] Checkpoints now sync to %q` (line 158) and last-rename-wins, so one user is told checkpoints now go to `X` while the file says `Y`. "First capture sticks" — the rule that keeps a mixed-habit repo from ping-ponging — becomes a coin flip. A unique temp name makes each *write* clean while leaving the *decision* racy, which is the half-measure shape: it looks like the concurrency box is ticked.
+
+`cmd/entire/cli/checkpoint/pushqueue.go` solves this exact problem for a file in the *same* git common dir: a paired `pushQueueFileName`/`pushQueueLockName` (lines 23-26) and `flock.Acquire(q.lockPath())` around every read-modify-write (62, 95, 118, 135), with the unique temp name kept underneath purely for reader atomicity (`writeFileAtomicInDir`, 228-248). `strategy` already imports `cmd/entire/cli/internal/flock` in non-test code (`session_state.go:19`), so this is zero new dependency.
+
+**Deeper fix:** add `capturedSyncRemotesLockName` next to the state-file const, wrap lines 133-157 in `flock.Acquire`, re-read the state under the lock, and emit the announcement only after the rename succeeds. Keep the unique temp name — under a lock it's the pushqueue arrangement exactly.
+
+## 3. Commit 2's rename didn't reach the two docs the repo mandates keeping current
+
+**file** `.../wctx/CLAUDE.md` (line 715) and `.../wctx/docs/architecture/sessions-and-checkpoints.md` (lines 249-271)
+**summary** CLAUDE.md still documents `` `captured` renders as "captured from your pushes" `` — both halves are now wrong; the architecture doc still calls the tier "captured" throughout.
+
+Outside the diff. CLAUDE.md's own strategy section says to keep both files current when strategy behavior changes, and CLAUDE.md is what the next agent reads as the source of truth for the enum value — a stale value there propagates into the next change. This drift is the mechanical symptom of finding 4: nothing links the enum to its prose.
+
+## 4. The source→prose mapping is hand-rolled over a `string`-widened field, opting out of the `exhaustive` linter that would have caught the rename
+
+**file** `.../wctx/cmd/entire/cli/status.go`
+**line** 253-257 (synthesized `dedicated`), 265-267 (field typed `string`), 355-359 (switch)
+**summary** `checkpointSyncInfo.Source` is `string` rather than `strategy.CheckpointSyncRemoteSource` so status can synthesize `"dedicated"`, which also means `exhaustive` (enabled at `.golangci.yaml:25`) cannot see the switch.
+
+Three of five source values (`default`/`sole`/`first`) already fall through to bare output silently, and nothing forced commit 2 to find this switch — it had to be located by hand, in a different package from the enum it renamed. A new tier renders with no annotation and no lint complaint.
+
+Two further layer-conflation costs worth naming, since one string literal currently serves as internal identity, JSON wire value, *and* presentation key:
+
+- `checkpoint_sync_remote_source` is a documented `entire status --json` field (`status.go:749`), so a copy-polish rename is simultaneously an output-format break for any script matching `captured` — visible in the diff as an integration test asserting the wire string (`integration_test/checkpoint_sync_remote_test.go:275`).
+- The capture announcement ("the remote your branch pushes to", `checkpoint_sync_capture.go:159`) and the status annotation ("follows your branch's push destination") are two independently maintained phrasings of one fact in two packages. Commit 2 rewrote one and left the other.
+
+**Deeper fix:** give `CheckpointSyncRemoteSource` an `Annotation() string` method in `strategy` — which already owns user-facing copy for this feature (line 158-160) — and move `dedicated` into the enum so `checkpointSyncInfo.Source` can be typed and `exhaustive` guards the switch. If the wire value should be stable independent of display, that's the moment to separate `String()` (wire) from `Annotation()` (prose) rather than have one literal do both.
+
+## 5. The phase-1 "at most one" cap lives only in the shape of one call site's literal
+
+**file** `.../wctx/cmd/entire/cli/strategy/checkpoint_sync_capture.go`
+**line** 21-25 (format), 76 (writer signature), 152 (sole caller)
+**summary** `saveCapturedSyncRemotes(ctx, remotes []string)` accepts any length; the cap is asserted in a comment and honored by one `[]string{pushRemote}` literal.
+
+The loader returns every entry, the resolver iterates and takes the first valid one, and nothing rejects a two-element write. The file being list-shaped for phase 2 is right, but the *code* being list-shaped in phase 1 means the invariant that prevents per-push ping-pong is unenforced, and tests already call the plural writer directly with a slice.
+
+**Deeper fix:** make the cap unrepresentable for now — `saveCapturedSyncRemote(ctx, name string)` writing `Remotes: []string{name}`. On-disk shape stays list-shaped (no migration when the multi-remote set ships), while phase 2 has to deliberately add a plural writer to lift the cap. Put the invariant in the signature, not the comment.</result>
+<usage><subagent_tokens>109501</subagent_tokens><tool_uses>23</tool_uses><duration_ms>226182</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>af9d9cf0d19c0d106</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-origin-push/0748193f-846c-4d9f-a445-e275636e66b0/tasks/af9d9cf0d19c0d106.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Measured on a real repo with a PATH-shimmed `git` that logs every child invocation (built from the review snapshot, `entire hooks git pre-push &lt;remote&gt;` run directly).
+
+## Baseline numbers (git subprocesses per pre-push)
+
+| scenario | total | identical `rev-parse --git-common-dir` |
+|---|---|---|
+| C: no capture ever (push to origin) — the common case | 10 | 4 |
+| A: the push that captures | 13 | 5 |
+| B: capture in force, push to captured remote | 8 | 3 |
+
+Wall clock, 10 runs: **119.0 ms/run**. With one fix (below): **93.5 ms/run**. A `git rev-parse` here costs ~10 ms.
+
+---
+
+### 1. `maybeCaptureCheckpointSyncRemote` resolves the same election three times per pre-push
+`cmd/entire/cli/strategy/checkpoint_sync_capture.go:129-151` (snapshot root: `…/scratchpad/wctx`)
+
+`capturedElectionStillValid` (line 133) runs the captured-tier loop; `ResolveCheckpointSyncRemote` (line 143) runs *the same loop again* over the same file; then `checkpointSyncAllowedForRemote` at `manual_commit_push.go:90` resolves a third time. Verified by subprocess accounting: `loadCapturedSyncRemotes` is called **3× per pre-push** in case C (4 `rev-parse --git-common-dir` = 3 loads + 1 from `settings.Load`), and case A adds a 4th from `saveCapturedSyncRemotes`. Each load = 1 git subprocess + 1 `os.ReadFile`. `settings.Load` is likewise re-run per resolve (up to 3 file reads + parse + validate each), on top of the one in `resolvePushSettings`.
+
+The commit's own rationale ("the two must agree on what a captured entry means") is better served by not having two: the resolver already answers the question.
+
+```go
+elected, err := ResolveCheckpointSyncRemote(ctx)
+if err != nil {
+    return // fail-closed on unreadable settings / bad checkpoint_push_remote
+}
+switch elected.Source {
+case SyncRemoteSourceConfig, SyncRemoteSourceObserved:
+    return // explicit override, or a capture already in force
+}
+if elected.Name == pushRemote {
+    return
+}
+```
+Equivalent outcomes on every branch (`Source==config` subsumes the `GetCheckpointPushRemote() != ""` guard; `err != nil` subsumes the fail-closed settings case), and it deletes `capturedElectionStillValid`, one `loadCapturedSyncRemotes`, one `settings.Load`, and the extra `isConfiguredRemote` probe. Follow-on: have `maybeCapture` return the post-capture elected remote so `checkpointSyncAllowedForRemote` doesn't resolve a third time — one election per pre-push instead of three.
+
+### 2. `strategy.GetGitCommonDir` is uncached, so every `loadCapturedSyncRemotes` forks git
+`cmd/entire/cli/strategy/common.go:1211`
+
+`capturedSyncRemotesPath` → `GetGitCommonDir` → a fresh `git rev-parse --git-common-dir` on every call, unlike `session.getGitCommonDir` (`session/state.go:799`), which memoizes per cwd. That is the 3-5 identical subprocesses in the table. `strategy` already imports `session`, so:
+
+```go
+func GetGitCommonDir(ctx context.Context) (string, error) { return session.GetGitCommonDir(ctx) }
+```
+
+Measured with exactly that one-line change: case C 10→7, case A 13→9, case B 8→6 subprocesses; **119.0 ms → 93.5 ms per pre-push (-21%)**. Pre-existing, but the capture feature is what turned one call into three, and it is the cheapest win on the page. (Fixing #1 without this still leaves 2 loads; fixing this without #1 still leaves 3 redundant file reads and settings loads. They're independent.)
+
+### 3. Non-finding, checked as asked: the duplicated `isConfiguredRemote` is genuinely free
+`checkpoint_sync_capture.go:67` and `:130`, `checkpoint_sync_remote.go:96`
+
+`isConfiguredRemote` goes through `cachedIsConfiguredRemote` (`git_remote_cache.go:211`), and `main.go:36` installs the cache on the root context, so hooks are covered. Confirmed empirically: cases A/B/C each show exactly **one** `git remote get-url &lt;name&gt;` despite 3-4 call sites. When the captured name differs from the push remote the new call is a miss, but it's memoized and the later `Resolve` would have paid it anyway — net zero. So commit 3 adds no git subprocesses; its cost is the redundant *file* read and settings load in #1.
+
+### 4. `declaredPushDestination` — up to 4 sequential git subprocesses, short-circuited in practice
+`checkpoint_sync_capture.go:175-191`
+
+`git symbolic-ref` plus 1-3 `git config --get`, worst case ~40 ms, only on a push that is a capture candidate (once per clone in the common flow — case A shows 2 of them, short-circuiting on the first hit). Could be one `git config --get-regexp '^(branch\.&lt;b&gt;\.(pushremote|remote)|remote\.pushdefault)$'`. Low value; noting for completeness, not worth blocking on.
+
+### 5. `defer os.Remove` and `tmp.Chmod` in `saveCapturedSyncRemotes` — trivial, no action
+`checkpoint_sync_capture.go:94-101`
+
+The success-path `os.Remove` is one failing `unlink` (~µs), and this function runs at most once per clone; it's the standard temp-file idiom and the comment already says so. Same verdict on `tmp.Chmod(0o600)`: `os.CreateTemp` already opens with `0600` on Unix, so it's a redundant syscall, but it's once per clone and it keeps the mode explicit for Windows. Not waste worth touching.
+
+No parallelization opportunity here (the gates are short-circuiting and ordered by cost), and no long-lived closure/captured-environment objects are introduced — the only new closure is the short-lived `defer` in `saveCapturedSyncRemotes`.</result>
+<usage><subagent_tokens>139247</subagent_tokens><tool_uses>45</tool_uses><duration_ms>468392</duration_ms></usage>
+</task-notification>
+
+---
+
+ok, 1951 is merged
+
+---
+
+ok, do 1987
+
+---
+
+after 1987 we are good to make a release with the current state, and then keep working on it?
+
+---
+
+yes, please look at persist only after delivery
+
+---
+
+ok, let's do it both halves
+
+---
+
+how much integration tests do we have for these scenarios?
+
+---
+
+yes
+
+---
+
+for easiness: can we somehow get all remaining PRs into one thing?
+
+---
+
+I mean the open PRs for this work item, not all
+
+---
+
+> Consolidates #1934 and #2003 into this PR. All three were the same work item and two pairs conflicted with each other 
+
+it says three but it's two or what do I miss
+
+---
+
+ok, the PR has conflicts, and can you look at the open copilot/bugbot comments and just resolve if obsolete, please also check if the trail has findings
+
+---
+
+ok 2036 merged
+
+---
+
+what's left here

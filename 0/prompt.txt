@@ -1,0 +1,78 @@
+/simplify
+
+---
+
+<task-notification>
+<task-id>a21d1ded04417cf7a</task-id>
+<tool-use-id>toolu_01TKtiuiaVuaUSKnxpR7fLhZ</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-clear-river-3582/418f3db9-336d-43ef-a64e-d09932326c97/tasks/a21d1ded04417cf7a.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have what I need. Here are the findings.
+
+## Verdict on the central question
+
+**The per-site calls are the right *fix* but one level too shallow for the *invariant*.** The diff is correct and minimal — it closes a real hang. But two concrete, already-existing (not manufactured) consolidations are sitting right next to it, and the reason this PR exists at all is proof the shallow approach already failed once.
+
+---
+
+### 1. `cmd/entire/cli/agent/claudecode/generate.go:180-184`, `generate_streaming.go:56-60`, `cmd/entire/cli/agent/text_generator_cli.go:51-55` — the three-line isolation block is byte-identical at all three sites and is already linked only by a prose comment
+
+All three sites are exactly:
+```go
+cmd.Dir = os.TempDir()
+cmd.Env = agent.StripGitEnv(os.Environ())
+execx.TerminateOnCancel(cmd)
+```
+`generate.go:179` even carries the comment `"(matches agent.RunIsolatedTextGeneratorCLI behavior)"` — a prose link where a code link belongs. **That prose link has already failed once: PR #2140 changed the shared helper and both claudecode copies silently drifted, which is the entire reason for this follow-up.** So `agent.PrepareIsolatedCLICmd(cmd)` is not speculative — it is retro-justified by an incident from the same week.
+
+It is genuinely clean, not forced: it is a pure `*exec.Cmd` mutator with no control flow, no I/O, no error return. It does not touch what claudecode actually forked for — `cmd.Run()` vs `Start`/`StdoutPipe`/`Wait`, the `is_error` envelope parsing, `classifyStderrError`, `TextGenerationError` wrapping. `RunIsolatedTextGeneratorCLI` calls it too, so there is one definition of "isolated provider CLI" rather than a canonical one plus two copies.
+
+**Cost of not doing it:** the next isolation-level change (a new env strip, a different `Dir`, a `WaitDelay` tweak) repeats the exact drift. **Cost of doing it:** ~8 lines added in `agent`, 6 deleted. Also removes the need for finding 3.
+
+### 2. `cmd/entire/cli/procutil/procutil.go:22` vs `cmd/entire/cli/execx/execx.go:47` — two packages export the same function with the same body, and this PR fixes only one of them
+
+`procutil.TerminateOnCancel` and `execx.TerminateOnCancel` are duplicates: same `WaitDelay` + `killProcessGroupOnCancel(cmd)` shape, same negative-PID SIGKILL, same Windows no-op. They differ only in the delay constant (`5s` vs `10s`). `checkpoint/remote/command_cancel.go:16` already aliases execx.
+
+This is the bigger altitude problem the diff walks past. `procutil`'s two callers are **agent-CLI spawn sites in the same domain**: `cmd/entire/cli/review/types/template.go:77` (spawns claude/codex/gemini/pi with `StdoutPipe`) and `cmd/entire/cli/investigate/loop.go:317`. This PR adds the Setsid/EPERM guard (`execx_unix.go:34`) to execx only, so **`procutil` is now the stale copy** — it unconditionally sets `Setpgid = true`. No live bug today (neither procutil caller uses `NonInteractive`), but the first person who routes a review spawn through `execx.NonInteractive` gets the bare "operation not permitted" the new comment warns about, from the copy that never got the fix.
+
+### 3. `cmd/entire/cli/agent/architecture_test.go:48` — the allowlist entry is legitimate, but it sanctions one of two twin packages without noting they are twins
+
+Not papering over a layering problem: `execx` imports only stdlib + `x/sys/windows`, making it a leaf utility in the same class as the already-listed `logging`/`paths`/`jsonutil`. The test's stated purpose (keep agents off `strategy`/`checkpoint`/`session`/`commands`) is untouched.
+
+Two concrete costs: (a) with finding 1's helper the entry is unnecessary, because `agent` itself is *not* scanned — `discoverAgentPackages` only walks subdirectories of the agent dir, so `agent/text_generator_cli.go` importing `execx` was never constrained; (b) `procutil` remains unlisted, so the next agent package that copies the review/investigate pattern hits a failure reading *"add it to allowedPrefixes"* rather than *"these two packages are the same thing."*
+
+### 4. `cmd/entire/cli/agent/external/external.go:445-448` — unbounded in the same way, with the exact pre-#2140 half-treatment
+
+```go
+cmd := exec.CommandContext(ctx, e.binaryPath, args...)
+cmd.WaitDelay = 3 * time.Second
+```
+Then `cmd.Stdout = stdoutLW` / `cmd.Stderr = stderrLW` (`limitedWriter`, non-`*os.File` → exec creates pipes and copy goroutines) and a deadline ctx (`defaultRunTimeout` applied if the caller set none). **WaitDelay without the group kill is precisely the state `execx.TerminateOnCancel` was created to replace.** An arbitrary third-party plugin binary is the *most* likely of all these to spawn a pipe-holding helper. Risk: every cancel/timeout costs a 3s stall and leaks the grandchild instead of killing it. Note `external` is in `architecture_test`'s `skipDirs`, so importing `execx` there has no allowlist cost.
+
+### 5. `cmd/entire/cli/agent/opencode/cli_commands.go:59-62` (also `:153`, `:175`) — same shape, no bound at all, on a hook path
+
+`cmd.Stderr = &amp;stderr` (a `bytes.Buffer`) with a 30s timeout ctx, no `WaitDelay`, no group kill. Lines 153/175 use `CombinedOutput()`, which is the same buffered-pipe shape. If an `opencode` subprocess leaves a helper holding stderr, `cmd.Run()` blocks **forever** past `openCodeCommandTimeout` — the timeout is silently defeated exactly as the execx doc describes. This is the worst of the four because `runOpenCodeExportToFile` is reached from `PrepareTranscript`, which per the comment at `lifecycle.go:230` runs **on every turn end** — a hook process, the same failure class `StatusWithBudget` exists to prevent.
+
+### 6. `cmd/entire/cli/review/target.go:119` — lower confidence, worth one line
+
+`entire` re-execing itself into a review worktree with a cancellable ctx. If `stdout`/`stderr` are real `*os.File`s there is no hang, but the default `Cancel` SIGKILLs the inner `entire`, so the agent tree that inner process was managing (via `procutil.TerminateOnCancel`) is orphaned rather than killed. A leak, not a hang.
+
+**Checked and dismissed** (not the shape): `plugin.go:165` (`os.Stdout`, deliberate SIGINT `Cancel`), all `git`/`gh` sites including `dispatch/mode_local.go` and `strategy/*` (short-lived, no pipe-holding grandchildren), `cursor/images.go:213` (sqlite3), and `claude.go:389` / `codex.go:235` / `gemini.go:391` (foreground TTY launches inheriting real files).
+
+### 7. Enforcement — the answer to "will it be forgotten at the next site" is yes, and the machinery already exists
+
+`architecture_test.go` already AST-parses every agent package (`extractImports`, `hasInitWithRegister`). An assertion that every `exec.CommandContext` in an agent package is followed by `TerminateOnCancel`/`PrepareIsolatedCLICmd` is ~30 lines in a file that already does the parsing, and it is the only thing that makes finding 4 and 5 impossible to reintroduce.
+
+Honest caveat: **forbidigo cannot express this.** The repo's other enforcement mechanism (`.golangci.yaml:104-121`, which enforces `gitrepo.Status`, `CheckoutBranch`, `HardResetWithProtection`) forbids *calls*; it has no "must be followed by" form. The AST test is the only mechanical option here.
+
+### 8. Minor — test duplication is the per-site fix's tax showing up
+
+The `sleep 60 &amp; echo ready; wait` fixture now exists in five places: `execx_unix_test.go` (×2, one new), `procutil_unix_test.go`, `agent/text_generator_cli_test.go`, and the new `claudecode/generate_cancel_test.go`. The diff deletes one copy (`checkpoint/remote`) and adds two. Defensible — a per-site call genuinely does need a per-site test — but it is the cost signal for findings 1 and 7.
+
+### 9. Neutral note — `cmd/entire/cli/execx/execx.go:44-46`
+
+The doc flips "Do not combine with NonInteractive" into "Safe to combine," with a guard (`execx_unix.go:34`) and a test, for a combination **no production caller currently uses**. Defensible as landmine removal (it converts a documented prohibition into safe composition), but it is speculative generality landing in a follow-up whose stated scope is two missing calls. Worth a sentence in the PR description saying so.</result>
+<usage><subagent_tokens>154910</subagent_tokens><tool_uses>22</tool_uses><duration_ms>221752</duration_ms></usage>
+</task-notification>

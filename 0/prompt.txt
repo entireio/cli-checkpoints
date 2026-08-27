@@ -1,0 +1,396 @@
+ok, this PR is merged, there isn't anything extra left, right?
+
+---
+
+The issue I see is that it's called nightly but we would make it "on change" so maybe we rather do another build called "dev" and that is the one permanently build on merge into main?
+
+---
+
+hmm, could we not only keep only one dev release overwriting the older?
+
+---
+
+nightly is for external users too, so leave it as it is, build the other stuff in a new branch of main
+
+---
+
+can you explain 2 more
+
+---
+
+yeah let's do both
+
+---
+
+can you run /simplify on the new PR
+
+---
+
+<task-notification>
+<task-id>ad6c1c8827e90854e</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-remove-local-dev/1d5476ca-8935-4175-90d1-f50f527b58fb/tasks/ad6c1c8827e90854e.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Efficiency review of PR #2085. All claims below traced through actual call paths, with measured numbers (macOS/APFS, warm cache).
+
+## Baseline I measured first
+
+- Real installed hooks in this repo total **1204 bytes across 5 files** (150–416 B each, 4–6 lines).
+- `os.ReadFile` on a 200-byte hook: **8.8 µs**. `os.Stat`: **1.1 µs**. One `entireHookPinnedPath` scan of a hook: **113 ns**.
+- So the pre-existing 5 `os.ReadFile` calls already cost ~44 µs and dominate this function entirely.
+- Hot path confirmed: `cmd/entire/cli/lifecycle.go:574` (`handleLifecycleTurnStart`) → `EnsureSetup` → `IsGitHookInstalled` → `CheckGitHookState` → `gitHookStateInHooksDir`. Called **once** per turn-start; no other per-turn caller.
+
+## Findings
+
+**1. `cmd/entire/cli/settings/absolute_hook_path_scope_test.go:70,102` — `t.Chdir` + `Load()` forces serial execution and spawns a `git rev-parse` per case.**
+
+`Load` → `ClonePreferencesPath` → `session.GetGitCommonDir`, whose cache (`session/state.go:826`) is keyed on **cwd**. Each subtest `t.Chdir`s to a fresh `t.TempDir()`, so every one is a cache miss → `git rev-parse --git-common-dir` subprocess. I measured that spawn at **~10 ms** from a non-repo temp dir. And `t.Chdir` is process-global, so none of the 7 cases can be `t.Parallel()`.
+
+Measured: `--- PASS: TestAbsoluteGitHookPath_ScopeGate (0.18s)`, 0.03 s per subtest, plus 0.03 s for `RejectionDoesNotSerialize` — **~0.21 s serialized per test run**.
+
+Cheaper alternative, with direct in-repo precedent: call the unexported `loadMergedSettings(t.Context(), projectPath, "", localPath)` and add `t.Parallel()`. The test is already in `package settings`, and `loadMergedSettings` (settings.go:590) contains *both* new code sites — `enforceAbsoluteGitHookPathScope` at :600 and the rejection-clear at :638 — so coverage is identical. No chdir, no git subprocess, no `.entire/` MkdirAll needed (paths are explicit). The closest sibling file, `opf_command_trust_test.go` — the very gate the diff's comments compare against — does exactly this: 8 `loadMergedSettings` call sites, **zero** `t.Chdir`, all `t.Parallel()`, and its 11 tests measure 0.01–0.02 s each *in parallel*. Expected saving: ~0.21 s → ~0.01 s wall. **Per test run** (unit + `test:ci`).
+
+**2. `cmd/entire/cli/strategy/hooks.go:265` — the same `os.Stat` is repeated 5× for one path.**
+
+Confirmed the hooks all embed an identical path: `InstallGitHook` (hooks.go:502) computes `cmdPrefix` **once** and passes it to `buildHookSpecs(cmdPrefix)` (:353), which builds all 5 specs from that single prefix. So in the healthy-pin case every iteration stats the same string.
+
+Precise behaviour, because the `continue` at :259 changes it per case:
+- `absolute_git_hook_path` **off** (the default — hooks use `command -v entire`): `entireHookPinnedPath` returns `""`, so **0 extra syscalls**.
+- **On, pin alive**: `reason` stays `""` all 5 iterations → **5 identical stats**, 4 of them provably redundant. ~4.4 µs wasted **per turn-start**.
+- **On, pin dead**: iteration 1 stats, fails, sets `reason`; iterations 2–5 hit the `continue` → **1 stat**, then reinstall self-heals.
+
+Cheaper alternative: hoist the probe out of the loop — remember the first non-empty `pinned` and skip the stat when the next hook matches it (or stat once after the loop). One line.
+
+Honest scale: ~4 µs against a p50 turn-end of seconds. This is worth doing because it's a one-line dedupe of a provably identical call, **not** because it's a latency problem.
+
+**3. `cmd/entire/cli/strategy/hooks.go:262-266` — the same content is now walked twice per hook.**
+
+Yes: `entireHookLineRunsFromWorkingTree` (:305) and `entireHookPinnedPath` (:321) each run their own `strings.SplitSeq(content, "\n")` and each re-test `strings.Contains(line, "hooks git ")`. The `else if` means both run for all 5 hooks in the normal (healthy) case. One pass could do both — find the `hooks git ` line once, then test legacy launchers and extract the pin from it.
+
+Cost, measured: 113 ns per scan × 5 = **~0.6 µs per turn-start**, i.e. **1.3% of the 44 µs the file reads already cost**. `SplitSeq` is an iterator, so there is no slice allocation. On efficiency grounds alone this does not justify the restructure; flagging it only because you asked, and because merging the passes would also fix finding #2 for free.
+
+## Checked and clear — no issue
+
+**`hooks.go:259` (`if reason != "" { continue }`) — not a regression; a small improvement.** It skips only the two content scans and the stat. It does **not** skip `os.ReadFile` (:246) or the marker `strings.Contains` (:251), and it must not: a missing or foreign hook later in the list still has to downgrade the result to `GitHooksAbsent`. So the loop does still read all 5 files regardless. Net effect vs. pre-diff: the old code set `outdated = true` and then kept running `entireHookLineRunsFromWorkingTree` on every remaining hook, so the new code is **strictly cheaper** in the outdated case.
+
+**`settings/absolute_hook_path_scope.go:31` and `settings.go:600,638` — O(1), zero I/O.** `enforceAbsoluteGitHookPathScope` is a nil check, a bool check, and two field writes. The rejection-clear at :638 is one bool test and one string assignment. Nothing added to the `settings.Load` hot path — and the function's doc comment explicitly *declines* the expensive index-and-HEAD probe that `enforceOPFCommandTrust` uses. Correct call; the `classifyLocalSettings` probe it avoids is the only expensive thing in that region (and that one is already memoized in `opf_command_trust.go:219`).
+
+**`doctor.go:541` — an extra `settings.Load`, but not a duplicate of anything in scope, and not on a hot path.** `checkGitHooks(cmd, force)` receives no settings value, and `grep 'settings\.'` over doctor.go shows only two uses total: this new `Load` and `settings.IsSetUpAny(ctx)` at :566, which is in a different (`GitHooksAbsent`) branch. So there is no already-loaded value to reuse. Marginal cost is 2–3 small `os.ReadFile` + a JSON unmarshal (~50–100 µs); `getGitCommonDir` is process-cached by then, so no extra git spawn. It does run unconditionally before the `GitHooksCurrent` early return, which is deliberate per the comment. On a hand-invoked diagnostic that also runs `ListSessionStates` and git operations, this is noise.
+
+**New strategy tests — exemplary, nothing to flag.** `TestCheckGitHookState_DeadPinnedPathIsDrift`, `TestEntireHookPinnedPath`, `TestGitHookStateReason_DistinguishesCauses` all measure **0.00 s**, all use `t.Parallel()`, no subprocesses, no sleeps, no real installs. `writeCurrentManagedHooks` (hooks_test.go:855) is pure `os.WriteFile`. Contrast with finding #1 — the strategy half of this diff got the test shape right and the settings half didn't.
+
+**Bottom line:** no meaningful runtime efficiency problem on the turn-start path. The default configuration pays **zero extra syscalls** and ~0.6 µs of string scanning. The only finding worth acting on is #1 (test-suite time, ~0.2 s, with a clean in-repo precedent); #2 is a one-line dedupe of a genuinely redundant call whose absolute cost is microseconds.</result>
+<usage><subagent_tokens>124247</subagent_tokens><tool_uses>28</tool_uses><duration_ms>306796</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aa965f4e6b46e9473</task-id>
+<tool-use-id>toolu_01EqKaSih2ZNAJppzqorWvKN</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-remove-local-dev/1d5476ca-8935-4175-90d1-f50f527b58fb/tasks/aa965f4e6b46e9473.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## REUSE findings — PR #2085
+
+**1. `cmd/entire/cli/setup.go:1565` `setAbsoluteGitHookPathLocal` re-implements `setEnabledRaw`, which sits 2 lines below it**
+Existing helper: `setEnabledRaw` — `cmd/entire/cli/setup.go:1581`. Same operation: `load(ctx)` → `json.Marshal(bool)` → `raw[key] = value` → `save(path, raw)`. 10 of the new function's 13 body lines are `setEnabledRaw` with `"enabled"` swapped for `"absolute_git_hook_path"` and the load/save funcs pinned to the local pair.
+Concrete shape: widen the existing one to `setRawKey(ctx, load, save, key string, value any) error`; then `setEnabledRaw(ctx, load, save, enabled)` = `setRawKey(..., "enabled", enabled)` and the new writer = `setRawKey(ctx, settings.LoadLocalRaw, settings.SaveLocalRaw, "absolute_git_hook_path", value)`. Call sites: 4 existing (`setup.go:1535,1540,1545,1614`) + 3 new (`setup.go:301,314,359` route through the new wrapper).
+Two side effects of the duplication worth noting:
+- The new doc comment was inserted **between `setEnabledRaw`'s doc comment and its declaration** (`setup.go:1552-1553`), so `setEnabledRaw` now has no doc and its two sentences read as the preamble to `setAbsoluteGitHookPathLocal`.
+- The third copy of this pattern, `persistOPFPromptDefaultAlways` (`cmd/entire/cli/strategy/manual_commit_opf_prompt.go:157`), carries an `if raw == nil { raw = map[...]{} }` guard the new function omits. `loadRaw` returns a nil map when the file's content is literally `null` (`json.Unmarshal` of `null` into a map nils it, `settings.go:709-713`), so the new writer panics there. A shared `setRawKey` would carry the guard once.
+
+**2. `cmd/entire/cli/strategy/hooks_test.go:2004-2135` — three new fixtures hand-copy the shape the generator emits, instead of calling the generator**
+Existing helpers: `buildHookSpecs` (`cmd/entire/cli/strategy/hooks.go:353`) and `gitHookCommand` (`hooks.go:425`), both package-private and already exercised by tests in this file (`hooks_test.go:951`, `1056`).
+- `hooks_test.go:2023-2027` builds `"if [ -x " + quoted + " ]; then " + quoted + " hooks git " + hook + ...` under the comment "The exact shape gitHookCommand emits" — `for _, spec := range buildHookSpecs(shellQuote(tc.path))` produces that shape *and* the marker line, 4 lines instead of 8.
+- `hooks_test.go:2045` `hookLine` closure is the same string again, and because it is hand-built the Windows case needs a name-keyed patch-up: `hooks_test.go:2074-2075` `if tc.name == "windows path uses -f" { strings.Replace(content, "[ -x ", "[ -f ", 1) }`. Verified unnecessary: `gitHookCommandAvailableTest` (`hooks.go:445`) already returns `[ -f … ]` for `shellQuote("C:\\…")` via `isWindowsAbsoluteHookCommand`, so using the generator deletes that branch (5 lines) and the test-name coupling.
+- This is also the answer to your question 3: the anti-drift mechanism worth having is not a shared constant between `entireHookPinnedPath` and `gitHookCommandAvailableTest` (that's 2 string literals), it's the *tests* generating their fixtures from `buildHookSpecs`/`gitHookCommand`. As written, generator and parser can drift and every new test still passes, because the fixtures are hand-copied.
+- Same file: the new `write` closure at `hooks_test.go:2091` is a body-templated `writeCurrentManagedHooks` (`hooks_test.go:855`), and the loop is hand-rolled a fourth and fifth time at `hooks_test.go:819-824` and `840-845`. One package-level `writeGeneratedHooks(t, dir, cmdPrefix)` (or `writeManagedHooks(t, dir, body)`) covers all five, ~6 lines each.
+
+**3. `cmd/entire/cli/settings/absolute_hook_path_scope_test.go:57-79` and `:100-108` re-do `setupSettingsDir`**
+Existing helper: `setupSettingsDir(t, base, local)` — `cmd/entire/cli/settings/settings_test.go:28`, same package, 6 existing call sites. Its own doc says it exists to DRY up "the same ~12 lines of tmpdir + .entire + .git + chdir boilerplate" — which the new file repeats twice (12 lines + 9 lines). One-line change needed to reuse: have `setupSettingsDir` return `tmpDir` (the read-back assertion at `:110` needs the path); existing callers use it as a statement, so none break.
+
+**4. `cmd/entire/cli/doctor.go:578-580` re-implements `printIndentedBlock`**
+Existing helper: `printIndentedBlock(w io.Writer, block, indent string)` — `cmd/entire/cli/trail_review_cmd.go:1531`, same `cli` package, identical body (`SplitSeq` + indented `Fprintln`). Replacing the loop with `printIndentedBlock(w, outdatedReason, "  ")` drops 3 lines and the `"strings"` import this diff adds to `doctor.go` — `strings` is used nowhere else in that file (verified: single hit at line 578).
+
+**5. `cmd/entire/cli/strategy/hooks.go:321` `entireHookPinnedPath` duplicates the invocation-line scan in `entireHookLineRunsFromWorkingTree` (`hooks.go:294`)**
+Both do `for line := range strings.SplitSeq(content, "\n")` + `if !strings.Contains(line, "hooks git ") { continue }`, and the "scope to Entire's own line" rationale is load-bearing in both (documented at `hooks.go:286-293`). `gitHookStateInHooksDir` calls both, so each hook file is now scanned twice. Extract `entireHookInvocationLines(content) []string` (or a single `entireHookInvocationLine`) and pass the line to both predicates: ~5 duplicated lines, 2 call sites, and one scan per hook instead of two.
+
+**6. `cmd/entire/cli/strategy/hooks.go:265` uses raw `os.Stat` where the package's `fileExists` is already in use**
+Existing helper: `fileExists` — `cmd/entire/cli/strategy/common.go:1542`, already called from this same file at `hooks.go:511` and `596`. `} else if pinned := entireHookPinnedPath(content); pinned != "" &amp;&amp; !fileExists(pinned) {` removes 2 lines and the `statErr` local.
+
+**7. `cmd/entire/cli/settings/absolute_hook_path_scope.go:31` ignores the package's existing provenance primitive, and pays for it with a two-site gate**
+Existing helpers: `rawHasKey` (`cmd/entire/cli/settings/opf_command_trust.go:120`) and its wrapper `localSetsOPFCommand` (`opf_command_trust.go:101`) — the established way this package asks "did the local file explicitly set this key?". The new gate instead relies on *call order* (`settings.go:600`, before the merge) plus a compensating fixup after the merge (`settings.go:637-639`, `if settings.AbsoluteGitHookPath { rejection = "" }`) — one setting's policy split across two sites 37 lines apart, one of which is an untyped side effect on a shared struct.
+Feasible collapse, mirroring `enforceOPFCommandTrust` exactly (it already receives `localData` at `settings.go:631`, so there is no new plumbing):
+```go
+func enforceAbsoluteGitHookPathScope(s *EntireSettings, localData []byte) {
+    if s == nil || !s.AbsoluteGitHookPath { return }
+    if localSetsKey(localData, "absolute_git_hook_path") { return }   // rawHasKey
+    s.AbsoluteGitHookPath = false
+    s.absoluteGitHookPathRejection = absoluteGitHookPathProjectReason
+}
+```
+Verified equivalent for every layer that can carry this key: `ClonePreferences` (`settings.go:190-220`) has no such field, `mergeRawBool` (`settings.go:1092`) applies on key *presence* — the same signal `rawHasKey` reads — and a tracked local file nils `localData` before either gate. One behavior difference, so it's a deliberate call rather than a pure refactor: with local `{"absolute_git_hook_path": false}` over project `true`, today's code records a rejection (pinned by the third table case, `absolute_hook_path_scope_test.go:76-82`); the unified version would not, since the local file did set the key. If you keep that case's message, keep the two-site version and say so in the comment.
+
+## Checked and found nothing
+
+- **`shellUnquote` (`hooks.go:345`)**: no existing shell-unquoting helper anywhere in the repo. `strconv.Unquote` (Go literals, `trail_review_cmd.go:1353`), `compact.unquote` (JSON, `transcript/compact/compact.go:732`) and `redact.unquoteRange` (JSON, `redact/redact.go:384`) all solve different problems, and `go.mod` has no shell lexer (`shlex`/`shellwords`) dependency. Nothing to reuse — dropping this one. (Aside, pre-existing and not this PR's doing: `shellQuote` is implemented three times — `strategy/hooks.go:699`, `cli/resume_picker.go:425`, `e2e/agents/tmux.go:284`.)
+- **Unifying the three rejection records** (your question 1): I'd leave them separate. The shapes are 1-2 unexported strings plus a 5-line accessor, and the three consumers are genuinely different — `status.go:158-165` changes a *label* and appends a `git rm --cached` fix; `strategy/common.go:425` and `:481` go through `warnUser` with per-setting structured attrs and remediation strings; the new one is one line in `status.go:167` and two in `doctor.go:542`. A shared `map[string]rejection` + generic `Rejection(key)` would save maybe 8 lines of accessor while trading compile-time-named accessors for string keys and giving the consumers nothing to share. The concrete reuse in that area is finding 7, not a common record type.
+- **`doctor.go` loading its own `settings.Load`** (`doctor.go:541`): consistent with the file — `runSessionsFix` passes no settings object down and the sibling checks load their own. Not a finding.</result>
+<usage><subagent_tokens>149251</subagent_tokens><tool_uses>37</tool_uses><duration_ms>360217</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>acfbb3176eeec6d88</task-id>
+<tool-use-id>toolu_019W11K4pcXyUgXiiq4SKw3d</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-remove-local-dev/1d5476ca-8935-4175-90d1-f50f527b58fb/tasks/acfbb3176eeec6d88.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Verified everything below against the worktree (`go build ./...` and `go vet ./cmd/entire/cli/...` are clean; the new tests pass; the setup.go behaviour claim is confirmed by running the built binary).
+
+## Findings, most valuable first
+
+**1. `cmd/entire/cli/setup.go:308-316` (repeated at `:1301-1306`, `:1983-1988`) — the comment says the value is not written into `s`, but it is, and the target-scope save persists it.**
+The comment reads "Deliberately not written into s: this key belongs in the local file regardless of the target scope", and the next line is `s.AbsoluteGitHookPath = opts.AbsoluteGitHookPath`, followed by `saveSettingsToTarget(ctx, s, targetFile)` → `settings.Save` → `saveToFile`, which marshals the whole struct (`absolute_git_hook_path,omitempty` with `true` serializes). `settingsTargetFile` defaults to the **project** file whenever one exists. Verified with the built binary in a temp repo:
+
+```
+$ entire configure --absolute-git-hook-path
+  absolute_git_hook_path written to .entire/settings.local.json (it describes this machine)
+✓ Settings updated (.entire/settings.json)
+--- .entire/settings.json ---   { "enabled": true, "absolute_git_hook_path": true }
+--- .entire/settings.local.json --- { "absolute_git_hook_path": true }
+```
+Then, with the local file removed (i.e. a colleague's clone): `entire doctor` prints `Git hooks: absolute_git_hook_path ignored`. The command that exists to keep this key out of the committed file is the thing that puts it there.
+Simpler form: drop the `s.AbsoluteGitHookPath = …` assignment; hold the value in a local var for the two uses below it (`strategy.InstallGitHook`, `CheckAndWarnHookManagers`). At the two `opts.AbsoluteGitHookPath` sites the same applies — the field assignment on `settings`/`targetSettings` is either dead (project scope: loader drops it) or a duplicate write of the same key (local scope). Cost of leaving it: one redundant write per invocation, plus the state the PR is designed to reject, plus three copies of a 5-line block whose comment contradicts its code.
+
+**2. `cmd/entire/cli/setup.go:1552-1580` — the new function was inserted under another function's doc comment, and its body duplicates that function.**
+`setEnabledRaw`'s doc comment ("setEnabledRaw loads a settings file via load, sets its "enabled" key…", line 1552-1553) is now the first two lines of `setAbsoluteGitHookPathLocal`'s doc block, and `setEnabledRaw` (line 1582) has no doc comment at all. The new doc also contains a mangled parenthetical at 1556-1557: "The setting is honored only from the local file (see / the settings loader drops it from the project scope):" — a half-finished edit.
+Body-wise, `setAbsoluteGitHookPathLocal` is `setEnabledRaw` with `"enabled"` swapped for `"absolute_git_hook_path"`; `setEnabledRaw` is already parameterized on `load`/`save`. Simpler form: generalize to `setRawKey(ctx, load, save, key string, value any)` and call it with `settings.LoadLocalRaw, settings.SaveLocalRaw, "absolute_git_hook_path"`. Cost: ~16 duplicated lines and a second copy of the raw read-modify-write idiom, plus one function silently losing its documentation.
+
+**3. `cmd/entire/cli/strategy/hooks.go:160-186` — three exported entry points, one of which now has zero out-of-package callers.**
+Full-repo grep: `CheckGitHookState` is called only at `hooks.go:193` (`IsGitHookInstalled`) and `hooks.go:206` (`AnyGitHookInstalled`) — `doctor.go:548` was its only external caller and this diff moved it to `CheckGitHookStateWithReason`. `CheckGitHookStateWithReason` has exactly one external caller (doctor). `CheckGitHookStateInDir` is genuinely used (3 call sites in `integration_test/local_dev_migration_test.go` plus `IsGitHookInstalledInDir`) and should stay.
+Simpler form: delete the wrapper, rename `CheckGitHookStateWithReason` → `CheckGitHookState` returning `(GitHookState, string)`, and update the three call sites (two of them intra-package `state, _ :=`). Two exported names instead of three, and no `WithReason` suffix on a function that is the only implementation.
+
+**4. `cmd/entire/cli/strategy/hooks_test.go:2020-2140` — the pinned-hook file body is hand-rolled three times, and one table test branches on `tc.name`.**
+Three independent constructions of the same shell shape: `:2025-2027` (with the comment "The exact shape gitHookCommand emits for an absolute prefix" — i.e. an acknowledged hand-copy of production output), the `hookLine` closure at `:2043`, and `write(t, dir, "if [ -x "+quoted+…)` at `:2118`. Production already exposes `buildHookSpecs(cmdPrefix)`, which this same file uses at `:1373`, `:1396`, `:1429`, `:1462`. Simpler form: one helper `writeManagedHooks(t, dir, cmdPrefix)` built from `buildHookSpecs(cmdPrefix)`, used by all three (and by `writeCurrentManagedHooks` at `:855`). That also removes the drift risk where the tests keep asserting on a shape production no longer writes.
+Separately, `:2074`: `if tc.name == "windows path uses -f" { content = strings.Replace(content, "[ -x ", "[ -f ", 1) }` — string-matching the case name inside the loop defeats the table. `gitHookCommandAvailableTest(prefix)` already emits `[ -f … ]` for a quoted `C:\…` prefix (`isWindowsAbsoluteHookCommand` trims the leading quote), so building `hookLine` from it removes the special case entirely.
+Also overlapping: `TestCheckGitHookState_DeadPinnedPathIsDrift`'s second case ("a pin that no longer resolves is outdated") asserts a strict subset of `TestGitHookStateReason_DistinguishesCauses`/"dead pin names the missing path". Fold the live-pin case into the reason test's table and drop the first test. Cost of leaving it: ~40 lines of near-duplicate scaffolding.
+
+**5. `cmd/entire/cli/strategy/hooks.go:277-282` + `cmd/entire/cli/doctor.go:578` — pre-wrapped multi-line reason strings, re-split by the consumer.**
+The two reason constants embed literal `\n` at a width that only makes sense inside doctor's 2-space-indented block, and doctor splits them back apart to apply that indent — `strings` is now imported into `doctor.go` for exactly one use (verified: 1 occurrence of `strings.` in the file). The two existing rejection constants in the same PR's neighbourhood (`localLayerTrackedReason`, `absoluteGitHookPathProjectReason`) are single long lines that the terminal wraps, and doctor prints the latter with a plain `Fprintf("  %s\n")`. Simpler form: make the hook reasons single-line too (dead pin: `"… no checkpoints are captured: " + path`), delete the `SplitSeq` loop and the import.
+Honest counterweight on the typed-enum alternative you asked about: I would *not* move the wording to doctor. `strategy` already owns user-facing text (`missingEntireGitHookWarning`, `hooks.go:429`), an enum would need a second exported type plus the path as an extra return, and doctor is not the only plausible consumer. The problem here is the embedded newlines, not the ownership.
+
+**6. `cmd/entire/cli/strategy/hooks.go:255-262` — the `if reason != "" { continue }` short-circuit buys almost nothing and leaves a trap.**
+`gitHookNames` has 5 entries. The `ReadFile` and marker check still run for every hook (they must — a missing hook means Absent), so the `continue` saves at most 4 line-scans over ~1KB files and 4 `os.Stat` calls, and only in the already-broken case that ends in a reinstall. What it costs: the `continue` sits directly below two `return GitHooksAbsent` checks, so any future Absent-detecting check appended after it would be silently skipped for hooks 2-5 — a latent correctness trap in exchange for microseconds. Simpler form: `if reason == "" { reason = hookOutdatedReason(content) }` with the two-cause logic extracted into that helper; same "first cause wins" semantics, no mid-loop `continue`, one fewer branch to reason about.
+
+**7. `cmd/entire/cli/strategy/hooks.go:154-157` and `:239-242` — two doc comments are now incomplete.**
+`GitHooksOutdated`: "Today that means running Entire from the working tree, which is broken as well as stale — the path it names is gone." `gitHookStateInHooksDir`: "A hook that is present but still invokes a removed local-dev launcher reads Outdated". After this diff Outdated also means a dead pin — that is half the point of the change, and neither comment mentions it. Cost: the enum's own documentation now understates what the state means, and it is the first thing a reader of `checkGitHooks` follows.
+
+**8. `cmd/entire/cli/strategy/hooks.go:321-330` — `entireHookPinnedPath` re-implements the invocation-line scan from `entireHookLineRunsFromWorkingTree` (`:293-296`).**
+Identical `for line := range strings.SplitSeq(content, "\n") { if !strings.Contains(line, "hooks git ") { continue } … }` preamble in both. Simpler form: one `entireHookInvocationLines(content)` iterator (range-over-func, matching the `SplitSeq` style already used), two small predicates over the line. Only ~4 lines duplicated, but it is two places to change if the `hooks git ` key ever moves — and that key is load-bearing for the "don't mistake a user's appended line for ours" guarantee documented at `:284-291`.
+
+**9. `cmd/entire/cli/settings/settings.go:637-638` + `settings/absolute_hook_path_scope.go` — set-then-clear at a distance, and a 37-line file for a 6-line function.**
+The rejection is written at line 600 (inside a function in another file) and conditionally unwritten at 637-638, ~37 lines later. Neither sibling does this: `localLayerRejection` (line 623) and the OPF `rejectedCommand`/`rejectionReason` are each set once and never cleared. Simpler form, computed once from the final state:
+```go
+projectPinnedHookPath := settings.AbsoluteGitHookPath
+settings.AbsoluteGitHookPath = false
+// … preferences, local merge, OPF trust …
+if projectPinnedHookPath &amp;&amp; !settings.AbsoluteGitHookPath {
+    settings.absoluteGitHookPathRejection = absoluteGitHookPathProjectReason
+}
+```
+Equivalent on all six table cases in the new test (I checked each). Cost of the current shape: a reader of `AbsoluteGitHookPathRejection()` cannot tell from the setter whether the field is final, and the "can this be cleared after being set?" question has to be answered by reading a second file. On the function itself: `enforceAbsoluteGitHookPathScope` earns its keep mainly as a hanger for the comment; the `s == nil` guard in it is unreachable (`loadFromFile` returns `(nil, err)` or `(non-nil, nil)`, and the caller returns on err) — it is defensible only as symmetry with `enforceOPFCommandTrust`, which needs its nil checks for the nested `Redaction` pointers.
+
+## Checked and found nothing
+
+- **`shellUnquote` (`hooks.go:344-350`) is not over-general.** The `ReplaceAll` is genuinely exercised — `shellQuote` renders `'` as `'\''`, so the apostrophe path in the test requires it — and the `len &lt; 2 || not quoted` guard is the hand-edited-hook case, one line. Nothing to trim.
+- **No dead constants, unused struct fields, or unreachable branches introduced.** `bareEntireHookCmd`, `legacyGitHookLaunchers`, `missingEntireGitHookWarning`, and all three new constants still have live callers; `go vet ./cmd/entire/cli/...` is clean.
+- **Comment volume is in line with the repo's house style.** The long blocks on `entireHookPinnedPath`, `localLayerTrackedReason`, and the scope gate each carry a distinct "why" (quiet failure mode, threat model, why this gate is shallower than the OPF one) rather than restating each other. The only comment problems are the misplaced/mangled block in item 2 and the stale ones in item 7.</result>
+<usage><subagent_tokens>133664</subagent_tokens><tool_uses>30</tool_uses><duration_ms>397306</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a7a4a11d009917ad2</task-id>
+<tool-use-id>toolu_01FiEgoxZw13RGnSnR5Rx3R5</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-remove-local-dev/1d5476ca-8935-4175-90d1-f50f527b58fb/tasks/a7a4a11d009917ad2.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Verification complete. Report below.
+
+## Verdict
+
+The **diagnosis** in both halves of this PR is right, and the dead-pin→`GitHooksOutdated` half is at the right altitude. The **scope half is enforced one layer too high**: the gate lives in the merged loader, but both of `absolute_git_hook_path`'s real consumers — the writer and the hook installer — reach around the merged loader. I reproduced two live bypasses that defeat the PR's stated purpose.
+
+---
+
+### 1. The write redirect doesn't remove the project write — the flag still commits the key (reproduced)
+
+`cmd/entire/cli/setup.go:309-320`. The comment says "Deliberately not written into s", and line 316 writes it into `s`. Line 320 then marshals the whole struct to the target scope, and the default target is the project file.
+
+```
+$ entire configure --absolute-git-hook-path     # repo has .entire/settings.json
+  absolute_git_hook_path written to .entire/settings.local.json (it describes this machine)
+✓ Settings updated (.entire/settings.json)
+
+.entire/settings.json      → {"enabled": true, "absolute_git_hook_path": true}   ← committed
+.entire/settings.local.json → {"absolute_git_hook_path": true}
+```
+
+Same at `setup.go:1300-1305`→`1342` (`runEnableInteractive`, and that struct is the *merged* view) and `setup.go:1982-1987`→`2014` (`setupAgentHooksNonInteractive`, which prints no notice at all). Reproduced there too:
+
+```
+$ entire enable --agent claude-code --absolute-git-hook-path --project
+.entire/settings.json → {"enabled": true, "absolute_git_hook_path": true}
+```
+
+Consequence: one `configure` + one commit and every cloner's `entire doctor` prints `Git hooks: absolute_git_hook_path ignored` — a warning our own writer created. Verified end to end.
+
+The codebase already declares this invariant, and `absolute_git_hook_path` is its canonical example: `setEnabledFlag`'s doc (`setup.go:1514-1532`) names the field in the list of local-only overrides that must not leak into the committed file, and `setup_test.go` has ~8 tests asserting exactly that (`:596` "local-only absolute_git_hook_path override leaked into project settings", `:935`, `:972`, `:1019`). All of them seed the value in the *local* file, so none covers the flag path. The one test that does — `TestConfigureCmd_AbsoluteGitHookPathFlag_PersistsAndReinstallsHook` (`setup_test.go:3673`) — asserts only against the merged view, so it passes either way.
+
+**Deeper fix, in scope now:** make the *writer* own the rule instead of each call site. `settings.saveToFile` (`settings/settings.go:1657`) is the single choke point; zero local-only fields when the target is `EntireSettingsFile`. Then all three `if opts.AbsoluteGitHookPath` blocks lose their comment and their hazard, and `setAbsoluteGitHookPathLocal` remains just the local write. That is the general "this field always writes local" notion item 4 asks about, and it costs about as much as the three bespoke comments do.
+
+---
+
+### 2. The gate is bypassed for the decision it exists to control (reproduced)
+
+`updateGlobalSettings` decides pinning from an **ungated** per-file load: `settings.LoadFromFile(targetFileAbs)` (`setup.go:271`) feeds `InstallGitHook(ctx, true, s.AbsoluteGitHookPath)` (`setup.go:325`). `LoadFromFile` never runs `enforceAbsoluteGitHookPathScope`.
+
+Reproduced in a clone whose committed `settings.json` pins, with **no local file at all**:
+
+```
+$ entire configure --force            # note: --absolute-git-hook-path NOT passed
+.git/hooks/post-commit:
+  if [ -x '/…/scratchpad/entire' ]; then '/…/scratchpad/entire' hooks git post-commit …
+```
+
+So "a repository could impose path-pinning on everyone who cloned" is still reachable — via `--force` instead of passively. The other three installers are clean: `EnsureSetup`→`hookSettingsFromConfig` (`strategy/hooks.go:705`), `runEnableInteractive`, and `setupAgentHooksNonInteractive:2026` all read the merged (gated) view.
+
+**Deeper fix, in scope now:** `updateGlobalSettings`'s `InstallGitHook` argument must come from the merged view, exactly as `setup.go:2026-2031` already does and documents. One line. More generally: `settings.LoadFromFile` is exported and ungated by design (status uses it to *display* a file), so any gated field read through it is a latent bypass — worth a sentence on `LoadFromFile`'s doc saying it is display-only.
+
+---
+
+### 3. Parsing what we generate: no test couples parser to generator, and it already round-trips wrong
+
+`entireHookPinnedPath` (`strategy/hooks.go:321`) + `shellUnquote` (`:345`) reverse `gitHookCommandAvailableTest`/`shellQuote`. Two verified problems:
+
+**No end-to-end coupling exists.** `grep 'InstallGitHook('` across all tests: **every** call passes `absolutePath=false`. Nothing anywhere installs a pinned hook and parses it back. The new tests hand-write the shape ("The exact shape gitHookCommand emits", `hooks_test.go:639`), matching the pre-existing `writeCurrentManagedHooks` (`:855`) — but that helper only fed `strings.Contains` checks, which survive generator changes. A structural parser does not. Change `[ -x ` to `test -x` and the parser silently returns `""`, dead pins go undetected, and all four new tests stay green.
+
+**The parse is already wrong on one `shellQuote` case.** `strings.Index(rest, " ]")` finds the first `" ]"`, which can be inside the path. Verified by running the real functions:
+
+```
+input="/Users/a ]b/entire"  quoted='/Users/a ]b/entire'  parsed="'/Users/a"   ← wrong
+input="/Users/John O'Brien/bin/entire"                    parsed=…            ← ok
+```
+
+A user with `]` in a path component gets a permanent false `Git hooks: OUT OF DATE` plus a futile reinstall attempt every turn-start (`writeHookFile` is content-idempotent, so it never repairs and never errors). The test suite specifically brags about covering the apostrophe case and misses the delimiter case.
+
+**Deeper shapes, and what's feasible:**
+- *Compare against a regenerated expectation* (the mechanism `writeHookFile:552` already uses) — **not feasible.** The state check would report Outdated whenever `os.Executable()` differs from a *working* pin, flipping hooks on every dev-build invocation. Rightly rejected.
+- *Machine-readable marker line* — feasible and clean. `buildHookSpecs` already emits a `# &lt;marker&gt;` header; adding `# entire-pinned-path: &lt;path&gt;` (raw, no shell quoting) makes the reader a `strings.Cut`. Cost: hooks written before the marker existed can't be checked until reinstalled, so you either keep the parser as a transition fallback (coupling survives one release) or accept the gap. **Follow-up.**
+- *In scope now, and cheaper than either:* one test that calls `InstallGitHook(ctx, true, true)` and asserts `entireHookPinnedPath` on the generated file equals the resolved exe. That single test converts every future generator change into a red build, which is the actual protection wanted. Plus tighten the delimiter to the last `" ]"` before `"; then"`.
+
+Minor, same function: for a healthy pinned set the loop stats the same path 5 times (once per hook, no short-circuit) on the turn-start hot path. Trivial to dedupe.
+
+---
+
+### 4. `GitHooksOutdated` is the right axis; its own doc no longer is
+
+I traced every consumer. Verdict: **overloading is fine, and the churn worry doesn't materialize.**
+
+- `strategy/common.go:110` (`EnsureSetup`): dead pin → reinstall. `hookSettingsFromConfig` reads the *merged* view, so a project-only pin unpins the hooks and a local pin re-pins to the running binary. Self-heals in **one** turn and stays Current. No loop, because `EnsureSetup` runs from *agent* hooks (`lifecycle.go:574`), which are never pinned (no `os.Executable` in `cmd/entire/cli/agent/`), so the running binary is always a live PATH resolution. One reinstall per `entire` upgrade under a version-manager shim — which is the intended repair, not churn.
+- `setup.go:2447` (`runUninstall`): uses `AnyGitHookInstalled` (`!= Absent`). A dead pin was `Current` before and is `Outdated` now — both non-Absent. **No change.**
+- `CheckGitHookStateInDir`/`IsGitHookInstalledInDir`: test-only consumers.
+- The one flip-flop case: two environments resolving `entire` to different absolute paths in one shared worktree (host + devcontainer bind mount) will re-pin against each other every turn. Each side is at least correct for itself, versus stale-and-broken before. Acceptable; the honest mitigation is "don't pin a shared worktree", which nothing says (see §5).
+
+Two loose ends worth fixing while here:
+- `strategy/hooks.go:154-155` — `GitHooksOutdated`'s doc still reads "a shape we no longer write. Today that means running Entire from the working tree". A dead pin is a shape we **do** write; only its environment changed. The enum doc is now the only place stating the old, narrower meaning. **In scope now** — it's the documentation of the very axis being widened.
+- `doctor.go:538-546` prints the rejection *before* the switch, so it fires even when hooks are `Absent` and `!settings.IsSetUpAny(ctx)` — the one case the surrounding code deliberately stays silent about ("treating this as actionable would let `doctor --force` install hooks into a repo that never opted in"). Small noise inconsistency with its own neighbor.
+
+---
+
+### 5. Nothing documents that the setting is local-only
+
+Verified: no README mention (`README.md:366,380` name the flag, not the rule), no `docs/` page, no CLAUDE.md line, and the flag help is unchanged at `setup.go:798` and `:965` — still "Embed full binary path in git hooks (for GUI git clients that don't source shell profiles)".
+
+This is a sharp contrast with the sibling gate the change explicitly models itself on: `docs/security-and-privacy.md` gives `openai_privacy_filter.command` a dedicated **"Why `command` is local-only"** section plus inline notes at `:74` and `:131` ("**Only read from `.entire/settings.local.json`**"). The rationale for the new rule exists only in a Go comment.
+
+Reach is weaker too. I measured where the rejection actually surfaces:
+
+| Surface | `localLayerRejection` | new `absoluteGitHookPathRejection` |
+|---|---|---|
+| bare `entire status` | – | **no** |
+| `status --detailed` | yes | yes |
+| `status --json` | – | **no** |
+| `entire doctor` | – | yes |
+| every hook run (`warnUser`) | yes (`strategy/common.go:425`) | **no** |
+
+**In scope now:** one clause in the flag help ("written to and honored only from `.entire/settings.local.json`") and a line in the README `configure` section. **Follow-up:** the `docs/security-and-privacy.md`-style short section, and adding it to `status --json` (CLAUDE.md's agent-safe-fallback rule makes the JSON omission the notable one).
+
+---
+
+### 6. Item 1 — the gate depth is right; what's accumulating is the *reporting*, not the gates
+
+Two field-level gates is not a table's worth, and the two share almost nothing: different verification depth (deep index+HEAD vs. none), different failure policy (fail-closed vs. positional drop), different consequence (code execution vs. a fragile hook). A declarative registry now would be premature, and there's no existing seam to hang it on — `mergeScalarFields` (`settings/settings.go:1055`) is hand-written per field too. **Don't build it.**
+
+What a fourth field would actually cost today is on the reporting side, and that's already three-of-a-kind: `LocalLayerRejection()`, `OPFSettings.CommandRejection()`, `AbsoluteGitHookPathRejection()` — each with its own unexported field, its own accessor, and its own hand-written print site in a different command, with the coverage table above showing they've already drifted apart. A small shared shape (`[]Rejection{Key, Reason, Remediation}` on `EntireSettings`, one printer used by status/doctor/`warnUser`) would collapse that and close the reach gap in one move. **Follow-up, but the right one** — that, not a scope table, is where the fourth field's cost lands.
+
+One structural note on the new gate itself: it is purely **positional** — it verifies nothing, relying entirely on being called at `settings.go:600` before the local merge, with a second positional patch at `:637` clearing the rejection after. One field's policy now sits in three places in `loadMergedSettings`. It happens to be correct today (`applyClonePreferences` at `:607` doesn't touch this field, and clone preferences are clone-local anyway), but a reader can't tell that from the function alone. Cheap hardening, same style as the sibling: give it the raw local bytes and decide from key presence (`localSetsOPFCommand`/`rawHasKey` already exist), which makes it order-independent and lets the `:637` special case go away. **Follow-up.**
+
+---
+
+### Suggested split
+
+**Before merge:** §1 (project-file leak — three sites, plus the missing assertion in `setup_test.go:3673`), §2 (`--force` bypass, one line), §3's coupling test + delimiter fix, §4's enum doc, §5's flag-help clause.
+
+**Follow-up:** marker-line hook format, unified rejection reporting + `status --json`, docs section, order-independent gate.</result>
+<usage><subagent_tokens>163944</subagent_tokens><tool_uses>54</tool_uses><duration_ms>510833</duration_ms></usage>
+</task-notification>
+
+---
+
+I have one more thought: people having this in their regular file will now be broken, I wonder if we should do a staged rollout. Like announce this will be deprecated, even use maybe an automigration for them (move the setting to local) and then in the next release (or in a week) rollout the breaking change?
+
+---
+
+yes
+
+---
+
+I'm really questioning the change. We also figured out something else: On windows relative paths are actually a risk.
+
+---
+
+but the agent hooks mean I trusted the repo when starting the agent
+
+---
+
+but if I create a repo with a malicious entire.exe in it and then tell you "clone it, run entire enable and then work with it"
+
+---
+
+ok, maybe quickly: https://github.com/entireio/cli/pull/2019 can you look at the comments and maybe findings on the trail
+
+---
+
+yes
+
+---
+
+yes
+
+---
+
+why could we not just use main hard coded instead of the head sha?
+
+---
+
+can the other commnents all be resolved?

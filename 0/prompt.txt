@@ -1,0 +1,55 @@
+<cross-session-message from="uds:/tmp/cc-socks/5575.sock" from-name="soph-pen-test-cd" from-mode="prompting">
+You have one security finding to fix. It came out of a full audit of this CLI, re-verified against current main. This message is your complete work order — you need no other context.
+
+WORKTREE / BRANCH
+  cd /Users/soph/.herdr/worktrees/cli/soph-sec-checkpoint
+  Branch soph/sec-checkpoint-redaction is already checked out there, branched from main @ 6561a64b8.
+  You own cmd/entire/cli/checkpoint/*.go (the package's own files). Do NOT touch redact/** — findings-1 is rewriting functions in there right now — and do not touch cmd/entire/cli/checkpoint/remote/** — findings-3 owns that.
+  There is one untracked file from an abandoned prior session: cmd/entire/cli/checkpoint/redaction_gaps_test.go. Review it, keep what is useful, delete it if it is a throwaway probe.
+
+THE FINDING (HIGH) — one NUL byte disables redaction on the branch that gets pushed
+
+Context: this CLI captures AI agent transcripts (the user's prompts, source code, command output) and pushes them to Entire's servers on the entire/checkpoints/v1 git branch. Redaction is the only thing between a developer's secrets and that push.
+
+cmd/entire/cli/checkpoint/persistent.go:2535, inside createRedactedBlobFromFile (starts :2517):
+
+    // Skip redaction for binary files — they can't contain text secrets and
+    // running string replacement on them would corrupt the data.
+    isBin, binErr := binary.IsBinary(bytes.NewReader(content))
+    if binErr != nil || isBin {
+        hash, err := CreateBlobFromContent(repo, content)   // raw content, ZERO redaction
+        ...
+        return hash, mode, nil
+    }
+
+I read go-git v6's implementation (utils/binary/read.go:158-175). IsBinary returns true on the FIRST SINGLE 0x00 BYTE within sniffLen (8000) and does nothing else. It is not a heuristic about file type — it is literally "is there a NUL in the first 8KB".
+
+So one NUL byte in the first 8KB of any file in the metadata directory causes that file to be committed VERBATIM. createRedactedBlobFromFile is the blob writer for copyMetadataDir, which builds entire/checkpoints/v1 — the branch that gets pushed. OPF (the opt-in 9th redaction layer) is off by default, so the pre-push rewrite ships v1 as-is. There is no second chance.
+
+binErr != nil also fails open: a read error is treated as "binary" and the content is blobbed raw.
+
+The comment's premise is false. "Binary files can't contain text secrets" does not hold for a mostly-text JSONL that happens to contain one NUL.
+
+REACHABILITY — stated honestly, do not overclaim it in your commit message
+Strict JSON escapes NUL as a six-character escape sequence, so a well-formed JSONL transcript does not trigger this by itself. The realistic triggers are an agent that writes a raw control byte into its transcript, and the non-JSONL files in the metadata dir (prompt.txt and friends) which go through this same function. Mechanism is confirmed; reachability is conditional. Fix it anyway — it is a fail-open on the push path and the fix is small.
+
+FIX DIRECTION
+The real problem is deciding "should this be redacted?" by sniffing content. Prefer deciding by WHAT THE FILE IS:
+- Key off treePath. You know which files are transcripts, which are metadata JSON, and which are genuinely opaque assets. That is the information the caller actually has.
+- If you keep a content-based fallback, use a NUL RATIO over the whole buffer rather than first-hit-wins, and FAIL CLOSED on binErr (redact, or refuse to write) rather than open.
+- Externalized image assets under assets/ are the legitimate "do not scan this" case. Make that explicit and narrow.
+
+RED TEST — write it first and confirm it fails
+A JSONL transcript containing one raw NUL byte plus a credential (e.g. a ghp_ prefixed token) must still have the credential redacted after going through createRedactedBlobFromFile.
+
+RULES
+- LOCAL BRANCH ONLY. Do not push, do not open a PR, do not add a remote. Commit locally.
+- Commit normally; entire is enabled and captures the session automatically. Never create checkpoints by hand.
+- Before each commit: mise run fmt && mise run lint && mise run test:ci
+- Two traps in that sequence: (a) mise run fmt can rewrite Go into non-compiling code while lint still reports 0 issues — always run go build ./... after fmt; (b) mise run test:ci rewrites .opencode/package-lock.json — never git add -A, stage explicit paths.
+- The checkpoint package is reportedly near the 10-minute CI test ceiling — keep new tests cheap, and use t.Parallel() unless the test touches process-global state.
+- Tests that touch git state must use an isolated temp repo via the testutil helpers (testutil.InitRepo), never the real repo CWD — handlers resolve the repo from CWD and will otherwise write into the real .git/. See CLAUDE.md.
+- When done, report: what you changed, the test that proves it, anything contradicting this brief, anything you deliberately left alone.
+
+If the premise turns out to be stale or wrong, STOP and say so rather than implementing a fix for a bug that is not there.
+</cross-session-message>

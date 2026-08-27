@@ -1,0 +1,600 @@
+Update the entire CLI's dispatch command(s) to be jurisdiction-scoped, matching the entire.io gateway/SPA change that just shipped for review.
+
+You are in a cli worktree branched off main (~/.marvin/worktrees/cli/cli-dispatch-jurisdiction). Read the contract first — do not guess it:
+
+1. The entire.io PR that defines the wire contract: gh pr view 3946 --repo entirehq/entire.io (read the description) and gh pr diff 3946 --repo entirehq/entire.io. Trail: https://entire.io/gh/entirehq/entire.io/trails/3020.
+2. The decision behind it (Slack, read with slack tools if available, otherwise the PR description covers it): one dispatch = one jurisdiction — it covers repos placed in exactly one jurisdiction and is generated AND stored by that jurisdiction's cell, not the caller's home cell. Do NOT build splitting across jurisdictions or fan-out generation.
+
+The gateway contract the CLI must speak (from that PR):
+- POST /api/v1/me/dispatches and every by-id dispatch/setup route take a gateway-only `?jurisdiction=<slug>` query selector (lowercase slug, e.g. "us"); omitted → the caller's home jurisdiction, so existing behaviour is the default. The POST body has NO jurisdiction field.
+- GET /api/v1/me/dispatch-setups is fanned out across jurisdictions by the gateway: rows come back stamped with `jurisdiction`, the page token is a gateway composite (still opaque to clients), a page can be longer or shorter than pageSize, ordering is newest-first within a page only, and a partial outage is reported via `unavailableJurisdictions` on the body rather than an error.
+- Point-to-point responses (POST, by-id reads) are NOT stamped with `jurisdiction` — a client labels rows with the scope it requested with. Poll the dispatch you created with the same `?jurisdiction=` you posted with.
+- A repo not placed in the target jurisdiction 404s at the cell ("repository not found: ..."). The right UX is to say which jurisdiction was targeted and suggest picking one the repo is mirrored into.
+
+Your task in this repo:
+1. Find how the CLI's dispatch surface works today (command(s), which endpoints it calls — the BFF's /api/v1/me/dispatches or something else — and how it selects repos). Also find whether the CLI already knows repo placements/jurisdictions from any existing listing it uses.
+2. Design the smallest matching change: likely a --jurisdiction flag (defaulting to home / current behaviour), sending the selector on the POST and on any polling/read/list calls, surfacing `unavailableJurisdictions` in list output, and a legible error for the cross-jurisdiction 404. If the CLI can cheaply derive "which jurisdictions do my selected repos live in" to validate or auto-pick, consider it — but do not build heavy topology plumbing if it doesn't already exist.
+3. Report what you found and your intended change BEFORE implementing, using the architecture-findings skill (plain narrative, no file paths/symbols — that is what I read). Keep code-level detail in a FINDINGS.md in this worktree. Then implement with tests and run this repo's lint/typecheck/test tasks.
+
+Important repo rule: do NOT run the e2e suite locally (mise run test:e2e*, test:ci, check — they are gated to skip; leave that alone). Verify with `mise run test` (unit) + `mise run lint` only.
+
+Prefer Entire search — search_entire_code to locate code across repos, and the `entire search` skill for prior checkpoints/sessions behind it — over grepping and reading whole files when scouting. Fall back to reading files only where search doesn't cover it.
+
+Rules: do NOT create a Linear ticket or entire-plans entry, and do not ask to. Do NOT open a PR or push without asking. Do not touch other worktrees or checkouts (the entire.io PR branch is read-only context).
+
+---
+
+/rubber-duck
+
+---
+
+hmm no we don't want cli dispatches to be saved. want them one off. I think we want to keep the old route and update it in entire.io
+
+---
+
+can you give prompt so I can have the agent add it to my entire.io pr
+
+---
+
+ly (no e2e). No ticket, no PR/push without asking.
+
+---
+
+commit then do /simplify
+
+---
+
+<task-notification>
+<task-id>a774bcbb2ef81397a</task-id>
+<tool-use-id>toolu_013UsXkkdEc3E9zQKpdh5oVe</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha--marvin-worktrees-cli-cli-dispatch-jurisdiction/6661b9d7-392b-4aaa-bdf4-835d53b96e32/tasks/a774bcbb2ef81397a.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review of dispatch diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Findings (efficiency only):
+
+**1. `/Users/alisha/.marvin/worktrees/cli/cmd/entire/cli/dispatch_jurisdiction.go:71-88` (worktree path: `/Users/alisha/.marvin/worktrees/cli/cli-dispatch-jurisdiction/cmd/entire/cli/dispatch_jurisdiction.go:71-88`) — one sequential control-plane `ListRepos` per missing repo, all sharing a single 5s deadline.**
+- Cost: up to `CloudRepoLimit = 5` (`cmd/entire/cli/dispatch/dispatch.go:50`) serialized HTTP round trips added to an interactive error path; total latency is the *sum* of RTTs, not the max. Worse, `context.WithTimeout(ctx, cellResolveTimeout)` is taken once at line 61 for the whole loop, so the budget is shared: if repo 1 is slow, repos 2..N get whatever's left and silently lose their hint (`continue` on error at line 79), producing a partial message non-deterministically.
+- Cheaper alternatives, both already in the codebase:
+  - One call: `client.ListRepos(ctx, coreapi.ListReposParams{})` and match locally with `resolveRepoFilters(repos, index.Repos)` (`cmd/entire/cli/search_cmd.go:625`, used unfiltered at `search_cmd.go:536` and `search_v4.go:231`). 1 RTT regardless of repo count. Caveat the codebase itself documents (`search_v4.go` comment at ~line 240): the full index can be truncated on large accounts, whereas `Filter` is exact-match server-side — so this trades robustness for the RTT.
+  - Keep per-repo filtered lookups but run them concurrently with a per-call timeout, exactly the shape of `fanOutCells` in `cmd/entire/cli/cell_fanout.go` (indexed results slice + `sync.WaitGroup`, `ctx, cancel := context.WithTimeout(ctx, perCellTimeout)` *inside* the per-item call). `errgroup` is already a dependency (`cmd/entire/cli/activity_cmd.go`, `dispatch/mode_local.go`). Latency becomes max(RTT) and each repo gets its own budget.
+
+**2. `dispatch_jurisdiction.go:71` — no dedupe of `notFound.Repos` before the lookup loop.**
+- `parseNotFoundRepos` (`cmd/entire/cli/dispatch/cloud.go:256`) splits the gateway message verbatim; a repeated slug in the message costs an extra full RTT and also emits a duplicated `"&lt;repo&gt; is placed in: …"` line in `describeDispatchRepoNotFound` (lines 43-52). Cheaper: dedupe with a `seen` map the way `normalizeScopeValues` (`cmd/entire/cli/dispatch/options.go:~86`) already does, either in `parseNotFoundRepos` or at the top of the lookup.
+
+**3. `dispatch_jurisdiction.go:81-87` — inner scan over `resp.Repos` with `EqualFold`/`TrimSpace` per entry.**
+- Negligible CPU, but it duplicates work the server already did: `Filter` is documented exact-match, and the established pattern is `out.Repos[0]` plus one identity check (`cmd/entire/cli/cell_target.go:192-205`). Reusing that keeps the two resolvers consistent and drops the loop. Low priority.
+
+**4. `cmd/entire/cli/dispatch/cloud.go:333` + `:273` — `json.Unmarshal` of the whole error body (up to the 1 MiB limit) on every non-2xx, plus the body retained twice in the error.**
+- New work vs. before (previously the body was only quoted). Non-JSON bodies (proxy/HTML error pages) get fully parsed only to fail. Cheaper: bail out before unmarshalling when the trimmed body doesn't start with `{` (or cap the parse to a few KB), and consider not storing both `message` and `raw` — `httpStatusError` (line 208) holds up to 1 MiB of `raw` for the lifetime of the returned error.
+
+Not an issue: no long-lived closure over a large scope is introduced by the diff — the new `huh` `Validate`/`WithHideFunc` closures in `dispatch_wizard.go` capture the same `state` variable the existing wizard groups already capture, and `NormalizeJurisdiction`'s regex is package-level (`dispatch/options.go:708` region), not recompiled per keystroke.</result>
+<usage><subagent_tokens>84874</subagent_tokens><tool_uses>15</tool_uses><duration_ms>94708</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a5a6af5865c2996f0</task-id>
+<tool-use-id>toolu_013JJuscPgbaHGuDVisSbGeD</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha--marvin-worktrees-cli-cli-dispatch-jurisdiction/6661b9d7-392b-4aaa-bdf4-835d53b96e32/tasks/a5a6af5865c2996f0.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review of dispatch diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Findings
+
+**1. `CreateDispatchResponse.Jurisdiction` is write-only** — `cmd/entire/cli/dispatch/cloud.go:126-130` (field + 3-line doc) and `:238-241` (the "gateway that does not stamp" fallback). Nothing reads it: `mode_cloud.go:94` uses only `response.GeneratedMarkdown`/window, and no other reader exists in the repo. Cost: a field, a doc block, a branch, plus two test assertions (`cloud_test.go` `...SendsJurisdictionSelectorAsQueryOnly` / `...HomeSendsNoSelectorAndLabelsHome`) that exist only to protect state no code consumes. Simpler: delete the field and the fallback; `RepoNotFoundError.Jurisdiction` (which *is* read) already carries what the CLI needs.
+
+**2. `RepoNotFoundError.ScopeLabel()` is exported for one internal caller** — `cloud.go:196-203`, called only from `Error()` at `:192` (not in tests, not outside the package). Cost: exported API surface + 6 lines of doc for a 4-line conditional. Simpler: inline into `Error()`.
+
+**3. `httpStatusError` carries both `message` and `raw` where `message` is derivable** — `cloud.go:208-212`; `message` is exactly `errorMessageFromBody(raw)` (`:333`). `Error()` uses `raw`, the not-found detection uses `message` (`:229`). Cost: two near-identical fields whose difference a reader has to reverse-engineer. Simpler: keep `raw` only and call `errorMessageFromBody(statusErr.raw)` at the single branch site in `CreateDispatch`.
+
+**4. `RepoNotFoundError.Message` is a copy of the message it was built from, and `Repos` re-parses that same string** — `cloud.go:181-185`, `:230-234`, `parseNotFoundRepos` `:253-268`. Cost: three representations of one gateway sentence (raw body → message → Message + Repos), plus a bespoke string parser with its own test. Simpler: wrap the status error with `%w` and drop `Message`; if the repo list is genuinely needed for the placement hint, keep the parse but not the duplicated message.
+
+**5. `jurisdictionQuery` + the new `query url.Values` parameter on `doJSON` thread a single value through a single caller** — `cloud.go:245-251`, `:293`, `:302-305`. `doJSON` in this file has exactly one call site (`CreateDispatch`). Cost: a helper, a signature change, and an `if len(query) &gt; 0` branch to express one optional query param. Simpler: build the path in `CreateDispatch` (`path := dispatchGeneratePath; if j != "" { path += "?jurisdiction=" + url.QueryEscape(j) }`) and leave `doJSON` alone.
+
+**6. The 10-positional-argument flag chain, and 12 test call sites patched with a bare `""`** — `dispatch.go:156-206` (`parseDispatchFlags` → `resolveDispatchOptions` → `ResolveOptions` at `dispatch/options.go:11-21`). Adding one flag required editing 12 test invocations to insert an anonymous `""` between two other `""`s (`options_test.go`, `dispatch_test.go`). Cost: unreadable call sites (`false, "7d", "", false, nil, "", "", false`) and guaranteed repeat churn on the next flag. Simpler: pass a `dispatchFlags` struct; the diff shrinks to one field and zero test-signature edits.
+
+**7. `showJurisdiction()` is a verbatim duplicate of `showRepoPicker()`** — `dispatch_wizard.go:117-121` vs `:113-115`, both `return !s.isLocal()`. Cost: two names for one predicate, plus a 2-line comment. Simpler: reuse `showRepoPicker()` or add a single `isCloud()`.
+
+**8. Dead guard inside the wizard's jurisdiction `Validate`** — `dispatch_wizard.go:316-322`. The group is hidden in local mode by `WithHideFunc` at `:324-326`, so `!state.showJurisdiction()` never holds when the validator runs; and the same value is validated again by `NormalizeJurisdiction` inside `resolve()` (`options.go:29`), which is what `dispatch_wizard_test.go` actually asserts. Simpler: drop the guard (keep the inline validator for UX, or drop it and rely on `resolve()`, which also removes the need to export `NormalizeJurisdiction`).
+
+**9. `buildDispatchWizardSummary` recomputes the mode test it just made** — `dispatch_wizard.go:180-197`: `mode` is derived from `opts.Mode == ModeLocal` at `:181`, then `:190` asks `opts.Mode != ModeLocal` again, forcing the fixed 3-element join to become a `lines` slice. Simpler: one `if/else` on the local check that builds both `mode` and the optional jurisdiction line.
+
+**10. Placement hint loses the typed error** — `dispatch_jurisdiction.go:39-52` builds the hint with a `strings.Builder` seeded from `err.Error()` and returns `errors.New(...)`, so `errors.As(..., *RepoNotFoundError)` stops working exactly in the case the hint fired (the sibling test at `dispatch_jurisdiction_test.go:1076` only checks the *no-hint* path preserves it). Simpler and shorter: `fmt.Errorf("%w%s", notFound, hint)`.
+
+**11. Over-long docs restating one fact five times** — `cloud.go:36-46` (11 comment lines above a 2-const block), repeated at `mode_cloud.go:92-93`, `dispatch/dispatch.go:39-41` (`Options.Jurisdiction`), the flag usage string `dispatch.go:114`, the command `Long` text `dispatch.go:50-54`, and again in test names/messages ("must never be in the body"). Cost: six places to update when the gateway contract changes. Simpler: one canonical paragraph (the `Options.Jurisdiction` doc), one-liners elsewhere. Same pattern at `dispatch_jurisdiction.go:14-28` — a 10-line essay for a best-effort hint that repeats the cloud.go explanation.
+
+**12. Duplicated cross-layer tests** — `mode_cloud_test.go` `TestServerMode_JurisdictionIsSentAsQuerySelector` asserts the same two things (query param present, `jurisdiction` absent from body) as `cloud_test.go` `TestCloudClient_CreateDispatch_SendsJurisdictionSelectorAsQueryOnly`; `TestServerMode_RepoNotFoundNamesJurisdiction` duplicates the `"gateway wording"` case of `TestCloudClient_CreateDispatch_RepoNotFoundNamesTargetJurisdiction`, including the `In AU: ...` prefix assertion. The only new information at the mode layer is "`Options.Jurisdiction` reaches the client". Cost: ~80 duplicated fixture lines, two mock servers. Simpler: keep the client-level tests; reduce the mode-level ones to one test asserting the option is forwarded.
+
+**13. Duplicated flag-parsing tests** — `dispatch_test.go` `TestParseDispatchFlags_JurisdictionNormalized` / `_LocalRejectsJurisdiction` are the same two assertions as `options_test.go` `TestResolveOptions_JurisdictionNormalizedForCloud` / `_JurisdictionRejectedWithLocal`, and `parseDispatchFlags` is a pure pass-through; normalization is *also* table-tested in `TestNormalizeJurisdiction`. Cost: three layers of coverage for one 8-line function. Simpler: keep `TestNormalizeJurisdiction` + the `ResolveOptions` local-rejection test.
+
+**14. Nesting/round-trips in the placement lookup** — `dispatch_jurisdiction.go:60-93`: a per-repo `ListRepos` call, each followed by an inner scan with `EqualFold` + `break`, three levels deep inside a never-failing best-effort helper. Cost: N control-plane round trips inside a shared `cellResolveTimeout` for an error-message garnish. Simpler: one filtered call (or a small `findRepoEntry(resp, fullName)` helper) to flatten the inner loop.</result>
+<usage><subagent_tokens>80049</subagent_tokens><tool_uses>8</tool_uses><duration_ms>127705</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a4a53b97a9562c7b4</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha--marvin-worktrees-cli-cli-dispatch-jurisdiction/6661b9d7-392b-4aaa-bdf4-835d53b96e32/tasks/a4a53b97a9562c7b4.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review of dispatch diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Altitude findings
+
+**1. `cmd/entire/cli/dispatch/cloud.go:187,229` — 404 classified by prose prefix match on the message body.**
+`strings.HasPrefix(lower(statusErr.message), "repository not found")` is the only thing standing between a routing hint and a bare 404. Every other API-error classification in this repo branches on structure, not prose: `api.HTTPError`/`api.IsHTTPErrorStatus` on status, `errRepoNotOnboarded` as a sentinel, and `api.ErrorResponse.Message()` which already decodes the newer `{"error":{"code":"...","message":"..."}}` envelope. **Deeper fix:** have the gateway stamp `code: "repo_not_found"` plus a `repos` array, and branch on `code` (the envelope shape the CLI already parses), keeping the prefix match as a legacy-gateway fallback. **Cost:** one server-side field in entire.io + ~5 CLI lines; until the server ships, at minimum read `code` first and treat the prose match as the fallback so a gateway reword doesn't silently kill the feature.
+
+**2. `cloud.go:208-221, 273-291` — private `httpStatusError` + `errorMessageFromBody` re-implement `api.HTTPError` and `api.ErrorResponse.Message()`.**
+`cloud.go:16` already imports `cmd/entire/cli/api`. `api.HTTPError{StatusCode, Message}` + `api.CheckResponse` + `api.IsHTTPErrorStatus` are the shared mechanism; the only thing they lack is huma's top-level `detail`. **Deeper fix:** `doJSON` returns `*api.HTTPError`; add `detail` to `api.ErrorResponse.Message()` (one place, fixes it for every huma endpoint the CLI talks to). **Cost:** ~25 lines deleted from cloud.go, ~5 added to `api/client.go` + a table row in its test. Also removes `strconv` from cloud.go.
+
+**3. `cloud.go:256-270` `parseNotFoundRepos` — a second scraping layer on the same prose.**
+Splitting on the first `:` then on `,` to recover repo slugs is guesswork about a human message; the "or `...in its region: a/b`" case in the doc comment is evidence the format is already unstable. **Deeper fix:** same structured `repos` field as #1 — then this function and `RepoNotFoundError.Repos`' best-effort caveat both disappear. **Cost:** folded into #1.
+
+**4. `cmd/entire/cli/dispatch.go:101` — error enrichment hook in `RunE`, bypassing the established `render*` contract.**
+Putting the control-plane lookup in the `cli` layer is right (the `dispatch` package has no `coreapi` dependency and shouldn't grow one). The problem is the shape: `describeDispatchRepoNotFound` returns `errors.New(b.String())`, discarding the typed `*RepoNotFoundError` chain, whereas the repo's convention (`authcmd.go:40 renderDataAPIAuthError`, `authcmd.go:70 renderRepoNotOnboarded`) is *print the actionable line to `errW`, return `NewSilentError(err)`, keep the chain intact*. **Deeper fix:** rename to `renderDispatchRepoNotFound(ctx, errW, err)` and sit it next to `renderRepoNotOnboarded`, wrapping with `%w`. **Cost:** ~10 lines moved, one test assertion updated. Note this also removes the "one hook bolted onto one call site" feel — all three dispatch error exits then flow through the same renderer.
+
+**5. `cmd/entire/cli/dispatch_jurisdiction.go:44` — new package-level func var seam where an interface seam already exists.**
+`cell_target.go:38` defines `cellCoreClient` (an interface, explicitly "so the resolver is unit-testable against a fake control plane") plus the `newCellCoreClient` var. The diff adds a *third* style — a stubbable global function — and the test file has to document that it can't run in parallel because of it. **Deeper fix:** `defaultLookupDispatchRepoJurisdictions(ctx, c cellCoreClient, repos []string)`, stub the client like `cell_target_test.go` does. **Cost:** signature change + ~15 lines of test rewrite; drops one global.
+
+**6. `dispatch_jurisdiction.go:59-90` — duplicates `resolveProcessingPlacement`'s repo-index lookup.**
+`cell_target.go:192-207` does the identical `ListRepos{Filter: fullName}` → zero-rows check → `EqualFold(entry.FullName, fullName)` identity check, and its comment explains at length *why* the identity check exists (Filter's exactness is an OpenAPI promise, not code). There are now two copies of that reasoning, one of which (the new one) silently `continue`s instead of erroring. **Deeper fix:** extract `lookupRepoIndexEntry(ctx, c cellCoreClient, fullName) (coreapi.RepoIndexEntry, error)` in `cell_target.go`; `resolveProcessingPlacement` and the placement hint both call it. **Cost:** ~15-line extraction, no behavior change. Secondary: the loop makes up to `CloudRepoLimit` sequential `ListRepos` calls under a *single* `cellResolveTimeout`, whose doc (`cell_target.go:14`) describes it as a per-lookup best-effort budget — either budget per call or use `requiredCellResolveTimeout`-style sizing.
+
+**7. `cmd/entire/cli/dispatch/options.go:15,85` — third `--jurisdiction` normalizer, first one with validation, and its rule disagrees with the existing one.**
+`auth/cell_data_api.go:45` already has `jurisdictionLabelPattern = ^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$` and `resolveJurisdiction` (cell_data_api.go:381) already does trim → lowercase → validate → typed error, with a doc comment about exactly the `--jurisdiction US` / `" us "` cases. The new `jurisdictionSlugPattern = ^[a-z0-9][a-z0-9-]{0,31}$` accepts things auth rejects (trailing hyphen) and rejects things auth accepts (33-39 chars), so `entire dispatch -j &lt;slug&gt;` and `entire auth token -j &lt;slug&gt;` can now disagree about the same slug. `api_cmd.go:144` and `auth.go:172` still only lowercase/trim. **Deeper fix:** export the auth-package validator (`auth.NormalizeJurisdiction`) as the single rule and call it from all three flag sites; `dispatch` already imports `cmd/entire/cli/auth` (`mode_cloud.go:11`), so there's no new dependency. **Cost:** move ~10 lines into `auth`, update 3 call sites, keep `dispatch.NormalizeJurisdiction` as a thin re-export for the wizard validator.
+
+**8. `dispatch.go:157` + `dispatch.go:184` + `options.go:17` — `ResolveOptions` at 9 positional args, mirrored across three signatures. Yes, worth fixing here.**
+This one flag required edits in four places (`parseDispatchFlags`, `resolveDispatchOptions`, `ResolveOptions`, `dispatch_wizard.go:143`), and the two middle functions are pure passthrough glue with `//nolint:wrapcheck`. The wizard's positional call already illustrates the failure mode: it passes a bare `false` in the `flagInsecureHTTPAuth` slot, invisible at the call site. **Deeper fix:** a `dispatch.Flags` struct that cobra binds directly (`cmd.Flags().StringVarP(&amp;flags.Jurisdiction, "jurisdiction", "j", ...)`), then `ResolveOptions(flags, currentBranch)`; both passthrough wrappers collapse and the next flag is a one-line change. **Cost:** ~60 lines mechanical, plus call-site updates in `options_test.go`, `dispatch_test.go`, `dispatch_wizard.go` — fully contained in the two packages this diff already touches.
+
+**Minor:** `dispatch_tui.go:150 dispatchStatusDetails` renders mode/scope for the same `Options` the wizard summary now renders `Jurisdiction` into (`dispatch_wizard.go:189`), but wasn't updated — two renderers of one struct drifting. Fold into whichever of the two is canonical.</result>
+<usage><subagent_tokens>86178</subagent_tokens><tool_uses>29</tool_uses><duration_ms>176184</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a97ad41c7c0b7bfda</task-id>
+<tool-use-id>toolu_01CNu9o7rDLFe666oTgeGibp</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha--marvin-worktrees-cli-cli-dispatch-jurisdiction/6661b9d7-392b-4aaa-bdf4-835d53b96e32/tasks/a97ad41c7c0b7bfda.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review of dispatch diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Findings (reuse only), highest value first:
+
+**1. `errorMessageFromBody` re-implements `api.ErrorResponse.Message()`**
+- `/Users/alisha/.marvin/worktrees/cli/cli-dispatch-jurisdiction/cmd/entire/cli/dispatch/cloud.go:270-291`
+- New hand-rolled error-body parser for `{"error"|"detail"|"message"}`.
+- Existing: `api.ErrorResponse` + `Message()` at `/Users/alisha/.marvin/worktrees/cli/cli-dispatch-jurisdiction/cmd/entire/cli/api/client.go:279-300` — and `cloud.go` already imports that package (line 16).
+- Cost: `api.ErrorResponse.Message()` handles the documented *newer* envelope `{"error":{"code":..,"message":..}}`; the new parser types `Error` as `string`, so that body makes `json.Unmarshal` return an `UnmarshalTypeError`, the function bails with `""`, and the repo-not-found detection at cloud.go:227-233 silently degrades to a generic 404 — exactly the case this feature exists for. Reuse would be `api.ErrorResponse` with a `detail` fallback added in one place instead of two divergent parsers.
+
+**2. `httpStatusError` re-implements `api.HTTPError`**
+- `cmd/entire/cli/dispatch/cloud.go:205-222` (constructed at `:333`)
+- New private type carrying status + message.
+- Existing: `api.HTTPError` + `api.IsHTTPErrorStatus` (`cmd/entire/cli/api/client.go:302-320`), which is the package-wide convention: `recap_errors.go:23`, `checkpoint_api_reader.go:305-348`, `trail_cmd.go:1694`, `auth.go:79`.
+- Cost: a third status-error taxonomy in the same binary; dispatch failures are invisible to `api.IsHTTPErrorStatus`, so any future caller (exit-code mapping, telemetry, recap-style friendly messages) must special-case dispatch. Embedding `api.HTTPError` in `httpStatusError` keeps the existing `"dispatch service returned status %d: %q"` wording (asserted by `TestCloudClient_CreateDispatch_EscapesErrorBody`) while making `errors.As(err, &amp;*api.HTTPError)` work.
+
+**3. Third independent jurisdiction-slug rule**
+- `cmd/entire/cli/dispatch/options.go:15` (`jurisdictionSlugPattern`) and `:85` (`NormalizeJurisdiction`)
+- Existing: `jurisdictionLabelPattern` + `resolveJurisdiction` (lower/trim/validate) at `cmd/entire/cli/auth/cell_data_api.go:45` and `:381`; plus the lower/trim-only copy in `cmd/entire/cli/api_cmd.go:144`.
+- Cost: the rules genuinely disagree — auth's `^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$` rejects a trailing hyphen and allows 40 chars; the new `^[a-z0-9][a-z0-9-]{0,31}$` accepts `us-` and caps at 32. So `entire dispatch -j us-` passes while `entire auth token -j us-` fails with different wording, and a future rule change needs three edits. Export one normalizer from `auth` (the package both `cli` and `dispatch` can import) and have all three call it.
+
+**4. Repo-index exact-match lookup re-implemented (including the identity guard)**
+- `cmd/entire/cli/dispatch_jurisdiction.go:76-84`
+- `ListRepos(Filter: fullName)` + `strings.EqualFold(entry.FullName, ...)` guard.
+- Existing: the same call and the same guard, with the reasoning comment, in `cmd/entire/cli/cell_target.go:191-208` (`resolveProcessingPlacement`); also `repo_mirror.go:1101` and `search_v4.go:283`.
+- Cost: a fourth copy of the "Filter is exact-match only per the OpenAPI doc, verify anyway" contract, on the same `cellCoreClient` seam. Extract `lookupRepoIndexEntry(ctx, cellCoreClient, fullName) (coreapi.RepoIndexEntry, error)` out of `resolveProcessingPlacement` and call it here, so a control-plane behaviour change is one edit.
+
+**5. `placementJurisdictions` re-implements the "usable placement" predicate, and picks a third definition**
+- `cmd/entire/cli/dispatch_jurisdiction.go:95-100`
+- Skips only `Failed`/`Suspended`.
+- Existing: the identical `Failed || Suspended` check in `cell_target.go:244`, and the stricter `Status != Ready` rule in `cell_fanout.go:routedRepoPlacement` (`cmd/entire/cli/cell_fanout.go:185-207`), which sits next to the already-shared `placementByID` helper (`cell_fanout.go:215`).
+- Cost: three definitions of "a placement a cell can answer for". Concretely, a `Processing` placement is offered by the new hint (the diff's own test asserts `p2 Processing` → `us` is suggested), while the fan-out treats it as unroutable — so the hint can tell a user to retry with `--jurisdiction us` against a cell that 404s again. Add one predicate (e.g. `placementUsable(p)`) beside `placementByID` and have `cell_target.go` and this file both use it, so the choice is made once and documented once.
+
+**6. Enrichment drops the typed error where `hintError` exists for this**
+- `cmd/entire/cli/dispatch_jurisdiction.go:39-52` — builds a message then `return errors.New(b.String())`.
+- Existing: `hintError` in the same package, `cmd/entire/cli/search_v4.go:45-52`, whose doc is literally "swaps in a friendlier user-facing message while keeping the underlying typed errors matchable with errors.Is/As".
+- Cost: after enrichment `errors.As(err, &amp;*dispatchpkg.RepoNotFoundError)` fails, so the type the diff just introduced is only matchable on the *no-hint* path (which is all its test covers); `&amp;hintError{msg: b.String(), errs: []error{err}}` is a one-line swap that preserves the chain.
+
+Skipped as trivial: the manual map-dedupe in `placementJurisdictions` vs `uniqueStrings` (`experts_cmd.go:597`); the new `query url.Values` parameter on `doJSON` where the package idiom is `path + "?" + q.Encode()` (`activity_cmd.go:140`, `experts_cmd.go:431`) — a simplification, not duplication.</result>
+<usage><subagent_tokens>114087</subagent_tokens><tool_uses>36</tool_uses><duration_ms>224700</duration_ms></usage>
+</task-notification>
+
+---
+
+commit and do code review
+
+---
+
+<task-notification>
+<task-id>a5395f8c723ccdeff</task-id>
+<output-file>/private/tmp/claude-501/-Users-alisha--marvin-worktrees-cli-cli-dispatch-jurisdiction/6661b9d7-392b-4aaa-bdf4-835d53b96e32/tasks/a5395f8c723ccdeff.output</output-file>
+<status>completed</status>
+<summary>Agent "/code-review main high" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Altitude angle in (interesting cross-repo detail: the gateway commit changes wording to "Repository not found in jurisdiction us: …", which would double-label). Waiting on A and Simplification.</result>
+<usage><subagent_tokens>144233</subagent_tokens><tool_uses>19</tool_uses><duration_ms>484841</duration_ms></usage>
+</task-notification>
+
+---
+
+check again
+
+---
+
+<task-notification>
+<task-id>a5395f8c723ccdeff</task-id>
+<tool-use-id>toolu_014PYXANnhhcwYPup75WAryW</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha--marvin-worktrees-cli-cli-dispatch-jurisdiction/6661b9d7-392b-4aaa-bdf4-835d53b96e32/tasks/a5395f8c723ccdeff.output</output-file>
+<status>completed</status>
+<summary>Agent "/code-review main high" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Verification complete. The gateway branch (`entire.io` `origin/juri-scoped-dispatches`, `api/src/lib/dispatch-generate.ts:102`) confirms the wording `Repository not found in jurisdiction ${jurisdiction}: …`, so the double-labelling finding is real. Angles A and Simplification never reported back, but their territory (line-by-line, redundant state) was covered by my direct reads plus the Reuse/Altitude passes, so I'm consolidating now.
+
+```json
+[
+  {
+    "file": "cmd/entire/cli/dispatch_wizard.go",
+    "line": 301,
+    "summary": "The Jurisdiction wizard group is hidden with `WithHideFunc(state.isLocal)` — a method value on a value-receiver method of the non-pointer `state` (line 260), so Go copies the receiver at creation time and the hide func is frozen to the initial modeChoice=local; the group is always hidden.",
+    "failure_scenario": "User runs bare `entire dispatch`, picks Cloud in the wizard, and never sees the Jurisdiction step — the wizard can never emit --jurisdiction, so a repo mirrored only outside the home jurisdiction still 404s with no interactive remedy. Every other group in the form uses a closure (`func() bool { return !state.showRepoPicker() }`) for exactly this reason; TestDispatchWizardState_JurisdictionIsCloudOnly only exercises resolve(), not the hide func. Fix: `WithHideFunc(func() bool { return state.isLocal() })`."
+  },
+  {
+    "file": "cmd/entire/cli/cell_target_test.go",
+    "line": 123,
+    "summary": "Data race: `fakeCellCore.ListRepos` writes `f.lastListReposParams` unsynchronised, and the new `lookupRepoJurisdictions` calls `client.ListRepos` from N concurrent `wg.Go` goroutines — reproduced: `go test -race -run TestDescribeDispatchRepoNotFound ./cmd/entire/cli/` FAILs with 'race detected during execution of test'.",
+    "failure_scenario": "`mise run test:ci` / `mise run check` run `go test -tags=integration -race ./...`, so CI fails on the cmd/entire/cli package via TestDescribeDispatchRepoNotFound_NoReadyPlacementSaysSo (two repos → two goroutines write the same field). Guard the fake's field with a mutex (the real *coreapi.Client is concurrency-safe, so this is a test-harness break, not a production race)."
+  },
+  {
+    "file": "cmd/entire/cli/dispatch/cloud.go",
+    "line": 215,
+    "summary": "`parseNotFoundRepos` treats everything after the first ':' in the server's 404 prose as repo slugs — no slug-shape validation, no cap, no intersection with the request's repos — and each token becomes a concurrent control-plane ListRepos call with its own 5s timeout.",
+    "failure_scenario": "CloudRepoLimit (5) applies only to flagRepos; CheckResponse buffers up to 16 MiB, so a gateway/proxy 404 whose message lists many comma-separated tokens (or contains prose after a colon, e.g. 'Repository not found: check the repo is onboarded') spawns one goroutine + one authenticated ListRepos per token, with no semaphore. `reqBody.Repos` (≤5 validated slugs) is already in hand — intersect with it, or at minimum run tokens through `githubRepoSlugPattern`/`validateRepoSlugs` and truncate to CloudRepoLimit."
+  },
+  {
+    "file": "cmd/entire/cli/dispatch/cloud.go",
+    "line": 212,
+    "summary": "Repo-not-found is classified by an English prefix (`strings.HasPrefix(lower(msg), \"repository not found\")`) on the gateway's `{\"error\":\"&lt;sentence&gt;\"}` — an unenforced cross-repo contract — and both sides now label the jurisdiction, producing a doubled sentence.",
+    "failure_scenario": "The gateway branch (entire.io e68fdaba05, api/src/lib/dispatch-generate.ts:102) emits `Repository not found in jurisdiction us: a/b` when a selector is sent; RepoNotFoundError.Error() then renders 'In US: Repository not found in jurisdiction us: a/b. Pick a jurisdiction…'. Any future copy edit on the gateway ('Repositories not found', 'No such repository') silently degrades to the generic statusError — no typed error, no placement hint — with all tests green in both repos. Deeper fix: a structured 404 `{\"error\":{\"code\":\"repo_not_found\",\"repos\":[…],\"jurisdiction\":…}}` and a `Code` field on api.HTTPError; parseNotFoundRepos and the prefix constant disappear."
+  },
+  {
+    "file": "cmd/entire/cli/dispatch.go",
+    "line": 101,
+    "summary": "`describeDispatchRepoNotFound` runs after `runDispatchCommand` returns — in the TUI path that is after `clearDispatchInlineView` has already erased the loading card — and then performs `coreapi.New()` (contexts.json read, possible token refresh) plus up to `cellResolveTimeout` (5s) of concurrent control-plane lookups with no spinner or message.",
+    "failure_scenario": "On a slow or hung control plane a user who hit a cross-jurisdiction 404 sees the spinner vanish and then a blank terminal for up to 5s before the error prints; Ctrl-C in that window hits main.go's context.Canceled handling and the 404 is never shown. Run the placement lookup inside the TUI's runDispatch closure (still under the card), or give the hint-only path a tighter budget than the routing lookups cellResolveTimeout was sized for."
+  },
+  {
+    "file": "cmd/entire/cli/dispatch_jurisdiction.go",
+    "line": 26,
+    "summary": "The 404 comes from the dispatch gateway (CloudClient base URL, overridable via ENTIRE_API_BASE_URL) while the placement hint comes from `newCellCoreClient()` → `coreapi.New()` (active context / ENTIRE_TOKEN aud); nothing requires the two to be the same environment.",
+    "failure_scenario": "`ENTIRE_API_BASE_URL=&lt;staging gateway&gt; entire dispatch --repos x/y` with a prod active context prints 'repository not found: x/y' followed by 'x/y is placed in: us' — a prod placement list — and following the hint (`--jurisdiction us`) 404s again on staging. Dev-only, but the hint asserts a fact about the wrong system; gate it on the two origins agreeing or note the assumption."
+  },
+  {
+    "file": "cmd/entire/cli/dispatch/cloud.go",
+    "line": 173,
+    "summary": "`RepoNotFoundError` has no `Unwrap`, so the underlying `*api.HTTPError` (StatusCode 404) is dropped for exactly the 404 the PR cares about, while the sibling `statusError` was introduced specifically to keep HTTPError matchable.",
+    "failure_scenario": "`api.IsHTTPErrorStatus(err, http.StatusNotFound)` is true for an empty-window 404 (TestCloudClient_CreateDispatch_Other404StaysGeneric asserts it) but false for a repo-not-found 404; any generic HTTP-status classification (telemetry, retry policy) sees the two 404s differently. Add `Cause *api.HTTPError` and `Unwrap() error`."
+  },
+  {
+    "file": "cmd/entire/cli/dispatch_jurisdiction.go",
+    "line": 91,
+    "summary": "`readyPlacementJurisdictions` inlines `strings.ToLower(strings.TrimSpace(p.Jurisdiction))` — the exact rule this PR centralised as `auth.NormalizeJurisdiction` — and skips its label check, so the hint can offer a slug the `--jurisdiction` flag will then reject.",
+    "failure_scenario": "The hint text is meant to be pasted into `--jurisdiction &lt;slug&gt;`, which is validated by dispatchpkg.NormalizeJurisdiction → auth.NormalizeJurisdiction. A catalog placement whose Jurisdiction is not a valid DNS label (dot, underscore, &gt;40 chars) is offered by the hint and rejected by the flag it points at. Use `auth.NormalizeJurisdiction(p.Jurisdiction)` and drop entries that error."
+  },
+  {
+    "file": "cmd/entire/cli/dispatch/options.go",
+    "line": 82,
+    "summary": "`dispatchpkg.NormalizeJurisdiction` is a second exported normaliser whose only job is to re-word auth's error (discarding it without %w), so the three `-j` flags (`dispatch`, `api`, `auth token`) now validate at three different points with two wordings, and `api_cmd.go:144` still hand-rolls trim/lower with no label check.",
+    "failure_scenario": "Same bad input yields 'jurisdiction \"x y\" is not a valid label; refusing to route' from `auth token`/`api` at dial time and 'invalid --jurisdiction \"x y\": expected a jurisdiction slug such as us or eu' from `dispatch` at parse time; errors.Is/As on the auth error is lost in dispatch. Call auth.NormalizeJurisdiction directly in ResolveOptions and the wizard Validate, wrapping with `fmt.Errorf(\"--jurisdiction: %w\", err)`; migrate api_cmd.go to the same helper rather than adding a third entry point."
+  },
+  {
+    "file": "cmd/entire/cli/dispatch/cloud.go",
+    "line": 267,
+    "summary": "Switching `doJSON` to `api.CheckResponse` regresses the old partial-body tolerance and raises the error-body cap: the deleted `io.ReadAll(io.LimitReader(resp.Body, 1&lt;&lt;20))` quoted whatever bytes arrived, while CheckResponse (client.go:338) returns a bare `*HTTPError{StatusCode}` on any read error and buffers up to 16 MiB (`maxResponseBytes`).",
+    "failure_scenario": "A 5xx whose body is cut mid-stream (proxy reset, read timeout) used to surface `dispatch service returned status 502: \"&lt;partial text&gt;\"`; it now surfaces only `dispatch service returned status 502`, losing the gateway's explanation, and a misbehaving endpoint can make the CLI allocate 16x more on the failure path. Low severity; note it also feeds the unbounded parse in the parseNotFoundRepos finding."
+  }
+]
+```
+
+Summary for the coordinator: 10 findings survive (2 CONFIRMED by reproduction/inspection — the wizard's frozen `WithHideFunc(state.isLocal)` and the `go test -race` failure in `fakeCellCore.ListRepos`; the rest PLAUSIBLE). Correctness items lead: the hidden wizard step, the CI-breaking race, unbounded/unvalidated parsing of the 404 prose into control-plane calls, the fragile prefix-match contract that now double-labels the jurisdiction against the gateway branch's new wording, the post-TUI 5s blank stall, environment mismatch between gateway and hint client, and `RepoNotFoundError` dropping the HTTPError chain. Cleanup items follow: inline lowercasing bypassing the new `NormalizeJurisdiction` label check, the duplicate `dispatchpkg.NormalizeJurisdiction` wrapper fragmenting `-j` validation across three commands, and the CheckResponse partial-body/16 MiB regression. Conventions pass found no quotable CLAUDE.md violations; all `CreateDispatch`/`ResolveOptions` callers were updated and `lint` is clean. ReportFindings was not invoked per this review's output contract (JSON block above).</result>
+<usage><subagent_tokens>151182</subagent_tokens><tool_uses>1</tool_uses><duration_ms>84214</duration_ms></usage>
+</task-notification>
+
+---
+
+how does the tui work? does it allow you to select multiple repos?
+
+---
+
+how hard to add jurisdiction selection?
+
+---
+
+okay update it
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>abae084859b63cc83</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha--marvin-worktrees-cli-cli-dispatch-jurisdiction/6661b9d7-392b-4aaa-bdf4-835d53b96e32/tasks/abae084859b63cc83.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review of wizard picker" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Findings — REUSE only, scoped to commit 544a6987d.
+
+**1. `showRepoPicker()` is now production-dead; the two new hide funcs inline it**
+- `/Users/alisha/.marvin/worktrees/cli/cli-dispatch-jurisdiction/cmd/entire/cli/dispatch_wizard.go:132` (definition), used from `:320` and `:340-343` as open-coded `state.isLocal()`.
+- After this diff the only remaining callers of `showRepoPicker` are `dispatch_wizard_test.go:121,126`. Existing helper to call: `state.showRepoPicker()` in both new hide funcs (`return !state.showRepoPicker() || !ensureScope().hasPicker()` and `if !state.showRepoPicker() { return true }`), or delete the method and its two tests.
+- Cost: a live predicate with a doc-worthy meaning now exists in three shapes; sibling `showLocalBranchMode` (`:136`) still routes through the method, so the file is internally inconsistent, and the tests now assert a method nothing ships.
+
+**2. `eligibleJurisdictions` hand-rolls set→slice→sort (3rd copy of the idiom)**
+- `/Users/alisha/.marvin/worktrees/cli/cli-dispatch-jurisdiction/cmd/entire/cli/dispatch_wizard_scope.go:55-70`.
+- Existing options: `slices.Sorted(maps.Keys(seen))` — already the repo idiom at `redact/fingerprint.go:65,68`, and go.mod is `go 1.26.6`. `uniqueStrings` (`cmd/entire/cli/experts_cmd.go:597`) is a poor fit here (no sort, and you need the set semantics across a nested loop), so the map + `slices.Sorted` is the right call, not `uniqueStrings`.
+- Cost: 8 lines instead of 1; and it duplicates the identical closing block in `readyPlacementJurisdictions` (`dispatch_jurisdiction.go:105-110`) which this same commit already depends on — two adjacent copies of the same 6-line tail in the jurisdiction code path.
+
+**3. `defaultListDispatchWizardPlacements` is a third open-coded control-plane index read**
+- `dispatch_wizard_scope.go:149-176`; siblings: `search_cmd.go:524-545` (client + 10s timeout + `Truncated` warn) and `search_v4.go:223-237` (`listFullIndex`, same shape with a cache).
+- There is no package-level helper to call today — `listFullIndex` is a private method on `semanticSearchV4Session`, so this is pattern duplication rather than a missed call. Concrete cost is low (~10 lines and one more place the 10s budget is spelled out); the natural fix is to lift `listFullIndex` into a shared `listFullRepoIndex(ctx, cellCoreClient)` used by all three, which is a bigger refactor than this commit's scope. Flagging as optional/low priority.
+- Worth noting explicitly, since it was asked: `groupReposByCell` / `resolveCellBaseURLs` / `resolveRepoFilters` are **not** reusable here. `groupReposByCell` routes each repo to exactly ONE placement via `routedRepoPlacement` (`cell_fanout.go:185`) and keys by cell, not jurisdiction; the wizard needs *all* READY jurisdictions per repo. `resolveCellBaseURLs` resolves apiUrls the wizard never dials. The one genuinely shared piece — `readyPlacementJurisdictions` (`dispatch_jurisdiction.go:95`) — is correctly reused.
+
+**4. Two "repo → ready jurisdictions" maps now coexist with divergent keying**
+- `dispatch_wizard_scope.go:149` (`map[lowercased slug][]string`, one full-index fetch) vs `dispatch_jurisdiction.go:65` `lookupRepoJurisdictions` (`map[raw repo string][]string`, N filtered fetches).
+- The fetch strategies differ deliberately (hint = few repos, immune to truncation; wizard = whole catalogue), so I would not merge them. But the key normalization differs: the wizard lowercases, the hint does not, so the two maps are not interchangeable and `scope.repoJurisdictions` (`:45`) has to re-lowercase on every read. Cheap fix: have the hint path key by `strings.ToLower(strings.TrimSpace(repo))` too, so one keying rule covers both. Cost if left: any future consolidation silently mismatches on mixed-case slugs like the test's `Acme/Widget`.
+
+**5. `auth.HomeJurisdiction` is a third implementation of "the caller's home jurisdiction", and the least authoritative one**
+- `cmd/entire/cli/auth/cell_data_api.go:582-593` (new). Existing paths: `resolveJurisdiction(override, loginJWT)` (`:381`) is the same `HomeJurisdictionFromLoginJWT` → `NormalizeJurisdiction` pair the new body re-types (it only differs in tolerating `""` instead of erroring), and `defaultFetchProfile` (`cmd/entire/cli/auth.go:390`) resolves it from `/me`'s `global.homeJurisdiction` with the JWT claim as *fallback* (`auth.go:444-446`).
+- That ordering is load-bearing per the comment at `auth.go:387-389`; the new function reads the claim only. The mirror-create wizard already has the "resolve caller's jurisdiction to pre-select a picker default" precedent and uses the profile path (`repo_mirror_create_wizard.go:407,415-420` / `:211-214`).
+- Existing helper to call instead: reuse the profile path for the wizard's default (or, if you want the claim-only cheap read, express it as `resolveJurisdiction("", subject.loginJWT)` with an empty-tolerant wrapper rather than re-typing its two steps).
+- Cost: a new exported symbol on `auth` plus a second answer to one question — the dispatch wizard can pre-select a different jurisdiction than `entire auth status` and the mirror wizard report for the same login. Also `resolveCellSubject` (`:222`) goes through `resolveActiveContextCellSubject`, which refreshes the login JWT, so the wizard's third concurrent source can do a token refresh the other two goroutines' clients already did.
+
+Not an issue: `withFakeCellCore` / `fakeCellCore` (`cell_target_test.go:140`) reused rather than re-stubbed; `newCellCoreClient` seam reused instead of `coreapi.New()`; `sync.OnceValue` replacing the bespoke `newLazyOptions` is a straight win; `readyPlacementJurisdictions` reused.</result>
+<usage><subagent_tokens>82152</subagent_tokens><tool_uses>31</tool_uses><duration_ms>161832</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a4992729b5f71c44b</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha--marvin-worktrees-cli-cli-dispatch-jurisdiction/6661b9d7-392b-4aaa-bdf4-835d53b96e32/tasks/a4992729b5f71c44b.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review of wizard picker" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Simplification findings for 544a6987d (no bugs listed, per scope):
+
+**1. Derived state recomputed from raw placements — precompute one index**
+`cmd/entire/cli/dispatch_wizard_scope.go:44-114` — `repoJurisdictions`/`eligibleJurisdictions`/`reposIn`/`hasPicker`/`defaultJurisdiction` are five mutually-recursive scans over `repos` × `placements`. Simpler form: build `byJurisdiction map[string][]string` (jurisdiction → repos, catalogue order) + sorted `jurisdictions []string` once, in `loadDispatchWizardScope` (or a `newDispatchWizardScope(repos, placements, home)` constructor the tests also use). Then `eligibleJurisdictions` = a field, `reposIn` = one map lookup (+ the `""`→all case), `hasPicker` = `len(jurisdictions) &gt; 1`, `defaultJurisdiction` = home-or-`max(len(byJurisdiction[j]))`, and `repoJurisdictions` disappears entirely. Cost today: `defaultJurisdiction:109` calls `reposIn` twice per candidate (each a full catalogue scan, and `reposIn(best)` is re-scanned every iteration) *after* `eligibleJurisdictions` already scanned everything; a single hide-func evaluation (`dispatch_wizard.go:320`) does `hasPicker` → full scan+sort, then `ensureScope` → `defaultJurisdiction` → the same scan again plus 2k more, and hide funcs are re-evaluated on each group navigation. ~70 lines of query code collapse to ~25, and the "unplaced repos belong to home" rule is applied in one place instead of on every read.
+
+**2. `state.scope` is redundant state; huh already narrows the selection**
+`cmd/entire/cli/dispatch_wizard.go:68` (field) + `107-127` (`resolveCloudRepos` filter). When the bound jurisdiction changes, huh reloads the repo options and `updateOptionsMsg` → `selectOptions()` → `updateValue()` (huh v2.0.3 `field_multiselect.go:362-371`, `540-548`) rewrites `state.selectedRepos` to only values present in the new option list — i.e. the cross-jurisdiction repo is already dropped before `resolve()`. If you keep the filter as defence, don't add a struct field written as a side effect of a hide func: pass the scope at the one call site (`state.resolve(loadScope())`, `dispatch_wizard.go:428`), and with finding 1's precomputed set the body is `slices.DeleteFunc(selected, func(s string) bool { return !offered[s] })` instead of building a set inline. Cost: a mutable field only one method reads, plus a second filtering rule that `previewScope` (`dispatch_wizard.go:~205`, uses unfiltered `selectedReposList`) does not share, so summary and options can disagree.
+
+**3. Dead: `showRepoPicker`**
+`cmd/entire/cli/dispatch_wizard.go:132-134` — both production callers were replaced by this diff (`:317-321`, `:339-345`); the only remaining caller is `dispatch_wizard_test.go:117-129`, a test of `!isLocal()` via an alias. Delete the method and that test.
+
+**4. `ensureScope`'s double role has two call sites; one is duplicate**
+`cmd/entire/cli/dispatch_wizard.go:339-345` — the Repos hide func's 4-line `if isLocal { return true }; ensureScope(); return false` exists only to re-run initialization. huh evaluates the Jurisdiction group's hide func (`:317-321`, which calls `ensureScope`) before the Repos group's in both `nextGroupMsg` and `prevGroupMsg` scans (`form.go:589-618`), so this reduces to `return state.isLocal()`. Simpler form: rename `ensureScope` → `applyScopeToState` and call it from exactly one hide func — that removes the need for the apologetic comment at `:318-319` and shrinks the block from 7 lines to 1.
+
+**5. Comment restating the same rule four times**
+"a dispatch covers exactly one jurisdiction, so only repos placed there are offered" appears at `dispatch_wizard.go:107-109`, `dispatch_wizard.go:316` (user-facing Description — keep), `dispatch_wizard_scope.go:27-30`, and `dispatch_wizard_scope.go:72-73`. Plus `dispatch_wizard.go:273-277` (5-line goroutine-discipline note) is partly re-stated at `:318-319`. Keep the invariant on the type doc, cite it elsewhere. Cost: four copies to update when the rule changes (and one is already narrower than the others).
+
+**6. Repeated defensive normalization of an already-normalized value**
+`dispatch_wizard.go:113`, `:286`, `dispatch_wizard_scope.go:46`, `:75` all `TrimSpace`/`ToLower` a jurisdiction or slug. Jurisdictions only ever arrive from the Select's own options, which come from `readyPlacementJurisdictions` (`dispatch_jurisdiction.go:95-110`) where `auth.NormalizeJurisdiction` already ran; slugs are lowercased once at `dispatch_wizard_scope.go:167`. Simpler: normalize at the two boundaries, compare raw everywhere else — with finding 1 the per-read `strings.ToLower` in the hot path vanishes too.
+
+**7. Naming: `loadRepos` no longer loads**
+`dispatch_wizard.go:292-294` — a one-line closure used once at `:327` that only maps slugs to options (`loadScope` does the loading). Inline it into the `OptionsFunc` call or call it `repoOptions`.
+
+**8. Tests overlap and bundle unrelated cases**
+`dispatch_wizard_scope_test.go:12-71` — test 1 and test 2 both assert `eligibleJurisdictions`/`hasPicker`/`defaultJurisdiction`, and `reposIn("")`-offers-everything is asserted twice (`:37` and `:62`). Test 2 packs three unrelated scopes (busiest-wins, no-data, single-jurisdiction) into one function with hand-rolled `Fatalf` per case, including `:59-60`/`:68-69` where the assert and the message re-invoke the same two methods. Simpler: one table test over `{repos, placements, home}` → `{wantEligible, wantPicker, wantDefault, wantReposIn}` covering all four scopes, which also drops the duplicated `strings.Join` boilerplate.
+
+**9. Test seam helper has an argument no caller uses**
+`dispatch_wizard_scope_test.go:129` — `stubDispatchWizardScopeSources(t, repos, placements, placementsErr, home)`; `placements` is `nil` at both call sites (`:116`, `dispatch_wizard_test.go:368`), so `(t, []string{"entireio/cli"}, nil, nil, "")` is unreadable at the call site. Simpler: drop the unused parameter (or take a small options struct) until a caller needs placements.
+
+**10. Low priority: `auth.HomeJurisdiction` doc re-derives documented precedence**
+`cmd/entire/cli/auth/cell_data_api.go:578-591` — the body is fine (and deliberately differs from `resolveJurisdiction:381-397` by returning `""` rather than erroring on a missing claim), but the 4-line comment restates the ENTIRE_TOKEN-vs-stored-context precedence already documented at `:160-170`. One line ("home_jurisdiction of the login the CLI would route with; \"\" when absent — see JurisdictionToken for subject precedence") avoids two copies drifting.</result>
+<usage><subagent_tokens>76028</subagent_tokens><tool_uses>19</tool_uses><duration_ms>206855</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a0c15161bce116dc2</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha--marvin-worktrees-cli-cli-dispatch-jurisdiction/6661b9d7-392b-4aaa-bdf4-835d53b96e32/tasks/a0c15161bce116dc2.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review of wizard picker" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Reviewed the diff plus the huh v2 internals (hide-func/OptionsFunc call frequency) and the three auth paths. Findings, ordered by cost:
+
+## 1. `go loadScope()` runs for every wizard, including the default local mode
+`cmd/entire/cli/dispatch_wizard.go:281` (with default `modeChoice: dispatchWizardModeLocal` at `:76`)
+
+The background load is kicked off at form construction, before Mode is answered. A local dispatch — the default answer — pays the whole cloud catalogue: data-plane `/.well-known` discovery + token exchange + `ListRepositories` (`api_client.go:22`), control-plane `ListRepos` (`dispatch_wizard_scope.go:153`), and a third credential resolution for home (`:178`). Three round trips and up to two token refreshes discarded, plus possible keychain unlock prompts, for users who never leave local mode.
+Cheaper: start the load when `modeChoice` first becomes `server` (a `Select.Validate`/`Func` on the Mode field, or lazily inside the jurisdiction `OptionsFunc`, which huh already runs off the UI goroutine).
+
+## 2. `ensureScope()` blocks the Bubble Tea update goroutine from a hide func
+`cmd/entire/cli/dispatch_wizard.go:317-321` and `:339-344`
+
+`loadScope()` blocks until all three fetches finish. huh calls group hide funcs on the form goroutine: `form.UpdateFieldPositions` on every `tea.KeyPressMsg` (huh `form.go:377`, `:386`, `:625-628`) and in `nextGroupMsg`/`prevGroupMsg` (`:592`, `:611`). So pressing enter on "Server" freezes the whole TUI — no spinner, no key handling — until the slowest source returns. Only placements are bounded (10s, `dispatch_wizard_scope.go:19`); the repo listing and `HomeJurisdiction` carry no budget of their own, so the freeze can exceed 10s. The code comment claims the background start means it "rarely waits", but the very first transition is exactly when it hasn't landed.
+Cheaper: publish the result via an `atomic.Pointer[dispatchWizardScope]` that the background goroutine sets; hide funcs read the snapshot non-blockingly (group hidden until ready), and let the jurisdiction `Select`'s `OptionsFunc` do the waiting — huh runs it as a `tea.Cmd` and shows a spinner after 25ms (`eval.go`, `spinnerShowThreshold`).
+
+## 3. `hasPicker()` recomputes the full catalogue scan on every render
+`cmd/entire/cli/dispatch_wizard_scope.go:92` → `:55`
+
+`hasPicker` calls `eligibleJurisdictions`, which walks every repo × its jurisdictions, allocates a `map` + a slice, and `sort.Strings` — all to answer `len(...) &gt; 1`. It is reached from the hide func at `dispatch_wizard.go:320`, i.e. several times per keypress (twice per group in `UpdateFieldPositions`). For a few hundred repos that's thousands of map lookups + allocations per keystroke on the render path.
+Cheaper: compute `eligible` once at the end of `loadDispatchWizardScope` (already off the UI goroutine) and store it as a field; `hasPicker` becomes `len(s.eligible) &gt; 1`.
+
+## 4. `defaultJurisdiction` is O(jurisdictions × repos) with a slice alloc per comparison
+`cmd/entire/cli/dispatch_wizard_scope.go:99-115`
+
+`len(s.reposIn(j)) &gt; len(s.reposIn(best))` re-walks the whole catalogue and allocates a fresh slice (cap `len(s.repos)`) twice per candidate, purely to compare counts — on top of the `eligibleJurisdictions()` scan on line 100.
+Cheaper: one pass building `map[string]int` counts (fold it into the same pass that builds `eligible`), then pick home, else max count with alphabetical tie-break.
+
+## 5. `repoJurisdictions` re-normalizes and allocates on every lookup
+`cmd/entire/cli/dispatch_wizard_scope.go:45-50`
+
+`strings.ToLower(strings.TrimSpace(slug))` allocates per repo per call — `scope.repos` keeps the API's original casing while `placements` keys are lowercased once at build (`:167`), so the normalization is paid at query time forever. The miss path also allocates a fresh `[]string{s.home}` for each placement-less repo, each call. Multiply by finding 3's frequency.
+Cheaper: lowercase `scope.repos` once when the scope is assembled (keep the display form separately if the picker needs it), and hold one reusable `homeOnly []string` field for the miss path.
+
+## 6. Third credential resolution + a redundant login-JWT refresh for one claim
+`cmd/entire/cli/auth/cell_data_api.go:582` (`HomeJurisdiction`), used at `dispatch_wizard_scope.go:178`
+
+`HomeJurisdiction` → `resolveCellSubject` → `resolveActiveContextCellSubject` does `activeContext()` (contexts.json + keyring) **and** `refreshCellLoginJWT` (a re-mint round trip against the core, `cell_data_api.go:305`) — just to base64-decode one claim it doesn't verify. The placements fetch in the same load already resolves the same active context and mints the same login JWT via `auth.ResolveControlPlaneTarget`'s `TokenSource` (`auth/control_plane.go:48`), and the repo listing performs a *second*, separate resolution (data-host discovery + exchange). So: three auth paths, two refreshes, up to two keyring reads per wizard. It does skip data-host discovery, so it's not a third discovery — but it is a third resolution.
+Cheaper: read the claim from the bearer the placements client already minted (call the resolved `TokenSource` and pass it to the existing `auth.HomeJurisdictionFromLoginJWT` — exactly the pattern at `cli/auth.go:445`), which makes home a free by-product of a fetch already in flight and removes one goroutine, one refresh, and one seam. Alternative: the control plane's `/me` already carries it (`coreapi.MeGlobal.GetHomeJurisdiction`).
+
+## 7. Minor: `resolveCloudRepos` builds a set over the whole jurisdiction to filter ≤ 10 selections
+`cmd/entire/cli/dispatch_wizard.go:119-122`
+
+`reposIn` allocates the full jurisdiction slice, then the loop copies it into a map, to filter at most `dispatchpkg.CloudRepoLimit` selected slugs.
+Cheaper: iterate the (short) selection and test membership with `slices.Contains(s.scope.repoJurisdictions(slug), s.jurisdiction)` — no catalogue scan, no allocation.
+
+## On the two things that are *not* problems
+- **`sync.OnceValue` + `go loadScope()` is not racy** for the scope value: `OnceValue` serializes callers and `loadDispatchWizardScope`'s `wg.Wait()` establishes happens-before for all three fields, so the eager goroutine and the form goroutine see a fully built value. It's wasteful (finding 1), not unsafe. *(Non-efficiency aside, since you asked about the race: `ensureScope` writes `state.jurisdiction`/`state.scope` on the form goroutine at `dispatch_wizard.go:284-288` while `loadRepos` reads `state.jurisdiction` from huh's `tea.Cmd` goroutine at `:293` — that pair is unsynchronized, contradicting the "OptionsFuncs … only read" comment. Correctness, not efficiency.)*
+- **Closures capturing large scopes: no finding.** The long-lived closures capture only `state` (heap-promoted, all small fields), `ctx`, and `currentRepo`. Notably the new `scope` field on `dispatchWizardState` costs nothing in the `&amp;state` `DescriptionFunc` bindings (`:397`, `:405`) because `hashstructure` skips unexported fields (`hashstructure.go:314`) — so the per-keypress binding hash does not walk the catalogue. Likewise `OptionsFunc(loadRepos, &amp;state.jurisdiction)` (`:327`) is correctly cached by huh's `Eval` per jurisdiction value, so the repo option build is not per-render.</result>
+<usage><subagent_tokens>76138</subagent_tokens><tool_uses>29</tool_uses><duration_ms>242532</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a3fd739d6fdd51e85</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha--marvin-worktrees-cli-cli-dispatch-jurisdiction/6661b9d7-392b-4aaa-bdf4-835d53b96e32/tasks/a3fd739d6fdd51e85.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review of wizard picker" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Read the diff, the huh v2.0.3 source, and the surrounding CLI infrastructure. Six altitude findings.
+
+## Findings
+
+**1. `ensureScope` in `WithHideFunc` — the form is being used as a scheduler, and huh's model doesn't support it**
+`/Users/alisha/.marvin/worktrees/cli/cli-dispatch-jurisdiction/cmd/entire/cli/dispatch_wizard.go:282-291, 317-321, 339-345`
+Hide funcs are not "the form goroutine" in the benign sense the comment assumes. `Form.isGroupHidden` is called from `UpdateFieldPositions`, which runs (a) synchronously inside `huh.NewForm` (`form.go:127`, reached via `uiform.New`) and (b) on **every `tea.KeyPressMsg` inside `Form.Update`** (`form.go:628`), plus at `form.go:519/592/611`. So the blocking `loadScope()` join lands on the bubbletea event loop the first keypress after the user picks Cloud: up to `dispatchWizardScopeTimeout` (10s) plus an unbounded gateway repo-list call with the UI frozen, no spinner, and no Ctrl-C. The background `go loadScope()` only helps if the user dawdles on Mode — the "rarely waits" premise isn't guaranteed by anything. Secondarily, the comment's own safety argument doesn't hold: `state.jurisdiction`/`state.scope` are written here (event loop) and read by `loadRepos` from a `tea.Cmd` goroutine (`field_multiselect.go:338`) with no synchronization.
+*Deeper fix:* let huh own the async. Drop `ensureScope` entirely and put the wait inside the jurisdiction `OptionsFunc` — that already runs on a `tea.Cmd` goroutine under huh's own loading spinner (`field_select.go:364-372`) — returning options in default-first order so `Select` seeds `state.jurisdiction` from option[0] via huh's normal binding instead of a manual write. `hasPicker` then becomes a read of a value cached by that same `sync.OnceValue`, so the hide func stays a pure predicate. The alternative — resolve the scope before `NewAccessibleForm` behind the spinner in `dispatch_tui.go` — is simpler but makes Local-mode users pay for cloud calls.
+*Cost:* ~40 lines in `runDispatchWizard`, one new test driving the form; roughly half a day. Requires accepting that the jurisdiction default is expressed as option ordering rather than an assignment.
+
+**2. Fourth hand-rolled "read the whole repo index" call site**
+`dispatch_wizard_scope.go:141-166` (and the constant at `:15-18`)
+`newCellCoreClient()` + `ListRepos(ctx, ListReposParams{})` + a 10s timeout + an `index.Truncated` warning is already written out at `search_cmd.go:525-543`, in `search_v4.go`'s `listFullIndex`, and in `repo_mirror.go:866/910`. The comment even says the timeout is "the same budget code search gives the same call" — the constant was copied rather than shared.
+*Deeper fix:* one `listRepoIndex(ctx)` helper beside `cell_fanout.go`, which already owns the index→routing vocabulary, owning client construction, the timeout constant, and the truncation warning; the wizard keeps only the entries→jurisdictions mapping.
+*Cost:* ~20 lines moved, but it touches both search paths, so their tests must be re-run. Small.
+
+**3. "repo → ready jurisdictions" is now built two different ways**
+`dispatch_wizard_scope.go:141-166` vs `dispatch_jurisdiction.go:66-88`
+Reusing `readyPlacementJurisdictions` is the right call and I'd keep it. But the map around it is now duplicated: the hint builds it per-repo via `lookupRepoIndexEntry` on a 3s-per-repo budget keyed by the user's typed slug; the wizard builds it from one full index read on 10s keyed by lowercased slug. Two shapes, two budgets, two key conventions for the same question.
+*Deeper fix:* one `repoReadyJurisdictions(ctx, client, repos ...string)` in `dispatch_jurisdiction.go` (empty variadic = full index), returning a lowercase-keyed map; both callers use it.
+*Cost:* ~40 lines consolidated. The real work is reconciling the two timeout policies (garnish-on-an-error vs blocking-a-picker) — they may legitimately differ, in which case pass the budget in.
+
+**4. `auth.HomeJurisdiction` is at the right layer but claims authority it doesn't have**
+`/Users/alisha/.marvin/worktrees/cli/cli-dispatch-jurisdiction/cmd/entire/cli/auth/cell_data_api.go:578-592`
+The layer is defensible: `resolveJurisdiction` (`:381-397`) routes on the `home_jurisdiction` claim, so for "where would we route by default" the claim *is* the operative value, and `resolveCellSubject` is unexported so the wizard can't compose this itself. The altitude problem is the name and doc: `auth.go:441-448` establishes that `/me`'s `global.homeJurisdiction` is *authoritative* for the home jurisdiction with the claim as fallback. There are now two exported-ish answers to "what is my home jurisdiction" that can silently disagree (stale claim after a home migration) with nothing linking them.
+*Deeper fix:* name it for what it is — `RoutingHomeJurisdiction`, or `HomeJurisdictionFromActiveLogin` — and say in the doc that the profile answer is `/me`'s. Or, more thoroughly, have `auth` expose the single `/me`-preferred resolver and let `runAuthStatus` call it, keeping the claim-only path as the explicitly-named routing variant.
+*Cost:* rename is trivial (one call site). Unifying is medium and drags a `/me` round-trip into a path that deliberately avoids one.
+
+**5. `showRepoPicker()` is now production-dead**
+`dispatch_wizard.go:132-134`
+The repo group's hide func was rewritten to `state.isLocal()` inline (to hang the `ensureScope()` side effect off it), leaving `showRepoPicker` referenced only by `dispatch_wizard_test.go:121/126`. The state predicate that used to express "which groups show" was bypassed rather than extended.
+*Deeper fix:* delete it and its two test assertions (it falls out naturally once finding 1 restores pure predicates).
+*Cost:* trivial.
+
+**6. `resolveCloudRepos` is a third enforcement point for "one dispatch, one jurisdiction"**
+`dispatch_wizard.go:107-130`
+The invariant is now enforced in three places: the restricted option list, huh's own narrowing (`updateOptionsMsg` → `selectOptions` → `updateValue` rewrites `state.selectedRepos` to the intersection with the new option set, `field_multiselect.go:362-370`), and this filter. None of them is `dispatch/options.go`, which owns `Options` and whose consumer — the cell — is what actually 404s on a cross-jurisdiction repo. A wizard state accessor silently discarding a user's selection is the wrong home for a domain rule (mitigated: the confirm summary shows the surviving list).
+*Deeper fix:* if the rule is real, validate it in `resolveDispatchOptions` so `--repos` + `--jurisdiction` gets the same treatment as the wizard; the wizard's filter then becomes redundant with huh's narrowing and can go.
+*Cost:* low-medium — needs a decision on whether the flag path should hard-error instead of silently dropping (I'd expect error there, drop here).
+
+## Explicit non-findings
+
+- **Two catalogues is not avoidable.** `api.Repository` (`api/repositories.go:11-14`) carries only `full_name` + `checkpoint_count`; `coreapi.RepoIndexEntry` carries `Placements` but no checkpoint count. No single source answers "offerable and placed where". Only the join's *location* is debatable, and findings 2-3 cover that.
+- **"READY placements only" is right and consistent.** It reuses `readyPlacementJurisdictions`, so the wizard offers exactly the slugs the placement hint offers and the `--jurisdiction` flag accepts. Its divergence from `routedRepoPlacement` (one elected processing primary, ready) is correct, not an inconsistency: that rule exists to dedup mirrors for *search indexing*, whereas the hint's existence proves a cell answers dispatch for any ready placement. Worth a one-line comment in `dispatch_wizard_scope.go` pointing at `routedRepoPlacement` to say the difference is deliberate.
+- **`insecureHTTP: false` hardcoded** in `defaultResolveDispatchWizardHome` matches the wizard's existing stance (`state.resolve()` already passes `false` for `InsecureHTTPAuth`), so it's pre-existing, not introduced here.</result>
+<usage><subagent_tokens>108231</subagent_tokens><tool_uses>41</tool_uses><duration_ms>278303</duration_ms></usage>
+</task-notification>
+
+---
+
+do code review
+
+---
+
+<task-notification>
+<task-id>a8271faaca8e0d4bc</task-id>
+<output-file>/private/tmp/claude-501/-Users-alisha--marvin-worktrees-cli-cli-dispatch-jurisdiction/6661b9d7-392b-4aaa-bdf4-835d53b96e32/tasks/a8271faaca8e0d4bc.output</output-file>
+<status>completed</status>
+<summary>Agent "/code-review main high" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>All findings verified. Final report:
+
+```json
+[
+  {
+    "file": "cmd/entire/cli/dispatch_wizard.go",
+    "line": 276,
+    "summary": "In ACCESSIBLE=1 mode the new Jurisdiction Select has zero options (huh's runAccessible ignores WithHideFunc and never evaluates OptionsFunc) and pressing Enter panics with index out of range.",
+    "failure_scenario": "`ACCESSIBLE=1 entire dispatch` (no flags → wizard) → pick Local or Cloud → the Jurisdiction prompt appears even in local mode with no options; because Value(&amp;state.jurisdiction) is a PointerAccessor the default choice is 1 and Enter/EOF evaluates `s.options.val[0]` on an empty slice → runtime panic (reproduced against huh v2.0.3). The Repos MultiSelect was already an infinite loop in accessible mode on main, but this diff adds an earlier hard crash and drags the group into local mode."
+  },
+  {
+    "file": "cmd/entire/cli/dispatch/cloud.go",
+    "line": 76,
+    "summary": "CreateDispatchResponse does not decode the `jurisdiction` the gateway echoes, so a sent selector is never verified and the CLI labels home-cell output with the requested jurisdiction.",
+    "failure_scenario": "Against a gateway predating the selector (lagging deploy, or ENTIRE_API_BASE_URL pointing at an older/self-hosted BFF — Hono ignores unknown query params, no strict schema), `--jurisdiction eu` is silently dropped, the dispatch is generated from the home cell, and the TUI detail (dispatch_tui.go) and wizard summary print 'Jurisdiction: eu' from Options — a silent wrong-region success the repo's cell-routing rules treat as worse than failure. Fix: add `Jurisdiction string \\`json:\"jurisdiction,omitempty\"\\`` and error/warn when sent != echoed."
+  },
+  {
+    "file": "cmd/entire/cli/dispatch_jurisdiction.go",
+    "line": 98,
+    "summary": "The placement hint lists every READY jurisdiction without excluding the one that just 404'd (or the home slug when no selector was sent), so it can recommend the exact jurisdiction that failed — contradicting its own doc comment.",
+    "failure_scenario": "The diff's own test asserts `In AU: repository not found: entirehq/ferrata. ... entirehq/ferrata is placed in: au, us`. Reachable divergence: control-plane index is 'readable repos' while the cell's /repos listing is membership-scoped, so a public/non-member repo is READY in AU per control plane yet 'not found' in the AU cell. Home case: `entire dispatch --repos a/b` → 'In your home jurisdiction: ... a/b is placed in: us' where us IS home → `--jurisdiction us` yields the identical 404. Drop notFound.Jurisdiction (and the resolved home via auth.HomeJurisdictionFromActiveLogin) from the offered list."
+  },
+  {
+    "file": "cmd/entire/cli/dispatch_wizard_scope.go",
+    "line": 61,
+    "summary": "A repo with no READY placement is attributed to `home`; when home is unknown (\"\") but other jurisdictions are known, that repo lands in no bucket and becomes unselectable in the wizard (it was offered before this diff).",
+    "failure_scenario": "resolveDispatchWizardHome returns \"\" on a JWT without home_jurisdiction (the code explicitly handles 'a core too old to send it') or when resolveCellSubject's refresh fails while coreapi.New() succeeds on the cached token. Then jurisdictions=[\"\"] is skipped by `if j != \"\"`, scope.jurisdictions is non-empty so options() never offers the Home/\"\" choice, and reposIn(&lt;any pick&gt;) never returns the repo. Producers of the unplaced state: index page truncation (see line 153) or PROCESSING-only placements. Tests cover home-known+unplaced and home-unknown+no-placements, but not this mixed state."
+  },
+  {
+    "file": "cmd/entire/cli/dispatch_wizard_scope.go",
+    "line": 153,
+    "summary": "defaultListDispatchWizardPlacements reads a single ListRepos page (no PageSize, NextPageToken never followed) and only logs on Truncated, so repos beyond the first page silently get home attribution in the wizard.",
+    "failure_scenario": "Caller with &gt;1000 onboarded repos (repoIndexDefaultPageSize=1000): repos on page 2+ miss the placements map → newDispatchWizardScope falls to `[]string{home}` → the repo is offered only under home; dispatching it there returns the very RepoNotFoundError the picker exists to prevent. Truncated IS set server-side when more pages remain, but the warning goes to `.entire/logs`, not the user. repo_mirror.go's fetchPagesBounded already walks NextPageToken; reuse it (or at least surface the truncation on stderr)."
+  },
+  {
+    "file": "cmd/entire/cli/dispatch_wizard.go",
+    "line": 289,
+    "summary": "The Repos OptionsFunc reads state.jurisdiction on huh's tea.Cmd goroutine while the Jurisdiction Select writes it on the Bubble Tea loop via its PointerAccessor — an unsynchronized read/write (data race under the Go memory model).",
+    "failure_scenario": "Forward flow is safe (Form.Update routes only to the selected group and Next is gated on options loaded), but MultiSelect Prev is not gated: a Repos OptionsFunc goroutine still unscheduled while the user Shift+Tabs back and moves the jurisdiction cursor reads the new value under the old bindings hash. Low probability in practice, but `-race` can flag it and the stale result is accepted as the US list. Snapshot the jurisdiction on the event loop (or pass it via the binding) instead of reading shared state in the closure."
+  },
+  {
+    "file": "cmd/entire/cli/dispatch/cloud.go",
+    "line": 179,
+    "summary": "RepoNotFoundError.Error() decides whether to prepend 'In &lt;SCOPE&gt;: ' by substring-probing the server prose for 'jurisdiction'; against today's merged gateway the default home path already renders awkwardly and any rewording silently flips the label.",
+    "failure_scenario": "Current gateway home-path string is 'Repository not found or not available in its region: X' → CLI prints 'In your home jurisdiction: Repository not found or not available in its region: X. Pick a jurisdiction ...' (triple region phrasing on the most common path; untested combination — the home-case test uses the cell wording). No structured code exists (gateway returns {error: string}), so the CLI should render its own sentence from Repos+Jurisdiction when Repos is non-empty and fall back to Message only when parsing failed, rather than probing wording."
+  },
+  {
+    "file": "cmd/entire/cli/dispatch_wizard_scope.go",
+    "line": 138,
+    "summary": "loadDispatchWizardScope resolves the active login three times concurrently (data-API token, coreapi.New, HomeJurisdictionFromActiveLogin), each constructing its own tokenmanager and hitting the OS keyring, when the home claim is readable from the JWT the core client already holds.",
+    "failure_scenario": "Three contexts.json parses, three Managers, ≥6 keyring.Get calls (each a /usr/bin/security subprocess on macOS, up to three Keychain prompts on a locked keychain) for one wizard step; two of the three are new in this PR. auth.ResolveControlPlaneTarget().TokenSource + auth.HomeJurisdictionFromLoginJWT derive home from the same login the placements goroutine uses (keep ENTIRE_TOKEN parity), removing the third goroutine and the resolveDispatchWizardHome seam."
+  },
+  {
+    "file": "cmd/entire/cli/dispatch/options.go",
+    "line": 82,
+    "summary": "dispatch.NormalizeJurisdiction is a second exported normalizer that only rewords auth.NormalizeJurisdiction's error (printing the slug twice), while `entire api --jurisdiction` (api_cmd.go:144) still hand-rolls ToLower/TrimSpace and never calls the new 'one rule'.",
+    "failure_scenario": "`entire dispatch --jurisdiction 'us east'` → `invalid --jurisdiction \"us east\" (expected a jurisdiction slug such as us or eu): jurisdiction \"us east\" is not a valid label` (slug doubled; differs in case for mixed input). `entire api --jurisdiction 'us east'` passes flag parsing and fails later with 'refusing to route'. Inline the flag-phrased error in ResolveOptions (drop the %w suffix), and route api_cmd.go through auth.NormalizeJurisdiction so the doc claim holds."
+  },
+  {
+    "file": "cmd/entire/cli/dispatch/cloud.go",
+    "line": 293,
+    "summary": "api.CheckResponse only ever returns nil or *api.HTTPError, so `errors.As` always succeeds and `return checkErr //nolint:wrapcheck` is unreachable; the statusError wrapper's stated purpose (preserving the old wording) already does not hold for JSON bodies.",
+    "failure_scenario": "The old code quoted the raw body; statusError quotes the parsed envelope Message, so `{\"error\":\"x\"}` now renders as `\"x\"` — the only preserved case is a non-JSON body. Both pinning tests (EscapesErrorBody, Other404StaysGeneric) assert only the 'dispatch service returned status N' prefix. Either return *api.HTTPError directly (update two prefix assertions) or wrap with fmt.Errorf(\"dispatch service: %w\", httpErr); in any case delete the dead branch and its nolint."
+  }
+]
+```
+
+Refuted during verification (dropped): `ErrorResponse.Detail string` breaking on non-string detail (no Entire service emits one; RFC 7807 defines it as string); bare `Repository not found` being an empty-window response (unreachable on the bearer path — empty windows return 200); wizard repo listing being home-scoped (it is not jurisdiction-scoped; the endpoint was deleted server-side so the wizard already always falls back to local discovery, pre-existing). The huh cache-hit "narrowing" comment inaccuracy was PLAUSIBLE-low and cut by the cap.</result>
+<usage><subagent_tokens>201090</subagent_tokens><tool_uses>27</tool_uses><duration_ms>1010133</duration_ms></usage>
+</task-notification>

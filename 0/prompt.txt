@@ -1,0 +1,62 @@
+<cross-session-message from="uds:/tmp/cc-socks/5575.sock" from-name="soph-pen-test-cd" from-mode="prompting">
+You have one security finding to fix. It came out of a full audit of this CLI, re-verified against current main. This message is your complete work order — you need no other context.
+
+WORKTREE / BRANCH
+  cd /Users/soph/.herdr/worktrees/cli/soph-sec-credentials
+  Branch soph/sec-destination-transport is already checked out there, branched from main @ 6561a64b8. (The branch name is broader than this one finding — ignore that, you are only doing the finding below.)
+  You own internal/remotehelper/**. Two other sessions are working in parallel — do NOT touch redact/** or cmd/entire/cli/checkpoint/**.
+  The worktree is clean; no prior work to review.
+
+THE FINDING (HIGH) — a server-supplied ref name can inject into the git remote-helper protocol
+
+Threat model: a malicious or compromised git server. This CLI ships a git remote helper (git-remote-entire) that speaks git's remote-helper protocol on stdout. Ref names come from the server's advertisement and are echoed into that protocol stream.
+
+internal/remotehelper/githelper/list.go:60:
+
+    line := strings.TrimRight(string(content), "\n")
+
+Only TRAILING newlines are trimmed. The result is then emitted (around :112-119) as:
+
+    fmt.Fprintf(stdout, "%s %s\n", value, name)
+
+pkt-lines are length-delimited, so a hostile server can embed \n INSIDE a ref name. It survives TrimRight and goes straight into the protocol stream.
+
+A PoC against a fake transport confirmed this. A ref named:
+
+    refs/heads/ok\n<sha> refs/heads/injected\n\nok refs/heads/main\n
+
+produced an injected blank line that TERMINATES THE REF LIST EARLY — truncating the real refs and the trailing "@<ref> HEAD" symref line — and left residue sitting in the stream exactly where canonical git reads the NEXT command's response. "ok <ref>" / "error <ref>" is precisely the shape of a push response, so a malicious server can plant a FORGED PUSH RESULT: git reports a push succeeded that did not.
+
+FIX DIRECTION
+Reject any advertised value or name containing \n, \r, or NUL. Fail the operation loudly rather than sanitising silently — a ref name with a newline in it is not something that legitimately occurs, and quietly stripping it hides a hostile server from the user.
+
+Then check whether the same trust assumption exists at the other advertisement parse sites and fix consistently:
+  internal/remotehelper/gitproto/gitproto.go
+  internal/remotehelper/githelper/refadv_cache.go
+
+RED TEST — write it first and confirm it fails
+Feed a hostile ref name (one containing \n) through the parser / handleList and assert it is rejected rather than echoed into stdout. A test that demonstrates the truncation-plus-residue behaviour before the fix is the deliverable here.
+
+OPTIONAL, only if the above is done and green
+Unbounded reads of remote bodies in the same package — no cap on io.ReadAll(refs) (githelper/stateless.go ~:37), the receive-pack advertisement cache (refadv_cache.go ~:48), the ref advertisement (gitproto/gitproto.go ~:143), or per-ref lines growth (list.go ~:100). All on the clone/fetch/push path, so a hostile server can OOM the client. The project's SECURITY.md scopes out only LOCAL resource exhaustion, so a server-triggered OOM is in scope. The model to copy is gitrepo/alternates_rewrite.go: capped read, truncation explicitly tracked, callers forbidden from falling back to the uncapped original.
+
+RULES
+- LOCAL BRANCH ONLY. Do not push, do not open a PR, do not add a remote. Commit locally.
+- Commit normally; entire is enabled and captures the session automatically. Never create checkpoints by hand.
+- Before each commit: mise run fmt && mise run lint && mise run test:ci
+- Two traps in that sequence: (a) mise run fmt can rewrite Go into non-compiling code while lint still reports 0 issues — always run go build ./... after fmt; (b) mise run test:ci rewrites .opencode/package-lock.json — never git add -A, stage explicit paths.
+- Never call git.PlainOpen / git.Open directly and never call go-git's worktree.Status() — see CLAUDE.md for why (reftable and alternates handling; a forbidigo lint rule enforces the second). Use the gitrepo package.
+- When done, report: what you changed, the test that proves it, anything contradicting this brief, anything you deliberately left alone.
+
+If the premise turns out to be stale or wrong, STOP and say so rather than implementing a fix for a bug that is not there.
+</cross-session-message>
+
+---
+
+<task-notification>
+<task-id>bhyp7jjru</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-green-river-e583/d5da92b5-a1d9-443f-9413-9935ff702b27/tasks/bhyp7jjru.output</output-file>
+<status>completed</status>
+<summary>Background command "Run full CI test suite" completed (exit code 0)</summary>
+</task-notification>

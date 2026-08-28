@@ -1,0 +1,65 @@
+does thsi also have gemini and opencode
+
+---
+
+okay proceed
+
+---
+
+<task-notification>
+<task-id>a95b21eada6256105</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-Documents---Peyton-s-MacBook-Pro-entire-devenv-entireio-cli--worktrees-tokens/9c35f38a-891b-4649-b49b-6602cc65a8a4/tasks/a95b21eada6256105.output</output-file>
+<status>completed</status>
+<summary>Agent "Spec review vs code" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have everything I need. Here is the review.
+
+## Concrete issues
+
+**§3.8 — `checkpoint tokens` "sliced at that session's token window"** (blocking design gap)
+Claim: totals/attribution are recomputed from stored `full.jsonl` sliced at the session's token window. Code: `SessionState.TokenTranscriptStart` (`cmd/entire/cli/session/state.go:240`) is session-state only; nothing in `api/checkpoint/metadata.go` persists a token offset (only `checkpoint_transcript_start`, line 423, which `carryForwardToNewShadowBranch` resets to 0 — per commit `c69c00337`). So a reader has no window start for post-carry-forward checkpoints; slicing at `checkpoint_transcript_start` reproduces the exact cumulative bug PR A fixed. The spec needs either a persisted `token_transcript_start` in `Metadata` (PR B addition, or a PR A follow-up) or an explicit derivation (previous checkpoint's transcript length) — and legacy checkpoints can never be sliced, so attribution there must be labelled cumulative too.
+
+**§3.1 — `flattenTokenUsage` named as existing.** No such function anywhere (`grep -rn flattenTokenUsage cmd` → none). Existing helpers are `addCheckpointTokenUsage` (`checkpoint_tokens.go:360`), `saturatingIntAdd` (`:383`), `totalTokens` (`status_style.go:111`). §7 lists it ambiguously; mark it new.
+
+**§3.1/§7 — `addCheckpointTokenUsage` drops PR A's fields.** `checkpoint_tokens.go:360-380` copies `Input/CacheCreation/CacheRead/Output/APICallCount` field-by-field and silently loses `ThinkingTokens`, `CacheCreation1hTokens`, `Model`. The spec says the flattening "stays in `cli` with the existing saturating helpers" — as written they would zero the subset fields the whole design depends on. CLAUDE.md explicitly calls this pattern out ("a field-by-field copy is how the nested total came to be dropped") and names `types.AddTokenUsage` as the single summing primitive. The spec should say the flatten helper is rewritten on `AddTokenUsage` (or extended and tested for the three new fields).
+
+**§7 — `cmd/entire/cli/tokens_cmd.go` does not exist.** The `tokens` group is `newTokensGroupCmd()` in `tokens_profile.go:52` (`Hidden: true`, RunE → `cmd.Help()`); `session tokens` is `newTokensCmd()` in `session_tokens.go:80`, registered from `sessions.go:194`.
+
+**§4 / §3.6 — the worked example contradicts the threshold table.** Example recommendation: "Context growth was the largest cost (41%)". §3.6 Claude `context-growth` threshold is ≥ 55% of cost. On the spec's own numbers this rule would not fire; the example needs a different rule (or the threshold text needs the "largest class" alternative trigger spelled out).
+
+**§4 — `formatTokenCount` cannot render "3.7M" / "4.1M".** `status_style.go:99-109` only emits `k` (3,700,000 → `"3700k"`); the parity table in `status_test.go:862` pins that. Either add an M tier (and update the parity table, so it is not a pure move) or change the example.
+
+**§1 item 4 — "Cache read is 94–96% of volume on every agent … 51–54% of cost".** Grounding §6: Gemini cache-read is 58% of volume / 24% of cost (median). True for Claude/Codex/OpenCode/Pi only.
+
+**§1 item 3 — "Gemini double-counted cache (+58–89%)".** Sources say +58% (commit `51f130261`, one real checkpoint) and +70% (grounding §2). The 89% figure appears in neither.
+
+**§1 item 5 / §3.4 — "Cursor records nothing".** True for the 38 legacy checkpoints, but `agent/cursor/lifecycle.go:134` (`tokenUsageFromStop`) captures input/cache_read/cache_write/output per turn from the stop hook, and CLAUDE.md says "Cursor tokens come only from stop-hook payloads". The Cursor profile row should allow the Usage table from `state.TokenUsage`/metadata (no thinking, no TTL, no tools) rather than "not recorded" wholesale; the mock doc already hints at this ("predates Cursor's per-turn token fields").
+
+**Header / §3.10 — "all experimental / `entire labs`".** `checkpoint tokens` (`checkpoint_group.go:42`) and `session tokens` (`sessions.go:194`) use plain `AddCommand`, no `Hidden`, no `experimental.Register` — they are canonical visible group verbs per CLAUDE.md ("`checkpoint`: `list`, `explain`, `tokens`, `search`"). Only the `tokens` group is experimental. The "Breaking: recommendation IDs change (labs-only)" caveat is therefore not accurate for the two visible commands.
+
+**§3.5 — "required method on all five stores".** Six production `ReadSessionContent` implementers: `persistent.go:1484`, `refs_store.go`, `routing_store.go`, `fanout.go:50`, `fsstore/fsstore.go`, `checkpoint_api_reader.go:272`. §7 lists all six; the count in §3.5 (and the 08-25 §3.6 it cites) is off by one. Seven test fakes: confirmed.
+
+**§3.6 `cache-miss` row — "p90 49%" is Codex-only.** Grounding: OpenCode fresh-input p90 = 39%, so a shared ≥ 45% threshold sits above OpenCode's p90 while the row cites Codex's. State both or split.
+
+**§3.3 — Gemini "session-level" model.** `geminicli/transcript.go:180-182` says real Gemini message rows carry a `model` field ("timestamp, model, and tokens that are present in real Gemini transcripts"). Worth re-checking a transcript before locking Gemini to session-level weighting.
+
+## Sections that check out
+- §3.1: `types.TokenUsage` has `ThinkingTokens`, `CacheCreation1hTokens`, `Model` (`agent/types/token_usage.go:24-36`); `AddTokenUsage`/`SubtractTokenUsage` propagate them.
+- `api/checkpoint.CheckpointSummary.TokenUsageVersion` + `const TokenUsageVersionDelta = 2` (`metadata.go:594-599`), stamped in `persistent.go:822` and `fsstore.go:147`; the legacy-signal description in §3.7 matches the field's doc comment exactly; "before v0.11" is consistent with CHANGELOG top = 0.10.2.
+- §3.8 symbols: `SessionReader.ReadSessionContent(ctx, id, sessionIndex) (*SessionContent, error)` with `.Transcript []byte` (`interfaces.go:20`, `metadata.go:369`); `strategy.ResolveTranscriptPath(state *SessionState) (string, error)` (`strategy/resolve_transcript.go:17`); `paths.SubagentsDir(transcriptDir, sessionID)` (`paths.go:259`, sessionID = the agent's ID). Current loading: `session tokens` → `strategy.LoadSessionState` + `state.TokenUsage` only (Source `"session_state"`); `checkpoint tokens` → `store.Read` + `ReadSessionMetadata` per session, root `summary.TokenUsage` fallback (Source `"committed_checkpoint"`); `profile` → same metadata path via `checkpointTokenUsage`, `--limit 50`/`--all`. No transcript reads today.
+- §3.5 new items are genuinely new: no `tokenreport/`, no `token_attribution.go`, no `TokenAttributor`/`AsTokenAttributor` (`capabilities.go` has the `AsTokenCalculator` pattern at :141), no `api/checkpoint.TaskRecord`/`ReadTaskRecords` (only `session.TaskRecord`, `state.go:457`). `tasks/&lt;id&gt;/task.json` layout and `taskRecordMetadata` fields (`persistent.go:469-531, 1310`) match; `FetchingTree.RawEntries`, `getCheckpointFetchingTree`, `checkpointTree`, `readOrder`/`firstResolved` all exist. `SkillEventTranscriptAnchor{Unit,Start,End,EntryIDs,ToolUseID}` (`skill_events.go:54`) matches.
+- §3.4/§3.5 parser facts: Codex reads only cumulative `total_token_usage`, subtracts `cached_input_tokens`, keeps `reasoning_output_tokens` (`codex/transcript.go:270-335`); OpenCode `Tokens.BilledOutput()` uses the total identity, `Part.Type/Tool` (`opencode/types.go:69-107`); Gemini `tokens.{cached,thoughts,tool}` + `toolCalls` (`geminicli/types.go:97-103`, `transcript.go:28`); Pi `Usage.CacheWrite1h`, `Message.Model`, `toolCall` parts (`pijsonl.go:80-99`, `pi/transcript.go:107`); Claude `thinking_tokens`, `ephemeral_5m/1h`, `message.model`, `tool_use` (`claudecode/types.go:113-127`). Neither Codex `turn_context.*`, Claude `effort`/`attributionSkill`, OpenCode `modelID`, nor Pi `cost`/`thinking_level_change` is parsed today — consistent with the spec treating them as new reads.
+- §3.6 vs grounding §6: Claude context-replay ≥70 (p90 71), Codex ≥67 (p90 67), Pi ≥66 (p90 66), Pi context-growth ≥45 (p90 45), model-choice fire rates 2/6/17%, Codex effort median 36–40 / p90 52, "cache write largest in 37%" (123/332) all match. §1's 64%/65% rule fire rates trace to the 08-25 spec §3.10 table; the 53%/4.03B claim traces to commit `c69c00337`. Current `context-pressure` constant is 80 (`session_tokens.go:73`).
+- §4 numbers match the mock doc (rows, totals, 57% thinking-of-output, 3-item remainder = 16.2k+11.2k); only cosmetic diffs (skill label abbreviated, 5-min row dropped).
+- §3.9: `AgentTypeVogon = "Vogon Agent"` (`vogon.go:27`); "Mock Lifecycle Agent" is the `lifecycle_test.go:100` fixture string.
+- CLAUDE.md: plain text + `--json`, no TTY gating, and `types.AddTokenUsage` as the sole summing primitive are respected apart from the flatten-helper issue above; no `gitrepo`/`Status` concerns arise since the commands read stores and session state.
+
+## Advisory
+- Codex `APICallCount` counts every `token_count` event including the 10–13% duplicates (`codex/transcript.go:298`), so "N API calls" and the "≥ 20 calls" gate are inflated on Codex; the dedupe the spec mandates for deltas should also feed the call count.
+- `formatPercent` already exists (`session_tokens.go:407`); §3.1's `FormatPercent` should be noted as a move, like `FormatTokenCount`.
+- `--compare` JSON today is `{baseline,current,change,change_percent,direction}` (`checkpoint_tokens.go:50`); mirror that shape for `cost_share` rather than a bare `{baseline,current}`.
+- Once `checkpoint tokens` reads transcripts it needs a `SessionReader`, not the narrower `reviewContextSessionMetadataReader` it takes now (`checkpoint_tokens.go:162`); worth a line in §7.
+- §3.4 claims Codex "✓ thinking" but Claude Code "since Aug 2026" — the Codex row could carry a similar "since" qualifier if `reasoning_output_tokens` was ever absent; not verified either way.</result>
+<usage><subagent_tokens>145822</subagent_tokens><tool_uses>33</tool_uses><duration_ms>1611087</duration_ms></usage>
+</task-notification>

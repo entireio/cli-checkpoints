@@ -1,0 +1,179 @@
+<task-notification>
+<task-id>bqk0ka1sf</task-id>
+<tool-use-id>toolu_011LVi4Xkup16qNndmstnWJ1</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha--marvin-worktrees-cli-cli-dispatch-jurisdiction/6661b9d7-392b-4aaa-bdf4-835d53b96e32/tasks/bqk0ka1sf.output</output-file>
+<status>completed</status>
+<summary>Background command "Wait for the gateway agent to stop working again and capture its output" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>b2yrmcl4x</task-id>
+<tool-use-id>toolu_013xEGu2vZqohUtuKEiyibjU</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha--marvin-worktrees-cli-cli-dispatch-jurisdiction/6661b9d7-392b-4aaa-bdf4-835d53b96e32/tasks/b2yrmcl4x.output</output-file>
+<status>completed</status>
+<summary>Background command "Wait for the gateway agent's next stop and capture its output" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>bp2cslkmf</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha--marvin-worktrees-cli-cli-dispatch-jurisdiction/6661b9d7-392b-4aaa-bdf4-835d53b96e32/tasks/bp2cslkmf.output</output-file>
+<status>completed</status>
+<summary>Background command "Watch CI for the token-fix push" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>bz729ok7h</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha--marvin-worktrees-cli-cli-dispatch-jurisdiction/6661b9d7-392b-4aaa-bdf4-835d53b96e32/tasks/bz729ok7h.output</output-file>
+<status>completed</status>
+<summary>Background command "Approve the format/diff-stat command and wait for the agent's next stop" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+how can I test the dispatch?
+
+---
+
+cloud dispatch still broken for me
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>a7421a096435037da</task-id>
+<tool-use-id>toolu_01H7RYRSWhQQ4z56soFuu1h2</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha--marvin-worktrees-cli-cli-dispatch-jurisdiction/6661b9d7-392b-4aaa-bdf4-835d53b96e32/tasks/a7421a096435037da.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review (CLI + gateway)" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## (A) Go — `/Users/alisha/.marvin/worktrees/cli/cli-dispatch-jurisdiction`
+
+**1. `resolveStoredCellSubject` does LESS I/O than `ResolveDataAPIToken` — not more. No finding.**
+- `/Users/alisha/.marvin/worktrees/cli/cli-dispatch-jurisdiction/cmd/entire/cli/auth/cell_data_api.go:595` → `resolveStoredCellSubject` (:263) = one `/.well-known/entire-api.json` resolve (disk-cached, long TTL with stale fallback — `internal/entireclient/clusterdiscovery/api_discovery.go:70`) + `refreshCellLoginJWT` (returns a still-valid token with **no** network call).
+- Old `ResolveDataAPIToken` (`cmd/entire/cli/auth/data_api.go:71`) did the *same* discovery + the same login re-mint **plus** an RFC 8693 STS POST to core (`NewRefreshingResourceProvider`, in-process cache only, so first call per process = a real round-trip). Net: the diff removes one core round-trip per `entire dispatch`.
+- **No cluster listing** on this path: `resolveCellAPIBaseURL` is only reachable from `CellClientFactory.ClientFor` (`cell_data_api.go:436`) and `JurisdictionToken` — never from `resolveStoredCellSubject`.
+- Only waste: `resolveStoredCellSubject` also builds `cellExchangeHTTPClient(dataOrigin)` and fills `discoveredCore`/`dataOrigin`, all of which `ResolveAccountAccessToken` discards. One `http.Client` + transport alloc, zero I/O — ignore.
+
+**2. Yes, the interactive dispatch wizard now resolves the login twice, and the diff makes the dedup free.** `cmd/entire/cli/dispatch_wizard_scope.go:223` (`HomeJurisdictionFromActiveLogin` → `resolveCellSubject` → `contexts.Load` + keychain read + fresh `tokenmanager`), then `cmd/entire/cli/dispatch/mode_cloud.go:35` (`ResolveAccountAccessToken` → `resolveStoredCellSubject` → `contexts.Load` + cached discovery read + keychain read + another `tokenmanager`). Concrete cost per interactive run: one extra contexts-file read + one extra keychain read (tens of ms on macOS Keychain, each tokenmanager is constructed fresh so nothing is shared in-process), and at an expiry boundary a second refresh POST (serialised by the advisory lock, so at least not a token-reuse hazard).
+Cheaper alternative, only possible *because* of this diff: the bearer now **is** the login JWT, so home can come from `auth.HomeJurisdictionFromLoginJWT(token)` (`cell_data_api.go:620` — pure base64+JSON, no I/O) instead of a second credential resolve; or wrap `resolveStoredCellSubject` in a `sync.OnceValue` so wizard + bearer share one subject. Note the wizard's other two legs each build `newCellCoreClient` (`cmd/entire/cli/auth/control_plane.go:98`), which resolves the login again — pre-existing, same fix applies.
+
+Trivial/no action: `mode_cloud.go:26` calls `auth.EnableInsecureHTTP()` and then `resolveStoredCellSubject` sets the same global again — duplicated no-op.
+
+## (B) TypeScript — `/Users/alisha/.marvin/worktrees/entire.io/dispatch-gateway-placement`
+
+**No efficiency issues worth fixing.** Specifically:
+- `api/src/lib/dispatch-generate.ts:144` `indexHomeReposByName` is **O(n)**, not O(n log n) — no sort anywhere; `pickHomePlacement` (:119) is a linear min-scan. At ~140 rows this is microseconds. Irrelevant.
+- `toLowerCase` runs exactly once per row (:146) and once per requested slug via `normalizeRepoSlug` (:317). No repeated lowering, no repeated sorting.
+- No closures added; the only closure in the changed region (`api/src/lib/dispatch-generate.ts:307` `homeRepos.map(...)`) captures nothing, and the reader closure captures only the small `defaultBranchByUlid` map.
+
+One optional simplification (not a perf fix): `indexHomeReposByName` makes two passes and allocates an intermediate `HomeRepoListItem[]` per distinct name, even though nearly every name has one row. Since `compareHomePlacement` is a total order, the batch min equals the running min, so a single pass keeping the current best per key (`const best = byName.get(key); if (!best || compareHomePlacement(row, best) &lt; 0) byName.set(key, row)`) drops the `grouped` map and ~140 array allocations. Cost saved: negligible; take it for readability, not speed. Same for building both `byName` and `byId` over the full listing (:306-307) when only 1-5 slugs are requested — two passes, ~280 map entries, not worth lazifying.</result>
+<usage><subagent_tokens>80209</subagent_tokens><tool_uses>24</tool_uses><duration_ms>161934</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a147be1196e256ccc</task-id>
+<tool-use-id>toolu_015ykT7dBcNr22T1vobGvpte</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha--marvin-worktrees-cli-cli-dispatch-jurisdiction/6661b9d7-392b-4aaa-bdf4-835d53b96e32/tasks/a147be1196e256ccc.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review (CLI + gateway)" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Verified both diffs against the actual trees. Findings, ordered by payoff.
+
+## A — Go (`cli`, 5718cce04)
+
+**1. Three comments telling one story; ~30 lines for a ~4-line contract**
+- `/Users/alisha/.marvin/worktrees/cli/cli-dispatch-jurisdiction/cmd/entire/cli/auth/cell_data_api.go:578-594` (17-line doc), `.../cmd/entire/cli/dispatch/mode_local.go:30-36` (7 lines), `.../cmd/entire/cli/dispatch/mode_cloud.go:33-34` (2 lines).
+- All three explain "gateway takes the login JWT, not the exchanged data-API token." Cost: three copies to keep in sync, and the middle paragraph of the doc comment is commit-message archaeology — "Every released CLI's `dispatch` failed this way from 2026-08-20 until callers moved here" plus the core-refuses-non-session-subject narrative — which dates instantly and belongs in the commit/CHANGELOG.
+- Simpler: on `ResolveAccountAccessToken` keep the contract only (returns the active context's refreshed login JWT; gateway mints cell tokens itself; discovery picks the context; ENTIRE_TOKEN not consulted) ≈4 lines. `mode_local.go` → one line ("bearer for the dispatch gateway; tests swap to a fixed-token closure"). Delete the `mode_cloud.go` comment — `lookupResourceToken` is one hop away.
+
+**2. The seam's `insecureHTTP` bool is redundant state — `mode_cloud.go:34`, `mode_local.go:37`**
+- `runServer` already called `auth.EnableInsecureHTTP()` at `mode_cloud.go:26` (a process-global sticky `atomic.Bool`, `auth/exchange.go:28`) and already ran `requireSecureDispatchURL(api.BaseURL())` at :28. The bool's only residual effect inside `resolveStoredCellSubject` (`cell_data_api.go:264-268`) is to re-run `api.RequireSecureURL` on the *same* `api.BaseURL()` — a duplicate check.
+- All four test stubs in this diff ignore it (`_ bool` in `dispatch_test.go:13`, `mode_cloud_test.go:24,374,406`). Cost: four signature edits for a parameter no caller reads and no test asserts.
+- Simpler: seam `func(context.Context) (string, error)`; `ResolveAccountAccessToken(ctx)` calls `resolveStoredCellSubject(ctx, insecureHTTPEnabled())`. `insecureHTTPEnabled()` already exists and is the pattern used at `cell_data_api.go:309` and `data_api.go:92`. Caveat: don't just pass `false` — `api.RequireSecureURL` (`api/base_url.go:85`) does not consult the global.
+
+**3. New auth test re-seeds 18 lines already seeded next door — `cell_data_api_test.go:645-675`**
+- Setup is near-verbatim `TestCellClientFactory_UsesLoginJWTDirectly` (`:593-624`): four `t.Setenv`, `UseFileBackendForTesting`, guard `coreSrv`, `CoreKeyringService`, `makeJWT`, `tokenstore.Set`, `contexts.Context`, `SetResolveContextForCellAPIForTest`. The same block is the 6th copy in this file (`:188, :250, :347, :418, :598, :650`).
+- Simpler: `func seedActiveLoginContext(t *testing.T) (coreURL, loginJWT string)` returning the guard-server URL and seeded JWT; the new test collapses to ~8 lines (seed, call, compare). Its only distinct content is the "no exchange" `t.Error` handler and the verbatim-JWT compare.
+- Minor: the added scope claim `"offline_access entire:session entire:api-access"` is decorative — nothing on this path reads `scope`.
+
+**4. Not findings (checked, they're fine):** the `api` import in `mode_cloud.go` is still live (`api.RequireSecureURL:21`, `api.BaseURL():24`), and `api.OriginOnly` still has 9 callers (`login.go`, `auth.go`, `data_api.go`, …) — removing its use here left no dead code.
+
+## B — TypeScript (`entire.io`, 934f32d406)
+
+**5. Two functions and two maps where one pass does it — `api/src/lib/dispatch-generate.ts:144-158`**
+- `indexHomeReposByName` builds `Map&lt;string, HomeRepoListItem[]&gt;`, then folds each group. Cost: an array allocation per repo name, a second loop, and an unreachable `if (pick)` guard (a group is never empty by construction).
+- Simpler: keep a running best in one pass — `const best = byName.get(key); if (!best || beats(row, best)) byName.set(key, row)`. 15 lines → 6, and `pickHomePlacement`'s fold disappears.
+
+**6. `pickHomePlacement` exported for tests only; comparator's numeric contract unused — `dispatch-generate.ts:119`, `:128-137`**
+- Verified: the only non-test caller is `indexHomeReposByName` (same file, `:154`). `compareHomePlacement`'s return is only ever read as `&lt; 0`, so the three-way ULID ternary `a.id &lt; b.id ? -1 : a.id &gt; b.id ? 1 : 0` encodes an ordering nothing sorts by.
+- Simpler: private `function beats(a, b): boolean` — `if (ap !== bp) return ap; if (ac !== bc) return ac &gt; bc; return a.id &lt; b.id` — and export only `indexHomeReposByName`, testing the ranking through it.
+
+**7. 11 tests where a table does it — `api/src/lib/dispatch-generate.test.ts:31, :35, :39` and `:107`**
+- `:31/:35/:39` are the identical assertion over three orderings. `:85` re-checks order-independence for ties, `:107` re-checks it through the index, and `api/src/routes/dispatches.test.ts:148` pins it end-to-end — order-independence is asserted at three layers.
+- Simpler: `it.each([[C,A,B],[A,C,B],[A,B,C]])("picks the canonical row whatever the listing order", ...)` — the repo already uses `it.each` (`api/src/lib/trail-base.test.ts:93`, `api/src/lib/github.test.ts:394`). Drop `:107` (the index adds only keying/lowercasing, covered by `:94`). Net ~11 → ~5 tests.
+
+**8. `can_manage_access` derivation spelled out 3×, the prod-502 story 3×**
+- Derivation: `api/src/lib/entire-api/dispatch-checkpoints-read.ts:200-204` (correct home — it's the wire field), `dispatch-generate.ts:110-112`, `dispatch-generate.test.ts:58-60`. Story: `dispatch-generate.ts:96-102`, `dispatch-generate.test.ts:6-10`, `dispatches.test.ts:149-151` — the last one is pure commit message ("The old last-row-wins map picked 01DUP…B and the dispatch 502'd").
+- Simpler: keep the type comment; on the picker keep only the three ranked bullets (`:107-115`); delete both test-file narratives — the test names already carry them.
+
+**9. Unowned TODO — `dispatch-generate.ts:116-117`:** "Follow-up: have entire-api flag or collapse duplicate/mirror rows" with no ticket. Either link the issue or drop it; as written it will outlive the reader who could act on it.</result>
+<usage><subagent_tokens>76872</subagent_tokens><tool_uses>21</tool_uses><duration_ms>191807</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ad85225ac6f656162</task-id>
+<tool-use-id>toolu_017GzLNj9NKh1cn6nN8kdCkX</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha--marvin-worktrees-cli-cli-dispatch-jurisdiction/6661b9d7-392b-4aaa-bdf4-835d53b96e32/tasks/ad85225ac6f656162.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review (CLI + gateway)" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Findings below. I also found that the gateway working tree already contains an uncommitted follow-up that fixes the biggest (B) issue — noted inline.
+
+## (A) Go — /Users/alisha/.marvin/worktrees/cli/cli-dispatch-jurisdiction
+
+**A1. Two exported bearer resolvers now exist for the same host (`api.BaseURL()`), and `entire dispatch` uses both in one run.**
+- `/Users/alisha/.marvin/worktrees/cli/cli-dispatch-jurisdiction/cmd/entire/cli/dispatch/mode_local.go:37` (new `auth.ResolveAccountAccessToken`) vs `/Users/alisha/.marvin/worktrees/cli/cli-dispatch-jurisdiction/cmd/entire/cli/api_client.go:34` (`auth.ResolveDataAPIToken`).
+- Existing helper: `auth.ResolveDataAPIToken` / `NewAuthenticatedAPIClient` — the shared "bearer for the data API" entry point every other data-plane command uses (`authcmd.go:18`, `search_cmd.go:353`, `setup.go:1040`, `recap.go:216`, and `dispatch_wizard.go:33`).
+- Concrete cost: the dispatch **wizard** lists repos through `NewAuthenticatedAPIClient` (exchanged `entire:api-access` token) while the generate call sends the login JWT — one command, two token shapes, two discovery+refresh round-trips against the same gateway. Per the new doc comment's own reasoning, any of those siblings whose gateway route is cell-backed will fail the same way (the gateway's pre-cutover fallback re-mint is `proxy.ts` `buildBearerCtx`, lines ~1235-1264, which is exactly the leg core refuses). Fixing the shared resolver (or migrating its data-plane callers) instead of adding a parallel one would have covered them; as shipped, each future route move needs its own one-off seam.
+
+**A2. Three independent subject resolutions per dispatch run, under two different precedence rules.**
+- `cell_data_api.go:595` (`ResolveAccountAccessToken` → `resolveStoredCellSubject`), `dispatch_wizard_scope.go:223` (`HomeJurisdictionFromActiveLogin` → `resolveCellSubject`), `cell_fanout.go:389` (`NewEntireAPICellClientFactory` → `resolveStoredCellSubject`).
+- Existing helper: `CellClientFactory` (`cell_data_api.go:114`), whose stated purpose is "resolve one login subject once and reuse it"; it just has no accessor for the subject (only `ClientFor`, line 132). Exposing `f.subject.loginJWT` (or a `Subject()`/`AccountAccessToken()` method) would have avoided a fourth entry point.
+- Concrete cost: (a) up to 3 `/.well-known/entire-api.json` discoveries + refresh-token round-trips in one wizard-driven `entire dispatch`; (b) a real behavioural split — `resolveCellSubject` honours `ENTIRE_TOKEN` (fail-closed, exclusive) while `resolveStoredCellSubject` ignores it, so with `ENTIRE_TOKEN` set the wizard's home-jurisdiction default comes from the env token but the dispatch bearer comes from the stored context. Answer to your question: yes, these should share one subject resolution.
+
+**A3. `--insecure-http-auth` and the secure-URL guard are now expressed twice on the same URL.**
+- `mode_cloud.go:24-31` calls `auth.EnableInsecureHTTP()` / `requireSecureDispatchURL(baseURL)`, then passes `opts.InsecureHTTPAuth` into `lookupResourceToken`, and `resolveStoredCellSubject` (`cell_data_api.go:264-269`) repeats both (`EnableInsecureHTTP` + `api.RequireSecureURL(api.BaseURL())`).
+- Existing convention: `ResolveDataAPIToken` takes no bool — the caller flips the global (`api_client.go:24-28`, `recap.go`) and the resolver reads `insecureHTTPEnabled()`. Cost: the seam signature churn across 4 test files (`dispatch_test.go`, `mode_cloud_test.go` ×3) buys a parameter that duplicates global state, and the redundant `RequireSecureURL` means the guard's error message depends on which layer fires first.
+
+**A4 (minor).** The new test at `cell_data_api_test.go:645` copies the ~20-line stored-login fixture (`ENTIRE_CONFIG_DIR`/`ENTIRE_API_BASE_URL`/`tokenstore.UseFileBackendForTesting`/`makeJWT`/`SetResolveContextForCellAPIForTest`) that already appears verbatim at lines 184, 245, 342, 412, 459, 593 — 7th copy, still no `seedStoredLoginContext(t, coreURL)` helper. Also `lookupResourceToken` is now a stale name (nothing resource-scoped remains).
+
+## (B) TypeScript — /Users/alisha/.marvin/worktrees/entire.io/dispatch-gateway-placement
+
+**B0. Already fixed in the working tree (uncommitted).** `pickHomePlacement`/`indexHomeReposByName`/`compareHomePlacement` have been moved out of `dispatch-generate.ts` into `/Users/alisha/.marvin/worktrees/entire.io/dispatch-gateway-placement/api/src/lib/entire-api/dispatch-checkpoints-read.ts:226-259` (next to `HomeRepoListItem`/`listHomeRepos`), the two-pass group-then-pick collapsed to one pass, and the test moved. So the "helper lives away from its type / redundant grouping map" concerns are resolved; don't re-raise them.
+
+**B1. The heuristic chooser re-implements placement selection that already exists authoritatively, and is reachable on this exact path.**
+- `dispatch-checkpoints-read.ts:226-244` (was `dispatch-generate.ts:119-136`), used at `dispatch-generate.ts:241`.
+- Existing helpers: `matchRepoInIndex` + `processingPlacement` / `canonicalPlacement` (`/Users/alisha/.marvin/worktrees/entire.io/dispatch-gateway-placement/api/src/lib/repos-federation/list-repos-index.ts:163`, `:183`, `:270`), as already composed by `resolveDispatchRepos` (`lib/dispatch-fanout.ts:77-115`) and `proxy.ts:1524-1561`.
+- Why it's reachable: now that the CLI bearer *is* the login JWT (diff A), the bearer path can obtain an index credential exactly as `proxy.ts` `buildBearerCtx` does — `ctx.indexCredential()` at `proxy.ts:1273-1281` returns `{ coreBaseUrl: resolveCoreBaseUrlForLoginJwt(cfg, bearerToken), jwt: bearerToken }` with no exchange. `dispatch-generate.ts` already imports `resolveCoreBaseUrlForLoginJwt`, `listReposIndex` and `resolveDispatchRepos` for its session path (lines 220-266).
+- Concrete cost: a 3-tier guess (`can_manage_access` → `checkpoint_count` → lowest ULID) plus a permanent "Follow-up: have entire-api flag or collapse duplicate/mirror rows" TODO, standing in for `primaries.processing`, which is authoritative and repo-global. Failure mode it keeps: when no row proves manage and counts tie (a repo with 0 checkpoints in-region, or a mirror that carries the canonical's count via `checkpoint_repo_id` as the test comment itself notes), lowest-ULID can select a mirror and the dispatch 502s again. It also makes the two resolution rules inside one file diverge (session path: index truth; CLI path: cell heuristic).
+
+**B2. Provider pinning is claimed but not reused.** `indexHomeReposByName`'s doc says lookups use "the same rule as the index's `matchRepoInIndex`", but `matchRepoInIndex` (`list-repos-index.ts:270-286`) takes a `provider` pin, fed by `parseRepoSearchFilter` (`:245`), precisely to stop same-named GitHub-vs-native rows colliding. The new map keys on bare lowercased `full_name`, so an `et/owner/repo` and `gh/owner/repo` pair in one cell collapse into one entry decided by checkpoint count. Cost: silent wrong-repo read for a same-named native/mirror pair; also `et/`-prefixed slugs miss entirely (`normalizeRepoSlug` only strips `gh/`) — same limitation as `matchRepoInIndex`, but here it's undocumented.
+
+**B3. Type reuse — no finding, the diff did the right thing.** Extending `HomeRepoListItem` (`dispatch-checkpoints-read.ts:196-208`) is correct: the other `RepoListItem` (`lib/repos-federation/list-cell-repos.ts:15`) is the `repos/batch` DTO with an `[key: string]: unknown` passthrough and no `full_name`, and `CellRepo` (`lib/entire-api/repo-meta.ts:76`) is the single-repo `repos/{id}` shape. Neither models the `/repos` list row. Likewise no `groupBy` utility exists in the repo (no lodash/es-toolkit, no `Map.groupBy` usage), so nothing was duplicated there.</result>
+<usage><subagent_tokens>120956</subagent_tokens><tool_uses>43</tool_uses><duration_ms>288879</duration_ms></usage>
+</task-notification>

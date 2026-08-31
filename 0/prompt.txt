@@ -1,0 +1,353 @@
+/simplify
+
+---
+
+<task-notification>
+<task-id>abf99053cafdc9a9b</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-quiet-field-2e15/c78e7f5e-6c1e-4988-b71b-af9c1e35e7ce/tasks/abf99053cafdc9a9b.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>All confirmed with exact line numbers. Here are the findings, ranked by value.
+
+## Findings
+
+**1. `render.py:36-37,94,194-195` — the coverage-percentage formula is defined three times under three names.**
+```python
+def cov(row):  return -1 if row["stmts"] == 0 else 100 * row["covered"] / row["stmts"]     # line 36
+def covp(fn):  return -1 if fn["stmts"] == 0 else 100 * fn["covered"] / fn["stmts"]          # line 94
+def cov_file(fl): return -1 if fl["stmts"] == 0 else 100 * fl["covered"] / fl["stmts"]       # line 194
+```
+`fn` (a function row) and `fl` (a file row) carry the exact same `"stmts"`/`"covered"` keys as `row` (a feature/area row), so `covp` and `cov_file` are byte-identical to `cov` modulo the parameter name. Cost: two extra function definitions plus two extra names a reader has to confirm are "the same thing" before trusting a diff. Simpler form: delete `covp` and `cov_file`, call `cov(fn)` and `cov(fl)` at their two call sites (`func_row`, line 185; `hot_rows`/`cov_file` call, lines 190 and 194-195).
+
+**2. `main.go:762-768` and `798-805` — `Ranked` is looked up by linear scan instead of being stored on `Func` like `Feature`/`Area` already are.**
+```go
+ranked := make([]*Func, 0, len(fns))
+for _, fn := range fns {
+    if rankedFeature(features, fn.Feature) {   // line 764
+        ranked = append(ranked, fn)
+    }
+}
+...
+func rankedFeature(features []*Agg, name string) bool {   // line 798
+    for _, a := range features {
+        if a.Name == name {
+            return a.Ranked
+        }
+    }
+    return false
+}
+```
+`parseFile` (line ~394) already has `feat := cfg.For(rel)` in scope and denormalizes `feat.Name`/`feat.Area` onto both `File` and `Func` — it just never copies `feat.Ranked` onto `Func` too, even though `File` gets it (line 400: `Ranked: feat.Ranked`). That gap is what forces the later O(fns×features) rescan through an 8-line helper. Simpler form: add `Ranked bool` to the `Func` struct, set it alongside `Feature`/`Area` in `parseFile`, then replace the loop with `if fn.Ranked { ranked = append(ranked, fn) }` and delete `rankedFeature` entirely.
+
+**3. `reach/main.go:341-347` vs `386-392` — `siteFan` (call-site fan-out map) is built twice with identical code, contradicting its own comment.**
+```go
+// buildSuccs, line 341
+siteFan := map[ssa.CallInstruction]int{}
+for _, n := range a.cg.Nodes {
+    for _, e := range n.Out {
+        if e.Site != nil {
+            siteFan[e.Site]++
+        }
+    }
+}
+```
+The same seven lines are repeated verbatim in `explainWho` (line 386), which is only reachable via the `-who` debug flag. The doc comment on `explainWho` (line 383) explicitly claims the diagnostic reads "each site's fan-out from the same map the cutoff uses, so the diagnostic can never describe a different filter" — but it isn't the same map, it's a second map built by copy-pasted logic that happens to compute the same thing today. A future edit to one copy (e.g. changing what counts as fan-out) silently breaks that invariant without any compiler or test signal. Simpler form: compute `siteFan` once in `buildSuccs`, store it as a field on `analysis`, and have `explainWho` read `a.siteFan` — making the comment's claim true by construction instead of by coincidence.
+
+**4. `main.go:710-721` vs `729-739` — the per-window churn header and row-building code is duplicated between `writeAggCSV` and `writeFilesCSV`.**
+Both functions contain the identical pair:
+```go
+for _, w := range windows {
+    hdr = append(hdr, "commits_"+w, "lines_changed_"+w)
+}
+...
+for _, w := range windows {
+    c := a.Churn[w]   // fl.Churn[w] in the other copy
+    row = append(row, itoa(c.Commits), itoa(c.Added+c.Deleted))
+}
+```
+Cost: ~8 lines duplicated; a future change to the churn-column shape (e.g. adding a percentage column) has to be made in two places or silently drifts. Simpler form: two small shared helpers, e.g. `churnHeader(windows []string) []string` and `churnCols(c map[string]Churn, windows []string) []string`, called from both writers (and from `writeFilesCSV`'s window loop too).
+
+**5. `dupl/main.go:105-110` — 4-deep nesting for a 3-line "sort a pair" operation.**
+```go
+if of := cfg.For(other).Name; of != feat {
+    k := [2]string{feat, of}
+    if k[0] &gt; k[1] {
+        k[0], k[1] = k[1], k[0]
+    }
+    cross[k]++
+}
+```
+This sits inside `for range rep.Issues { if m != nil { if of != feat { if k[0] &gt; k[1] {` — four levels deep for what is conceptually "canonicalize an unordered pair, then count it." Simpler form: extract a `sortedPair(a, b string) [2]string` helper and collapse to `cross[sortedPair(feat, of)]++`, dropping one nesting level and naming the operation.
+
+**6. `main.go:697` / `reach/main.go:513` — `itoa` is defined identically in two of the module's three binaries.**
+```go
+func itoa(i int) string { return strconv.Itoa(i) }
+```
+Trivial (one line, low cost either way), but since `internal/cx` already exists as the place these binaries share conventions, this is the kind of one-liner that belongs there (`cx.Itoa`) rather than being retyped per binary. Lowest priority — only worth doing if touching either file anyway.
+
+**7. `main.go:244-256` — one extra nesting level from a positive-condition `if` instead of an early `continue`.**
+```go
+if !f.IsTest {
+    if pkgImports[f.PkgDir] == nil { ... }
+    for _, ip := range f.Imports {
+        ...
+        if dep != f.PkgDir {
+            pkgImports[f.PkgDir][dep] = true
+        }
+    }
+}
+```
+Inverting to `if f.IsTest { continue }` up front (and `if dep == f.PkgDir { continue }` inside the inner loop) flattens both the outer `if` and the inner `if`, matching the early-return style already used elsewhere in the same file (e.g. `parseTree`'s walk function). Minor, cosmetic.
+
+## Not flagged
+The BFS traversal in `reach/main.go` (lines 199-231), the coverage-profile merge in `main.go` (`mergeCoverage`), and the hand-rolled `atoi`/`dotPair`/`parseCoverLine` parsers are all nested or manual for a stated, load-bearing reason (avoiding `cover.ParseProfiles`'s allocation cost on ~4.8M blocks, or graph-traversal shape) and already use early `continue`/skip patterns — these are inherent to the tool's stated performance goals, not gratuitous complexity, and I did not flag them.</result>
+<usage><subagent_tokens>163209</subagent_tokens><tool_uses>13</tool_uses><duration_ms>206141</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aff50671082395a98</task-id>
+<tool-use-id>toolu_01Bm3ezTKeWW6J4BdTMPR6zL</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-quiet-field-2e15/c78e7f5e-6c1e-4988-b71b-af9c1e35e7ce/tasks/aff50671082395a98.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Review: tools/complexity (reuse-focused)
+
+Scope covered: `main.go`, `reach/main.go`, `dupl/main.go`, `internal/cx/cx.go`, `internal/cx/cx_test.go`, `render.py`. Ranked most valuable first.
+
+### 1. Hand-rolled bounded worker pool where `golang.org/x/sync/errgroup` already does the job
+**File:** `tools/complexity/main.go:358-380` (`parseTree`)
+
+```go
+var mu sync.Mutex
+var wg sync.WaitGroup
+sem := make(chan struct{}, runtime.NumCPU())
+for _, p := range paths {
+    wg.Add(1)
+    sem &lt;- struct{}{}
+    go func(p string) { defer wg.Done(); defer func() { &lt;-sem }(); ... }(p)
+}
+wg.Wait()
+```
+This reimplements exactly what `errgroup.Group.SetLimit(n)` + `.Go()` + `.Wait()` provides (bounded concurrency, wait-for-completion), removing the manual channel semaphore and `WaitGroup` bookkeeping (the map-write mutex would still be needed). The cost isn't hypothetical: `golang.org/x/sync` is **already resolved and downloaded** in this module — confirmed via `go mod why -m golang.org/x/sync`, which shows it's pulled in transitively through `golang.org/x/tools/go/packages` (used by `reach`) → `golang.org/x/sync/errgroup`. Using it directly from `main.go` only promotes an existing indirect requirement to direct in `tools/complexity/go.mod` (`go mod tidy`), it does not add a new dependency.
+
+### 2. JSON-write boilerplate duplicated 3 times; `internal/cx` already has the CSV equivalent but not the JSON one
+**Files:** `main.go:321-323`, `reach/main.go:310-312`, `dupl/main.go:138-140`
+
+All three do the identical sequence:
+```go
+b, err := json.MarshalIndent(out, "", " ")
+cx.Check(err)
+cx.Check(os.WriteFile(path, b, 0o644))
+```
+`internal/cx/cx.go` already extracted this exact shape for CSV (`cx.WriteCSV`), but never added the JSON counterpart even though every one of the three binaries needs it. Add `cx.WriteJSON(path string, v any) error` (mirroring `WriteCSV`'s signature/behavior) and replace all three call sites. (`main.go:269` and `reach/main.go:296` also duplicate `cx.Check(os.MkdirAll(*outDir, 0o755))` right before their JSON/CSV writes — worth folding into the same helper or a small `cx.EnsureOutDir`.)
+
+### 3. `filepath.Rel` + `filepath.ToSlash` (repo-relative, slash-normalized path) reimplemented in 2-3 places
+**Files:** `main.go:384-386` (`parseFile`), `reach/main.go:153-154` (decl indexing loop), `dupl/main.go:71-79` (`norm`, a variant)
+
+`main.go` and `reach/main.go` do the byte-identical pair:
+```go
+rel, err := filepath.Rel(absRoot, p)
+rel = filepath.ToSlash(rel)
+```
+to compute the exact key later passed to `cfg.For(rel)`. `dupl/main.go`'s `norm` does the same core operation with extra handling (already-relative input, escape check) for a third call site. Extract `cx.RelSlash(absRoot, path string) (string, error)` for the two identical sites in `main.go`/`reach/main.go`; `dupl`'s `norm` could build on top of it for its extra cases.
+
+### 4. `splitList`'s trim/skip-empty logic reimplemented inline in `reach`'s `shortener` — and recomputed per call
+**Files:** `main.go:657-665` (`splitList`), `reach/main.go:502-511` (`shortener`)
+
+`main.go` has a named helper:
+```go
+func splitList(s string) []string {
+    for _, p := range strings.Split(s, ",") {
+        if p = strings.TrimSpace(p); p != "" { out = append(out, p) }
+    }
+    ...
+}
+```
+`reach/main.go` needs the same comma-list/trim/skip-empty semantics for `-trimprefix` but inlines it inside the closure returned by `shortener`, where it re-trims and re-checks emptiness **on every call** (once per symbol key formatted) instead of once up front:
+```go
+for _, tp := range trims {
+    if tp = strings.TrimSpace(tp); tp != "" { s = strings.ReplaceAll(s, mod+"/"+tp, "") }
+}
+```
+Move `splitList` into `internal/cx` (e.g. `cx.SplitList`), call it once in `reach/main.go` at `strings.Split(*trims, ",")` (line 112), and pass the already-cleaned slice into `shortener`.
+
+### 5. `itoa` wrapper duplicated verbatim
+**Files:** `main.go:697`, `reach/main.go:513`
+
+Both define the identical:
+```go
+func itoa(i int) string { return strconv.Itoa(i) }
+```
+Either drop both wrappers and call `strconv.Itoa` directly at each of the ~15 call sites, or if the shorter name earns its keep, put one copy in `internal/cx` and have both binaries use `cx.Itoa`. Low value on its own, but it's an exact duplicate with a one-line stdlib replacement, so cheap to fix.
+
+### 6. `render.py`: the same coverage-percent formula defined three times
+**File:** `render.py:36-37` (`cov`), `render.py:94` (`covp`), `render.py:194-195` (`cov_file`)
+
+```python
+def cov(row):  return -1 if row["stmts"] == 0 else 100 * row["covered"] / row["stmts"]
+def covp(fn):  return -1 if fn["stmts"] == 0 else 100 * fn["covered"] / fn["stmts"]
+def cov_file(fl): return -1 if fl["stmts"] == 0 else 100 * fl["covered"] / fl["stmts"]
+```
+All three operate on dicts with the same `stmts`/`covered` keys (features, functions, and files all carry them per the Go JSON output) — there is no reason for three names. Collapse to one `cov(d)` used at all three call sites (`f["cov"] = cov(f)`, inside `undercov_all`/`func_row`, and inside `hot_rows`).
+
+---
+
+Everything else checked out clean and didn't warrant flagging:
+- `cx.LoadConfig`/`cx.ReadModulePath`/`cx.WriteCSV`/`cx.Check` are already correctly shared via `internal/cx` and used consistently by all three binaries — no duplication there.
+- The byte-level `atoi`/`parseCoverLine`/`dotPair` parsers in `main.go` (avoiding `strconv.Atoi(string(b))` allocation on a ~4.8M-line hot path) are deliberate and justified by the adjacent comment; not a reuse smell.
+- `main.go`'s tree-walk (skip dot-dirs, skip nested `go.mod`) has no counterpart to deduplicate against: `reach` uses `golang.org/x/tools/go/packages` instead (a genuinely different, type-aware loading need), and `dupl` doesn't walk a tree at all.
+- The feature-mapping precedence logic (`Config.For`/`matchPass`) exists in exactly one place (`internal/cx`) as intended, and `cx_test.go` tests it directly rather than duplicating it per-binary.</result>
+<usage><subagent_tokens>162106</subagent_tokens><tool_uses>9</tool_uses><duration_ms>244803</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ad36c7d5ca4dbedfe</task-id>
+<tool-use-id>toolu_01LiyQDvwCiVWe13PwXt7XPp</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-quiet-field-2e15/c78e7f5e-6c1e-4988-b71b-af9c1e35e7ce/tasks/ad36c7d5ca4dbedfe.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Clean. Here are the efficiency findings, ranked by measured value, with the two explicitly-requested assessments folded in as confirmed non-findings.
+
+## Findings
+
+**1. `tools/complexity/main.go:227-231` — `mergeCoverage` and `applyChurn` run sequentially but are independent, wasting real wall-clock time**
+
+`mergeCoverage(...)` (line 228) and `applyChurn(...)` (line 231) both only read from the `files` map that `parseTree` already finished building; they write disjoint fields on each `*File` (`Stmts`/`Covered`/`Funcs[].*` vs `Churn`). Nothing needs them ordered.
+
+Measured on this repo (built the binary, ran it for real):
+- `parseTree` alone (1329 files, parallel): **0.11s**
+- `mergeCoverage` alone over a synthetic 373MB/4.8M-line profile matching the doc's stated size: **~1.2s**
+- `applyChurn`'s `git log --since=180d --numstat` alone: **~1.5–2.2s**
+- Full sequential run (both steps): **3.1–4.7s** — consistent with simple addition, confirming they aren't overlapping today.
+
+Running them concurrently (two goroutines + `sync.WaitGroup`) would cut total time to roughly `max(1.2s, 2.0s) ≈ 2.0s` instead of `~3.3s` — a 30-40% reduction in the tool's actual runtime, for a person waiting on it interactively. It's safe: the WaitGroup join provides the happens-before needed for the disjoint-field writes to be visible.
+
+A related, smaller instance of the same issue: `mergeCoverage`'s own per-profile loop (`main.go:466`, `for _, cp := range profiles`) scans each `-cover a.out,b.out` profile one at a time. If a second (e.g. integration) profile is passed, as the doc comment's own usage example shows, that scan is also serialized when it could reuse the same bounded-worker-pool pattern `parseTree` already uses (local map per goroutine, merged at the end).
+
+**Cheaper alternative:** wrap the two `main()` call sites in goroutines joined by a `WaitGroup`; for multi-profile scanning, mirror `parseTree`'s existing semaphore + per-goroutine-map pattern.
+
+**2. `tools/complexity/reach/main.go:340-348` vs `385-393` — `explainWho` rebuilds a map `buildSuccs` already built and discarded**
+
+`buildSuccs` computes `siteFan` (an O(edges) walk of every `a.cg.Nodes[*].Out`) as a local variable, uses it, and lets it go out of scope. `explainWho` then rebuilds the identical `siteFan` from scratch by re-walking the same call graph, only to print diagnostics for the `-who` debug flag.
+
+This is real duplicated work (a full callgraph-edge walk, over a ~74k-node VTA graph so likely several hundred thousand edges), but it's gated behind an opt-in debug flag (`-who &lt;substr&gt;`) used for one-off symbol investigation, not part of a normal run — so the practical cost is low. The fix is free, though: store `siteFan` as a field on `analysis`, populate it once in `buildSuccs`, and have `explainWho` reuse it.
+
+## Explicitly assessed, found NOT worth reporting
+
+**`cx.Config.For` redundancy (main.go:394, reach/main.go:159)** — you asked me to check whether the ~168-rule linear scan, called once per file and effectively once per declaration (~8800 times in reach), matters at these sizes. I benchmarked it directly against the real `features.json` (53 features, 168 total path patterns): **8800 calls took ~36ms total**. That's dwarfed by reach's own SSA build and VTA callgraph construction (documented at ~100 packages / ~74k nodes, which runs for seconds to minutes). A per-file memo would cut ~8800 calls to ~630 (one per unique file), but even eliminating the redundancy entirely saves tens of milliseconds out of a multi-second-to-minute run. Not worth adding a cache for.
+
+**370MB coverage-profile handling (main.go's `mergeCoverage`)** — you flagged this size as worth checking for unbounded memory. It's already handled correctly: `bufio.Scanner` streams the file line-by-line (1MB initial buffer, 16MB max token), there's no full-file slurp, and per its own doc comment it deliberately avoids `x/tools/cover.ParseProfiles`'s approach of materializing and sorting every block. I measured peak RSS at **~778MB** processing a synthetic 373MB/4.8M-line profile built as an adversarial worst case (every block key forced unique, which real profiles won't be — real cardinality is bounded by actual code blocks, not raw line count). ~2.1x input size for an in-memory merge structure is reasonable; this is not a "whole file in memory" problem.
+
+## Not reviewed further (confirmed fine, no write-up needed)
+
+`tools/complexity/dupl/main.go` and `tools/complexity/render.py`: both operate on already-aggregated, small JSON/report data (hundreds to low-thousands of items), not the raw 370MB/4.8M-line profile or the 74k-node callgraph. I found no redundant I/O, no recompiled regexes in loops (both `dupl`'s regexes are compiled once at package scope), and no repeated subprocess calls. Nothing here rises above "microseconds," so no findings reported for these two files.</result>
+<usage><subagent_tokens>169165</subagent_tokens><tool_uses>23</tool_uses><duration_ms>409579</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a4d966dc7d2dacc09</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-quiet-field-2e15/c78e7f5e-6c1e-4988-b71b-af9c1e35e7ce/tasks/a4d966dc7d2dacc09.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result># Altitude Review: tools/complexity
+
+I read `internal/cx/cx.go` (the stated single source of truth) first, then checked whether `main.go`, `reach/main.go`, `dupl/main.go`, and `render.py` actually route every "which feature/should this rank" decision through it, or re-decide it locally. I verified two of the findings empirically (a live test-swap for #1, direct CSV/JSON inspection for #2 and #3) rather than relying on reading alone.
+
+## Findings, most valuable first
+
+### 1. `internal/cx/cx.go` — directory-prefix rules have no "most-specific-wins" tiebreak; config order silently decides, and I demonstrated it flipping a real file's feature
+
+`file: tools/complexity/internal/cx/cx.go`, `line: 148` (`matchPass`), `line: 76` (`matchRule`)
+
+`matchPass` gives exact-path rules order-independent priority over globs/dir-prefixes (that's the whole point of the two-pass split, and it's well tested: `TestFor_ExactPathBeatsEarlierGlob`). But *within* the glob/dir-prefix pass, two directory-prefix rules of different specificity are resolved purely by **list order**, first match wins — there is no "longest prefix wins" tiebreak. `features.json` has exactly this shape: `test-infra` claims `"e2e/"` and `agent:vogon` claims `"e2e/vogon/"` (a strict sub-prefix). Today `agent:vogon` happens to sit earlier in the array (index 44 vs 52), so `e2e/vogon/*.go` resolves correctly. I verified by loading the real config, swapping just those two array entries, and re-running `cfg.For`:
+
+```
+original order -&gt; e2e/vogon/main.go maps to: agent:vogon
+swapped order  -&gt; e2e/vogon/main.go maps to: test-infra
+```
+
+Zero errors, zero warnings, either way — exactly the "invisible misattribution" class of bug the exact-path/glob split and its dedicated test were built to rule out, left unclosed for the one case (directory prefix vs. directory prefix) the design didn't generalize to.
+
+**Cost**: currently works by accident of ordering. A future edit to `features.json` (alphabetizing it, or inserting a new broad rule) can silently move LOC/complexity/coverage from one feature to another with no test catching it — `cx_test.go` covers exact-vs-glob and glob-not-crossing-directories, but has no case for two overlapping dir-prefix rules.
+
+**Deeper fix**: in the glob/dir pass, prefer the longest matching directory-prefix (or track and pick the winner by prefix length) instead of first-in-list-order — the same "specificity, not position" principle already applied to the literal tier.
+
+**Worth doing**: yes. It's in the one shared mechanism, the fix is a few lines plus one test case, and it directly protects the property the module is built to guarantee (deterministic, order-independent attribution).
+
+### 2. `render.py` (and `main.go`'s own report.md) re-decide the norank/ranked exclusion instead of reading the `ranked` field they already have
+
+`file: tools/complexity/render.py`, `line: 153` (`feature_rows`), `line: 230` (`area_tiles`) — contradicts `line: 7-8` (module docstring) and `line: 315` (page's own caption)
+`file: tools/complexity/main.go`, `line: 753`, `line: 755` (`aggTable` calls) — contradicts `line: 11-12` (package doc) and `line: 751` (report.md's own caption)
+
+`render.py`'s docstring states: *"Rank policy (which features count in rankings) comes from the data... nothing here re-decides it."* Elsewhere in the same file that's true (`core = [f for f in features if f["ranked"]]`, `prod_funcs`, `hot_files`, `unreached` all correctly gate on `ranked`). But `feature_rows()` and `area_tiles()` instead filter with `f["area"] != "generated"` / `a["name"] != "generated"` — a literal name check standing in for the real policy. Since `generated:coreapi` always has 0 prod LOC (main.go zeroes generated-file contributions upstream), that check is coincidentally harmless for it — but it does nothing for the other two norank features. I confirmed both leak through:
+
+```
+test-infra   area=test-infra  ranked=false  prod_loc=10210  sum_cognit=1319
+agent:vogon  area=agents      ranked=false  prod_loc=1121   sum_cognit=185
+```
+
+Both pass the `!= "generated"` filter and would show up in the "Cost by feature" ranking table and "At a glance" area tiles — directly contradicting the page's own note ("features marked norank... are excluded from headline totals and rankings"). The same gap already exists one layer down: `main.go`'s `writeMarkdown()` prints its own caption ("Ranking tables exclude features marked norank") immediately above the `aggTable(&amp;b, areas, ...)` / `aggTable(&amp;b, features, ...)` calls, but `aggTable` takes no ranked filter at all — only the func tables and hotspots (further down the same function) actually apply it.
+
+**Cost**: the report is wrong exactly where it claims to be authoritative from data; adding a fourth norank feature later reproduces the same leak, since the check names one specific area rather than the general property already sitting on every row.
+
+**Deeper fix**: `shown = [f for f in features if f["ranked"]]` in `feature_rows`, and `if a["ranked"]` in `area_tiles` — this also makes the "generated" special case disappear on its own, since that feature is norank too. In `main.go`, filter the aggs slice by `.Ranked` before the "By area"/"By feature" `aggTable` calls (or add a `rankedOnly` param), matching what the func-table/hotspot code already does two paragraphs later in the same function.
+
+**Worth doing**: yes, but low urgency — this is a human-read report/page, not a gate; still a one-line fix per site.
+
+### 3. `dupl/main.go` buckets duplication by a hardcoded `_test.go` check, bypassing `Ranked` — norank generated/test-infra code counts as ordinary "prod" duplication
+
+`file: tools/complexity/dupl/main.go`, `line: 95`
+
+`dupl`'s test/prod split is `strings.HasSuffix(fn, "_test.go")` only — it never calls anything equivalent to `cfg.For(fn).Ranked`. `generated:coreapi` (`internal/coreapi/*_gen.go`, non-test) and `test-infra` (`testutil.go`, `benchutil.go`, non-test helper files — confirmed both exist and are non-`_test.go`) are both `norank`, but any dupl finding in them lands in `prod_by_feature`/`lines_by_feature`/`cross`, which `render.py`'s `dupl_rows()` (line 204) displays without re-filtering. So generated-client boilerplate or test-helper duplication can appear ranked alongside genuine hand-written duplication in the page's "Duplication" section, under features the rest of the pipeline has already agreed to exclude from rankings.
+
+**Cost**: skews exactly the kind of "where's the real duplication problem" conclusion this sub-tool exists to answer, and it's inconsistent with `main.go`/`reach/main.go`, which both preserve the `Ranked` flag through to their own JSON for downstream use.
+
+**Deeper fix**: bucket via `cfg.For(fn).Ranked` (fold norank into the same excluded bucket as test, or track it separately) instead of the suffix check alone.
+
+**Worth doing**: yes, moderate priority — two-line fix, one report column affected.
+
+### 4. `main.go` compares against the bare string `"_unmapped"` instead of an exported sentinel from `cx`
+
+`file: tools/complexity/main.go`, `line: 298`
+`file: tools/complexity/internal/cx/cx.go`, `line: 96` (`var unmapped = Feature{Name: "_unmapped", ...}`, unexported)
+
+`cx.go` owns the unmapped sentinel but doesn't export it; `main.go` has to know and re-spell the string to detect it for the unmapped-files count/stderr listing. Every other consumer of `cx` only ever calls `.For()` and reads the resulting `Feature`/`Name` — this is the one spot that has to know cx's internal spelling.
+
+**Cost**: low today (one call site, well-commented), but it's the one place outside `internal/cx` "which decides `_unmapped`" leaks out; a future rename of the sentinel in `cx.go` compiles fine and silently breaks unmapped-file reporting.
+
+**Deeper fix**: export `cx.Unmapped` (or add `Feature.IsUnmapped() bool` / a `Config` helper) so `main.go` never needs the literal.
+
+**Worth doing**: optional — cheap, mostly hygiene, no live bug today.
+
+### 5. `render.py`'s coverage-chip cutoffs (50/65) are independent literals, not derived from `COV_WARN`
+
+`file: tools/complexity/render.py`, `line: 147-148` (`cov_cell`), `line: 339` ("Coverage under 65% is flagged")
+
+`COV_WARN` is correctly threaded from `report.json` meta (line 26) and used for the "complex and under-covered" definition throughout the page. But the visual chip thresholds in `cov_cell` (`c &lt; 50` → "crit", `c &lt; 65` → "ser") and the matching caption text are separate hardcoded numbers that merely happen to agree with `COV_WARN`'s current default (50).
+
+**Cost**: low-medium — running the pipeline with `-cov-warn=40` (a documented, supported flag) would desync the chip coloring and its own caption from every other "under-covered" figure on the same page, undercutting the README's claim that thresholds "travel in report.json meta so the rendered page labels itself from data."
+
+**Deeper fix**: derive the bands from `COV_WARN` (e.g., `COV_WARN` and `COV_WARN + 15`) instead of bare `50`/`65`.
+
+**Worth doing**: optional — one-line fix, only manifests if the flag is ever changed from default.
+
+## What's already at the right altitude
+
+- `internal/cx/cx.go`'s core design — the exact-path-beats-glob precedence, the `_test.go`-follows-source rule, the `validate()` guard against a silently-unmatchable glob — is genuinely well-generalized and well-tested (`cx_test.go` pins exactly the shape of bug it's meant to prevent, for the cases it covers).
+- `main.go`'s own threshold flags (`cyclo-warn`, `cognit-warn`, `cov-warn`) are used consistently everywhere in that file — no internal drift, unlike render.py's coverage chip.
+- The README's specific claim ("thresholds are flags... their effective values travel in `report.json` meta") holds for the three named flags; I checked `render.py` reads `cognit_warn`/`cov_warn` from `meta` rather than re-declaring them. The `dupl` threshold (50, in `dupl-config.yaml`) is outside that claim's scope — it's golangci-lint's own linter config, not a cxtool flag — so its being echoed as a hardcoded "threshold 50" string in two prose spots (`main.go:334`, `render.py:384`) is a much lower-stakes doc-rot risk than a genuine meta-bypass, not worth a fix given how rarely `dupl-config.yaml` would change.
+- `main.go`, `reach/main.go`, and `dupl/main.go` all route feature/area resolution exclusively through `cfg.For(...)` — no parallel glob-matching logic was found duplicated anywhere outside `cx`.</result>
+<usage><subagent_tokens>190194</subagent_tokens><tool_uses>37</tool_uses><duration_ms>555990</duration_ms></usage>
+</task-notification>

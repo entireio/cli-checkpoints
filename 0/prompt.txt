@@ -1,0 +1,467 @@
+I want as small as possible a patch to achieve the following:
+
+$ entire clone /et/paul/dogbark
+
+should go to entire-core and retrieve the Entire-native repo 'dogbark' in the 'paul' project.  That repo will have a home cluster it's on, say aws-ap-southeast-2.entire.io.  the command should do a clone equivalent to:
+
+$ git clone entire://aws-ap-southeast-2.entire.io/et/paul/dogbark.git
+
+take a look - also in ~/src/entirehq/entiredb (where entire-core lives) and lay out your plans for implementation.  Verify all assumptions, read the code, don't just guess based on comments or docs.
+
+as for details, if there's only one slash in the argument, 'project/repo' should be treated as: '/et/project/repo'
+
+---
+
+<task-notification>
+<task-id>a15c30986a393c17c</task-id>
+<tool-use-id>toolu_01WXhCDA2iKqXeouXi3CuvBe</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-paul-src-entireio-cli/cbac77ba-e468-44e9-8590-9d7d92b226bf/tasks/a15c30986a393c17c.output</output-file>
+<status>completed</status>
+<summary>Agent "Explore CLI clone path" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Findings below. Everything is cited; nothing inferred without a citation.
+
+## 1. The existing `entire repo clone`
+
+**File:** `/Users/paul/.claude/worktrees/cli/floating-crunching-honey/cmd/entire/cli/repo_clone.go` (registered at `cmd/entire/cli/repo.go:31` inside `newRepoCmd`).
+
+**Accepted argument formats — GitHub mirrors only.** `repo_clone.go:23`:
+
+```go
+var mirrorCloneRefRe = regexp.MustCompile(`^/?gh/` + gitHubOwnerPat + `/` + gitHubRepoPat + `$`)
+```
+
+(`gitHubOwnerPat`/`gitHubRepoPat`/`gitHubDotOnlyRe` are at `cmd/entire/cli/repo_mirror_probe.go:34,35,48`.)
+
+So only two shapes are accepted (`repo_clone.go:80-95`):
+- `/gh/&lt;owner&gt;/&lt;repo&gt;` (leading slash optional) — `parseMirrorCloneRef` (`repo_clone.go:65`) lowercases owner/repo and hard-pins provider to `"github"` (`repo_clone.go:29`).
+- A full `entire://…` URL — detected by prefix only (`isEntireCloneURL`, `repo_clone.go:34-40`) and passed verbatim to `git clone` with no lookup and no `validateClusterHost` (`repo_clone.go:106-118`).
+
+**There is no `/et/` branch.** `parseMirrorCloneRef` rejects `/et/paul/dogbark` with `expected gh/&lt;owner&gt;/&lt;repo&gt; …` (`repo_clone.go:67-68`).
+
+**Placement selection.** `RunE` calls `resolvePullablePlacements` (`repo_clone.go:232`), which hits the pull-gated mirror endpoint:
+
+```go
+out, err := c.ResolveMirrorPlacements(ctx, coreapi.ResolveMirrorPlacementsParams{
+    Provider: coreapi.ResolveMirrorPlacementsProviderGithub,
+    Owner: owner, Repo: repo,
+})
+```
+
+Then `selectCloneTarget` (`repo_clone.go:263`) → `selectPlacement` (`repo_clone.go:276`). `selectPlacement` dedupes by lowercased `ClusterHost`, honors `--cluster` exactly, returns the single placement when there's one, and otherwise prompts with a `huh` select (falling back to an error naming `--cluster` when `interactive.CanPromptInteractively()` is false). Note it is typed on `coreapi.ResolvedPlacement` (mirror-shaped), not on a native-repo type.
+
+`--cluster` also swaps the control-plane dialer to `runCoreForCluster` (`repo_clone.go:139-152`; `corecmd.go:590`), so a cluster in another federation resolves.
+
+**URL construction** (`repo_clone.go:57`):
+
+```go
+func mirrorCloneURL(host, owner, repo string) string {
+	return fmt.Sprintf("%s%s/gh/%s/%s", entireCloneURLScheme, host, owner, repo)
+}
+```
+
+The `gh` segment is hardcoded; the doc comment at `repo_clone.go:42-56` explicitly flags this as a "HARDCODED ASSUMPTION … If a non-GitHub provider ever lands, this must take a provider argument or the URL will lie." Guard before use: `validateClusterHost(chosen.ClusterHost)` at `repo_clone.go:170` (impl `cmd/entire/cli/repo_mirror.go:427`).
+
+## 2. Existing `entire://` handling
+
+Yes — extensive.
+
+- **Remote helper binary:** `cmd/git-remote-entire/main.go`. It parses the URL (`main.go:85-99`), rejects a non-`entire` scheme, and rejects an empty host *or* a forge id in the host slot via `gitremote.IsSupportedForge(parsedURL.Host)`. **It does not care about the path prefix** — `parsedURL.Path` is passed straight into the transport (`main.go:130-138`), so `/et/paul/dogbark` already works today. `internal/remotehelper/replicas/replicas.go:62-72` documents exactly this: `entire://host/et/project/repo -&gt; "et/project/repo"`.
+- Binary name constant: `internal/remotehelper/name.go:10` (`git-remote-entire`); installed onto PATH by `scripts/install.sh:258-262`.
+- **Existing test already asserts the target shape:** `cmd/git-remote-entire/main_test.go:123` uses `Path: "/et/paul/dogbark"` and `main_test.go:143` expects `git clone entire://aws-eu-central-1.entire.io/et/paul/dogbark`.
+- **URL parsing in the CLI:** `cmd/entire/cli/gitremote/gitremote.go:170-182` — for `entire://`, the first path segment is the forge (`splitForgePrefix`, `gitremote.go:186`). `IsSupportedForge` (`gitremote.go:65`) only knows `"gh"` (from `hostToForge`, `gitremote.go:47`) — **`"et"` is NOT a supported forge id** by that predicate, though the doc comments at `gitremote.go:29` and `:231` name `"et"` as a real forge, and `cmd/entire/cli/trail_cmd_test.go:483` exercises an `et` forge through the trails API.
+- **Native repo remote URL already exists:** `cmd/entire/cli/repo.go:67-74`
+
+```go
+func repoRemoteURL(r coreapi.Repo) string {
+	host := strings.TrimSpace(r.ClusterHost.Or(""))
+	path := strings.TrimSpace(r.Path.Or(""))
+	if host == "" || path == "" { return "" }
+	return "entire://" + host + "/" + strings.TrimPrefix(path, "/")
+}
+```
+
+  Used by `entire repo get` (REMOTE column, `repo.go:51-58`) and `entire repo create` (`repo.go:86-108`, `repo.go:168-170`). **This is the exact URL builder your patch wants** — it takes the server-supplied `Path`, which is the `/et/&lt;project&gt;/&lt;repo&gt;` slug.
+- Mirror-URL decomposition (`gh`-only): `cmd/entire/cli/repo_mirror.go:1254-1279` `parseMirrorCloneURL`.
+- No credential helper is involved. Auth is inside `git-remote-entire`: `resolveCreds` (`cmd/git-remote-entire/main.go:352-...`) uses `ENTIRE_TOKEN` verbatim, else resolves the login context for the cluster host via `clusterdiscovery.ResolveClusterAuth` and uses the refreshed login JWT as the transport bearer (`main.go:395-410`). Bearer is attached in `setAuthWithProvider` (`main.go:212-227`), gated on the request being a recognised git smart-HTTP endpoint (`gitActionFromRequest`, `main.go:439`).
+
+## 3. Control-plane (coreapi) surface
+
+**Client methods** (`internal/coreapi/oas_client_gen.go`):
+- `GetRepo(ctx, GetRepoParams{RepoId string}) (*Repo, error)` — `:3008`
+- `ListProjectRepos(ctx, ListProjectReposParams) (*ListProjectReposOutputBody, error)` — `:5194`; params at `oas_parameters_gen.go:211` (`ProjectId`, plus optional exact-match `Name`); output at `oas_schemas_gen.go:4396` with a **singular `Repo OptRepo`** for name-filtered lookups plus plural `Repos []Repo`
+- `ListProjects(ctx, ListProjectsParams{Name})` — `:5349`
+- `ListRepos(ctx, ListReposParams) (*ListReposOutputBody, error)` — `:5724`; params `oas_parameters_gen.go:246` (`Filter` = exact `owner/repo`, `Scope`)
+- `ListClusters(ctx) (*ListClustersOutputBody, error)` — `:4099`
+- `ResolveMirrorPlacements(...)` — `:6735`
+- **`LookupRepoBySlug(ctx, LookupRepoBySlugParams{Slug string}) (*LookupBySlugOutputBody, error)` — `:6148`. This is the one that matters and it is currently UNUSED anywhere in the CLI.** Param doc, `oas_parameters_gen.go:277-280`:
+
+```go
+// Provider-scoped slug, e.g. gh/acme/oss-lib or et/my-project/my-repo.
+Slug string
+```
+
+  Spec: `GET /repos/lookup-by-slug`, summary *"Resolve a repo slug to routing info (unauthenticated)"* — and it genuinely sends no auth (`oas_client_gen.go:6153-6195` has no security wrapping; the spec has no global `security`). Response `LookupBySlugOutputBody` (`oas_schemas_gen.go:4886`): `Cell string`, `Jurisdiction string`, `Owner string`, `Repo string`, `RepoId string`. **Caveat: no `clusterHost` and no `publicUrl`** — you'd have to join `Cell` against the cluster catalog (see `matchClusterByCellInURL` below) to get `aws-ap-southeast-2.entire.io`.
+
+**Field shapes:**
+- `Repo` (`oas_schemas_gen.go:7761-7780`): `ClusterHost OptString`, `Path OptString`, `FullName OptString`, `ID`, `Name`, `OwningProjectId`, `State`, `Visibility`, `Foreign`, …
+- `Cluster` (`oas_schemas_gen.go:816-823`): `ApiUrl OptString`, `IsDefault bool`, `Jurisdiction string`, `PublicUrl string`, `Slug string`
+- `RepoPlacement` (`oas_schemas_gen.go:8291-8299`): `Cell`, `ClusterSlug`, `ID`, `Jurisdiction`, `Mirror bool`, `Status`
+- `ResolvedPlacement` (`oas_schemas_gen.go:8651-8659`): `Cell OptString`, `ClusterHost string`, `Jurisdiction OptString`, `MirrorId string`
+- `RepoIndexEntry` (`oas_schemas_gen.go:8141-8157`): `FullName`, `Placements []RepoPlacement`, `Primaries`, `Candidate`, …
+
+**`cell_target.go`** (`/Users/paul/.claude/worktrees/cli/floating-crunching-honey/cmd/entire/cli/cell_target.go`):
+- `resolveRepoCellTarget(ctx, fullName, ulid string) (*auth.CellTarget, error)` — `:70`. ULID path: `GetRepo` → `Repo.ClusterHost` → `cellTargetForClusterHost` (`:109`) → `ListClusters` + `matchClusterByHost` (`:335`) → `cellTargetFromCluster` (`:155`). owner/repo path: delegates to `resolveRepoCellPlacement` and discards the id.
+- `resolveRepoCellPlacement(ctx, owner, repo string) (repoCellPlacement, error)` — `:278`. Returns `repoCellPlacement{RepoID string; Target *auth.CellTarget}` (`:252-262`). Path: `ListRepos(Filter: "owner/repo")` → `resolveProcessingPlacement` (`:191`) → `cellTargetForPlacement` (`:138`) → `matchClusterBySlug` (`:357`) then `matchClusterByCellInURL` (`cell_fanout.go:332`).
+- **These return `*auth.CellTarget{BaseURL, Jurisdiction}` — an entire-api *cell API URL*, not a git cluster host.** They are not directly reusable for building a clone URL; the reusable pieces are `ListClusters` + `matchClusterByHost` / `matchClusterByCellInURL` / `hostFromPublicURL`.
+- Timeouts: `cellResolveTimeout = 5s` (`:19`), `requiredCellResolveTimeout = 15s` (`:34`). Injectable client via `newCellCoreClient` var (`:47`) and the `cellCoreClient` interface (`:39`) — this is the established unit-test seam.
+
+Helpers for slug→host: `clusterHostBySlug` (`repo_mirror.go:256`) and `hostFromPublicURL` (`repo_mirror_create_wizard.go:89`), both of which deliberately reject the `host@evil.com` userinfo trick.
+
+## 4. `/et/` vs `/gh/` in the codebase
+
+`/gh/` is first-class throughout. `/et/` exists only as **documentation, test data, and a server-side slug convention** — there is no production Go code that parses or builds an `/et/` path:
+
+- `internal/remotehelper/replicas/replicas.go:62-72` — documents `/et/&lt;project&gt;/&lt;repo&gt;` (and legacy `/git/&lt;owner&gt;/&lt;repo&gt;`) alongside `/gh/`; `ExtractRepoPath` (`:73`) is prefix-agnostic (`strings.Trim(urlPath, "/")`).
+- `internal/remotehelper/transport/proxy.go:36` — "path on each node (e.g. `/et/project/repo`)".
+- `cmd/entire/cli/gitremote/gitremote.go:29` and `:231` — forge ids `"gh", "et", ...`. But `forgeToHost`/`IsSupportedForge` (`:51-66`) contain **only** `gh`.
+- `internal/coreapi/oas_parameters_gen.go:278` — the `lookupRepoBySlug` slug doc naming `et/my-project/my-repo`.
+- Tests: `cmd/git-remote-entire/main_test.go:102-108, 123, 143`; `cmd/entire/cli/trail_cmd_test.go:483`; `cmd/entire/cli/checkpoint/remote/util_test.go:141, 334, 801`; `internal/remotehelper/transport/proxy_test.go` passim.
+- `repo.go:67-74` (`repoRemoteURL`) is prefix-agnostic — it uses whatever `Repo.Path` the server returns. `cmd/entire/cli/repo_test.go:22-70` only tests generic paths (`acme/web`), and `corecmd_mutation_test.go:72` uses `/gh/o/web`.
+- Native repos are explicitly excluded from the mirror surface: `repo_mirror.go:275-280` — *"Non-mirror (native Entire) placements are skipped … a native repo has no GitHub mirror clone URL"* (see `RepoPlacement.Mirror`).
+
+## 5. Top-level `clone`? Registration mechanics
+
+**There is no top-level `clone`.** `grep -rn 'Use:\s*"clone'` returns exactly one hit: `repo_clone.go:80`. `entire repo clone` is the only spelling.
+
+**Registration:** `cmd/entire/cli/root.go:167-213` inside `NewRootCmd`. Relevant existing lines:
+
+```go
+cmd.AddCommand(exemptFromEntireDirCheck(inGroup(newRepoCmd(), groupControlPlane)))  // root.go:180
+cmd.AddCommand(inGroup(newSearchCmd(), groupSessions))                             // root.go:201
+```
+
+Groups are declared at `root.go:159-165` (`groupSetup`, `groupSessions`, `groupAccount`, `groupControlPlane`). Precedent for "same command in two places": `search` is registered both at top level and under `checkpoint` (`root.go:201`, asserted by `TestSearchIsVisibleAtTopLevelAndUnderCheckpoint`, `root_test.go:216`).
+
+Cobra `Aliases` only alias a command **within its parent** (`checkpoint_group.go:16`, `sessions.go:160`; asserted by `TestRoot_NounGroupShorthandsUseCobraAliases`, `root_test.go:180`) — so you cannot alias `repo clone` to top-level `clone`; you must `AddCommand` a second command object at root.
+
+**Four test gates a new visible top-level command must satisfy:**
+
+1. **`agentHelpClassification`** — `cmd/entire/cli/agent_help_cmd.go:97-181`, a `map[string]agentHelpFacts{audience, listed}`. `TestAgentHelpClassification_CoversEveryAdvertisedCommand` (`agent_help_cmd_test.go:634-658`) fails CI on any advertised top-level command that is unclassified. `repo` is currently `{agentHelpAudienceUserOwned, false}` (`agent_help_cmd.go:176`), so a top-level `clone` would most naturally be `{agentHelpAudienceUserOwned, false}` too. **Escape hatch:** `isAgentHelpAdvertised` (`agent_help_cmd.go:538-549`) skips `Hidden` commands without the `agentHelpAnnotation`, so a *hidden* top-level `clone` needs no classification entry.
+2. **`TestRoot_VisibleCommandsAreGrouped`** — `root_test.go:267-341`. Any visible, non-experimental, non-deprecated root command must appear in `wantGroups` (`root_test.go:284-305`) with a matching `GroupID`, or in the `ungrouped` allowlist (`root_test.go:275-281`).
+3. **`entireDirCheckExemptions`** — `cmd/entire/cli/entiredir_guard_test.go:37-51`. If you wrap with `exemptFromEntireDirCheck` (`entiredir_guard.go:42`) — which you should: cloning runs outside any repo — you must add `"entire clone": "&lt;reason&gt;"` to that map, or `TestEntireDirCheckExemptions` (`entiredir_guard_test.go:72`) fails.
+4. **Docs** — `CLAUDE.md:78-89` and the identical `AGENTS.md:78-89` describe the `repo` command surface; `CLAUDE.md:1120` / `AGENTS.md:1120` cite `entire repo clone /gh/...` as a non-TTY-behavior exemplar.
+
+## 6. How `git clone` actually runs, and auth
+
+`runGitClone` — `repo_clone.go:364-378`:
+
+```go
+func runGitClone(ctx context.Context, cmd *cobra.Command, cloneURL, targetDir string) error {
+	args := []string{"clone", cloneURL}
+	if targetDir != "" { args = append(args, targetDir) }
+	fmt.Fprintf(cmd.ErrOrStderr(), "Cloning %s\n", cloneURL)
+	gitCmd := exec.CommandContext(ctx, "git", args...)
+	gitCmd.Stdin  = cmd.InOrStdin()
+	gitCmd.Stdout = cmd.OutOrStdout()
+	gitCmd.Stderr = cmd.ErrOrStderr()
+	if err := gitCmd.Run(); err != nil {
+		return NewSilentError(fmt.Errorf("git clone failed: %w", err))
+	}
+	return nil
+}
+```
+
+Plain `exec.CommandContext(ctx, "git", …)` — not the `gitexec`/`execx` packages. Stdio is wired through so the helper's prompts reach the user. **No credential helper is installed and no headers are set by the CLI**: git resolves `entire://` by exec'ing `git-remote-entire` from PATH, and that binary does its own auth (see §2). This means a native-repo clone needs **zero** auth work in the patch — only a correct `entire://&lt;clusterHost&gt;/et/&lt;project&gt;/&lt;repo&gt;` URL.
+
+---
+
+## Implications for the minimal patch (all citation-backed)
+
+The data path already exists end-to-end; only the CLI front door is missing.
+
+- **Cheapest correct resolution for `paul/dogbark`:** `resolveProjectRef(ctx, c, "paul")` (`resolveref.go:161`) → `ListProjectRepos{ProjectId, Name: "dogbark"}` → singular `out.Repo` (`resolveref.go:197-208`, `oas_schemas_gen.go:4401`) — that response is already a full `coreapi.Repo` carrying both `ClusterHost` and `Path`, so you can feed it straight to `repoRemoteURL` (`repo.go:67`) and then `runGitClone` (`repo_clone.go:364`). Two round trips, no new coreapi call, no cluster-catalog join, and `repo.Path` supplies the `/et/` prefix authoritatively rather than you synthesizing it. `resolveRepoRef` (`resolveref.go:186`) does the same walk but throws away everything but the ULID, so you'd need `GetRepo` after it — prefer inlining the `ListProjectRepos` call, or add `GetRepo(repoID)` for one extra hop.
+- **Alternative (single call, unauthenticated, but incomplete):** `LookupRepoBySlug{Slug: "et/paul/dogbark"}` (`oas_client_gen.go:6148`) returns only `Cell`/`Jurisdiction`/`RepoId` — you'd still need `ListClusters` + `matchClusterByCellInURL` (`cell_fanout.go:332`) + `hostFromPublicURL` (`repo_mirror_create_wizard.go:89`) to get the host. Worth knowing it exists, but it is strictly more work than the `ListProjectRepos` route.
+- **`selectPlacement` is not reusable as-is** — it is typed on `coreapi.ResolvedPlacement` (`repo_clone.go:276`), which is mirror-specific. A native repo has exactly one `ClusterHost` on the `Repo` object, so no picker is needed at all.
+- **Ref parsing must be new code.** `mirrorCloneRefRe` (`repo_clone.go:23`) is anchored on `gh/`, and `mirrorCloneURL` (`repo_clone.go:57`) hardcodes `/gh/`. Do not widen `mirrorCloneRefRe`; the `gh` path also drives provider selection at `repo_clone.go:29`. Note that `gitHubOwnerPat` (`[A-Za-z0-9-]+`) is a GitHub charset, not necessarily a valid Entire project-name charset — check whether project/repo names allow `_` or `.` before reusing it.
+- **`validateClusterHost`** (`repo_mirror.go:427`) should be applied to the server-supplied `Repo.ClusterHost` before interpolation, matching the existing guard at `repo_clone.go:170`.
+- **The remote helper needs no change** for `/et/` paths (`main.go:130-138`, `replicas.go:62-73`). One cosmetic gap: `missingClusterHostMessage` (`main.go:274-296`) only offers the `entire repo clone` hint when `gitremote.IsSupportedForge(seg[0])` — and `"et"` is not in `forgeToHost` (`gitremote.go:47-51`), so `entire:///et/paul/dogbark` falls back to a bare `fatal: missing host in URL` rather than an actionable hint. Optional to fix.
+
+Blockers: none. I did not find any server-side contract stating the exact `Repo.Path` value for a native repo — the `/et/&lt;project&gt;/&lt;repo&gt;` shape is attested by `oas_parameters_gen.go:278`, `replicas.go:62-72`, and `main_test.go:123`, but `repo.Path` is `OptString` with no format constraint in the spec (`core.gen.json` `Repo.path` is a bare `{"type":"string"}`), so the patch should treat it as opaque (which `repoRemoteURL` already does) rather than assert an `et/` prefix.</result>
+<usage><subagent_tokens>137066</subagent_tokens><tool_uses>70</tool_uses><duration_ms>297729</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a777b71281f5401e1</task-id>
+<tool-use-id>toolu_01JxTg7obrTCqjDKf2Td5G5g</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-paul-src-entireio-cli/cbac77ba-e468-44e9-8590-9d7d92b226bf/tasks/a777b71281f5401e1.output</output-file>
+<status>completed</status>
+<summary>Agent "Explore entiredb repo model" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have everything I need. Here's the report.
+
+---
+
+# entiredb (entire-core control plane) — findings for `entire clone /et/paul/dogbark`
+
+Repo: `/Users/paul/src/entirehq/entiredb` @ `ca75ccf2fc`. Note: the `entire` CLI and `git-remote-entire` live in **github.com/entireio/cli**, not here (`README.md:66`, `CLAUDE.md:47`). Everything below is the server side the CLI would call.
+
+---
+
+## 1. Repo model: Entire-native vs mirrored GitHub
+
+**Two path surfaces, three prefixes.** They are declared once each and mirrored where needed:
+
+| Prefix | Constant | Meaning |
+|---|---|---|
+| `/et/` | `repourls/store.go:41` `URLPathPrefix`; `core/authn/audience.go:47` `AudiencePathRepoPrefix` | Entire-native repo, `/et/&lt;project&gt;/&lt;repo&gt;` |
+| `/git/` | `repourls/store.go:48` `LegacyURLPathPrefix`; `core/authn/audience.go:51` | Legacy pre-rename native prefix; still routed/resolvable |
+| `/gh/` | `core/mirrorrepo/mirrorrepo.go:77` `URLPrefix`; `core/authn/audience.go:62` `AudiencePathMirrorRepoPrefix` | GitHub mirror, `/gh/&lt;owner&gt;/&lt;repo&gt;` |
+| `/git/repo/&lt;ULID&gt;` | `core/authn/audience.go:37` `AudiencePathGitRepoPrefix` | Internal by-ULID surface (DISS repair, mirror-worker, entire-backup) |
+
+**Native path is minted at create time** — `core/coreapi/repos.go:161`:
+```go
+url := repourls.URLPathPrefix + project.Name + "/" + name   // "/et/&lt;project&gt;/&lt;repo&gt;"
+```
+with the comment at `:158-160` explaining why there's no owner segment: *"project.Name is globally unique (core/resource/project_name.go), so /et/&lt;project&gt;/&lt;name&gt; names the repo without needing the owner segment."*
+
+**A "mirror" is now also a native repo.** `core/mirrorrepo/mirrorrepo.go:1-10`: *"A mirror is promoted to a native EntireDB repo (COR-434): it has a mirrors-project parent, a repo_registry row, and SpiceDB-governed pull/push."* The mirrors project is a reserved namespace, `core/resource/store.go:1458` `MirrorsProjectNamePrefix = "gh:mirrors:"`, and `core/coreapi/repos.go:101-103` forbids user repo creation inside it.
+
+The real discriminators:
+- **`repo_group.forge`** — `core/model/types.go:27-28`: `RepoGroupForgeGitHub = "github"`, `RepoGroupForgeEntire = "entire"`. Surfaced on the wire as `Repo.Provider` (`api/corev1/repos.go:16`, enum `github,entire`).
+- **URL table** — native URLs live in the global `repo_urls` (`repourls/`), mirror URLs in the per-cluster `github_mirror_repo_urls`. `core/coreapi/ci_webhooks.go:1477-1494` documents this disjointness explicitly and switches on `IsMirrorPlacement` rather than trying one table and falling back.
+- **`RepoPlacement.Mirror`** bool — `api/corev1/repos.go:423`.
+
+**Full path shape** for your example: repo `dogbark` in project `paul` → `repo_urls.url = "/et/paul/dogbark"`, and the remote is `entire://&lt;clusterHost&gt;/et/paul/dogbark`.
+
+---
+
+## 2. Control-plane endpoints to resolve project/repo → home cluster
+
+All under `/api/v1` on entire-core. The live OpenAPI spec is served (unauthenticated) at `/api/v1/openapi.json` / `.yaml` / `-3.0.json` — see `core/coreapi/register.go:193-198`. **There is no checked-in `core.openapi.json`**; it's generated by huma at runtime.
+
+### The candidates, ranked for this feature
+
+**(a) `POST /api/v1/repos/resolve`** — `core/coreapi/repos.go:685`, registered at `:3675-3682`. Best fit.
+- Input (`api/corev1/repos.go:691-705`): `{"repositories":[{"provider":"entire","fullName":"paul/dogbark"}]}`, max 100, order-preserving.
+- Output `RepoResolution` (`api/corev1/repos.go:712-728`): `provider`, `requestedFullName`, `fullName`, `status` (`ready|processing|no-mirror|unavailable`), `repoId`, `placements[]`, `primaries`.
+- Authenticated but **read-classified**: `core/coreapi/register.go:174-186` exempts `POST /api/v1/repos/resolve` from the session-mutation gate, so an api-access token works.
+- Per-placement authz is a batched SpiceDB `repo#pull` check (`core/coreapi/repos.go:782`) — the exact permission the clone's STS exchange enforces.
+- ⚠️ **`placements[]` carries `clusterSlug` and `cell`, but NOT `clusterHost`** (`api/corev1/repos.go:412-431`).
+
+**(b) `GET /api/v1/repos/{repoId}`** — `core/coreapi/repos.go:293`, registered `:3578-3585`. This is the only endpoint that returns **both** halves of the remote:
+```go
+// api/corev1/repos.go:68-75
+// ClusterHost and Path locate the repo: the entire:// remote is
+// "entire://" + ClusterHost + Path (e.g. "entire://royalcanin.partial.to" +
+// "/et/&lt;project&gt;/&lt;repo&gt;"). Both are populated on single-repo responses
+// (create, get). List responses carry ClusterHost too ... but still omit Path.
+ClusterHost string `json:"clusterHost,omitempty"`
+Path        string `json:"path,omitempty"`
+```
+Built in `buildRepoWire` (`core/coreapi/repos.go:351-442`): `path` from `ListRepoURLsFollowerRead` (`:401-405`), `host` from `ClusterPublicHost(repo.ClusterSlug)` (`:409-413`). Gated on `repo#pull` at `:310-317`.
+
+**(c) `GET /api/v1/projects?name=paul` → `GET /api/v1/projects/{projectId}/repos?name=dogbark`**
+- `ListProjectsInput.Name` (`api/corev1/projects.go:36`) — exact-match, case-insensitive; returns a single `Project`.
+- `ListProjectReposInput` (`api/corev1/repos.go:808-813`) — with `?name=` returns a single `Repo` in `body.repo` (`api/corev1/repos.go:822`). Handler `core/coreapi/repos.go:2969`; the `?name=` arm calls `stampClusterHosts` at `:3036`/`:3049`, so **`clusterHost` is populated, `path` is not**.
+- Downside: two round-trips, and it resolves the project by ULID path param (`pattern:"^[0-9A-HJKMNP-TV-Z]{26}$"`).
+
+**(d) `GET /api/v1/repos/lookup-by-slug?slug=et/paul/dogbark`** — `core/coreapi/repos.go:3379`, registered `:3699-3708`.
+- **Unauthenticated** (`core/coreapi/register.go:207` in `isPublicDocsPath`), and **public-repos-only**: gated on the SpiceDB `public_viewer` wildcard, private → 404 (`:3399-3423`).
+- Slug parsing: `strings.SplitN(slug, "/", 3)`, `case "gh"` / `case "et"` (`:3380-3394`) — note **no leading slash**, `et/paul/dogbark`.
+- Output (`api/corev1/repos.go:258-266`): `repoId`, `cell`, `jurisdiction`, `owner`, `repo`.
+- ⚠️ **No `clusterHost`.** `cell` is not a git host (see §3). Not sufficient on its own for a clone.
+
+**(e) `GET /api/v1/mirrors/placements?provider=github&amp;owner=…&amp;repo=…`** — `core/coreapi/mirrors.go:121`, registered `:438-445`. This is the **existing precedent for exactly your feature**, but GitHub-only:
+```go
+// core/coreapi/mirrors.go:104-106
+// ResolvePlacements returns the cluster placements of a mirrored upstream that
+// the caller may discover, each with the public cluster host needed to build an
+// entire:// clone URL. It backs `entire repo clone /gh/&lt;owner&gt;/&lt;repo&gt;` ...
+```
+`ResolvedPlacement` (`api/corev1/mirrors.go:56-61`) carries `mirrorId`, **`clusterHost`**, `jurisdiction`, `cell` — *"just the routing info the CLI needs to synthesize an entire:// clone URL"*. Gated on `repo#lookup_placement` (superset of `pull`), placements with an unresolvable host are dropped (`core/coreapi/mirrors.go:157-162`).
+
+&gt; **Gap to note in your plan: there is no `/et/` twin of `/mirrors/placements`.** For a native repo the CLI must either (b) `resolve` → `GET /repos/{repoId}`, or (a)+(f) `resolve` → map `clusterSlug` via `/clusters`.
+
+**(f) `GET /api/v1/clusters`** — `core/coreapi/clusters.go:29`, registered `:57-66`. Authenticated, no per-cluster authz (*"cluster topology is shared infrastructure"*, `:25-27`). Returns `[{slug, jurisdiction, publicUrl, isDefault, apiUrl}]` (`api/corev1/clusters.go:6-22`). This is the `clusterSlug → git host` map.
+
+### Which placement is "home"?
+
+For natives, `RepoResolution.Primaries` / `RepoIndexEntry.Primaries` (`api/corev1/repos.go:394-407`):
+- `primaries.git_data` / `data_primary` = the immutable data primary — for an `entire` group, *"GitData names the primary placement native replicas follow"* (`:352-355`). **This is the home cluster.**
+- `primaries.processing` / `processing_primary` = elected processing primary.
+
+Server-side selection logic in `lookupNativeSlug` (`core/coreapi/repos.go:3495-3564`) does elected-first, primary-fallback:
+```go
+if elected := electedNativePlacement(placements); elected != nil {
+    repoID, clusterSlug = elected.ID, elected.ClusterSlug
+} else if primary := primaryPlacement(placements); primary != nil {
+    repoID, clusterSlug = primary.ID, primary.ClusterSlug
+}
+```
+where `primaryPlacement` (`:2934-2941`) returns the first placement with `!IsNativeMirror()` — i.e. the original, non-replica placement. Native repos may now have **multiple** placements ("native mirroring", `api/corev1/native_mirrors.go`, `GET/POST/DELETE /repos/{repoId}/native-mirrors`), so single-placement is no longer a safe assumption.
+
+---
+
+## 3. How the git hostname is derived
+
+**Cluster catalog is a checked-in YAML fixture reconciled into a `clusters` table on boot.**
+
+- Model: `core/cluster/cluster.go:22-40` — `ID, Slug, Jurisdiction, DisplayName, PublicURL, InternalURL, Cell, IsDefault, Hidden, NativeMirrorHosting, …`
+- Fixture loader: `core/cluster/fixture.go:12-14` (`//go:embed fixtures/clusters.{staging,prod,local}.yaml`), env selected by `ENTIRE_CLUSTER_FIXTURE_ENV` (`:19-28`).
+- **Prod fixture** `core/cluster/fixtures/clusters.prod.yaml:34-41` — your exact example:
+```yaml
+- id: clu_01KVM23VNJ67DTA3G4KZQ813DA
+  slug: aws-ap-southeast-2
+  jurisdiction: au
+  cell: aws-ap-southeast-2
+  display_name: AWS AP Southeast 2
+  public_url: https://aws-ap-southeast-2.entire.io
+  internal_url: https://svctok.aws-ap-southeast-2.entire.internal:8281
+```
+
+**The field the CLI uses is `public_url`'s host** — `core/api/accessors.go:387-403`:
+```go
+func (s *Server) ClusterPublicHost(ctx context.Context, slug string) (string, error) {
+	c, err := s.cluster.GetBySlugGlobal(ctx, slug)   // globally-unique slug, NOT jurisdiction-scoped
+	...
+	u, err := url.Parse(c.PublicURL)
+	return u.Host, nil
+}
+```
+The doc comment at `:379-386` is important: the lookup is **not** jurisdiction-scoped, *"the mirror/repo listings render hosts for clusters in every jurisdiction from a single core"*. So any core can resolve any cluster's host.
+
+**Do NOT derive the host from `slug` or `cell`.** In prod they happen to coincide, but staging proves otherwise — `core/cluster/fixtures/clusters.staging.yaml:55-59`: `slug: royalcanin`, `cell: aws-us-west-2`, `public_url: https://royalcanin.partial.to`. And `api/corev1/repos.go:415-422` warns that `Cell` is the *entire-api* addressing axis (`https://&lt;cell&gt;.api.partial.to`), while `ClusterSlug` is a logical name.
+
+Memoized helper for batch use: `core/repodirectory/url.go:37-50` `ClusterHostMemo` (fails quiet with `""`).
+
+---
+
+## 4. `entire://` vs HTTPS — where the scheme is handled
+
+**`entire://` is a client-side Git remote helper only.** There is no server-side `entire://` listener.
+
+- ADR `docs/adrs/20260119-custom-git-remote-transport.md` — decision to replace the credential helper with `git-remote-entire`; *"Git discovers the transport by looking for `git-remote-entire` in `$PATH`"*; trade-off noted at line ~52: *"Non-standard URL scheme (while `https://` URLs still work, you need to construct them manually)"*.
+- `README.md:260` — the helper handles auth using the JWT from `entire login`.
+- Flow diagram `docs/git-flows.md:21-73`.
+
+**The server speaks plain Git smart HTTP over HTTPS.** Mounts in `server/githttp/service.go:204-214`:
+```go
+mux.Handle("/et/",  gitAuth(userRateLimit(http.HandlerFunc(svc.handleRepo))))
+mux.Handle("/git/", gitAuth(userRateLimit(http.HandlerFunc(svc.handleRepo))))
+mux.Handle("/gh/",  gitAuth(userRateLimit(http.HandlerFunc(svc.handleRepo))))
+```
+`handleRepo` (`server/githttp/repo.go:110-160`) canonicalizes then resolves via `repo_urls.LookupByPrefix` (`:133-134`), longest-prefix match (`repourls/store.go:189-232`).
+
+Proof HTTPS works directly: `test/objectformat_e2e_test.go:235-237` builds `https://&lt;node&gt;/et/&lt;owner&gt;/&lt;repo&gt;` and clones it with `-c http.&lt;url&gt;.extraHeader=Authorization: Bearer …` (`:181-182`); `test/workloads/git_workflow.go:95` clones `http://test/et/&lt;user&gt;/&lt;repo&gt;` with basic auth. Also `core/api/mirrors.go:1013-1014` returns **both** forms on mirror create:
+```go
+MirrorURL: "entire://" + clusterHost + url,
+PublicURL: publicURL + url,      // "https://&lt;cluster public url&gt;" + "/gh/owner/repo"
+```
+
+### ⚠️ The `.git` suffix in your proposed URL is a bug
+
+Your plan says `git clone entire://aws-ap-southeast-2.entire.io/et/paul/dogbark.git`. **`.git` stripping is `/gh/`-only.**
+
+`core/authn/audience.go:332-344`:
+```go
+func CanonicaliseMirrorPath(path string) string {
+	if !strings.HasPrefix(path, AudiencePathMirrorRepoPrefix) {   // "/gh/"
+		return path
+	}
+	...
+}
+```
+And there's a regression test pinning this — `server/githttp/repo_test.go:114,123-134`:
+```go
+// scoped to /gh/ — a /et/&lt;project&gt;/&lt;repo&gt;.git request must not silently ...
+require.NoError(t, urls.Set(t.Context(), "/et/acme/widgets.git", repoID))
+...
+assert.Equal(t, "/et/acme/widgets.git/info/refs", resolver.called[0],
+	"native /et/ paths route on the request path verbatim — .git stripping is /gh/-only")
+```
+Plus `core/authn/audience_test.go:33`: `{"/et/acme/widgets.git", "/et/acme/widgets.git"}`.
+
+Since `repourls.pathPrefixes` (`repourls/store.go:484-499`) only splits on `/`, a stored row `/et/paul/dogbark` will **not** match a request for `/et/paul/dogbark.git/info/refs` → 404. The STS exchange would also mint an audience for `…/et/paul/dogbark.git`, which won't match either.
+
+**Correct URL: `entire://aws-ap-southeast-2.entire.io/et/paul/dogbark`** (no `.git`). Note git will then name the working directory `dogbark`, which is what you want anyway.
+
+### Canonical URL construction helper (reuse this shape)
+
+`core/repodirectory/url.go:23-33`:
+```go
+func EntireRemote(host, path string) (string, error) {
+	if host == "" { return "", errors.New("unresolved cluster public host") }
+	if path == "" { return "", errors.New("empty repo path") }
+	return "entire://" + host + path, nil
+}
+```
+Test vectors, `core/coreapi/mirrors_internal_test.go:14-16`:
+```go
+{name: "native repo", host: "aws-us-east-2.entire.io", path: "/et/acme/widgets", want: "entire://aws-us-east-2.entire.io/et/acme/widgets"},
+{name: "mirror",      host: "c.entire.io",             path: "/gh/torvalds/linux", want: "entire://c.entire.io/gh/torvalds/linux"},
+```
+Same construction in `core/coreapi/ci_webhooks.go:1519` and `core/api/mirrors.go:1013`.
+
+### The host must be a real placement host (STS enforces it)
+
+`core/authn/oidcop/token_exchange.go:295-330` `resolveAudienceRepo`: the audience host must be the repo's **home cluster**, or a cluster holding a read-eligible **native-mirror placement**:
+&gt; *"Without a match the exchange fails: any caller with permission on a repo could otherwise mint a token aimed at a different cluster that trusts the same issuer and replay it there — the repo_id claim alone doesn't pin the cluster."*
+
+So `entire clone` cannot pick an arbitrary host; it must use a host derived from an actual placement.
+
+### Case folding
+
+`core/authn/audience.go:91-96` `CanonicalizeRepoURL` lowercases `/gh/` and `/et/` paths (not `/git/`), so `entire://host/et/Paul/DogBark` resolves. Native names are already forced lowercase at create (`core/resource/project_name.go:37-48` `NormalizeRepoName`).
+
+---
+
+## 5. How anything clones Entire-native repos today
+
+- **`git-remote-entire` + `git clone entire://&lt;host&gt;/et/&lt;project&gt;/&lt;repo&gt;`** is the only user-facing native clone path. E2E: `test/git_remote_entire_test.go:21-24`, `test/git_remote_entire_shallow_test.go:37`, `test/push_size_limit_test.go:32`, `test/admin_provider_test.go:28`. Harness: `test/testserver/test_server.go:1083-1105` `GitClone`, `:1249-1263` `GitOpts`.
+- **`entire repo clone /gh/&lt;owner&gt;/&lt;repo&gt;`** exists for mirrors and is served by `GET /api/v1/mirrors/placements` (§2e). No `/et/` equivalent — this is the gap your feature fills.
+- **`entire-repo` content verbs** take `&lt;cluster&gt;/et/&lt;org&gt;/&lt;repo&gt;` positionals (`cmd/entire-repo/cli/root.go:22-28`, examples throughout `cmd/entire-repo/cli/content.go:43-51` etc.), parsed by `internal/clidial/parse.go:23-72`. That parser is directly reusable:
+  - accepts either `entire://host/et/proj/repo` or `host/et/proj/repo` (`:29-57`),
+  - rejects non-`entire` schemes (`:34-36`),
+  - `validateRepoSurfacePrefix` (`:64-72`) requires `et/`, `git/`, or `gh/` and emits an actionable error.
+- **`entire-backup`** deliberately moved *off* `entire://` to plain HTTPS + JWT: `cmd/entire-backup/git.go:153` (*"Replaces the legacy entire:// URL + git-remote-entire"*), `cmd/entire-backup/backup.go:269` uses `https://%s/git/repo/%s/`.
+- **Web UI**: the `frontend/` in this repo is only the CLI device-auth page (`frontend/src/pages/CliAuthPage.tsx`) — no clone-URL rendering anywhere. `grep -i cloneurl` across `.go`/`.ts`/`.tsx` finds nothing user-facing. The real web UI is the external entire.io BFF (referenced at `api/corev1/repos.go:769` and `core/coreapi/register.go:203-206`), which consumes `lookup-by-slug` for anonymous repo routing.
+- **Cluster-host → login-context resolution** already exists client-side: `client/clusterdiscovery/resolve.go` (`ResolveContextForCluster`) checks the `cluster_contexts` binding in `~/.config/entire/contexts.json`, falls back to `GET https://&lt;clusterHost&gt;/.well-known/entire-cluster.json` → `{"core_urls":[...]}`, matches a local context, and auto-binds (`client/clusterdiscovery/resolve_test.go:16-75`). `README.md:88-101` documents this. Your `clone` command gets host→context routing for free.
+
+---
+
+## 6. `paul` is a **project name**, not an org or a user
+
+- `/et/&lt;project&gt;/&lt;repo&gt;` — `core/coreapi/repos.go:158-161` and `core/authn/audience.go:20`: `https://&lt;entiredb-host&gt;/et/&lt;project&gt;/&lt;repo&gt;`.
+- Project names are **globally unique**, enforced by `core/resource/migrations/016_projects_name_global_unique.sql:2` (`CREATE UNIQUE INDEX projects_name_key ON projects (name)`) plus the case-folding index `023_projects_lower_name_unique.sql:11` (`lower(name)`).
+- ADR `docs/adrs/20260522-global-project-names.md`: *"Project names are globally unique, immutable, human-readable identifiers… 3–32 characters, `[a-z0-9-]`, no leading or trailing hyphen. Raw ULID-shaped strings are rejected so the CLI resolver can fast-path ULIDs without a server round-trip."* And: *"No cross-resource reservation: project names are not reserved against org names, account handles, repo URL owners, mirror paths, or reserved words."*
+- Shape enforced at `core/resource/project_name.go:10-34` (`projectNameMinLen=3`, `projectNameMaxLen=32`; `foldProjectName` lowercases for lookup).
+- A project is owned by either an **org or an account** — `Project.OwnerType` enum `org,account` (`api/corev1/projects.go:11`). So `paul` is very plausibly an account-owned personal project named after the handle (cf. `test/workloads/git_workflow.go:95` → `/et/&lt;username&gt;/&lt;repo&gt;`), but the path segment is unambiguously the **project name**.
+- **API addressing**: paths use ULIDs (`GetProjectInput.ProjectID` `pattern:"^[0-9A-HJKMNP-TV-Z]{26}$"`, `api/corev1/projects.go:53`). Name→ULID resolution is `GET /api/v1/projects?name=&lt;name&gt;` (`api/corev1/projects.go:36`, single-project response at `:46`). Server-side the anonymous lookup uses `res.GetProjectByName` (`core/coreapi/repos.go:3501`).
+- Repo-within-project lookup is by **repo_group full_name** = `"&lt;project&gt;/&lt;repo&gt;"`: `GetRepoGroupByProjectAndFullName(ctx, project.ID, projectName+"/"+repoName)` (`core/coreapi/repos.go:3510`, and `:3002` for the authenticated arm). This can return `resource.ErrAmbiguous` → **409** when two upstreams share a short name in one project (`:3515-3521`) — worth surfacing in the CLI rather than swallowing.
+
+---
+
+## Recommended resolution path for `entire clone /et/paul/dogbark`
+
+1. Parse with the existing `internal/clidial/parse.go:23` shape (accept `/et/p/r`, `et/p/r`, `host/et/p/r`, and full `entire://` URLs).
+2. `POST /api/v1/repos/resolve` `{"repositories":[{"provider":"entire","fullName":"paul/dogbark"}]}` → `repoId`, `placements[]`, `primaries` (one round-trip, authz-correct, read-token-friendly).
+3. Pick the home placement: `primaries.data_primary.repo_id` (falling back to `primaries.processing`, then the single non-mirror placement) — mirrors `core/coreapi/repos.go:3533-3539`.
+4. Turn `clusterSlug` into a git host — either `GET /api/v1/repos/{repoId}` (gives `clusterHost` **and** `path`, one extra hop, and `path` is authoritative rather than reconstructed) or `GET /api/v1/clusters` (cacheable slug→`publicUrl` map, then build `/et/&lt;project&gt;/&lt;repo&gt;` yourself).
+5. Build `entire://` + host + path — **no `.git` suffix** — and shell out to `git clone`.
+
+Alternative worth proposing: add an `/et/` twin of `GET /api/v1/mirrors/placements` (e.g. `GET /api/v1/repos/placements?provider=entire&amp;project=paul&amp;repo=dogbark`) returning `ResolvedPlacement`-shaped rows with `clusterHost` already populated. That would make it a single call and would reuse `repodirectory.ClusterHostMemo` + the `repo#lookup_placement` gate, exactly as `core/coreapi/mirrors.go:121-171` does today.</result>
+<usage><subagent_tokens>160004</subagent_tokens><tool_uses>78</tool_uses><duration_ms>481082</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>bq1lbqfx6</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-paul-src-entireio-cli/cbac77ba-e468-44e9-8590-9d7d92b226bf/tasks/bq1lbqfx6.output</output-file>
+<status>completed</status>
+<summary>Background command "Run full CI test suite (unit + integration + canary)" completed (exit code 0)</summary>
+</task-notification>

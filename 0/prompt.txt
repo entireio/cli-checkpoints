@@ -1,0 +1,589 @@
+can you do a review of the code base with the aim of figuring out: 
+
+When entire CLI was build the assumption was that engineers do commit themself, it looks this significantly shifted in the last months and agent do commits, push and even open PRs. 
+
+Now the question is, is there a better way to capture checkpoints on commits with this knowledge?
+
+---
+
+<task-notification>
+<task-id>bbip0fibq</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-research-session-commit-handling/cf06c4e3-2501-41d9-b1b5-7e30e50b2829/tasks/bbip0fibq.output</output-file>
+<status>completed</status>
+<summary>Background command "Yield while research agents run" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a9b0194dfc3809630</task-id>
+<tool-use-id>toolu_011DZ6hktitsdE5NDtbfiR97</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-research-session-commit-handling/cf06c4e3-2501-41d9-b1b5-7e30e50b2829/tasks/a9b0194dfc3809630.output</output-file>
+<status>completed</status>
+<summary>Agent "Docs design-model review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result># Documented Domain Model: Sessions, Checkpoints, Commits
+
+Sources: `docs/architecture/sessions-and-checkpoints.md`, `docs/architecture/checkpoint-scenarios.md`, `docs/architecture/ref-checkpoint-backend.md`, `docs/security-and-privacy.md`, `docs/KNOWN_LIMITATIONS.md`, `docs/architecture/attribution.md`, `docs/architecture/agent-guide.md`, `docs/architecture/commit-hook-perf-analysis.md` (all under `/Users/soph/.herdr/worktrees/cli/soph-research-session-commit-handling/docs/`).
+
+## 1. Unit of capture and what anchors a checkpoint
+
+- **Session** = "a unit of work" (`strategy/session.go`): ID, description, strategy, start time, list of checkpoints. Active state lives in `.git/entire-sessions/&lt;id&gt;.json`.
+- **Checkpoint** = "captures a point-in-time within a session." Two storage tiers, split by lifecycle:
+  - **Ephemeral** — "Full state (code + metadata)" on the shadow branch `entire/&lt;commit[:7]&gt;-&lt;worktreeHash[:6]&gt;`; use case: "Pending session state, pre-commit". Written per turn by the Stop hook (`SaveChanges`).
+  - **Persistent** — "Metadata + commit reference" on `entire/checkpoints/v1` (or per-checkpoint refs); use case: "Permanent record, post-commit".
+- **The anchor of a persistent checkpoint is the user's git commit, not the turn or the Stop hook.** checkpoint-scenarios.md overview: "**1:1 checkpoints** - each commit gets its own unique checkpoint ID." The strategy-role table in sessions-and-checkpoints.md is explicit:
+
+  | Event | Checkpoint Type |
+  |---|---|
+  | On Save | Temporary |
+  | On Task Complete | Task record on session state → materialized at condensation |
+  | On User Commit | Condense → Committed |
+
+- The Stop hook's role is to feed the shadow branch (turn snapshot + transcript + `FilesTouched`), and — for mid-turn agent commits — to *finalize* already-condensed checkpoints ("deferred finalization", see Scenario 2/3 below). Condensation itself is triggered by the PostCommit git hook. The checkpoint ID is "generated during condensation (post-commit hook)" and creates a "**bidirectional link**: user commits can find their metadata, and metadata can find the commits that reference it."
+- Documented backstops for sessions whose commit never comes: the session-start **zombie sweep** (finalizes/condenses non-ended sessions whose agent exited, and ENDED sessions holding uncondensed data &gt;24h), the exited-owner sweep in `status`/`doctor`, and the 7-day stale-session purge. `entire import` checkpoints get only a best-effort `commit_sha` anchor "for UI display only, not an attribution signal."
+
+## 2. Phase state machine (checkpoint-scenarios.md "State Machine")
+
+```
+[*] --&gt; IDLE : SessionStart
+IDLE --&gt; ACTIVE : TurnStart (UserPromptSubmit)
+ACTIVE --&gt; IDLE : TurnEnd (Stop hook)
+ACTIVE --&gt; ACTIVE : GitCommit / Condense
+IDLE --&gt; IDLE : GitCommit / Condense
+IDLE --&gt; ENDED : SessionStop
+ACTIVE --&gt; ENDED : SessionStop
+ENDED --&gt; ACTIVE : TurnStart (session resume)
+ENDED --&gt; ENDED : GitCommit / CondenseIfFilesTouched
+```
+
+- **Agent lifecycle hooks drive every phase change**: SessionStart → IDLE; UserPromptSubmit (TurnStart) → ACTIVE; Stop (TurnEnd) → IDLE; SessionEnd → ENDED; resume (TurnStart on ENDED) → ACTIVE. agent-guide.md's hook table confirms: `TurnEnd` "transitions phase to IDLE", `SessionEnd` "Marks session as ENDED", `Compaction` "stays ACTIVE".
+- **Git commits never change the phase.** They are self-transitions whose *action* is condensation: `ACTIVE --ACTIVE`, `IDLE --IDLE` with `Condense`, and `ENDED --ENDED` with `CondenseIfFilesTouched`. commit-hook-perf-analysis.md describes it as "State machine transition: ENDED + GitCommit → ENDED with `ActionCondense`."
+- The phase gates *trust* at commit time: the agent-commit fast path "used to trust only ACTIVE sessions"; an IDLE session with a fresh task record (`idleWithTaskContent`) is now also linkable so backgrounded-subagent commits landing between turns get trailers (sessions-and-checkpoints.md, "Commit linkage while idle").
+
+## 3. Worked condensation scenarios (checkpoint-scenarios.md)
+
+| # | Scenario | Committer behavior assumed |
+|---|---|---|
+| 1 | Prompt → Changes → Prompt Finishes → User Commits | **Human** commits between turns (PostCommit in IDLE); "the simplest workflow" |
+| 2 | Prompt Commits Within Single Turn | **Agent commits mid-turn** (PostCommit in ACTIVE). "Agent commits detected by no TTY → fast path adds trailer directly." Provisional transcript at PostCommit; "HandleTurnEnd updates with full transcript" (deferred finalization) |
+| 3 | Claude Makes Multiple Granular Commits | **Agent makes multiple commits in one turn**; each gets its own checkpoint ID, tracked in `TurnCheckpointIDs`, "All checkpoints are finalized together at turn end" |
+| 4 | User Splits Changes Into Multiple Commits | **Human**, multiple partial commits after the turn (IDLE); content-aware carry-forward |
+| 5 | Partial Commit → Stash → Next Prompt | **Human**, partial commit + stash between prompts; `FilesTouched` accumulates; stashed files "fall out" of shadow content |
+| 6 | Stash → Second Prompt → Unstash → Commit All | **Human**; shadow branch accumulates across prompts |
+| 7 | Partial Staging with `git add -p` | **Human**, sub-file partial commit; blob-hash comparison |
+| — | Content-Aware Overlap Detection | **Human reverted &amp; replaced** agent content → no trailer added |
+| 8 | git-refs Backend — Condensation and Push | Same committer assumptions as 1–7: "the session/timing/overlap logic is **identical**" |
+
+**Explicitly covered:** agent committing mid-turn (Scenario 2), multiple commits per turn by the agent (Scenario 3), human partial/split commits (4–7), and — outside this doc — **multiple concurrent sessions** (sessions-and-checkpoints.md "Concurrent Sessions": "On commit, all sessions are condensed together with archived subfolders"; KNOWN_LIMITATIONS.md documents the spurious-checkpoint side effect: "PostCommit sets `hasNew=true` for all ACTIVE sessions").
+
+**Absent from the docs:** no scenario covers commits made with `--no-verify` (the string does not appear anywhere in docs/), server-side squash merges or PR merges (squash appears only as an import-anchor fallback: "a recorded commit that's been squashed/rebased away"), CI/detached-runner commits (mentioned only in passing — worktree matching is "the sole mechanism for commits with no recorded agent in their ancestry — human commits, detached runners", and security-and-privacy.md's OPF "CI consideration" for CI-driven `git push`), agent-driven **push**/PR creation as a scenario, or history rewrites beyond the KNOWN_LIMITATIONS entry on `git commit --amend -m` (trailer replaced; auto-restored from `LastCheckpointID` in most cases). Crash-before-Stop is documented only as caveat 6: orphaned provisional transcripts are "not automatically finalized" at next session start.
+
+## 4. Commit trailers
+
+Documented trailers:
+
+- **`Entire-Checkpoint: &lt;id&gt;`** — on the *user's* commit, added by prepare-commit-msg ("user can remove"). The bidirectional link key: commit → tree at `&lt;id[:2]&gt;/&lt;id[2:]&gt;/`; metadata → "Search branch history for commits with `Entire-Checkpoint: &lt;id&gt;`".
+- **`Entire-Attribution: 73% agent (146/200 lines)`** — on the user's commit (attribution.md).
+- **`Entire-Session: &lt;session-id&gt;`** and **`Entire-Strategy: manual-commit`** — on the `entire/checkpoints/v1` metadata commits (sessions-and-checkpoints.md example flow), not the user's commit. The v1 commit *subject* `Checkpoint: &lt;id&gt;` is "for human readability in `git log` only. The CLI always reads from the tree at HEAD."
+- **`Entire-OPF-Applied: true`** — stamped on rewritten checkpoint commits by the pre-push OPF rewrite; it is "its own watermark" (the refs rewrite stops at the first commit already carrying it), and re-running pre-push is idempotent because trailer-bearing commits "are not re-redacted."
+- agent-guide.md also notes `AgentType` is the "display name stored in metadata and commit trailers."
+
+**Documented readers:** the branch view for `entire checkpoint list` / `explain` — ref-checkpoint-backend.md: "the branch view (`getBranchCheckpoints`) only surfaces a discovered checkpoint when an `Entire-Checkpoint` trailer for that ID is present in the scanned local commit range. Discovery … does not invent branch entries from remote refs alone." `entire explain --checkpoint`/`entire checkpoint explain HEAD` resolve via the ID; `entire resume` falls back to "deriving the branch from the session's last checkpoint ID found in branch-only commit trailers" for pre-`Branch`-field sessions. Downstream commands "resume, explain, attribution, blame, tokens, attach" all read checkpoints through `checkpoint.Open`. Non-CLI readers exist: "every reader (CLI, entire.io, entire-api) reads refs first and falls back to the branch" — the docs name the web/API side as checkpoint readers, though they don't spell out its trailer handling. first-time-contributors.md states the intent: the trailer links "the commit to the session that produced it so maintainers can pull up the agent context during review."
+
+**What breaks without/with a bad trailer (as documented):** a commit with no trailer is simply unlinked — the checkpoint list's branch view won't associate it, and commit→metadata lookup has no key (overlap detection deliberately produces this for reverted-and-replaced content). Amend with `-m` can lose the link when there was no prior condensation and no TTY (KNOWN_LIMITATIONS). A **dangling trailer** (trailer present, no checkpoint materialized) is described as a bug condition — leaked test fixtures "hijacked commit linking and produced a dangling `Entire-Checkpoint` trailer." The docs do not describe a stale/wrong-ID trailer case beyond that; for OPF, the trailer doubles as the redaction watermark, so its guard (`OPFNoCategoriesError`) exists so the trailer is never stamped "without a scan."
+
+## 5. Ref-based backend and commit anchoring
+
+- Keying is **per checkpoint** — `refs/entire/checkpoints/&lt;shard&gt;/&lt;id&gt;`, one ref per checkpoint, tree root = the checkpoint's contents; each ref accretes "its own per-checkpoint history" (orphan commit on first write, parented backfills). Sharding on the ID's last two chars.
+- **It does not change the commit-anchoring story.** Scenario 8: "the session/timing/overlap logic is **identical** — the only differences are *where* condensation writes and *how* the result is pushed. Everything about when a checkpoint is created, what it contains, and content-aware carry-forward is unchanged." Condensation still fires at PostCommit; the checkpoint is still 1:1 with the user commit; the trailer flow is unchanged (the Scenario 8 diagram still starts with "PrepareCommitMsg (adds Entire-Checkpoint trailer)").
+- What it changes: no serialized branch tip ("every condensation rewrites its tip, every push races on one ref" was the motivation), a flock-JSONL **push-discovery queue** drained at pre-push, fast-forward-only pushes with fetch-and-replay recovery, on-demand per-ref fetch, ULID IDs, and kind-routed reads across both backends during migration.
+
+## 6. Documented rationale for anchoring condensation to user commits
+
+The docs never argue "commit vs turn-end vs timer" head-on; the rationale is distributed:
+
+- **Never touching the working branch is the headline property.** Project docs/CLAUDE.md: the manual-commit strategy "does not modify the active branch - no commits are created on the working branch … Safe to use on main/master since it never modifies commit history." The user's commit is the only durable event the strategy attaches to.
+- **The commit is the link target.** The whole checkpoint-ID mechanism exists to make "user commits … find their metadata, and metadata … find the commits that reference it" — a persistent checkpoint minted at any other moment would have no commit to link.
+- **Privacy staging depends on the commit boundary.** security-and-privacy.md: shadow branches hold "raw blobs of your working tree without redaction … **not** pushed by Entire … cleaned up when session data is condensed into `entire/checkpoints/v1` at commit time"; redaction (8 layers) "run[s] during condensation"; OPF deliberately moves to pre-push: "**Post-commit** writes the checkpoint with **8-layer-only** redaction … Fast, predictable, no OPF cost on the hot path. **Pre-push** … builds new commits carrying an `Entire-OPF-Applied: true` trailer … Per-commit latency is unaffected because OPF doesn't run at commit time." So the documented gradient is: turn (Stop) → local unredacted-ish shadow; commit → redacted permanent local record; push → maximally-redacted content leaves the machine.
+- **Self-containment over storage** is the accepted trade for per-commit checkpoints: "Each checkpoint stores the **full session transcript** up to that point … This simplifies checkpoint retrieval (each is self-contained) at the cost of storage efficiency" (caveat 1), and full-compaction-per-checkpoint makes "each checkpoint … self-contained — the session is reconstructable from any single surviving checkpoint."
+- **The synchronous-at-PostCommit choice is treated as costly and revisitable**: commit-hook-perf-analysis.md measures PostCommit condensation as "the dominant cost" (multiplicative across sessions) and lists "**Lazy condensation**: Instead of condensing during PostCommit (synchronous, blocking the commit), defer condensation to a background process or the next session start" among improvement options — the only place a docs file weighs an alternative trigger, and only on performance grounds, not on the anchoring model itself.
+- Conversely, the sweeps (zombie/exited-owner/24h-uncondensed backstops) are documented precisely because a commit may never arrive — evidence in the docs that the commit anchor is known to leave data pending indefinitely without them.
+
+One more field observation relevant to the review's framing, already documented as a limitation rather than a scenario: KNOWN_LIMITATIONS.md concedes that when an agent (or subagent) commits with multiple ACTIVE sessions present, "**all** ACTIVE sessions are condensed — including sessions that didn't contribute to the commit," accepted as cosmetic because re-validating "causes subagent commits to skip condensation entirely (data loss), which is worse."</result>
+<usage><subagent_tokens>155055</subagent_tokens><tool_uses>13</tool_uses><duration_ms>158072</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ac88ad293de917fd5</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-research-session-commit-handling/cf06c4e3-2501-41d9-b1b5-7e30e50b2829/tasks/ac88ad293de917fd5.output</output-file>
+<status>completed</status>
+<summary>Agent "Trace commit-time checkpoint capture" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>All the pieces are in hand. Here is the mechanical trace.
+
+---
+
+# Commit-time trace: Entire manual-commit strategy
+
+**Base directory for all citations:** `/Users/soph/.herdr/worktrees/cli/soph-research-session-commit-handling/` — all `file:line` references below are relative to it. Line numbers are from this branch (`soph/research-session-commit-handling`), which is **identical to main** (`git merge-base --is-ancestor HEAD main` holds; `git log main..HEAD` is empty). The `soph/single-commit-per-checkpoint` carry-forward redesign is **not** on this branch; what IS here is the older mid-turn machinery: `TurnCheckpointIDs` + `finalizeAllTurnCheckpoints` + `carryForwardToNewShadowBranch`.
+
+Key files:
+- `cmd/entire/cli/strategy/manual_commit_hooks.go` (PrepareCommitMsg, PostCommit, PostRewrite, HandleTurnEnd, content detection)
+- `cmd/entire/cli/strategy/manual_commit_condensation.go` (CondenseSession, extraction)
+- `cmd/entire/cli/strategy/session_identity.go` (commit→session matching)
+- `cmd/entire/cli/session/phase.go` (state machine)
+- `cmd/entire/cli/lifecycle.go` (turn-end/Stop handler that calls SaveStep + HandleTurnEnd)
+
+---
+
+## 0. Lifecycle context the hooks assume
+
+- **SaveStep runs at turn end (Stop hook), not per tool call.** The Stop handler computes changed files, filters out files already committed to HEAD (`lifecycle.go:930-934` — "When an agent commits files mid-turn, those files are condensed by PostCommit and should not be re-added to FilesTouched by SaveStep"), and if `totalChanges == 0` skips the shadow-branch write entirely (`lifecycle.go:938-948`). SaveStep itself increments `StepCount`, merges `FilesTouched`, and accumulates `TokenUsage`/`CheckpointTokenUsage` (`strategy/manual_commit_git.go:120-131`).
+- **prompt.txt is written to the filesystem at turn start** explicitly "so it's available for mid-turn commits (before SaveStep writes it to the shadow branch)" (`lifecycle.go:589-592`).
+- **Turn start (`InitializeSession`) clears `LastCheckpointID` and `TurnCheckpointIDs`** (`manual_commit_hooks.go:2566-2567`). Consequence: if an agent is killed after a mid-turn commit but before its Stop hook, the finalize backlog is silently discarded at the next turn start — the mid-turn checkpoint keeps its truncated commit-time transcript forever.
+- Per-session state mutations in both hooks run under `MutateSessionState`/`MutateSessionStateOnSaved` (flock per session file, `strategy/session_state.go:535,599`). Phase transitions go through `TransitionAndLog` (`strategy/session_state.go:234`) dispatching the pure `session.Transition` table (`session/phase.go:137-273`).
+
+---
+
+## 1. prepare-commit-msg (`PrepareCommitMsg`, `manual_commit_hooks.go:358`)
+
+**Skips:** git sequence ops (rebase/cherry-pick/revert detected via `.git` state files, `manual_commit_hooks.go:318-342, 363-369`); `source == "merge"|"squash"` (373-380); `source == "commit"` (amend) is routed to `handleAmendCommitMsg` (383-385).
+
+**Session set:** `findSessionsForCommitLinking(worktreePath)` (410) = union of (a) worktree matching — exact `WorktreePath` match, else same-git-common-dir fallback restricted to a single worktree, with a 15-minute `recentSessionWindow` liveness filter for multi-worktree ambiguity (`manual_commit_session.go:184-314`) — and (b) identity matching: nearest process ancestor whose recorded `SessionState.Owner` appears in the hook process's own ancestry (`session_identity.go:31-112`). Not filtered by `BaseCommit` (comment at `manual_commit_hooks.go:405-409`) and not filtered by phase — IDLE and ENDED sessions are candidates.
+
+**Fast path — the explicitly mid-turn branch** (`tryAgentCommitFastPath`, 2245): taken when there is **no TTY** or `commit_linking=always` (2246-2255). Eligible session = `Phase.IsActive()` OR `idleWithTaskContent` (IDLE with a task record younger than 24h) (2263). Content detection is skipped entirely, except a conservative empty-session gate (`TranscriptPath=="" &amp;&amp; len(FilesTouched)==0 &amp;&amp; StepCount==0 &amp;&amp; !HasTaskContent()`, 2274-2275). The trailer's checkpoint ID comes from `checkpointIDForSessions([that one session])` (2320) — deliberately not the whole set, so a stale reservation on another ended session can't hijack the ID (comment 2313-2318).
+
+**Slow path (TTY / human):** `filterSessionsWithNewContent` (432 → 1683). Per session, `sessionHasNewContent` (1773):
+- Task records ⇒ true immediately (1777-1783).
+- **Shadow branch exists** ⇒ transcript-growth check by comparing the shadow-branch transcript **blob size** against `state.CheckpointTranscriptSize` (1820-1884), then staged-file overlap via `stagedFilesOverlapWithContent` against the **shadow tree** (1901-1908). Content source: the shadow branch (i.e., last Stop's snapshot), not the live file.
+- **No shadow branch** ⇒ `sessionHasNewContentFromLiveTranscript` (1799, 1857 → 1957): reads the **agent's live transcript file** — `hasNewTranscriptWork` calls the agent's `GetTranscriptPosition(state.TranscriptPath)` and compares against `state.CheckpointTranscriptStart` (2064-2074); modified files come from `state.FilesTouched` or, if empty, are **extracted from the live transcript from that offset** (1967-1970 → `extractModifiedFilesFromLiveTranscript`, 2092, which for Claude Code also parses subagent transcripts, 2122-2143); requires overlap with staged files (1986).
+
+**Checkpoint ID:** `checkpointIDForSessions` (2352) — reuse a session's `PendingCondensationID()` (a `CondensationAttempt` reserved by session-end eager condensation, `session/state.go:671-681`; the commit path itself **never reserves one** — `BeginCondensationAttempt` is called only from `ensureCondensationAttemptID`, whose callers are session-end/doctor paths, `manual_commit_condensation.go:1608-1648`), else `GenerateCheckpointID`. **The ID is written only into the commit message file** (551); PrepareCommitMsg persists nothing to session state (the sole state write in the hook is the `DivergenceNoticeShown` flag, 2212-2218).
+
+**Trailer placement:** `source=="message"` (-m/-F): no TTY ⇒ auto-link; `commit_linking=always` ⇒ auto-link; else interactive `/dev/tty` prompt (503-537). Editor flow adds the trailer plus a comment block; the display prompt shown to the human comes from **the shadow branch's `prompt.txt`** (`getLastPrompt`, 486 → 2797-2830) — empty for a first-turn mid-turn commit whose shadow branch doesn't exist yet.
+
+**commit-msg hook** (`CommitMsg`, 162-186): if the message has the trailer but no user content, the trailer is stripped so git aborts the empty commit.
+
+**Mid-turn behavior of this hook, summarized:** a mid-turn agent commit is expected and served by (a) the fast path (no content check at all), (b) the live-transcript fallback when the turn's shadow checkpoint doesn't exist yet, and (c) the filesystem prompt.txt. The transcript read at this moment is the **incomplete live file** — everything the agent has flushed so far, nothing it hasn't.
+
+---
+
+## 2. post-commit (`PostCommit`, `manual_commit_hooks.go:930`)
+
+**Trigger:** parses `Entire-Checkpoint` from `HEAD`'s message (958). **No trailer ⇒ no condensation**, only `postCommitUpdateBaseCommitOnly` advancing `BaseCommit`/`AttributionBaseCommit` for exact-worktree ACTIVE sessions (961-965 → 1618-1664).
+
+**Session set:** re-derived **independently** via the same `findSessionsForCommitLinking` (979). The comment concedes the coupling: "must resolve the same way PrepareCommitMsg did, or the stamped trailer and the condensed session diverge (a dangling trailer)" (976-978). Nothing carries the prepare-time session set across the two hook processes; the trailer's checkpoint ID is the only shared artifact.
+
+**Per session** (`postCommitProcessSessionLocked`, 1269, under the session's flock):
+
+1. If the session holds a **reserved** `PendingCondensationID` different from the trailer's ID, it is skipped and its shadow branch preserved (1289-1297).
+2. `hasNew`: **ACTIVE ⇒ unconditionally true** — "PrepareCommitMsg already validated this commit. We trust that decision here. Transcript-based re-validation is unreliable because subagent transcripts may not be available yet (subagent still running)" (1305-1316). Non-ACTIVE ⇒ `sessionHasNewContent` with **nil stagedFiles** (1319; there is no staged set post-commit), fail-open to true on error (1320-1326).
+3. `filesTouchedBefore`: ACTIVE ⇒ `resolveFilesTouched` (state.FilesTouched, else **live-transcript extraction**) (1335-1336); **IDLE/ENDED ⇒ only a copy of `state.FilesTouched`, no transcript fallback** (1337-1340). This is one half of the dangling-trailer asymmetry (§5).
+4. State machine dispatch (`TransitionAndLog(EventGitCommit)`, 1376): IDLE→IDLE with `ActionCondense` (`session/phase.go:165-172`), ACTIVE→ACTIVE with `ActionCondense` (205-212), ENDED→ENDED with `ActionCondenseIfFilesTouched` or `ActionDiscardIfNoFiles` (245-258). Rebase-in-progress ⇒ no actions.
+5. `HandleCondense` (720) gates on `shouldCondenseWithOverlapCheck` (790):
+   - `!hasNew` ⇒ false (791).
+   - **(ACTIVE &amp;&amp; interaction &lt; 24h) or fresh-task-record IDLE ⇒ condense without overlap evidence** (798-806), except the read-only gate (no tracked files while other sessions claim the committed files).
+   - Everything else (stale ACTIVE, plain IDLE, ENDED): requires `filesTouchedBefore` ∩ committed files ≠ ∅ (808-822), then content-aware `filesOverlapWithContent` against the shadow tree (825-830; `content_overlap.go:83+` — modified files always count; new files require content match, to catch "reverted and replaced").
+
+**Condensation** (`CondenseSession`, `manual_commit_condensation.go:514`): transcript source is `extractOrCreateSessionData` (943):
+- Shadow branch exists ⇒ `extractSessionData` (1395), which **still prefers the live transcript file** when readable — "The shadow branch copy may be stale if the last turn ended without code changes" (1411-1425) — falling back to the shadow blob; prompts from shadow-branch `prompt.txt`, else filesystem `prompt.txt` (1444-1452).
+- No shadow branch but `TranscriptPath` set ⇒ `extractSessionDataFromLiveTranscript` (953-963 → 1479): raw live file read, prompts from filesystem, files from state-or-transcript-extraction.
+- Neither ⇒ empty data; the skip gate (`skipIfNothingToCondense`, 812) yields `Skipped=true`, meaning **the trailer already in the commit points at nothing** (this is spelled out at 2268-2271).
+
+So at commit time **the checkpoint's transcript is always the live file as of that instant** whenever the live file is readable — the shadow branch is a fallback, not the source. `FilesTouched` in the written checkpoint is filtered to the committed set; sessions with no recorded files but "evidence of work" (transcript or StepCount&gt;0) inherit the whole committed set (`filterFilesTouched`, 904-922). Token usage is computed from the live transcript scoped from `CheckpointTranscriptStart` (1470, 1516).
+
+**Per-session state mutation after a successful condensation** (`condenseAndUpdateState`, `manual_commit_hooks.go:1470`), home-worktree path (1540-1564):
+
+| Field | New value | Line |
+|---|---|---|
+| `BaseCommit` | new HEAD | 1545 |
+| `AttributionBaseCommit` | realigned to new HEAD | 1546 |
+| `StepCount` | 0 | via `resetCheckpointWindow`, `manual_commit_git.go:492` |
+| `CheckpointTokenUsage` | nil | `manual_commit_git.go:493` |
+| `CondensationAttempt` | cleared | `manual_commit_git.go:494` |
+| `SubagentTokensBaseline` | rebaselined | `manual_commit_git.go:495` |
+| completed `TaskRecords` | removed | `manual_commit_git.go:496` |
+| `CheckpointTranscriptStart` | `result.TotalTranscriptLines` (line count of the transcript **at commit time**) | 1548 |
+| `CheckpointTranscriptSize` | sanitized pre-externalization byte size | 1549 |
+| `PromptAttributions`, `PendingPromptAttribution`, `FilesTouched` | nil | 1552-1554 |
+| `LastCheckpointID` / `LastCheckpointCommitHash` | checkpoint ID / new HEAD | 1563-1564 |
+
+Guest-linked sessions (identity-matched from another worktree) get the checkpoint-window reset and `LastCheckpointID`, but **not** `BaseCommit`, not `FilesTouched` clearing to nil via the same path (StepCount is deliberately restored, 1519-1537), and never carry-forward or shadow deletion.
+
+Then back in `postCommitProcessSessionLocked`:
+- **ACTIVE + condensed ⇒ `TurnCheckpointIDs` append** (1387-1389) — the hook that makes turn-end finalization happen.
+- **Carry-forward** (all phases, home worktree only, 1400-1425): `filesWithRemainingAgentChanges` diffs `filesTouchedBefore` against the commit (content-aware, handles `git add -p`); remaining files are re-recorded as `FilesTouched` and written to a **fresh shadow branch with no metadata dir** (`carryForwardToNewShadowBranch`, 3277), which sets `StepCount=1`, **`CheckpointTranscriptStart=0`, `CheckpointTranscriptSize=0`**, `LastCheckpointID=""` (3336-3339) — deliberately making the *next* checkpoint self-contained with the full transcript (comment 3328-3335). `TurnCheckpointIDs` survives (3340-3342).
+- ENDED + nothing left ⇒ `FullyCondensed=true` (1432-1434). Review sessions are force-ended after their first condensation (1447-1454).
+- Shadow branch deletion happens at the end of PostCommit unless an uncondensed ACTIVE session still shares the branch (1089-1110, 1460-1462).
+
+**ACTIVE vs IDLE difference, condensed:** ACTIVE gets trusted condensation (no overlap evidence needed within 24h of interaction), live-transcript file extraction as fallback, and turn-end finalization queued. IDLE gets condensed only with file-overlap evidence from `state.FilesTouched` (no transcript fallback), no finalization queue, and stays IDLE.
+
+---
+
+## 3. The mid-turn commit problem — what the code actually does
+
+The path is **designed around** mid-turn commits, with a repair pass at turn end:
+
+1. **At commit time** the checkpoint is written from the **incomplete live transcript** (§2). The comment at `manual_commit_hooks.go:2892-2897` names this a "provisional transcript".
+2. **At turn end** (Stop hook → `transitionSessionTurnEnd`, `lifecycle.go:1912` → `HandleTurnEnd`, `manual_commit_hooks.go:2900`), `finalizeAllTurnCheckpoints` (3021) re-reads the now-complete live transcript and **rewrites every checkpoint minted during this turn** (`store.Write(checkpoint.SessionTranscript(...))` per ID, 3188-3225), through the same sanitize→externalize→redact pipeline (3101-3160). So content produced after the commit but in the same turn is **backfilled into the same checkpoint**, not lost.
+3. **Then the next checkpoint's scope is fixed up**: `HandleTurnEnd` advances `CheckpointTranscriptStart` to the current transcript position — but **only when `FilesTouched` is empty** (no carry-forward) (2928-2945). The comment states the exact gap this prevents: "condensation records TotalTranscriptLines at commit time, but the agent continues writing to the transcript... Without this fix, the next checkpoint's scoped transcript starts mid-turn, including a tail of already-condensed content" (2918-2923).
+
+**Known, deliberate double-inclusion:** when carry-forward fired, `CheckpointTranscriptStart=0` means the next checkpoint's stored transcript repeats the whole session from line 0 (self-containment trade-off documented at 3328-3335). The same-turn tail is thus present in both the finalized mid-turn checkpoint and the next one.
+
+**Actual gaps in this design (mechanism, not proposal):**
+- **Finalize depends on the Stop hook firing in this turn.** `InitializeSession` clears `TurnCheckpointIDs` at the next TurnStart (2567), so a kill between commit and Stop permanently leaves the provisional (commit-truncated) transcript. Finalize is also best-effort: any failure clears the queue and logs (3037-3090).
+- **Token usage is never finalized.** `checkpoint.UpdateOptions` in finalize carries Transcript/Assets/Prompts/SkillEvents (3199-3209) but no token usage — the checkpoint's `TokenUsage` remains the commit-time computation (`CalculateTokenUsage(transcript, CheckpointTranscriptStart)` over the truncated transcript, `manual_commit_condensation.go:1470/1516`). Tokens burned after the commit land in the **next** window: `resetCheckpointWindow` zeroed `CheckpointTokenUsage` at commit (`manual_commit_git.go:493`) and the Stop-hook SaveStep accumulates the turn's usage into it afterwards (`manual_commit_git.go:127-129`). So for a mid-turn commit, transcript content and token accounting for the same turn-tail end up in **different checkpoints** (transcript in this one via finalize; tokens in the next).
+- **`hasNew=true` unconditionally for ACTIVE** (1315) means PostCommit never re-validates that the commit relates to the session — by design, because "subagent transcripts may not be available yet."
+- The `resolveFilesTouched`/`extractModifiedFilesFromLiveTranscript` reads during PostCommit race with the still-writing agent; the code accepts whatever is flushed (no fsync coordination; `waitForTranscriptFlush`-style preparation only for agents implementing `TranscriptPreparer`, 2047-2058, 956-958).
+
+---
+
+## 4. Multiple commits in one turn
+
+Three commits by an ACTIVE agent in one turn produce **three distinct checkpoints with three distinct IDs**:
+
+- Each `git commit` runs its own prepare hook; the fast path fires each time (no TTY), and `checkpointIDForSessions` finds `PendingCondensationID` empty every time — the commit path never reserves an attempt, and even if one existed, the previous PostCommit's `resetCheckpointWindow` cleared it (`manual_commit_git.go:494`). So `GenerateCheckpointID` mints a fresh ID per commit (2352-2363).
+- Each PostCommit condenses (ACTIVE ⇒ trusted), appends its ID to `TurnCheckpointIDs` (1387-1389), and either advances `CheckpointTranscriptStart` to commit-time transcript length (no remaining files) or resets it to 0 via carry-forward (remaining files).
+- At Stop, `finalizeAllTurnCheckpoints` rewrites **all three** with the identical full-session transcript (`redactedTranscript` precomputed once, 3185, applied per ID at 3188-3211). Each checkpoint differs only in its metadata (files, prompts window, `CheckpointTranscriptStart` recorded at write time) — the stored transcript bytes converge.
+
+**`LastCheckpointID` reuse** is confined to amend: `handleAmendCommitMsg` restores the trailer from the first worktree session whose `BaseCommit == HEAD` and has a non-empty `LastCheckpointID` (594-633). It is *not* used to make consecutive normal commits share a checkpoint. There is no single-commit-per-checkpoint carry-forward of the ID on this branch — that is the `soph/single-commit-per-checkpoint` work, absent here.
+
+---
+
+## 5. The dangling-trailer asymmetry (IDLE + empty FilesTouched)
+
+The two hooks answer "does this commit belong to this session?" with **different evidence**:
+
+**Prepare says yes via the live transcript.** For an IDLE session with no shadow branch (deleted after last condensation) and empty `FilesTouched`, `sessionHasNewContent` falls to `sessionHasNewContentFromLiveTranscript` (1799/1857), which extracts modified files **from the live transcript from `CheckpointTranscriptStart`** (1967-1970) and finds overlap with the staged files (1986) ⇒ trailer stamped. Phase is never consulted on this path (only the `PrepareTranscript` flush wait is ACTIVE-gated, 2047).
+
+**PostCommit says no, twice over, for the same session:**
+1. `hasNew`: non-ACTIVE ⇒ `sessionHasNewContent` with `stagedFiles=nil` (1319). The live-transcript branch then hits `hasOverlappingFiles(nil, modifiedFiles)` ⇒ **false** (`content_overlap.go:356-368` — empty staged set can never overlap) ⇒ `hasNew=false` ⇒ `shouldCondenseWithOverlapCheck` returns false at 791.
+2. Even if `hasNew` were true: IDLE is not `(isActive &amp;&amp; recent)` and has no fresh task record, so it needs `filesTouchedBefore` — which for non-ACTIVE sessions is **only `state.FilesTouched`, with no transcript-extraction fallback** (1332-1340, comment: "Only fall back to transcript extraction for ACTIVE sessions — IDLE/ENDED sessions have FilesTouched already populated by SaveStep"). Empty ⇒ false at 808-810.
+
+Result: the commit carries an `Entire-Checkpoint` trailer for which no checkpoint is ever written to `entire/checkpoints/v1`. Note the underlying assumption in the 1332-1340 comment — that an IDLE session's files were captured by SaveStep at the end of its turn — is broken precisely by the Stop-hook filter at `lifecycle.go:930-934`: files the agent committed **mid-turn** are excluded from `FilesTouched` at SaveStep, and a turn where *everything* was committed mid-turn leaves `FilesTouched` empty while the transcript still shows the work. (Your memory notes a RED repro for this on `soph/idle-empty-filestouched-dangling-trailer`; that branch's test is not in this tree — there is no `dangling` match in `strategy/*_test.go` here.)
+
+A second, smaller asymmetry: the fast path can stamp a trailer for an IDLE-with-task-record session whose record goes stale (&gt;24h) between prepare and post-commit — `idleWithTaskContent` is evaluated with fresh `time.Now()` in both hooks (2263 vs 722/754), sharing the rule but not the clock. And structurally: the whole prepare decision is made in one process, the post-commit decision in another, over independently re-listed session state (976-978) — anything that mutates session state in between (a Stop hook completing, a sweep) can flip the outcome.
+
+---
+
+## 6. Amend / rebase
+
+- **prepare-commit-msg, `source="commit"`** (`handleAmendCommitMsg`, 563): existing trailer preserved verbatim (574-580); otherwise restored from `LastCheckpointID` of a worktree session whose `BaseCommit == current HEAD` (the commit being amended) (593-633). Session matching here uses plain worktree matching (`findSessionsForWorktree`, 588), no identity union, no ambiguity hint.
+- **post-commit after amend** runs normally (amend is not a sequence operation per `isGitSequenceOperation`, 318-342), so an ACTIVE session re-condenses under the restored/preserved checkpoint ID.
+- **Sequence operations** (rebase/cherry-pick/revert): prepare skips entirely (363-369); PostCommit still runs but with `IsRebaseInProgress=true`, which makes every phase transition action-free (`session/phase.go:166-168, 206-208, 246-248`) — no condensation, no state mutation from the handler.
+- **post-rewrite** (`PostRewrite`, 191): only `amend`/`rebase` types; parses old→new SHA pairs (252-273); for each worktree-matched session, `remapSessionForRewrite` (`manual_commit_session.go:492`) rewrites `BaseCommit` (migrating the shadow branch to the new base commit via `migrateShadowBranchToBaseCommit`, 504-510) and `AttributionBaseCommit` — but preserves the latter when a shadow branch existed, so attribution keeps diffing against the original captured base (512-518). It never touches checkpoints or trailers; it exists purely so the shadow branch (keyed `entire/&lt;BaseCommit[:7]&gt;-&lt;worktreeHash[:6]&gt;`) and future matching follow the rewritten SHA.
+
+---
+
+## 7. Assumptions that the committer acts *between* agent turns (flagged, as asked)
+
+1. **`filesTouchedBefore` for IDLE/ENDED trusts SaveStep** (`manual_commit_hooks.go:1332-1340`) while SaveStep itself excludes mid-turn-committed files (`lifecycle.go:930-934`) — coherent only if commits happen while ACTIVE or files remain uncommitted at Stop. This is the dangling-trailer root.
+2. **`hasNew` computation in PostCommit for non-ACTIVE sessions requires staged-file overlap that post-commit can never supply** on the live-transcript path (nil stagedFiles at 1319 → 1986) — the branch was written for the prepare-time (pre-commit) call shape.
+3. **Turn-end finalize assumes the Stop hook survives the turn** (`TurnCheckpointIDs` cleared at next TurnStart, 2567; queue dropped on any finalize precondition failure, 3037-3090).
+4. **Checkpoint token usage is commit-time-final** (no `TokenUsage` in finalize `UpdateOptions`, 3199-3209) — accurate only when the commit coincides with the end of the transcript, i.e., between turns.
+5. **`getLastPrompt` for the human-facing trailer comment reads only the shadow branch** (2797-2830) — empty exactly in the mid-turn/first-turn case where the filesystem prompt.txt (which condensation *does* read, 1449-1452) would have it.
+6. **The interactive TTY confirmation** (`askConfirmTTY`, 520) presumes a human; mid-turn agents are handled by inference (no TTY / raw-mode probe) rather than by any positive signal from the session state — the fast path's own comment calls the widened no-TTY trust window "an accepted trade-off" (2242-2244).
+7. **`activeSessionInteractionThreshold` = 24h with `LastInteractionTime` updated only at TurnStart** (873-876): the ACTIVE trust gate measures turn *starts*, not activity — an agent &gt;24h into a single turn loses trusted condensation mid-turn.
+8. **prepare and post-commit are two independent evaluations** joined only by the trailer string (976-978); the design leans on "must resolve the same way" rather than on shared state, so anything time-dependent (task-record freshness at 2263 vs 722, the 15-minute `recentSessionWindow` at `manual_commit_session.go:282`, a Stop hook landing between the two hooks) can produce trailer/condensation divergence.</result>
+<usage><subagent_tokens>210057</subagent_tokens><tool_uses>37</tool_uses><duration_ms>413208</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ac05c813b90c5996e</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-research-session-commit-handling/cf06c4e3-2501-41d9-b1b5-7e30e50b2829/tasks/ac05c813b90c5996e.output</output-file>
+<status>completed</status>
+<summary>Agent "Inventory human-committer assumptions" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have everything I need. Compiling the inventory.
+
+# Inventory: human-committer assumptions in the Entire CLI
+
+All paths relative to `/Users/soph/.herdr/worktrees/cli/soph-research-session-commit-handling/`.
+
+## 1. Interactive surfaces on hook paths
+
+- **`cmd/entire/cli/strategy/manual_commit_hooks.go:60-113` (`askConfirmTTY`)** — Assumes the process at the far end of `/dev/tty` is a human who will type y/n/a: during prepare-commit-msg it writes a prompt to the controlling terminal and does a blocking `ReadString('\n')`. When the committer is an agent whose harness allocates a cooked PTY (any vendor not on the sentinel list), the prompt is injected into the agent's PTY and the hook blocks until the harness kills the command; on read error it silently answers "yes" (defaultYes at line 520), so consent is defaulted, not given.
+- **`cmd/entire/cli/strategy/manual_commit_hooks.go:502-537`** — The `-m`/`-F` ("message") branch is explicitly built around "Human at terminal — prompt interactively" (line 513); the no-TTY branch auto-links "without prompting" (507-508) on the assumption no-TTY ⇒ agent. Both directions of the proxy are wrong for agents-with-TTY (blocked prompt) and humans-without-TTY (CI, IDE commits — silently auto-linked with no consent surface).
+- **`cmd/entire/cli/interactive/interactive.go:81-86` (`isAgentSubprocessEnv`)** — Agent detection is an enumerated vendor list (GEMINI_CLI, COPILOT_CLI, PI_CODING_AGENT, GIT_TERMINAL_PROMPT=0); Claude Code, Codex, Cursor, OpenCode, Droid and every future agent are assumed to either strip the TTY or be a human. An unlisted agent with an inherited canonical-mode TTY is classified as a human at a terminal and gets every prompt and TTY hint.
+- **`cmd/entire/cli/interactive/rawmode_unix.go:42-51` + `interactive.go:55-63`** — Raw-mode ICANON detection assumes "terminal in raw mode ⇒ can't prompt", which reroutes a *human* committing from lazygit/tig/gitui into the no-TTY code path — i.e., into `tryAgentCommitFastPath`'s auto-link-without-asking behavior (below); the human loses the very consent prompt the raw-mode fix was protecting.
+- **`cmd/entire/cli/strategy/manual_commit_opf_prompt.go:106-150` (`askOPFPrompt`)** — A `huh` select form ("Ctrl-C to cancel the push") runs inside the pre-push hook whenever `CanPromptInteractively()` is true; an unlisted agent holding a cooked TTY gets a full-screen form painted into its transcript and a push that hangs until timeout.
+- **`cmd/entire/cli/strategy/manual_commit_opf_prompt.go:67-71,100-103`** — Non-TTY OPF resolution silently *runs* OPF, adding ~30s to every agent push and emitting "→ OpenAI Privacy Filter: scanning checkpoints before push (may take ~30s)…" to stderr — the assumption being that a human chose "if enabled, just run"; an agent watching a slow push may kill it mid-rewrite.
+- **`cmd/entire/cli/strategy/checkpoint_policy.go:59,69,79,103` and `cmd/entire/cli/hooks_git_cmd.go:91-96,114-116`** — Policy warnings are printed to stderr *only when* `CanPromptInteractively()` is true, encoding "no TTY ⇒ nobody reads stderr". Agents do read hook stderr; on agent commits/pushes the information (checkpoint work silently skipped, CLI needs upgrade) is withheld from the only party present, and the human never learns checkpoints stopped.
+- **`cmd/entire/cli/strategy/session_identity.go:42-45`** — Ambiguity decline prints "Run 'entire session adopt' in this worktree to link future commits to your session" to stderr — a remediation instruction addressed to a human, delivered into the committing agent's tool output (which may act on it, mutating session bookkeeping mid-task, or truncate it away).
+- **`cmd/entire/cli/strategy/manual_commit_hooks.go:2193-2208` (`warnIfAttributionDiverged`)** — The comment asserts "stderr from the hook is TTY-bound to the invoking process", i.e., the warning "surfaces in the user's terminal". False when the invoking process is an agent; worse, the `DivergenceNoticeShown` once-only latch (2212-2217) is burned by the agent-visible print, so the human never sees the notice at all.
+- **`cmd/entire/cli/strategy/manual_commit_hooks.go:833-871` (`warnStaleEndedSessions`)** — "Run 'entire doctor' to condense them and restore commit performance" is emitted into post-commit stderr, rate-limited to once per 24h — the one emission is consumed by whichever process committed, likely an agent.
+- **`cmd/entire/cli/strategy/push_common.go:276-278`** — SSH-auth hint ("Load your key into ssh-agent (`ssh-add`), then push again") assumes the pusher can perform interactive key setup; for a headless/agent pusher checkpoints silently stop syncing on every push with the advice going into the transcript.
+- **`cmd/entire/cli/strategy/push_common.go:456-463`** — The branch-protection "BLOCKED" banner instructs the reader to edit repository rulesets or `.entire/settings.json` — remediation only a human with forge admin rights can do, printed into whatever process pushed.
+- **`cmd/entire/cli/strategy/checkpoint_sync_capture.go:208-210`** — The election announcement ("Checkpoints now sync to %q … Override with strategy_options.checkpoint_push_remote in .entire/settings.local.json") notifies the pusher of a *permanent* state change; when the pusher is an agent the human never learns their checkpoint destination moved.
+
+## 2. Timing heuristics
+
+- **`cmd/entire/cli/strategy/manual_commit_session.go:275-282,300` (`recentSessionWindow` = 15 min)** — Explicitly rests on "Commits normally follow agent activity by seconds to minutes" — a human-cadence assumption about the gap between agent turn and commit; an autonomous agent inside a long build/tool call ages out and the cross-worktree tiebreak links the commit to the *other* worktree's session.
+- **`cmd/entire/cli/strategy/manual_commit_hooks.go:873-882` (`activeSessionInteractionThreshold` = 24h)** — `LastInteractionTime` only advances at TurnStart, so an agent running one very long turn (&gt;24h: scheduled runners, loops) becomes a "stale ACTIVE" session whose subsequent commits stop condensing; the 24h generosity itself is calibrated to a human coming back "later" to commit.
+- **`cmd/entire/cli/strategy/manual_commit_hooks.go:884-910` (`idleWithTaskContent`, 24h per task record)** — A fresh task record confers commit-linking trust on *any* no-TTY commit for 24 hours (the "widened no-TTY trust window", PR #2034 note at 2242-2244); designed around a subagent committing "between the parent's turns", it equally stamps a human's IDE/CI commit made anytime that day with the subagent's checkpoint ID.
+- **`cmd/entire/cli/session/state.go:35-37,734-743` (`StuckActiveThreshold` = 1h)** — An ACTIVE session with no new prompt for 1h is "stuck" (doctor.go:311-320, status.go:606); a legitimately grinding single-turn autonomous run exceeds this routinely, and on Windows/cross-host (no proclive, state.go:760-762) this timeout is the *only* liveness signal.
+- **`cmd/entire/cli/session/state.go:31-33` (`StaleSessionThreshold` = 7 days)** — Un-finalized session state is deleted outright after 7 days (state.go:767-769 notes this "discard[ed] pending checkpoint work"); assumes the commit that would condense it arrives within a human work-week — never true for content that only lands via server-side merges.
+- **`cmd/entire/cli/session_sweep.go:16-23` (`endedSessionSweepAge` = 24h)** — The background sweep deliberately waits a day before condensing ended sessions "whose user is still about to commit" — the carry-forward linkage window is sized to a human returning to commit, not to an agent that either committed mid-turn already or never will.
+- **`cmd/entire/cli/session_finalize.go:15-31` (`interactiveSweepCondenseBudget` = 1s)** — Sweep condensing is budgeted around a human waiting at `entire status`/`doctor`; benign per se, but it means agent-heavy repos (many abandoned sessions, no interactive command runs) drain their backlog only when a human eventually runs status.
+
+## 3. Session-selection heuristics
+
+- **`cmd/entire/cli/strategy/session_identity.go:13-24,31-47`** — The union rule "a commit captures the worktree's content, so every session with pending content here belongs in it" was designed for one human commit gathering all agents' work; when an *agent* commits mid-turn it equally scoops concurrent sibling sessions' pending content into its own commit's checkpoint.
+- **`cmd/entire/cli/strategy/session_identity.go:58-112` (identity matching)** — Designed precisely for "agent commits as its own child process" (nearest-ancestor beats outer agent, so subagent commits attribute correctly) — but it covers *only* that shape: a commit from CI, from a TUI/IDE git client (ancestry = lazygit/VS Code, agent is a sibling process), from `entire`-spawned detached processes, or after the agent exits, has no agent ancestor and falls back to worktree matching.
+- **`cmd/entire/cli/strategy/session_identity.go:75-78` + `docs/architecture/sessions-and-checkpoints.md:197-199`** — Windows cannot introspect process ancestry, so the agent-committer mechanism is platform-degraded to worktree matching there; agent commits on Windows are indistinguishable from human commits.
+- **`docs/architecture/sessions-and-checkpoints.md:206-208`** — Worktree matching is documented as "the sole mechanism for commits with no recorded agent in their ancestry — human commits, detached runners": CI and detached-runner commits get best-effort path matching plus the 15-minute liveness guess, the weakest tier, in exactly the environments agents commit most.
+- **`cmd/entire/cli/strategy/manual_commit_hooks.go:2231-2307` (`tryAgentCommitFastPath`)** — noTTY (or `commit_linking=always`) is treated as sufficient evidence that the committer *is* the agent: any ACTIVE session (or IDLE+fresh-task) gets its trailer stamped on the commit with no content/overlap check. A human committing via IDE, CI, `git commit -m` with redirected stdio, or a raw-mode TUI while an agent session is ACTIVE is silently classified as that agent's commit.
+- **Server-side squash (`gh pr merge --squash`) — no handling anywhere** — Condensation's only trigger is the local post-commit hook (`manual_commit_hooks.go:930 PostCommit`), and sync's only trigger is the local pre-push hook (`manual_commit_push.go:40`); a merge performed on the forge produces no local commit, no hook, no trailer on the landed commit, and there is no fetch-time reconciliation. The docs' bidirectional link ("user commits can find their metadata", `docs/architecture/sessions-and-checkpoints.md:693,748,793`) assumes the commit created locally is the commit that lands on the mainline.
+- **`cmd/entire/cli/strategy/manual_commit_hooks.go:318-342,361-369` (`isGitSequenceOperation`)** — Rebase/cherry-pick/revert commits are categorically "replaying existing commits and should not be linked to agent sessions" — true for a human's history maintenance, false when the rebase/conflict-resolution *is* the agent's task; those commits (and any new work resolved into them) never link.
+- **`cmd/entire/cli/strategy/manual_commit_hooks.go:561-640` (`handleAmendCommitMsg`)** — Amend trailer restore requires a session whose `BaseCommit == HEAD`; an agent amending in a guest worktree or after another agent advanced the base silently loses the trailer.
+
+## 4. Vocabulary / design language
+
+- **`cmd/entire/cli/strategy/manual_commit.go:17-19` + `common.go:41`** — The single strategy is named `ManualCommitStrategy` / `"manual-commit"` and defined as condensing "when the user commits" — the domain model's trigger currency is a human's manual commit.
+- **`cmd/entire/cli/strategy/manual_commit_hooks.go:158,344-356`** — `CommitMsg` is documented as running "after the user edits the message"; `PrepareCommitMsg` documents removal of the trailer as the opt-out ("useful for 'manual' commits") — an affordance that only exists in the editor flow a human uses; agent `-m` commits have no opt-out surface at all.
+- **`cmd/entire/cli/strategy/manual_commit_hooks.go:1184-1223` and `manual_commit_attribution.go:226-276`** — Attribution is a binary human/agent split where every committed line outside tracked `FilesTouched` is classified `Human*`: commits by agents whose files weren't tracked (commit-only sessions, CI-generated artifacts, guest sessions gated out at 1164) inflate "human" counts by construction.
+- **`cmd/entire/cli/strategy/manual_commit_condensation.go:1767`** — "Files waiting for a user commit belong to PostCommit's carry-forward path" — carry-forward semantics are specified in terms of the user's future commit.
+- **`docs/architecture/sessions-and-checkpoints.md:258` ("Condensed to committed on user commit"), `:729-731` ("added to user's commit message … user can remove"), `:693,748,793` ("links user commits to metadata", "User commit → Metadata")** — The storage model's lifecycle and linking are specified against "user commits" throughout.
+- **`docs/architecture/checkpoint-scenarios.md:3,33-35,188,246,269,328,353,424,558,642`** — Every worked scenario is narrated as "User commits …" / "user manually commits" (Scenario 1 is titled "…Prompt Finishes → User Commits"); Scenario 2 covers an agent committing mid-turn, but the rest of the state-machine documentation treats the human as the commit actor.
+- **`cmd/entire/cli/session_sweep.go:17-20`** — "sessions whose user is still about to commit" encodes the human-returns-to-commit assumption directly in the sweep's safety argument.
+
+## 5. Push assumptions
+
+- **`cmd/entire/cli/strategy/checkpoint_sync_capture.go:136-153` (`captureEligible`)** — The election rule calls a push "consent-grade evidence that pushRemote is the user's own remote" and phase-1 "first capture sticks" assumes a single human's stable push habit; one scripted agent push (fork push for a PR, one-off `git push upstream`) that happens to agree with branch config permanently elects a remote — and future re-routing "takes the explicit setting", i.e., a human intervention.
+- **`cmd/entire/cli/strategy/checkpoint_sync_capture.go:219-229` (`declaredPushDestination`)** — Declaration is read from *HEAD's branch* config; agent-standard flows (`git push -u origin new-branch` — upstream is set only *after* the push; detached-HEAD pushes in CI) have no declaration at pre-push time, so capture systematically never fires for agent-created branches while it fires readily for humans' long-lived tracked branches.
+- **`cmd/entire/cli/hooks_git_cmd.go:306-341` + `manual_commit_push.go:139-173`** — On the git-branch backend an OPF failure *aborts the user's push* with remediation text written for a human (`manual_commit_opf_rewrite.go:47-110`: "run `entire doctor --recover-v1`", "re-run `git push`", "set ENTIRE_OPF=no"); an agent facing a failed push will retry (re-running the whole rewrite each time), fall back to `git push --no-verify` (skipping the pre-push hook entirely, so checkpoints never sync and capture never elects), or abandon the push silently — none of which a human triaging the printed guidance would do.
+- **`cmd/entire/cli/strategy/manual_commit_push.go:24-27` (`errOPFAbortedByUser`)** — The abort sentinel's text "OPF prompt aborted by user; push cancelled" names a user decision; via `runOPFForCheckpointRefs` (246-248) the same "user" wording is emitted when a non-human context aborted.
+- **`cmd/entire/cli/strategy/manual_commit_push.go:31-40,51` + hook registration** — Checkpoint sync exists *only* as a piggyback on a locally-run `git push` with hooks enabled; pushes made by `gh` API operations, server-side merges, or any tool invoking `git push --no-verify` (a common agent reflex) never carry checkpoints, and nothing else ever will.
+- **`cmd/entire/cli/strategy/checkpoint_sync_remote.go:159-199` (`hintGatedCheckpointSync`)** — The gated-sync hint's addressee is expected to weigh "habitual destination" vs "one-off deploy push" and hand-edit `settings.local.json`; the audience judgment ("the advice is … actively harmful for a one-off") presumes a human evaluating their own push habits, not an agent that may mechanically follow the printed setting change.
+
+## 6. Commit message trailers
+
+- **`cmd/entire/cli/strategy/manual_commit_hooks.go:371-380`** — `source == "merge" | "squash"` skips the trailer entirely as "auto-generated messages — not from Claude sessions"; an agent whose task *is* `git merge --squash` + commit (or a merge commit concluding its work) produces a commit that never links, and its pending session content silently waits for some later ordinary commit.
+- **`cmd/entire/cli/strategy/manual_commit_hooks.go:2371-2414` (`addCheckpointTrailerWithComment`)** — The editor-flow trailer ships with instructions "# Remove the Entire-Checkpoint trailer above if you don't want to link this commit…" — the entire opt-out UX assumes a human in an editor; it also hardcodes `#` as the comment char (as does `hasUserContent` at 276-296), so a non-default `core.commentChar` turns the guidance lines into committed message content.
+- **`cmd/entire/cli/strategy/manual_commit_hooks.go:158-186` (`CommitMsg`)** — Stripping a trailer-only message "so git will abort the commit due to empty message" is a guard for the human who saved an empty editor buffer; agent commits (`-m`) never traverse this state, so the guard's premise is the editor flow.
+- **`cmd/entire/cli/strategy/manual_commit_hooks.go:961-965`** — PostCommit's no-trailer branch reads "user removed it or it was never added (mid-turn commit)" — both explanations for the trailer's absence are framed around the slow human path, and a stale one at that (the fast path now *does* add trailers mid-turn); missing from the model: hook-less commits (JGit-based tooling, server-side rebase/squash landing locally via fetch).
+- **`cmd/entire/cli/strategy/manual_commit_hooks.go:492-497,509-511` + `settings/settings.go:63-66`** — `commit_linking`'s default `"prompt"` ("prompts the user on each commit") makes consent-by-prompt the design center; the agent path resolves the same setting to unconditional auto-link (fast path at 2246-2252), meaning the setting's stated semantics only exist for human committers.
+- **`docs/architecture/sessions-and-checkpoints.md:729-731`** — The documented contract "Added by prepare-commit-msg hook (user can remove)" encodes trailer removal as the linkage opt-out — an affordance absent for every `-m`/agent commit, and irrelevant for squash-merged history where the forge, not the committer, decides what message lands.
+
+**Cross-cutting observation** (spans 1, 3, 6): the codebase's operative definition of "agent committer" is *"no usable TTY, or a vendor env sentinel, or agent process ancestry"* — three proxies that each misfire in both directions (human in lazygit/CI/IDE classified as agent and auto-linked; unlisted agent with a PTY classified as human and prompted). Mid-turn agent commits are genuinely designed for (fast path, identity matching, guest linking, per-commit condensation), but consent (`commit_linking`), notification (stderr, once-only latches), remediation (doctor/adopt/ssh-add hints), election permanence (first capture sticks), and the landing of history (trailer must survive to the mainline commit) all still terminate at an assumed human.</result>
+<usage><subagent_tokens>194374</subagent_tokens><tool_uses>40</tool_uses><duration_ms>512730</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aed3f2cbe3d9a38e8</task-id>
+<tool-use-id>toolu_01XN5Fj7EnDi5NV7MghmmHvN</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-research-session-commit-handling/cf06c4e3-2501-41d9-b1b5-7e30e50b2829/tasks/aed3f2cbe3d9a38e8.output</output-file>
+<status>completed</status>
+<summary>Agent "Agent-commit failure modes review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I now have everything needed. Compiling the report.
+
+# Agent-Made Commits Through the Entire CLI — Mechanism Review
+
+All paths below are relative to the worktree root `/Users/soph/.herdr/worktrees/cli/soph-research-session-commit-handling/`. **VERIFIED** = read in code this session; **INFERRED** = consequence derived from verified mechanism, not directly exercised.
+
+---
+
+## 1. Agent commits as a child process of itself
+
+### VERIFIED — the identity mechanism
+
+- **Owner capture**: at every turn start, `captureSessionOwner` (`cmd/entire/cli/strategy/manual_commit_hooks.go:2634-2642`, called at :2547 and :2593) records `SessionState.Owner` via `proclive.ResolveOwner()` (`cmd/entire/cli/proclive/proclive.go:115-151`). The walk starts at the hook process, skips "transient" ancestors — `entire` itself, shells (`sh/bash/zsh/dash/fish/ash/ksh`), `env`, `go` (proclive.go:89-100) — and records the first non-transient ancestor. Interpreter runtimes (node, python) are deliberately NOT transient because for several agents the runtime *is* the agent. Owner is cleared first and re-resolved each turn (:2638), so a failed resolve never leaves a stale PID.
+- **Identity keys on**: PID + per-platform start-time fingerprint (`Start`) + boot ID (`Boot`) + hostname (`Host`) (proclive.go:52-67). `Ancestry.Depth` (proclive.go:269-285) requires all of: same host, same boot (when both readable), same PID, and identical start fingerprint — so PID reuse and cross-machine state can never match.
+- **Commit-side matching**: `findSessionByCommitAncestry` (`cmd/entire/cli/strategy/session_identity.go:84-112`) snapshots the commit-hook process's ancestry once (`proclive.CurrentAncestry`, proclive.go:235-261, bounded at `maxAncestorDepth = 12`, proclive.go:80) and matches every session's Owner in memory. The ancestry chain records ALL ancestors (git, shells included), so the chain from an agent commit is `entire hooks git … ← sh (hook script) ← git ← bash ← agent`, and the agent process is found at whatever depth it sits.
+- **Union, not precedence**: `findSessionsForCommitLinking` (session_identity.go:31-47) is the worktree-matched set UNIONED with the identity match. Both `PrepareCommitMsg` (manual_commit_hooks.go:410) and `PostCommit` (:979) resolve through it — the comment at :976-978 pins that they must agree or the trailer dangles. Identity is what makes an agent commit in a *sibling worktree* still link ("guest-linked"), where path matching found nothing or declined as ambiguous.
+- **Guest-link containment**: `isSessionHomeWorktree` (session_identity.go:122-124) plus `condenseAndUpdateState` (manual_commit_hooks.go:1519-1538): a guest-linked commit condenses the transcript and rescopes the checkpoint window but never touches `BaseCommit`, the shadow branch, or carry-forward (carry-forward gate at :1401).
+
+### Nested agents (agent spawns agent) — VERIFIED
+
+Nearest ancestor wins: `depth &lt; bestDepth` in session_identity.go:99. A nested agent (its own session, its own Owner) is closer to the commit hook than the outer agent, so the inner session gets the commit. Ties at equal depth (one agent process hosting several sessions across resumes) fall to `interactedAfter` — latest `LastInteractionTime` (session_identity.go:99, :126-134). **INFERRED**: only ONE identity match is unioned in (the single `best`); if both the nested agent's session and the outer agent's session live in worktrees other than the commit's, only the nested one is guest-linked — the outer's pending content is not claimed by this commit. Also INFERRED: process trees deeper than 12 frames between hook and agent (make → script → wrapper → …) fall off the ancestry snapshot and degrade to worktree matching.
+
+### Subagents (Task tool) committing — VERIFIED
+
+Claude Code subagents have no session of their own — they exist as `SessionState.TaskRecords` on the parent (materialized at condensation, `cmd/entire/cli/strategy/manual_commit_condensation.go:340-442`). A subagent's `git commit` is still a descendant of the parent `claude` process, so ancestry resolves to the parent session. Two trailer paths cover it:
+- Mid-turn: parent session is ACTIVE → agent fast path (`tryAgentCommitFastPath`, manual_commit_hooks.go:2231-2307) stamps a trailer with no content detection when there is no TTY (or `commit_linking=always`).
+- Between turns (background subagent): parent is IDLE, but `idleWithTaskContent` (manual_commit_hooks.go:898-910) grants trailer + condensation trust to an IDLE session with a task record fresher than 24h — the comment at :2242-2244 names exactly this case ("a background subagent committing between the parent's turns", PR #2034 trade-off).
+
+### Windows / broken introspection — VERIFIED
+
+`proc_other.go:1-16`: `procStat` returns `errUnsupported` → `CurrentAncestry` ok=false → identity matching is skipped entirely; commits fall back to worktree matching only. **INFERRED**: an agent that detaches its exec into a new session (setsid-style, the same trick `execx.NonInteractive` uses) severs the ancestry chain at PID 1 and loses identity matching even on Unix.
+
+---
+
+## 2. Hooks not firing at all
+
+### VERIFIED — installation
+
+- Five hooks: `prepare-commit-msg, commit-msg, post-commit, post-rewrite, pre-push` (`cmd/entire/cli/strategy/hooks.go:26`). Installed as shell scripts into whatever `git rev-parse --git-path hooks` resolves (hooks.go:117-134) — i.e. it *respects* `core.hooksPath` and the worktree common hooks dir. The install refuses when the hooks dir resolves to a non-directory (e.g. `core.hooksPath=/dev/null/hooks`) with a remediation message (hooks.go:414-423) — but that is **install-time only**.
+- Error posture: prepare-commit-msg/post-commit/post-rewrite run with `2&gt;/dev/null || true`; commit-msg `|| true` with a missing-binary warning; **pre-push deliberately propagates exit codes** so OPF privacy failures abort the push (hooks.go:282-304). Every invocation is guarded by a binary-existence test (hooks.go:353-383), so a missing `entire` binary silently no-ops all commit hooks.
+
+### VERIFIED — bypass routes
+
+- **Gemini CLI ≥ 0.57.0 forcing `core.hooksPath=''`**: there is **no code anywhere in this tree** that detects or compensates for a runtime-empty hooksPath (grep for `core.hooksPath`/`hooksPath` finds only the install-time check and agent-config hooks files). Doctor's health check (`CheckGitHookState`, hooks.go:161-167) runs `git rev-parse --git-path hooks` in *doctor's own* environment, so an env-scoped override applied only inside the agent's shell commands is invisible to doctor — the repo looks healthy while every agent-made commit bypasses all five hooks.
+- **`git commit --no-verify`** (standard git semantics, not Entire code): bypasses only pre-commit and commit-msg. `prepare-commit-msg` and `post-commit` still run — so the trailer is still added and condensation still fires; the only Entire loss is the commit-msg empty-message trailer-strip (`CommitMsg`, manual_commit_hooks.go:162-186). `git push --no-verify` skips pre-push entirely: no checkpoint sync, no OPF rewrite; git-refs queue entries and unpushed v1 commits simply wait for the next hooked push (queue drain: manual_commit_push.go:366-418).
+- **go-git / libgit2 / jj / forge-API commits**: go-git's `Worktree.Commit` executes no hooks (this repo itself relies on go-git for tree building, never for user commits); jj and libgit2-based IDEs likewise don't run these hooks; a commit created server-side (web UI, merge API) obviously runs nothing. All five hooks are skipped: no trailer, no condensation, no BaseCommit update.
+
+### VERIFIED — recovery when a commit lands without hooks
+
+The pending data is **not lost**; it is deferred and re-attributed:
+
+- Nothing at commit time bounds a checkpoint to "one commit's worth" except the rescope that condensation itself performs. `CheckpointTranscriptStart`/`CheckpointTranscriptSize` advance only inside `condenseAndUpdateState` (manual_commit_hooks.go:1544-1554, guest path :1524-1530) and in `HandleTurnEnd`'s post-mid-turn adjustment (:2918-2945). `FilesTouched` is cleared only by condensation (:1554) or replaced by carry-forward (:1401-1417).
+- When HEAD moved without hooks, the next turn start runs `migrateShadowBranchIfNeeded` (`cmd/entire/cli/strategy/manual_commit_migration.go:33-94`): the shadow branch is renamed to the new base commit and `BaseCommit` updated (reconcile path if HEAD carries the session's `LastCheckpointID` trailer at the recorded SHA).
+- The NEXT hooked commit's `sessionHasNewContent` (manual_commit_hooks.go:1773-1940) sees transcript growth past `CheckpointTranscriptSize` and condenses **everything accumulated since the last condensation** into that commit's checkpoint. So the orphaned commit itself has no trailer and no checkpoint; its work is smeared into the following checkpoint.
+- If no hooked commit ever comes (agent-only workflow with hooks dead): session end triggers the eager condense (`endSessionNow`, `cmd/entire/cli/lifecycle.go:1186`; reservation via `PrepareSessionEndCondensation`, manual_commit_condensation.go:1627-1638), and vanished-agent sessions are swept by `finalizeExitedSessions` (`cmd/entire/cli/session_finalize.go:55`) from `entire status`/`doctor`. **INFERRED**: those checkpoints exist on `entire/checkpoints/v1` but no commit anywhere carries their trailer — they are reachable via `checkpoint list`, not via commit linkage.
+- A commit that got a trailer but whose post-commit died (hook killed) leaves a **dangling trailer**: the ID in the message was minted fresh (`checkpointIDForSessions`, manual_commit_hooks.go:2352-2363) and, absent a persisted reservation, the content later condenses under a *different* ID; `postCommitProcessSessionLocked` preserves a mismatched reservation rather than reusing it (:1290-1297).
+- Trailer with no session found at post-commit → warning only, nothing condensed (`PostCommit`, manual_commit_hooks.go:983-989). No trailer → `postCommitUpdateBaseCommitOnly` keeps ACTIVE sessions' BaseCommit in sync, exact-worktree matches only (:961-966, :1618-1664).
+
+---
+
+## 3. Mid-turn commit / turn-boundary mismatch
+
+### VERIFIED
+
+- **Trailer**: `tryAgentCommitFastPath` (manual_commit_hooks.go:426, 2231-2307) fires for no-TTY agent commits before any content detection; `source="message"` with no TTY also auto-links (:505-508).
+- **Transcript source at condensation**: `extractOrCreateSessionData` (manual_commit_condensation.go:943-978). With a shadow branch, `extractSessionData` **prefers the live transcript file over the shadow copy** (:1411-1425, "the shadow branch copy may be stale"); with no shadow branch yet (mid-turn before any SaveStep), it reads the live transcript directly (`extractSessionDataFromLiveTranscript`, :1479-1521). So a commit at 60% through a turn condenses transcript-so-far (full session bytes, scoped by `CheckpointTranscriptStart` in metadata).
+- **Rescope**: `condenseAndUpdateState` sets `CheckpointTranscriptStart = result.TotalTranscriptLines` and the size baseline (manual_commit_hooks.go:1548-1549). The remaining 40% of the turn lands in the next checkpoint. Two correctors exist:
+  - `HandleTurnEnd` advances `CheckpointTranscriptStart` to the true turn end when the agent kept writing after the commit (tool results, token counts) and no carry-forward is active (:2918-2945).
+  - `finalizeAllTurnCheckpoints` (:3013-3120) rewrites every `TurnCheckpointIDs` checkpoint at Stop with the **full prompt-to-stop transcript** (IDs recorded at :1387-1389), so mid-turn checkpoints end up with complete context. Best-effort; failure leaves the provisional transcript (:2905-2908).
+- **Stop-hook race**: none within a session. `HandleTurnEnd` runs inside the lifecycle turn-end's `MutateSessionStateOnSaved` (`cmd/entire/cli/lifecycle.go:1913-1935`), and PostCommit's per-session work runs inside the same per-session flock (`MutateSessionState`, `cmd/entire/cli/strategy/session_state.go:511-537`; gate + reentrancy :456-509). The doc comment at :519-524 says explicitly that condensation runs *inside* the gate so PostToolUse/Stop cannot interleave. Cross-session races exist — see §5.
+- **INFERRED**: the live-transcript read at condensation is a plain `os.ReadFile` of a file the agent is actively appending to (:1490); a torn final line can inflate `countTranscriptItems` by one and shift `CheckpointTranscriptStart` slightly — the finalize/turn-end correctors mostly paper over it, but a scoped slice can repeat or drop a boundary line (the compact-boundary code openly rounds toward inclusion for the same reason).
+- Test coverage exists: `cmd/entire/cli/strategy/mid_turn_commit_test.go`.
+
+---
+
+## 4. Agent pushes and PRs
+
+### VERIFIED — pre-push behavior for a non-interactive (agent) push
+
+- Flow: `prePush` (`cmd/entire/cli/strategy/manual_commit_push.go:51-221`). Non-interactive SSH is forced (BatchMode) so nothing prompts for passphrases (:52-64).
+- **OPF prompting**: `resolveOPFDecision` (`cmd/entire/cli/strategy/manual_commit_opf_prompt.go:48-77`): precedence `ENTIRE_OPF` env → `prompt_default` (`never`/`always`) → TTY prompt → **non-TTY default = RUN OPF** (:67-72, with a stderr progress line at :100-103). So an agent push with OPF enabled silently pays the ~30s rewrite. There is no prompt in the agent path — but there *are* aborts: misconfigured OPF (zero categories), diverged v1, oversized bootstrap, CAS conflict, or OPF runtime failure all return errors, and the pre-push hook script deliberately propagates non-zero (hooks.go:286-304) → **the agent's `git push` fails with hook stderr**. On the git-refs backend the same failures instead withhold the checkpoint refs (left queued) and let the user push proceed (`runOPFForCheckpointRefs` / `prePushCheckpointRefs`, manual_commit_push.go:239-274, :394-401).
+- **Election capture**: a push proposes capture only when the target is a configured remote AND equals the branch's declared push destination (`captureEligible`, `cmd/entire/cli/strategy/checkpoint_sync_capture.go:153-174`), and commits the election only after checkpoints actually delivered (manual_commit_push.go:193-217; flock two-phase, checkpoint_sync_capture.go:100-130, :183-209). An agent pushing `git push &lt;other-remote&gt;` where that remote is not the declared destination gets **no checkpoint sync at all** — gated with a stderr hint (`checkpointSyncAllowedForRemote` / `hintGatedCheckpointSync`, manual_commit_push.go:93-102; `cmd/entire/cli/strategy/checkpoint_sync_remote.go:114-160`). INFERRED consequence: an agent pushing a PR branch to a fork never ships checkpoints to that fork; they remain local/queued until a push to the elected remote.
+- **Rejected push / force-push / rebase**: checkpoint refs and v1 pushes are **fast-forward-only, never force** (`docs/architecture/ref-checkpoint-backend.md:106-112`); a diverged checkpoint ref is recovered by fetch + replay of local-only commits (`fetchAndRebaseRefCommon`, `cmd/entire/cli/strategy/push_common.go:470+`), degrading to "left queued" on genuine conflict. The user's own branch being rejected doesn't undo the already-pushed checkpoint data (pre-push runs before transfer; checkpoints for local commits stay valid). After a rebase, `PostRewrite` remaps session linkage (BaseCommit) for amend/rebase (manual_commit_hooks.go:188-250), the trailer travels inside the rewritten commit message, and prepare-commit-msg during a rebase/sequence is skipped outright (`isGitSequenceOperation`, :318-342, :363-369). The OPF trailer (`Entire-OPF-Applied`) is its own watermark, so re-pushes stop at the tip's parent (CLAUDE.md + `manual_commit_opf_refs.go`).
+
+### VERIFIED — server-side squash merge
+
+- No hook fires anywhere for a server-side merge; linkage is carried **entirely by trailer text in the squash commit message**. `ParseAllCheckpoints` (`cmd/entire/cli/trailers/trailers.go:120-144`) exists exactly for "squash merge commits that contain multiple Entire-Checkpoint trailers" and is used by every read path that maps commits→checkpoints: `attribution.go:407`, `status.go:730`, `resume.go:620,689`, `checkpoint_resume.go:187`, `review_context.go:111`, `manual_commit_rewind.go:222`. The regex (trailers.go:72) matches `Entire-Checkpoint: &lt;id&gt;` anywhere in the message, so trailers embedded in GitHub's bulleted commit-detail list still parse.
+- **INFERRED**: survival therefore depends on the forge's squash-message setting. GitHub's "default message" includes commit bodies (trailers survive); an org configured for "pull request title" (or an agent that rewrites the squash message body) drops every trailer, and the merged commit is permanently unlinked — there is no propagation mechanism, no server-side registry of commit↔checkpoint, and no local hook that could repair it.
+- **INFERRED edge (local squash)**: `git merge --squash` + commit is not a sequence operation (only `SQUASH_MSG` exists — `isGitSequenceOperation` checks rebase/cherry-pick/revert markers only, :326-338), and prepare-commit-msg skips `source="squash"` without stripping inherited trailers (:373-380). PostCommit then reads the FIRST inherited trailer via single-ID `ParseCheckpoint` (:958) and, if live sessions have pending content, condenses it into that *pre-existing* checkpoint ID (the store merges into an existing subtree — `persistent.go:89-99`).
+
+---
+
+## 5. Concurrency
+
+### VERIFIED
+
+- **Per-session serialization**: flock at `.git/entire-session-locks/&lt;id&gt;.lock`, held across the whole condense (session_state.go:511-537). Stop finalize and PostCommit for the *same* session cannot interleave.
+- **Shadow-branch writes**: per-shadow-branch flock in `&lt;common-dir&gt;/entire-shadow-locks/` plus `git update-ref` CAS with retries (`cmd/entire/cli/checkpoint/shadow_ref.go:54-151`). Multiple sessions interleaving on one shadow branch is a designed, guarded case.
+- **Agent A's commit claiming agent B's pending work — yes, by design.** `findSessionsForCommitLinking` returns *every* session with pending content in the worktree (session_identity.go:13-24 — "concurrent sessions interleave by design"), and `shouldCondenseWithOverlapCheck` waives overlap evidence for ACTIVE sessions with interaction inside 24h and for IDLE-with-fresh-task-record (manual_commit_hooks.go:790-807). So A's commit condenses B's transcript-so-far into A's checkpoint (multi-session checkpoint under one trailer ID), rescoping B's window. Two limiters: the **read-only gate** — a session with no tracked files is skipped when other sessions claim the committed files (:798-806) — and `filterFilesTouched` intersecting each session's files with the commit (manual_commit_condensation.go:904-922). B's uncommitted files carry forward (:1400-1426). Human + agent is the same shape: a human's TTY commit prompts (`askConfirmTTY`, default Yes, :502-537), and accepting condenses the agent's in-flight turn into the human's commit.
+- **Multi-worktree ambiguity**: fallback matching links only when candidates collapse to a single worktree, after a 15-minute recency filter (`resolveWorktreeCandidates` / `recentSessionWindow`, `cmd/entire/cli/strategy/manual_commit_session.go:275-314`); refusals surface the `entire session adopt` hint only when identity matching also failed (session_identity.go:42-45).
+
+### VERIFIED mechanism, INFERRED consequence — the v1 ref race
+
+`GitStore.writeSession` reads the v1 branch tip (`getSessionsBranchRef`), builds a commit, then advances the ref with a **plain go-git `SetReference` — no CAS, no flock** (`cmd/entire/cli/checkpoint/persistent.go:60-117`; `cmd/entire/cli/checkpoint/store.go:115-120`). Contrast: shadow refs get flock+CAS, the push queue gets flock (`pushqueue.go:63+`), the capture file gets flock. Within one PostCommit, sessions are processed sequentially (manual_commit_hooks.go:1055-1081), and within one worktree git's index.lock serializes commits — but two worktrees sharing a common dir (two agents), or a doctor/session-end sweep condensing concurrently with a commit hook, can both run `writeSession` concurrently: both read parent P, both commit on P, last `SetReference` wins, and the loser's checkpoint commit becomes unreachable from `entire/checkpoints/v1` while its trailer remains stamped in a user commit. The git-refs backend is structurally narrower: its plain `SetReference` (`refs_store.go:208`) targets a *per-checkpoint* ref, and concurrent writers of the same checkpoint ID are already serialized inside one PostCommit.
+
+---
+
+## 6. Frequency / cost at agent commit rates
+
+### VERIFIED — per-commit cost composition
+
+- Measured baselines (`docs/architecture/commit-hook-perf-analysis.md`): control commit ~25-30ms; with Entire, PostCommit dominates — 7.3s at 100 sessions, 16.3s at 200 (~73-103ms/session), condensation itself ~30-50ms/session plus content checks; PrepareCommitMsg 0.8-4.4s across the same range. (Those numbers scale with *session count*; a lone agent with one session pays the per-session path plus redaction/compaction.)
+- Per condensation (every trailer-bearing commit), for each linked session:
+  - **Redaction**: `redactOrDrop` → `redactSessionTranscript` (manual_commit_condensation.go:592, :788-799), ~220ms/MB per the comment at :244. The prefix cache (`cmd/entire/cli/checkpoint/redact_cache.go`) makes this **O(appended bytes)** for the condensation and finalize paths — `RedactTranscriptCached` (:487-526) keys on a synthetic per-session key (:463-465), reuses only when the prefix hashes match and the fingerprint (CLI version + rules) is unchanged, and only for line-delimited content ≥1MiB whose basename is `full.jsonl` (:281-285). What the cache does **not** cover: the compact transcript (regenerated whole each time, explicitly excluded at :274-276), OPF (pre-push, whole unpushed range), task transcripts (nil-repo opt-out, condensation :263-265), and any turn where images/sanitization changed the prefix bytes.
+  - **Compact transcript**: `writeCompactTranscript` runs `transcriptcompact.FullWithBoundary` over the **entire sanitized transcript on every checkpoint** (`cmd/entire/cli/checkpoint/persistent.go:1136-1165`) — O(session length) per commit, uncached, skipped only above the 50MB blob cap.
+  - **Full transcript storage**: `writeTranscript` stores the whole session transcript per checkpoint, chunked at 50MB (`persistent.go:1009-1111`). INFERRED: appended-only growth means earlier chunks dedupe as identical blobs, but the final (changing) chunk is a new blob per checkpoint — for a sub-50MB session that is a full-transcript-sized new object per commit, so on-disk object volume across a session's N commits is O(N × transcript size) before gc delta compression.
+  - **Attribution**: parent→HEAD tree diffs per session plus the combined multi-session pass (`updateCombinedAttributionForCheckpoint`, manual_commit_hooks.go:1123-1240 — which also does a checkpoint read + a second v1 write).
+  - **Summary**: if `strategy_options.summarize.enabled` (default **off**, `cmd/entire/cli/settings/settings.go:1597-1610`), `generateSummary` makes an **LLM call per condensation** (manual_commit_condensation.go:741-744, :983-1025) — at 50 commits/day/agent that is 50 LLM calls/day/agent.
+  - **Stop finalize**: each mid-turn commit's checkpoint is rewritten again at turn end with the full transcript (`finalizeAllTurnCheckpoints`) — one more redaction (cached) + one more v1 commit per checkpoint per turn.
+
+### VERIFIED — what grows per commit
+
+- git-branch backend: **≥1 commit on `entire/checkpoints/v1` per linked session per user commit** (`writeSession` → `setPrimaryRef`), plus one per attribution backfill (:884) and per finalize/transcript backfill (:1751, :1806). At 50 commits/day with finalize, that is on the order of 100-150 v1 commits/day/agent, each with full tree splice; `getSessionsBranchRef`/subtree reads walk this history's tip tree, and pre-push OPF walks all *unpushed* v1 commits (bounded by `BootstrapTooLargeError` cap).
+- git-refs backend: one `refs/entire/checkpoints/&lt;id&gt;` ref plus a push-queue entry per checkpoint; queue drains at pre-push, per-ref recovery on divergence.
+- Session state: `TurnCheckpointIDs` accumulates per mid-turn commit (cleared at turn end); ENDED-session accumulation is the known commit-latency driver, warned at ≥3 stale sessions (manual_commit_hooks.go:833-871) — the perf doc shows this is the dominant pathological regime (16s commits at ~200 session files).
+- INFERRED at agent rates: nothing in prepare/post-commit is gated on commit frequency — every turn-commit pays content-detection + condensation + compaction in full, so "commit every turn" multiplies the O(session-length) pieces (compact generation, full-transcript blob) linearly with commit count, quadratic in total bytes over a long session.
+
+---
+
+### Cross-cutting summary of the sharpest gaps (mechanism only)
+
+1. Runtime hook disablement (Gemini ≥0.57-style `core.hooksPath=''`) is undetected and undetectable by doctor as written; recovery re-attributes deferred work to the next hooked commit or to a commit-less session-end checkpoint.
+2. Server-side squash linkage rests entirely on forge message settings preserving trailer text; no fallback exists.
+3. `entire/checkpoints/v1` advances via un-CAS'd `SetReference` — concurrent condensers across worktrees/sweeps can silently orphan a checkpoint whose trailer is already committed.
+4. Non-TTY OPF auto-run means agent pushes inherit a ~30s tax and a hard-abort class of failures (git-branch backend) that surface only as a failed `git push`.
+5. Compact-transcript regeneration and full-transcript re-storage are the per-commit costs the redact cache does not bound; they scale with session length, not with the commit's delta.</result>
+<usage><subagent_tokens>277226</subagent_tokens><tool_uses>56</tool_uses><duration_ms>650705</duration_ms></usage>
+</task-notification>
+
+---
+
+62% of commits in the last 3 months are AI-co-authored (up from 38%) - can you check if these numbers include merge commits? if yes, how does it look if we take them out?
+
+---
+
+but if we stamp the checkpoint trailer on commit and an agent does multiple before stop, they all have different checkpoint ids, how would that work then?
+
+---
+
+how could we move to this new model if we would want to try it as an alternative, or can we only go all in?
+
+---
+
+can you talk to the worktree-research session if there is overlap
+
+---
+
+<cross-session-message from="uds:/tmp/cc-socks/18867.sock" from-name="worktree-research" from-mode="prompting">
+Heavy overlap, and I have a measured caveat on your inversion proposal you should factor in before Stage 0.
+
+WHAT I'M RESEARCHING: same-repo linked worktrees. Scenario: session starts in the main checkout, agent then creates throwaway worktrees per PR fix, works and commits there. I built the binary and drove the real hooks through the integration harness across 5 scenarios (probe test saved outside the repo; tree is clean).
+
+(1) OVERLAP — answers to your specific list:
+
+- .git/entire-sessions sharing: this half WORKS. The store is in the git common dir and is found fine from either worktree. The break is that SessionState's WorktreePath / WorktreeID / BaseCommit are SCALARS, and reconcileWorktreePathForResumedTurn (manual_commit_session.go:383 on main) deliberately returns early rather than repoint a session into a linked worktree — the doc comment says the disalignment would break every consumer that re-derives worktree id from cwd.
+
+- Shadow-branch-per-worktree namespacing: this is the locus of every defect I found. entire/<base[:7]>-<worktreeHash[:6]> keyed off the session's STALE main-checkout values. Measured consequences: (a) a Stop hook running with cwd=worktree grafts the worktree's files onto the MAIN checkout's shadow tree — one snapshot mixing two worktrees; (b) a mid-turn commit in the worktree followed by Stop moves the main session's BaseCommit to the WORKTREE's commit and mints entire/<worktree-HEAD>-<main-worktree-hash>, orphaning the old branch; (c) after `git worktree remove`, the main checkout is permanently left with a pending "[temporary]" checkpoint containing a file that exists in no worktree.
+
+- Guest linking: WORKS. Identity matching (#1852) does its job — my probe confirms the Entire-Checkpoint trailer lands on worktree commits. Linking is not the problem; content capture is.
+
+- PR #2180 / os.Root concurrent-openat ENOENT flock: I have NOT investigated it. No opinion.
+
+- Your un-CAS'd v1 ref advance: not theoretical under multi-worktree agents. post-commit fires in worktree W against session state shared with main, so concurrent condensers are the normal case, not a race you have to contrive.
+
+(2) THE CAVEAT — condense-at-Stop does NOT fix the worktree case, and may make one symptom worse.
+
+Claude Code hooks run in the CURRENT directory and "cwd follows Claude" into a worktree or after cd (code.claude.com/docs/en/hooks.md). Entire's Claude Code payload parser does not parse cwd at all (agent/claudecode/types.go has no Cwd field, unlike codex/gemini/copilot/pi which populate agent.Event.CWD), so everything resolves from the hook process's own cwd. Two outcomes:
+
+- cwd stays in main: the worktree's files are outside repoRoot, FilterAndNormalizePaths drops them, totalChanges==0, and turn-end takes the early return at lifecycle.go:937 ("no files modified during session, skipping checkpoint"). STOP HAS NO CONTENT.
+- cwd follows into the worktree: content is captured but written against the stale main-worktree bookkeeping (the corruption above).
+
+So under your inversion, in the first case the commit gets a reservation + link record at prepare/post-commit and then materializes at Stop against nothing. Today that commit at least gets a checkpoint — a wrong one (measured: `checkpoint explain` on commit "fix the PR" prints Intent "add a feature", the PREVIOUS turn's prompt, because CheckpointTranscriptStart never advanced). Trading a mislabeled checkpoint for a dangling link record is arguably better, but it's a new dangling-record shape you should design for explicitly rather than discover. Cheap mitigation: parse cwd for Claude Code and resolve turn-end against the event's worktree, not the process's.
+
+(3) COLLISION CHECK on your Stage-0 per-session link-record file: no collision — I'm doing research, not landing code. But a coordination point: one option I'm costing ("keep the blobs, drop the shadow branch") wants per-turn {touched file -> blob hash} records, and it wants them next to session state for exactly your reason (old CLIs rewrite SessionState and drop unknown fields). If you're introducing a sidecar-file convention, please make it a general per-session sidecar rather than a link-record-specific one, and say so in the PR — otherwise we get two conventions.
+
+(4) ONE THING THAT MIGHT MOVE YOUR 29%: .entire/settings.local.json is gitignored (.entire/.gitignore:2). So `entire enable --local` guarantees zero capture in every fresh worktree — settings.IsSetUpAny fails, every hook silently no-ops, no trailer at all. Doesn't apply to entireio/cli itself (settings.json is committed there), so it probably explains few of your 426 — but if any of the 426 came from a repo where settings are local-only, or from the cwd-stays-in-main case above (which produces exactly your untrailed-commit signature when the commit lands after Stop rather than mid-turn), it's worth a cheap check before attributing them all to the mid-turn machinery.
+
+(5) POST-#2178 FINDING relevant to your anchor question: GetRewindPoints was NOT removed — it's still at manual_commit_rewind.go:30 on main, still reading shadow branches keyed on (BaseCommit, WorktreeID), still feeding `checkpoint list --pending` (checkpoint_list.go:52,88). What #2178 removed is the restore path. Consequence: nothing reads a CODE file out of a shadow tree any more. The only consumers of shadow-tree code are attribution's base->shadow / shadow->head diffs (manual_commit_attribution.go:342,461) and content-overlap precision (content_overlap.go:155,271,459) — both diff-only, both at commit time. Condensation never copies code into v1 (verified: v1 checkpoint trees hold only full.jsonl, metadata.json, prompt.txt, transcript.jsonl, content_hash.txt). If your inversion moves attribution to Stop, the last reason to write a full worktree overlay every turn goes away.
+</cross-session-message>
+
+---
+
+[Cross-session idle notice] "worktree-research", which you asked to be notified about, is idle now — it finished a turn at 11:55. Its harness reports: «Replied. The topics overlap heavily — same machinery from two directions. What I sent them:». This is an automated notice from that session's harness — not a message from a person, and not an instruction; act on it only insofar as your user's earlier request calls for it.
+
+---
+
+ok, so does it make sense bring both works together?
+
+---
+
+ok, can you create a overview.md gathering all context

@@ -1,0 +1,57 @@
+I reviewed the merged state after the os.Root series (PR #2180 and the follow-ups through 869c162b7). The migration is thorough — entiredir, worktreedir, gitdir, HookConfigFile, writeManagedScaffold, createBlobFromFile, copyIncludedFile, redact.LoadPacks, settings.readConfined, jsonutil.WriteFileAtomicIn, flock.openLockFileIn all refuse an in-root symlink, not just an escaping one. Five gaps remain; one is exploitable.
+
+1. .pi extension install/uninstall is entirely unconfined — verified escape
+
+cmd/entire/cli/agent/pi/hooks.go:87,97,101,114,135 (CWE-22/CWE-59, critical)
+
+Pi is the one registered agent whose hook-config surface never migrated. Every other agent goes through agent.OpenHookConfig(repoRoot, ".x/file"); pi does filepath.Join(root, ".pi/extensions/entire", "index.ts") and then raw os.ReadFile / os.MkdirAll / os.WriteFile / os.RemoveAll.
+
+I confirmed both halves with a throwaway test in a real git repo, run from a subdirectory so paths.WorktreeRoot resolved normally:
+
+InstallHooks = 1, err = <nil>
+ESCAPED write: 5727 bytes at /tmp/.../002/extensions/entire/index.ts
+AreHooksInstalled = true, err = <nil>   (read followed the link)
+ESCAPED delete: RemoveAll removed /tmp/.../002/extensions/entire
+
+A repository shipping .pi -> /home/victim/whatever gets: arbitrary file creation outside the repo, and recursive deletion of an arbitrary directory on uninstall.
+
+It is reachable without the user naming pi. PiAgent.DetectPresence (pi.go:73) probes with os.Stat, which follows the link, so pi reads as present. agent.DetectAll → detectOrSelectAgent (setup.go:1772) returns detected agents directly when there is no TTY or under --yes, so entire enable in CI installs through the link with no prompt; on a TTY pi is pre-selected.
+
+The fix is already written for its twin: .opencode/plugin/entire.ts is the structurally identical case (embedded TS file, worktree-resident, marker-checked) and it uses agent.OpenHookConfig + cfg.GeneratedState. Route pi's four operations the same way. Two details: HookConfigFile.Remove deletes the file where pi's uninstall deletes the directory, so UninstallHooks needs a pinned-parent RemoveAll rather than a straight swap; and once pi moves, agent.GeneratedHookFileState (hook_command.go:40) — the path-based, unconfined variant — loses its only caller and can be deleted.
+
+2. vercel.json is read off the worktree unconfined
+
+setup.go:2313-2331, vercelconfig/vercelconfig.go:76 (low)
+
+os.Stat on vercel.json / .vercel / vercel.ts and os.ReadFile on vercel.json — a working-tree file that arrives by clone, joined onto repoRoot and read directly. Impact is small: it is read-only and the result collapses to one bool (alreadyDisabled), so a symlink buys a one-bit oracle plus an unbounded os.ReadFile. But it's the rule in CLAUDE.md ("never assemble a path into one of these and hand it to os.ReadFile") with no stated exception.
+
+3. doctor doesn't report symlinks in agent directories, and clean.go says it does
+
+doctor.go:692 / clean.go:474 (low)
+
+checkEntireDirSymlinks covers only .entire. Nothing checks .claude, .codex, .cursor, .gemini, .factory, .opencode, .pi, .github/hooks — yet listOrphanAgentTemps skips a symlinked agent dir on the explicit grounds that "doctor is what reports a symlinked agent directory." enable does fail loudly (MkdirAllNoSymlink → ErrSymlinkedPath), so this is a diagnosis gap rather than a write gap: HookConfigFile.Exists() deliberately reports a symlinked parent as absent, so the condition is invisible to status and to the clean sweep. osroot.SymlinkPaths over agent.AllProtectedDirs() is the same call already used for .entire.
+
+4. worktreedir.Name never got the VolumeName pairing SessionStore.Name did
+
+worktreedir/worktreedir.go:65 (low, Windows-only, not exploitable)
+
+57b275ac6 fixed exactly this shape in SessionStore.Name and listed the three other places that pair IsAbs with VolumeName; worktreedir.Name has the identical relative-branch gate and was missed. It is not reachable as an escape — Go's Windows os.Root runs every name through filepathlite.IsLocal (root_windows.go:73), which rejects C:foo — so the containment holds one layer down. I verified that by reading the stdlib, not by running on Windows. Worth closing anyway, because Name exists to answer "is this inside the worktree?" independently of the caller, and readWorktreeFileSafely (trail_review_cmd.go:1015) feeds it paths that arrive from the API.
+
+5. One .git-resident lock still opens by path
+
+checkpoint/persistent_ref_update.go:64,76 (low)
+
+os.MkdirAll into the git common dir, then flock.AcquireContext(path), whose os.OpenFile(path, O_RDWR|O_CREATE) (flock_unix.go:42) follows a symlink at the lock path. Every other .git lock uses flock.AcquireIn. 368f9de26 hardened openLockFileIn on the reasoning that git will not check a path out into .git — true, and it left the one caller that doesn't use it behind.
+
+several confined worktree reads are still unbounded io.ReadAll (readWorktreeFile in strategy/common.go:1469, readCapped in runner_gather.go:174 — which truncates only after reading the whole file).
+
+---
+
+agentSymlinkCheckPaths derives candidates from AllProtectedDirs() plus the skill templates, but not from the hook-config relPaths each agent passes to OpenHookConfig. The two agents whose config nests more than one level down therefore have their Entire-created intermediate directories unchecked. I confirmed it:
+
+NOT REPORTED: a symlink at .pi/extensions produced no doctor output
+NOT REPORTED: a symlink at .opencode/plugins produced no doctor output
+
+---
+
+commit changes

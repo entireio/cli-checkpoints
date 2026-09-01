@@ -1,0 +1,244 @@
+/simplify
+
+---
+
+<task-notification>
+<task-id>a93811e1616f7fdbc</task-id>
+<tool-use-id>toolu_01WgJzgSWjyLHFijtbXtZUQQ</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--entire-worktrees-pfleidi-cor-1185-cli-submit-mirror-creates-through-the-async-mirror-request/c1ca87c1-a68c-488b-9ee5-cf9e6577bb21/tasks/a93811e1616f7fdbc.output</output-file>
+<status>completed</status>
+<summary>Agent "Review diff for efficiency" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Findings
+
+### 1. Async path polls an empty upstream for the full `--wait-timeout` (worst offender)
+`cmd/entire/cli/repo_mirror.go:646` (the `created.Empty` short-circuit) and `:672` (`awaitMirrorReady`).
+
+`awaitMirrorPlacement` (`cmd/entire/cli/repo_mirror_probe.go:112-121`) synthesizes `CreatedMirror` from `MirrorRequestResult`, which only carries `mirrorId/mirrorUrl/publicUrl` (`internal/coreapi/oas_schemas_gen.go:6367`). So `created.Empty` and `created.Suspended` are always `false` in async mode, and both short-circuits at `repo_mirror.go:642` / `:646` become dead.
+
+Cost: for an empty upstream — the case the sync path explicitly documents as "nothing to clone, so don't poll for 'ready' — it never would" — the async path falls into `awaitMirrorReady` and polls `GetMirror` every 2s for the default 30-minute `--wait-timeout`: ~900 wasted control-plane calls per mirror, multiplied by `mirrorCreateConcurrency` in the wizard, ending in a spurious timeout error instead of the immediate "nothing to clone" exit. (Suspended is cheaper: one extra poll, since `awaitMirrorReady` returns `errMirrorSuspended` on the first read.)
+
+Cheaper: carry `empty`/`suspended`/`created` through `MirrorRequestResult` and populate them in `awaitMirrorPlacement`, or — if the API can't carry them yet — do the one best-effort `GetMirror` before entering the clone poll and treat a non-`processing`/non-`ready` status as terminal.
+
+### 2. First placement poll always waits a full 2s tick
+`cmd/entire/cli/repo_mirror_probe.go:104` + `:132-139` — the loop checks the initial 202 body, then unconditionally blocks on `&lt;-ticker.C` before the first `GetMirrorRequest`.
+
+Cost: the async route replaces one blocking `CreateMirror` with submit + poll, and adds a hard 2s floor to placement even when the server finished the request in ~200ms. That is a directly user-visible 0–2s regression on every `repo mirror create` with the toggle on (and on the wizard's first line update). Note `awaitMirrorReady` (`:234-240`) does *not* have this problem — it polls immediately, then ticks.
+
+Cheaper: poll at a short initial interval (e.g. 250ms) backing off to `mirrorPollInterval`, or at minimum do one immediate `GetMirrorRequest` before entering the ticker loop.
+
+### 3. Phase de-duplication implemented twice
+`cmd/entire/cli/repo_mirror.go:524-534` (`onPhase` compares `next == phase`) and `:578-585` (`reportPhase` compares `phase == currentPhase`) both suppress repeated phases; the wizard's callback at `repo_mirror_create_wizard.go:575` relies only on the inner one.
+
+Cost: zero runtime cost (three phase transitions total) — flagging only because the outer guard is redundant state the one-shot caller has to keep in sync. Drop the `next == phase` check in `newRepoMirrorCreateCmd` and let `createAndAwaitMirror` own the dedup.
+
+### 4. Minor: settings load runs before argument validation
+`cmd/entire/cli/repo_mirror.go:493-496` — `LoadEntireSettings` runs first thing in `RunE`, ahead of `parseGitHubURL` and `validateClusterHost`.
+
+Cost: `settings.Load` forks `git rev-parse --git-common-dir` and reads up to three JSON layers (`settings.go:555-573`, uncached), so a typo'd URL pays a subprocess before failing. Single-digit milliseconds against a command that then does cluster discovery plus HTTP, so this is only worth moving if you're touching the block anyway — load it after validation, or lazily in the two branches that use it.
+
+## Checked and clean
+
+- Settings are loaded exactly once and threaded down through `runMirrorCreateWizard` → `createMirrors` → `createOneMirror`; no per-target or per-poll reload.
+- `mirrorRequestPollTarget` parses the `Location` URL and installs the server URL into the context once, before the loop — no per-iteration parsing or allocation beyond a trivial `GetMirrorRequestParams` struct.
+- Both poll loops hoist their `time.Ticker` and reuse it; no per-iteration timer allocation.
+- The async timeout is applied once via `waitCtx` and `pollTimeout` is zeroed for `awaitMirrorReady` (`repo_mirror.go:668-672`) — no duplicated deadline timers.
+- `canonicalizeMirrorRequestLocation` (`internal/coreapi/cross_juris_transport.go:310`) guards on status code and exact path before parsing, so it adds two comparisons to non-matching responses.
+- Wizard concurrency is unchanged: one client per distinct region, `errgroup` with `SetLimit`, per-target results written by index.
+- Closures captured here (`onPhase`, `reportPhase`, the status callback) capture only small scalars/writers and live only for the command's duration — no long-lived retention concern.</result>
+<usage><subagent_tokens>54171</subagent_tokens><tool_uses>15</tool_uses><duration_ms>130147</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ac6367c17c30e4208</task-id>
+<tool-use-id>toolu_01ByhGt2rNoREsDoZWNFeemR</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--entire-worktrees-pfleidi-cor-1185-cli-submit-mirror-creates-through-the-async-mirror-request/c1ca87c1-a68c-488b-9ee5-cf9e6577bb21/tasks/ac6367c17c30e4208.output</output-file>
+<status>completed</status>
+<summary>Agent "Review diff for simplification" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Findings
+
+### Production code
+
+**1. `cmd/entire/cli/repo_mirror.go:524-535` — the one-shot's `onPhase` re-implements phase de-duplication that `createAndAwaitMirror` already guarantees.**
+`reportPhase` inside `createAndAwaitMirror` (lines 581-588) already drops repeats (`phase == currentPhase → return`), so the caller's `if next == phase { return }` plus its own `phase` variable can never fire. Cost: a second piece of mutable state (`phase`) tracking something the callee owns, and a reader has to check both to know the contract. Simpler: drop `var phase` and the guard; keep only `finishPhase`.
+
+**2. `cmd/entire/cli/repo_mirror_probe.go:189-212` — `mirrorRequestFailureError`'s "known code" allow-list only changes wording.**
+Ten server failure-code literals are duplicated into the CLI purely to choose between `mirror placement failed (%s): %s` and `mirror placement failed with unknown failure code %q: %s`. Both messages contain the same code and message; the user learns nothing extra, and the list is a sync obligation with the server spec that will silently rot. Cost: ~15 lines, a magic-string list, plus a dedicated `unknown` test case (`repo_mirror_request_test.go:169`). Simpler form:
+
+```go
+message := fmt.Sprintf("mirror placement failed (%s): %s", failure.Code, failure.Message)
+if failure.Retryable { message += "; retry this command" }
+```
+
+**3. `cmd/entire/cli/repo_mirror_probe.go:177-186` — the relative-`Location` branch is unreachable, and one of its guards is dead twice over.**
+Every `*coreapi.Client` is built with `newCrossJurisHTTPClient()` (`internal/coreapi/client.go:148`), and `canonicalizeMirrorRequestLocation` (`cross_juris_transport.go:308`) rewrites Scheme+Host on *every* 202 from `/api/v1/mirror-requests`. So by the time `mirrorRequestPollTarget` sees the header it is always absolute; the `else if locationURL.Host != "" || !strings.HasPrefix(...)` arm can't be reached in production or in these tests. Inside it, `!strings.HasPrefix(locationURL.Path, "/")` is unconditionally false anyway, since `strings.CutPrefix(path, "/api/v1/mirror-requests/")` already succeeded. Cost: a branch reviewers must reason about that no input can reach. Simpler: require an absolute Location (the transport's contract) and error otherwise — one branch instead of two mechanisms for the same problem.
+
+**4. `cmd/entire/cli/repo_mirror_probe.go:160-187` — `mirrorRequestPollTarget` is a parser that also returns a derived `context.Context`.**
+It threads `ctx` through five return statements just to hand it back unchanged on every error path, and mixes URL parsing with `coreapi.WithServerURL` injection. Cost: a 3-value signature where 2 would do, and `ctx` shadowing at the call site (`:96`). Simpler: `func mirrorRequestPollTarget(location string) (serverURL *url.URL, requestID uuid.UUID, err error)`, with `awaitMirrorPlacement` doing `ctx = coreapi.WithServerURL(ctx, serverURL)`. Also, the four identical `fmt.Errorf("invalid mirror request Location %q", location)` returns can collapse to a single labelled/`invalid:` exit.
+
+**5. Three copies of the same context-error classifier.**
+`classifyWaitContextErr` (`repo_mirror_probe.go:286`), `classifyPlacementWaitContextErr` (`repo_mirror_probe.go:276`), and the inline block in `createAndAwaitMirror` (`repo_mirror.go:607-615`) are byte-for-byte the same shape — `errors.Is(err, context.Canceled) → NewSilentError`, else `fmt.Errorf("timed out &lt;phrase&gt;: %w")` — differing only in the phrase. Cost: three places to keep in sync, one of them inlined so it reads differently from the other two. Simpler: `classifyWaitContextErr(err error, what string) error` and three call sites passing `"submitting mirror request"` / `"waiting for mirror placement"` / `"waiting for initial clone"`.
+
+**6. `cmd/entire/cli/repo_mirror.go:558, 638, 688, 695` — `createdStateUnknown` is branched on twice in `reportOneShotMirror` for one decision.**
+The `switch` at 687 picks a header line, then `if !outcome.createdStateUnknown` at 695 re-tests the same flag to decide whether to print the URL — because the async header inlines the URL. Cost: two conditionals on one condition; adding a fourth outcome shape means touching both. Simpler: make the async case print `"\nMirror placed\n"` and let the shared `fmt.Fprintf(out, "  %s\n", created.MirrorUrl)` run unconditionally (or give each case its own full block and delete the second `if`). Separately, the field itself is exactly `opts.async`, which both call sites already know — it exists only so `reportOneShotMirror` needn't take another param, which is defensible, but worth naming as duplicated state.
+
+**7. `cmd/entire/cli/repo_mirror.go:590-595 + 668-671` — two mechanisms express one deadline.**
+Async wraps the whole operation in `context.WithTimeout(ctx, opts.timeout)` and then must *neutralize* the same timeout at the clone poll (`pollTimeout = 0`); sync leaves the context alone and passes `opts.timeout` into `awaitMirrorReady`. A reader has to hold both paths in their head to answer "what is bounded by `--wait-timeout`?". Simpler (if the behavior change is acceptable): always derive `waitCtx` from `opts.timeout` and always call `awaitMirrorReady(waitCtx, ..., 0)`. That does make the sync `CreateMirror` call deadline-bounded too, which it currently is not — flag it as a deliberate choice rather than an accident if you keep the split.
+
+**8. `cmd/entire/cli/repo_mirror_create_wizard.go:509, 563 — `asyncMirrorRequests` is threaded as a 7th/8th positional bool.**
+`createOneMirror(ctx, t, c, clientErr, noWait, waitTimeout, asyncMirrorRequests, report)` has two adjacent bare `bool`s at the call site (`:542`, and `false` in three tests), and the three values are forwarded verbatim into `mirrorCreateOptions` at `:573`. Cost: positional-bool call sites that read as `..., nil, false, time.Second, false, nil`. Simpler: pass `mirrorCreateOptions{async, noWait, timeout}` down from `runMirrorCreateWizard` and let `createOneMirror` set `onPhase` — the struct already exists.
+
+**9. `cmd/entire/cli/repo_mirror.go:569-571 — `label()` reconstructs display text by slicing.**
+`strings.ToUpper(string(p[:1])) + string(p[1:])` is a clever way to get `"Queued"`/`"Placing"`/`"Cloning"` for a single caller, and it panics on an empty phase. Minor, but a three-arm `switch` returning literals (or a `map[mirrorCreatePhase]string`) says the same thing without byte indexing.
+
+**10. `cmd/entire/cli/repo_mirror_probe.go:100 and :153` — the request-ID invariant is checked twice, with two different error strings.**
+`initial.RequestId != requestID` and `next.RequestId != requestID` guard the same "server returned an id we didn't ask for" case. Cost: two message formats to maintain for one defensive check. Keep the poll-response one (the loop actually re-reads) and drop the pre-loop one, or share one message.
+
+**11. Path literal duplicated across packages.**
+`"/api/v1/mirror-requests/"` (`repo_mirror_probe.go:168`), `apiBasePath+"/mirror-requests"` (`cross_juris_transport.go:309`), and `mirrorRequestsAPIPath` in the test file are three independent spellings of one route. One exported constant in `coreapi` would keep the transport hook and the poll parser from drifting.
+
+### Tests
+
+**12. `cmd/entire/cli/repo_mirror_request_test.go` — 14 copies of the same four-line server/client bootstrap.**
+`srv := httptest.NewServer(...)` / `t.Cleanup(srv.Close)` / `client, err := coreapi.NewWithBearer(srv.URL, "token")` / `require.NoError(t, err)` repeats at lines 37-64, 88-101, 142-148, 172-188, 207-224, 235-245, 260-270, 284-290, 300-314, 323-335, 400-417, 442-465, 497-515, 578-607. Simpler: one helper `newMirrorRequestClient(t *testing.T, h http.HandlerFunc) *coreapi.Client` that does all four — removes ~45 lines and makes each test's handler the only thing on screen.
+
+**13. `repo_mirror_request_test.go:434-436, 484-486, 535-537` — `useFastMirrorPolling` exists (line 657) but three tests inline its exact body.**
+Same three lines (save/set/restore `mirrorPollInterval`) copy-pasted where a call to the existing helper would do. Straight substitution.
+
+**14. `repo_mirror_request_test.go:37-61, 497-512, 540-557` — the "first poll processing, then succeeded" handler script is written three times.**
+`TestCreateAndAwaitMirror_AsyncSuccess`, `TestRepoMirrorCreate_AsyncSetting` and `TestCreateOneMirror_AsyncProgress` each hand-roll the same `requestPolls == 1 → processing, else succeeded` state machine with slightly different `switch` shapes (`switch r.URL.Path` vs `switch { case ... }`). Simpler: one `mirrorRequestScript(t, statuses ...coreapi.MirrorRequestStatus) http.HandlerFunc` that walks a status list, composed with the mirror-status handler where needed.
+
+**15. `repo_mirror_request_test.go:664-701` — a five-layer helper chain for "write a JSON body".**
+`writeSuccessfulMirrorRequest → writeSuccessfulMirrorRequestWithStatus → writeJSONResponse → writeMirrorRequestBody → printJSON(wireJSON(...))`, plus `writeMirrorRequest` which is nothing but `writeJSONResponse(t, w, http.StatusOK, request)`. Cost: to answer "what bytes does this test serve?" you follow four hops. Simpler: keep `writeJSONResponse` + `wireJSON` and delete `writeMirrorRequest` and `writeMirrorRequestBody`; fold `writeSuccessfulMirrorRequest` into its `WithStatus` variant with a default.
+
+**16. `repo_mirror_request_test.go:113-135` — `TestRepoMirrorCreate_BrokenEntireDirUsesDefaultRoute` doesn't observe the route.**
+Both subtests differ only in how `.entire` is broken and both assert the same thing: the command reaches `parseGitHubURL` and reports `not a recognized GitHub URL`. Nothing checks which route (async vs sync) was taken, so the name over-promises and neither subtest would fail if the settings-load fallback changed to async. Either assert the actual route (a server that only serves `/api/v1/mirrors`) or collapse the two into one case.
+
+**17. `cmd/entire/cli/settings/settings_test.go:667-691` — 3 of 4 cases re-test the generic merge machinery.**
+`local setting enabled` and `local false` exercise `mergeRawBool`/local-override layering, which is field-agnostic and already covered by `TestLoad_MergesLocalOverrides`, `TestMergeJSON_ExternalAgents` and `TestLoad_ExternalAgentsField`. Cost: a new 25-line table per bool field forever. The load-bearing case is `project setting enabled` (proves the field is wired into `mergeScalarFields`); the rest can go.
+
+### Not flagged
+`canonicalizeMirrorRequestLocation` and its test, the `case Succeeded, Failed:` empty arm (required by the `exhaustive` linter), and the silent `LoadEntireSettings` error swallow at `repo_mirror.go:493-496` all look deliberate and proportionate. No comments in the diff merely restate their code — the ones that were removed (the `maxConsecutivePollErrors` rationale, the `onCreated` contract) were arguably carrying more information than what replaced them, but that's a documentation call, not added complexity.</result>
+<usage><subagent_tokens>80677</subagent_tokens><tool_uses>20</tool_uses><duration_ms>208212</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ae20594409a601294</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--entire-worktrees-pfleidi-cor-1185-cli-submit-mirror-creates-through-the-async-mirror-request/c1ca87c1-a68c-488b-9ee5-cf9e6577bb21/tasks/ae20594409a601294.output</output-file>
+<status>completed</status>
+<summary>Agent "Review diff for reuse" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Findings
+
+**1. `mirrorCreatePhase.label()` re-implements `upperFirst`**
+`cmd/entire/cli/repo_mirror.go:569-571`
+```go
+func (p mirrorCreatePhase) label() string {
+	return strings.ToUpper(string(p[:1])) + string(p[1:])
+}
+```
+Cost: a second capitalize-first-character implementation in the same package — and a byte-sliced one, where the existing helper is rune-safe.
+Use instead: `upperFirst` at `cmd/entire/cli/model_label.go:72` (package `cli`, no import needed): `return upperFirst(string(p))`.
+
+**2. `classifyPlacementWaitContextErr` is a copy of `classifyWaitContextErr` — and there is a third inline copy**
+`cmd/entire/cli/repo_mirror_probe.go:276-281`, plus `cmd/entire/cli/repo_mirror.go:607-615`
+The new function is byte-for-byte the existing `classifyWaitContextErr` (`repo_mirror_probe.go:286-291`) except for the message text; the submit branch in `createAndAwaitMirror` open-codes the same `errors.Is(err, context.Canceled) → NewSilentError` / else "timed out …" shape a third time.
+Cost: three copies of the Ctrl+C-vs-deadline classification; a fix to the cancel semantics (e.g. also treating `DeadlineExceeded` from a parent ctx) now has to land in three places.
+Use instead: give the existing `classifyWaitContextErr` a phase-description parameter (`classifyWaitContextErr(err, "initial clone" | "mirror placement" | "mirror request submission")`) and call it from all three sites.
+
+**3. Phase-change de-duplication is implemented three times**
+`cmd/entire/cli/repo_mirror.go:526-529` (caller `onPhase` guard), `cmd/entire/cli/repo_mirror.go:582-588` (`reportPhase` guard), `cmd/entire/cli/repo_mirror_probe.go:111-116` (`lastStatus` guard).
+Cost: `createAndAwaitMirror`'s `reportPhase` already guarantees `onPhase` never fires twice with the same phase, so the `if next == phase { return }` guard in the one-shot command is dead code that nonetheless has to be reasoned about (it looks like it's what keeps a spinner from being restarted). `awaitMirrorPlacement`'s `lastStatus` guard is likewise redundant once statuses are mapped onto phases by `reportPhase`.
+Use instead: keep only `reportPhase` (`repo_mirror.go:582`) as the single de-dupe point; the spinner callback should just stop the previous spinner and start the next one unconditionally, and `awaitMirrorPlacement` can call `onStatus` on every poll.
+
+**4. `awaitMirrorPlacement` re-implements the poll scaffolding of `awaitMirrorReady`**
+`cmd/entire/cli/repo_mirror_probe.go:95-158` vs. existing `awaitMirrorReady` at `cmd/entire/cli/repo_mirror_probe.go:228-274`
+Cost: a second copy of ticker-at-`mirrorPollInterval` + `consecutiveErrs`/`maxConsecutivePollErrors` tolerance + `ctx.Err()` classification + terminal-status dispatch. The existing loop's comment budget (the stale-read tolerance rationale) was rewritten to cover both, but the mechanics now diverge subtly: the new loop increments `consecutiveErrs` and `continue`s without a `select` on the error path (so a fast-failing server burns the 15-attempt budget without any pacing), while the old loop always waits for the next tick. Also note the timeout ownership is duplicated: `createAndAwaitMirror` wraps `waitCtx` with `context.WithTimeout` (`repo_mirror.go:590-595`) and then deliberately passes `pollTimeout = 0` (`repo_mirror.go:668-671`) to disable `awaitMirrorReady`'s own identical `context.WithTimeout` block (`repo_mirror_probe.go:229-233`).
+Use instead: factor the shared tick/error-budget/ctx-classification loop once (a small generic `pollUntil(ctx, func() (done bool, err error))`) and have both `awaitMirrorReady` and `awaitMirrorPlacement` supply only the per-tick call and terminal-status mapping.
+
+**5. `wireJSON` hand-builds wire JSON for types that already have generated marshalers**
+`cmd/entire/cli/repo_mirror_request_test.go:703-737` (plus `writeJSONResponse`/`writeMirrorRequestBody` at 689-701)
+Cost: ~35 lines of hand-maintained field-name mapping for `coreapi.MirrorRequest` and `coreapi.Mirror`. It silently drifts from the spec — a renamed/added field in the generated schema won't fail this test, it will just stop being served, so the fixture can diverge from what the real control plane sends.
+Use instead: `coreapi.MirrorRequest` and `coreapi.Mirror` both have generated `MarshalJSON` (`internal/coreapi/oas_json_gen.go:16648` and `:16202`, pointer receivers), and the existing sibling helper already relies on this — `serveMirrorCreate` in `cmd/entire/cli/repo_mirror_test.go:150-157` does `printJSON(w, created)` / `printJSON(w, m)` on the ogen structs directly. Pass `&amp;request` / `&amp;mirror` to `printJSON` (`cmd/entire/cli/corecmd.go:657`) and delete `wireJSON`.
+
+**6. `writeCoreProblem` duplicates the existing problem+json test writer**
+`cmd/entire/cli/repo_mirror_request_test.go:739-746`
+Cost: two RFC-7807 fixture writers in the same test package, with the same "must set `application/problem+json` or ogen reports a decode error" subtlety documented only on the old one.
+Use instead: `writeNotFoundProblem` at `cmd/entire/cli/corecmd_delete_test.go:26` — either call it at the 404 site (`repo_mirror_request_test.go:52`), or keep the new general form and make `writeNotFoundProblem` delegate to it so there is one writer.
+
+**7. Poll-interval override re-typed instead of calling the file's own helper**
+`cmd/entire/cli/repo_mirror_request_test.go:484-486` and `:535-537` (also `cmd/entire/cli/repo_mirror_test.go:172-174`)
+Cost: the same 3-line `mirrorPollInterval` save/override/restore repeated while `useFastMirrorPolling` (defined 120 lines below, at `repo_mirror_request_test.go:657`) does exactly this.
+Use instead: `useFastMirrorPolling(t)`.
+
+**8. Repo + settings.json scaffolding re-implemented in `TestRepoMirrorCreate_AsyncSetting`**
+`cmd/entire/cli/repo_mirror_request_test.go:488-493`
+Cost: 6 lines duplicating existing package helpers — and the copy is not equivalent: it `t.Chdir`s without `paths.ClearWorktreeRootCache()`/`session.ClearGitCommonDirCache()`, so it depends on test ordering for the settings file to be found (the neighbouring new test at `:124` does remember to clear the cache).
+Use instead: `setupTestRepo(t)` (`cmd/entire/cli/setup_test.go:51`, which goes through `setupTestDir` and clears both caches) followed by `writeSettings(t, `{"async_mirror_requests":true}`)` (`cmd/entire/cli/setup_test.go:58`).
+
+**9. Feature-toggle read open-coded instead of following the settings accessor convention**
+`cmd/entire/cli/repo_mirror.go:493-496`
+Cost: the load-and-swallow-the-error bool read is inlined in `RunE`, so the toggle has no single definition point and every future call site repeats it (the wizard already has to receive it as a plumbed-through parameter).
+Use instead: the established pattern in `cmd/entire/cli/settings/settings.go` — `IsExternalAgentsEnabled` (`:1747`), `IsFilteredFetchesEnabled` (`:1550`), `IsTelemetryEnabled` (`:1569`), all `func IsXEnabled(ctx) bool { s, err := Load(ctx); if err != nil { return false }; return s.X }`. Add `settings.IsAsyncMirrorRequestsEnabled(ctx)` next to them and call that.
+
+**10. Location canonicalization re-implements URL reference resolution**
+`internal/coreapi/cross_juris_transport.go:308-320`
+Cost: `location.Scheme = req.URL.Scheme; location.Host = req.URL.Host` re-does what reference resolution already does, and does it more aggressively — an absolute `Location` pointing at a different host gets silently rewritten onto the request host, which is not what the surrounding transport's other URL handling does (`followMisdirected`/`validateExchangeURL` parse and validate origins explicitly).
+Use instead: `req.URL.Parse(resp.Header.Get("Location"))` (stdlib `URL.ResolveReference`, the same call `net/http`'s own redirect handling uses), which resolves a relative Location against the request URL and leaves an absolute one intact.
+
+## Not a finding (checked)
+- `clusterCoreClient` (`cmd/entire/cli/corecmd.go:570`) is correctly reused in place of the direct `coreapi.NewForCluster` call in the wizard.
+- `startSpinner` / the wizard's `prog.set` progress renderer are reused, not re-implemented.
+- The `mirrorRequestFailureError` known-code list has no counterpart in generated code — `MirrorRequestFailure.Code` is a plain `string` (`internal/coreapi/oas_schemas_gen.go:6290`) and the codes do not appear in the spec, so there is no existing enum to reuse.
+- `settings.go` / `settings_test.go` and `cross_juris_transport_test.go` additions follow the existing `mergeRawBool` and `newCrossJurisTestServer` helpers.</result>
+<usage><subagent_tokens>93941</subagent_tokens><tool_uses>42</tool_uses><duration_ms>251126</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ac9d0e93a563cbc73</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--entire-worktrees-pfleidi-cor-1185-cli-submit-mirror-creates-through-the-async-mirror-request/c1ca87c1-a68c-488b-9ee5-cf9e6577bb21/tasks/ac9d0e93a563cbc73.output</output-file>
+<status>completed</status>
+<summary>Agent "Review diff for altitude" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Verdict
+
+Most of the branch is well-shaped: `mirrorCreateOptions` replacing a 7-arg helper is a genuine improvement, there is **no** async→sync fallback (a clean either/or toggle, not duct tape), and the settings field itself follows the house pattern (struct field + `mergeRawBool` + local-override test). The altitude problems are concentrated in how the async flow's *routing* information crosses the coreapi/CLI boundary, and in how the async result is squeezed into the sync DTO.
+
+## Findings
+
+**1. `cmd/entire/cli/repo_mirror_probe.go:160-187` — trust decision about a server-supplied URL made in the command layer, with weaker rules than the ones coreapi already owns.**
+`mirrorRequestPollTarget` takes the `Location` header, and if absolute, re-points the authenticated client (carrying the login JWT) at that host via `coreapi.WithServerURL` — validating only `scheme in {http, https}`. `internal/coreapi/cross_juris_transport.go:74-92` documents an explicit trust model for exactly this class of "server tells us to go elsewhere": HTTPS-except-loopback, same-origin for `token_exchange_url`, federation-manifest membership for `home_core_url`. None of that applies here. Cost: this is only safe today because of finding 2 — the transport rewrites `Location`'s host to the host that actually served the request, so the CLI can never be pointed off-federation. That invariant lives in a different package, is undocumented on both sides, and is invisible to anyone touching either file. Deeper fix: origin pinning belongs in `internal/coreapi` (a client method or a documented `coreapi` helper that takes the raw `Location` and applies the same federation/scheme gate as `followMisdirected`), not in a `cmd/` probe file.
+
+**2. `internal/coreapi/cross_juris_transport.go:305-317` — `canonicalizeMirrorRequestLocation` is a per-endpoint patch inside shared transport code.**
+It hardcodes `apiBasePath+"/mirror-requests"` and `202`, and it is the only function in this heavily-commented file with no doc comment explaining why it exists. The real information being smuggled is "which origin actually served this request after a possible 421 follow" — a property of the transport's general redirect mechanism, not of this endpoint. Cost: the next async endpoint (or a second async flow) copies the branch; conversely a reader who prunes it as dead one-off silently breaks finding 1's safety. Deeper fixes, in order of preference: (a) have the server list `421` on `GET /mirror-requests/{requestId}` and let the existing, already-trusted 421-follow handle the poll — then both this function and the `Location`-parsing in the CLI disappear; (b) if pinning must be client-side, expose the effective origin generically (set `resp.Request` to the final hop, or an opt-in `WithEffectiveOrigin(ctx, *string)` the transport fills), so any multi-step flow can use it without a path literal.
+
+**3. `cmd/entire/cli/repo_mirror.go:638`, `686-696` and `repo_mirror_probe.go:123-127` — the async result is fabricated into a `CreatedMirror` and then disclaimed with a boolean.**
+`awaitMirrorPlacement` builds a `coreapi.CreatedMirror` with only id/url/publicURL, so `Created`, `Empty` and `Suspended` are silently zero; `createdStateUnknown` is the "don't trust three of these fields" marker. Cost: only one of the two consumers honors it. `reportOneShotMirror` branches on it, but `createOneMirror` (`cmd/entire/cli/repo_mirror_create_wizard.go:582`, `594`) still reads `outcome.created.Suspended` / `.Empty` as if they were meaningful, so in async mode `mirrorStatusEmpty` and the `--no-wait` suspended path become unreachable rather than "unknown". Every future field added to `CreatedMirror` inherits the same trap. Deeper fix: make `mirrorCreateOutcome` the real model — carry `mirrorID`/`mirrorURL` directly plus optional/tri-state lifecycle facts — instead of a struct-shaped lie plus a flag.
+
+**4. `cmd/entire/cli/repo_mirror.go:493-498` and wizard `:310, :509, :542, :563` — the toggle is read in `RunE` and threaded as a positional bool through four signatures.**
+The codebase precedent for exactly this shape is `settings.IsExternalAgentsEnabled(ctx)` (`cmd/entire/cli/settings/settings.go:1747`, consumed at the single decision point in `agent/external/discovery.go:40`). Here the inline `if settings, err := LoadEntireSettings(...); err == nil` re-implements that predicate, then `runMirrorCreateWizard`/`createMirrors`/`createOneMirror` each grow a parameter that only `createAndAwaitMirror` uses. Cost: three intermediate functions now have a signature that changes again the moment the flag is retired or a second routing knob appears; two of them already take `noWait, waitTimeout` positionally and are drifting toward the arg-list this branch just cleaned up in `createAndAwaitMirror`. Deeper fix: `settings.IsAsyncMirrorRequestsEnabled(ctx)` in the settings package, called once inside `createAndAwaitMirror` (or when building `mirrorCreateOptions`), so nothing in between knows the flag exists.
+
+**5. `cmd/entire/cli/repo_mirror_probe.go:195-207` — hardcoded allow-list of ten failure-code strings.**
+`MirrorRequestFailure.Code` is a plain `string` in the spec (no enum), so this list duplicates a server-side vocabulary with no compiler or generator backing, and the only behavioral difference is the wording "with unknown failure code". Cost: a server adding a code makes the CLI editorialize about the server being wrong; the list will silently rot. Deeper fix: either declare the enum in the spec so ogen generates the type (then a `switch` is checkable), or drop the list and always render `code: message` — the code is already documented as "stable machine-readable".
+
+**6. `cmd/entire/cli/repo_mirror.go:590-594, 667-672` — `--wait-timeout` means two different things depending on the toggle.**
+Async wraps submit + placement poll + clone poll in one `waitCtx` and then passes `pollTimeout = 0` to `awaitMirrorReady`; sync applies the timeout to the clone poll only. The flag help says "How long to wait for the initial clone to finish". Cost: the deadline semantics silently change with a settings key, and the `pollTimeout = 0` line only makes sense if you know about `waitCtx` 80 lines up. Deeper fix: one timeout policy owned by `mirrorCreateOptions` (either always a whole-operation deadline, or always per-phase), applied identically in both routes.
+
+**7. `cmd/entire/cli/repo_mirror.go:526-535` vs `:582-588` — phase de-duplication implemented twice.**
+`createAndAwaitMirror` already suppresses repeat phases via `currentPhase`, and the one-shot's `onPhase` closure does the same check again before swapping spinners. Cost: two places to keep in sync; the command-layer copy is dead logic that reads as if it were load-bearing. Keep the dedupe in the helper and let the command assume distinct phases.
+
+**8. `cmd/entire/cli/repo_mirror_probe.go:228` (removed `onStatus`) + `repo_mirror.go:565-571` — the phase enum is a lossy re-modelling of the API's statuses, and it cost the wizard its live clone status.**
+`awaitMirrorReady` lost its per-poll callback so the wizard's Docker-style line now sits on a static `cloning` instead of streaming `processing`/`ready`. Also `mirrorCreatePhase.label()` title-cases the enum's own string to produce UI text, coupling wire-ish identifiers to display. Deeper fix: keep the status stream from `awaitMirrorReady` and let the phase type carry a display label explicitly, so the CLI vocabulary and the API vocabulary can diverge without one being derived from the other by `strings.ToUpper` on a substring.
+
+**9. Minor, same file: `classifyPlacementWaitContextErr` (`:276`) is a copy of `classifyWaitContextErr` (`:286`) differing only in the message**, and `maxConsecutivePollErrors` (`:68-73`) is now shared by two loops whose rationales differ — the comment explaining the 15/30s budget (post-create stale reads) was replaced with a vaguer one that no longer justifies the number for either caller. One parameterized helper and a phase-specific budget would be honest about the two concerns.</result>
+<usage><subagent_tokens>78028</subagent_tokens><tool_uses>28</tool_uses><duration_ms>231209</duration_ms></usage>
+</task-notification>

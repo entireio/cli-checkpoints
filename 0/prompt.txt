@@ -1,41 +1,583 @@
-fix trail title and body now please
+i did git restore can you check
 
 ---
 
-since the pr is in draft, wja
+go head and pull so you're on latest main
 
 ---
 
-since the pr is in draft, what is next on the agent now here
+here's the artifact copied
+
+Entire Filesystem Trust Tiers
+A home for per-user configuration (OPF first), a place for preferences that today live in .git/entire/preferences.json, and one convention for where Entire reads and writes files so path-traversal and symlink fixes stop being whac-a-mole.
+
+Investigated on main@8c77cdc + origin/main@a918e75
+Branches read: feat/global-trust (#2030), fix/global-takeover-migration
+PRs read: #1365 #1449 #2154 #2156 #2163
+Contents
+Target posture, in one screen
+Two things you should know first
+Where Entire writes today
+What is already in flight
+The problems, precisely
+The convention: four trust tiers
+Primitives: what exists, what to add
+User settings file: schema and precedence
+Migration 1 — OPF out of the worktree
+Migration 2 — dissolving preferences.json
+Migration 3 — logs and tmp
+Windows checklist
+Decisions the team needs to make
+Target posture, in one screen
+Every file Entire touches falls into one of four tiers, and the tier — not the individual call site — decides how it is opened, who may set what in it, and whether its contents may ever name something to execute.
+
+owner-trusted
+User
+~/.config/entire · ~/.cache/entire
+The developer's own machine state. The only place exec-bearing settings (OPF command) are honored. Symlinks are legitimate here (dotfile managers). Private perms, strict decode where it matters.
+
+machine-local, repo-scoped
+Clone
+<git-common-dir>/entire…
+Shared by every worktree of one clone, never committed. Runtime and caches only: session state, redact cache, sync-remote capture, per-worktree runtime roots. No policy, no preferences.
+
+repository-controlled
+Worktree
+<worktree>/.entire
+Arrives with a clone. Configuration, never consent, never a command. Read through os.Root, symlinks refused (#2154/#2156), strict decode, IDs validated before joining paths.
+
+hostile input
+Remote
+entire/checkpoints/v1 · API responses
+Anyone with push access authored it (CVE-2026-57208). Every field that becomes a path is validated at the read boundary; every write lands through an os.Root anchored at the destination.
+
+Main recommendation
+Do not invent a new file. ~/.config/entire/settings.json already exists on your feat/global-trust stack (#2030) with a loader, a lock, an atomic symlink-following writer and 0600 perms. Grow that file: add a redaction.openai_privacy_filter block and a per-repo repos map, make it the only source for exec-bearing keys, and retire the git-index/HEAD "is this local file tracked?" probe from the hot path entirely. Then move the two kinds of content in preferences.json to where they belong — durable preferences to the user tier, the trails cache to ~/.cache.
+
+Two things you should know first
+Your main worktree is missing 1,355 tracked files
+git status in the primary checkout reports 1,355 deletions — including go.mod, cmd/entire/cli/paths/, internal/entireclient/userdirs/ and the AGENTS.md → CLAUDE.md symlink. There are no .icloud placeholders, and the last reflog entry is a clean pull: Fast-forward, so this is not a git operation you ran; the repo sits under iCloud Drive (Archive), which does not preserve symlinks and evicts aggressively. The .worktrees/global-settings-tier checkout shows the same symptom for AGENTS.md only. I did not touch the tree. Everything in this write-up was read from git objects (git show HEAD:…, branch refs) and from the intact .worktrees/ checkouts.
+
+git restore . will bring the files back (the six real modifications are .claude/settings.json, .codex/hooks.json, .entire/.gitignore, .entire/settings.json and two others), but the durable fix is to move the clone out of iCloud. Local main is also 127 commits behind origin/main, which matters here because #2154 and #2156 merged today.
+
+I could not open the shared artifact
+claude.ai/share/94e99223-… returns only the SPA shell to a fetch. If you paste the TL;DR text or re-share it as a claude.ai/code/artifact/… link I can reconcile this proposal against it. What follows is grounded in the code, the advisories and the in-flight PRs instead.
+
+Where Entire writes today
+Every on-disk surface, its resolver, and how it is written. The write idioms differ file to file — three lock/write styles, two permission conventions, three separate "where is the user's directory" resolvers — which is the first thing a convention should collapse.
+
+Path    Tier    What lives there    Resolver · writer · lock    Notes
+~/.config/entire/    user    contexts.json (login JWTs), tokens.json (file token store), version_check.json; on branches: settings.json (global tier), global_warn_ack, sessions/<id>.json (session binding #1959)    userdirs.Config() ← $ENTIRE_CONFIG_DIR else ~/.config/entire. contexts: gofrs/flock + temp+rename, 0600. user settings: internal/flock + WriteFileAtomicFollowingSymlinks, 0600. version check: MkdirAll 0755    Dir mode is whoever created it first — #2163 adds EnsurePrivateDir to force 0700. Same path on Windows (%USERPROFILE%\.config\entire). Shared with the git-remote-entire binary.
+~/.cache/entire/    user    nodes.json, cluster_cores.json, api_discovery.json, onboarding_*.json, context/, antigravity/    userdirs.Cache() ← $XDG_CACHE_HOME/entire else ~/.cache/entire    Rebuildable. No repo-scoped caches here yet.
+$XDG_DATA_HOME/entire/plugins · %LOCALAPPDATA%\entire\plugins    user    Managed plugin binaries (kubectl-style externals)    pluginParentDir() in plugin_store.go — its own resolver, rejects relative ENTIRE_PLUGIN_DIR, Windows-aware    The one resolver that does Windows idiomatically. userdirs does not know about it.
+<git-common>/entire/preferences.json    clone    review profiles, default profile, legacy review map, review_fix_agent, review_migration_dismissed, trails enablement cache (trails_enabled*, keyed by repo_key + api_base + auth_key, 1h TTL), agent-help refresh backoff, and GlobalSetupCompleted on feat/global-writer    settings.ClonePreferencesPath (git rev-parse --git-common-dir). internal/flock + WriteFileAtomic, dir 0750, file 0644, lenient decode    The grab bag. Durable per-developer preferences and a volatile network cache in one file; every trails refresh rewrites the review prefs.
+<git-common>/entire-sessions/ · entire-session-locks · entire-redact-cache · entire-search · entire-checkpoint-sync-remotes.json    clone    Session state, locks, incremental redaction prefixes, search cache, captured sync-remote election    Each has its own path constant; session state uses os.Root (#1365)    Five sibling top-level names in .git/; on the global branch runtime moves under .git/entire/worktree/<key>/.
+<worktree>/.entire/settings.json    worktree    Team configuration, committed    readConfined: os.Root at parent + Lstat + post-open re-check (#2156), strict decode    GHSA-hqjp-v5g5-vxvf: this file once selected code to execute (local_dev, OPF command).
+<worktree>/.entire/settings.local.json    worktree    enable --local, OPF command, checkpoint_remote, investigate config, review --local profiles, summary provider    Same reader, plus classifyLocalSettings (git index probe) on every settings.Load; the OPF command adds a HEAD probe    Per worktree, not per clone. Gitignored, but .gitignore does not apply to an already-tracked path, hence the probe.
+<worktree>/.entire/{metadata,logs,tmp}    worktree    Runtime: shadow-tree staging, entire.log, hook scratch    paths.AbsPath; state.go/clean.go use os.Root for tmp    Gitignored. The global tier relocates these to <git-common>/entire/worktree/<hash>/ for globally tracked repos.
+Agent home dirs (~/.claude, ~/.gemini, ~/.codex, ~/.cursor, …)    user    Transcripts we read; hooks we install    16 direct os.UserHomeDir() calls across agent/*, plus setup.go (shell rc), utils.go, global_warn.go    Legitimately outside userdirs, but they should be the allow-list for a lint rule, not the norm.
+What is already in flight
+The two advisories and the PRs around them define the constraints any convention has to respect.
+
+The advisories
+GHSA-hqjp-v5g5-vxvf (high) — repository-controlled .entire/settings.json could select code to run: local_dev pointed hooks at the checkout, and OPF command became argv[0] at pre-push. Fixed by removing local_dev and honoring command only from an untracked settings.local.json (settings/opf_command_trust.go). The residual cost of that fix is a git-index read on every settings load and a HEAD read whenever the command is set locally — measured 8.3 ms → 2.5 ms per hook process, 39 ms → 11 ms on reftable.
+CVE-2026-57208 (medium) — a SessionID from the remote entire/checkpoints/v1 branch was joined into a path during resume/rewind. Fixed in #1365/#1449 by validating IDs at the read boundary and writing session state through os.Root (session/state.go, state.go).
+Merged today
+#2154 — paths.ValidateEntireDirAt: .entire must be a real directory (Lstat, so a symlink to a good directory is still refused); root PersistentPreRunE guards every command, with an audited exemption list.
+#2156 — extends the guard one level down (no symlinks/FIFOs among .entire's direct children, fs.ModeIrregular masked for OneDrive placeholders) and makes readConfined refuse symlinked settings files with a post-open SameFile re-check.
+Open
+#2163 (pjbgf) — userdirs.EnsurePrivateDir: create at 0700 and strip group/other bits from an existing dir; skipped on Windows.
+#2030 (yours, feat/global-trust; freshest head fix/global-takeover-migration, 161 commits ahead) — introduces ~/.config/entire/settings.json with a global block, repopolicy.LoadUserSettings/ModifyUserSettings, userdirs.ResolveConfig() (error-returning, never CWD-relative), jsonutil.WriteFileAtomicFollowingSymlinks with cycle detection, a hook-boundary policy snapshot on ctx, and RepoPolicy.RuntimeRoot() routing runtime data to <git-common>/entire/worktree/<key>/ for globally tracked repos. Your own machine already has {"global":{"enabled":true}} in that file.
+#1959 (session binding) — writes ~/.config/entire/sessions/<id>.json via userdirs.Config(). That is state, not config, and it is the first thing that would move under a state/data directory if one existed.
+Compatibility hazard already latent in #2030
+LoadUserSettings strict-decodes the whole file and any unknown key turns the global tier off machine-wide (by design, fail closed). The moment a newer binary adds redaction or repos to that file, every older entire on the same machine — a pinned Scoop install, a CI image, the git-remote-entire helper if it ever reads it — stops tracking. Extending the file requires a decode rule that is strict per block (unknown top-level keys tolerated with a warning; unknown keys inside a security-bearing block still fail that block closed). See schema.
+
+The problems, precisely
+1. settings.local.json is per worktree, and it is where the sensitive knobs live
+Linked worktrees are the norm in this repo (fifteen under .worktrees/). Every one needs its own settings.local.json to carry the OPF command, the checkpoint_remote, the investigate config. Nothing propagates. And because the file sits inside content the repository controls, the loader has to prove on every load that the file is not tracked — that is the index probe, and for OPF the HEAD probe. The security work is paying for a location choice.
+
+2. preferences.json mixes two lifetimes
+Review profiles are a developer's durable preference for a repo. The trails enablement cache is a one-hour network answer keyed by repo_key + api_base + auth_key — all three are properties of the user's identity and the remote, not of the clone. Putting them in one file means every SessionStart refresh rewrites the review prefs, the cache is duplicated per clone of the same repo, and the writer has to run git rev-parse --git-common-dir under a 3 s deadline (the comment in trail_context_cache.go about answering at 2.9 s and then failing to store is exactly this). It is also written 0644 in a 0750 directory, lenient-decoded, with no owner semantics at all.
+
+3. Three "user directory" resolvers, three write idioms
+userdirs (config/cache), plugin_store.go (data, Windows-aware), and 16 bare os.UserHomeDir() calls. Writers use gofrs/flock, internal/flock, or no lock; dirs are 0700, 0750 or 0755 depending on which code path ran first. #2163 exists precisely because of that last point.
+
+4. The safety story is per call site
+readConfined is right but lives privately in settings; osroot (on the global branches) is a thin, unwrapped helper; state.go, clean.go and session/state.go each open their own os.Root. Each fix is correct and none is reusable, so the next path-bearing field will be joined with filepath.Join again.
+
+5. Windows gets the non-idiomatic location and the least-tested primitives
+Config resolves to %USERPROFILE%\.config\entire, permissions are synthetic, os.Rename onto an open file fails with a sharing violation, directory fsync is unsupported, and os.Root treats junctions as symlinks (so an os.Root anchored above a junctioned ~/.config refuses to read through it). Twenty-plus Windows issues in the tracker (#455 object-rename Access Denied, #886, #1424, #1398, #1707…) say the platform needs the convention to be explicit, not implied.
+
+The convention: four trust tiers
+One table the whole team can point at in review. "Owner" is who can put bytes in the file without local access to the developer's machine; every other column follows from it.
+
+Tier    Owner    May carry    Must never carry    Read discipline    Write discipline    Symlinks
+user    The developer    Identity, consent (trust_*), exec-bearing settings (command), per-repo preferences, machine caches, cross-repo state    Anything derived from repository or remote content without validation    Resolve symlinks, then open; strict-per-block decode; a parse error fails that block closed. Unix: refuse a file writable by group/other (matches OpenSSH's stance on ~/.ssh/config)    EnsurePrivateDir (0700) → flock on <file>.lock → temp in same dir → fsync → rename through the resolved target → best-effort dir sync. Files 0600.    Followed (dotfile managers)
+clone    The developer, indirectly the repository (hooks path, .git contents arrive with the clone only for bare/shared setups)    Runtime and caches that are inherently per clone: session state, locks, redact prefixes, sync-remote capture, per-worktree runtime roots (metadata/logs/tmp in global mode)    Policy records, preferences, anything a user would want to survive rm -rf of the clone    Paths built only from validated IDs; open through an os.Root anchored at <git-common>/entire    Same atomic writer; one lock helper; dir 0700    Not followed
+worktree    Anyone who can push to the repository    Team configuration and per-worktree developer overrides: enabled, redaction categories/engines, review profiles, strategy options    Any string that becomes argv[0], an env value, a hook path, or a URL Entire will authenticate to. No consent bits.    ValidateEntireDirAt (#2154/#2156) then readConfined; strict decode; the "is it tracked?" probe becomes unnecessary once nothing exec-bearing is read here    Runtime writes only (metadata/logs/tmp), always via os.Root at .entire    Refused (merged today)
+remote    Anyone with push access to the checkpoint branch, or the API    Data    Paths. A field is an identifier until paths.ValidateID says otherwise    Validate every ID at the decode boundary; errors.Is the sentinel, never string-match    Restore writes go through root.OpenFile/root.Rename on a Root at the destination; never os.WriteFile(filepath.Join(...))    Refused
+Why the tiers are shaped this way
+Exec-bearing keys live in one tier, so trust needs one check. Today enforceOPFCommandTrust proves a repo file is not tracked (index + HEAD) because the file sits in the repo. A file under ~/.config needs no such proof — the repository cannot reach it. The whole classifyLocalSettingsDeep path and its memoization go away.
+Symlink policy flips at the boundary. #2156 is right to refuse symlinks inside .entire, because a repository put them there. The same rule applied to ~/.config/entire would break every stow/chezmoi user; the branch's WriteFileAtomicFollowingSymlinks already encodes the opposite policy. Making "symlinks followed?" a property of the tier, not of the helper, keeps both correct.
+Clone tier stops holding preferences. A developer who rm -rfs a clone and re-clones expects their review setup to survive; a developer with two clones of the same repo expects one setting. Both point at the user tier keyed by repo, which the global tier already has a normalized key for (host/owner/repo, repopolicy.NormalizeOrigin).
+Runtime consolidates under one root per clone. #2030 already introduces <git-common>/entire/worktree/<key>/ for global mode. Adopting it for repo-enabled mode too gives one layout, one os.Root anchor, and a byte-clean git status everywhere — but it is a behaviour change (`doctor bundle`, log tailing docs) and is listed as a decision, not assumed.
+Primitives: what exists, what to add
+Most of the pieces already exist somewhere on main or the global stack. The proposal is to gather them into two packages with a lint fence around them, so a reviewer flags a raw os.ReadFile the same way they flag a raw git.PlainOpen today.
+
+Need    Exists today    Proposed home    Change
+Resolve user config / cache / data / state    userdirs.Config/Cache (main), ResolveConfig/ResolveCache (branch), EnsurePrivateDir (#2163), pluginParentDir (plugin_store.go)    internal/entireclient/userdirs    Add Data()/State() (XDG on Unix, %LOCALAPPDATA%\entire on Windows); fold pluginParentDir in; reject a relative ENTIRE_CONFIG_DIR like ENTIRE_PLUGIN_DIR already does; extend testdirs for the new surfaces
+Read an owner-trusted file    os.ReadFile in LoadUserSettings, contexts.readNoLock    internal/safefile (new)    ReadOwned(path): EvalSymlinks → open → fstat → (Unix) refuse if not owned by euid or writable by group/other → read. Windows: skip the mode check (ACLs inherit from the profile dir).
+Read a repository-controlled file    settings.readConfined + validateOpenedFile (origin/main), osroot.ReadFile (branch)    internal/safefile    Export as ReadConfined(dir, base); keep the Lstat → Open → re-Lstat/SameFile shape; return paths.SymlinkedEntryError so callers keep their errors.Is
+Atomic write    jsonutil.WriteFileAtomic (main), WriteFileAtomicFollowingSymlinks + SyncDir per-OS (branch)    internal/safefile    Move out of jsonutil (it is not JSON-specific); add WriteConfined(root *os.Root, base, data, perm) using root.OpenFile + root.Rename; on Windows retry the rename on ERROR_SHARING_VIOLATION/ERROR_ACCESS_DENIED with a short backoff (#455 is this failure)
+Locked read-modify-write    gofrs/flock (contexts.go), internal/flock (prefs, user settings, sessions)    internal/flock    One Modify(ctx, path, perm, func([]byte) ([]byte, error)) that owns lock + read + write; drop the gofrs dependency
+Validate an identifier before it becomes a path    Session-ID validation from #1365 (session/state.go), droid link-ID check (#1735 follow-ups), paths.IsRelativeTraversal    paths    ValidateID(kind, s): single-component, no separators, no ./.., printable, length-capped, and on Windows no reserved device names (os.Root rejects them, but a plain filepath.Join path does not)
+Guard a directory Entire owns inside untrusted space    paths.ValidateEntireDirAt / RequireEntireDir (#2154/#2156)    paths    Reuse for <git-common>/entire (same shape: must be a real dir, no symlinked children)
+Lint fence    forbidigo already bans os.Getwd, go-git Reset/Checkout/Worktree.Status    .golangci.yaml    Ban os.UserHomeDir/os.UserConfigDir/os.UserCacheDir outside userdirs and an agent/** allow-list; ban os.ReadFile/os.WriteFile/os.Open inside settings, checkpoint, session, strategy so those packages go through safefile; ban os.OpenRoot outside safefile/paths so there is one place that knows the platform caveats
+Go's os.Root: what it does and does not give you (Go 1.26.6 doc)
+Confines every method to the directory; follows symlinks but refuses ones that escape or are absolute; on Windows also rejects reserved device names and treats junctions as symlinks. It does not stop bind mounts or /proc, and Chmod/Chown/Chtimes race against a file-to-symlink swap on Unix — so set perms on the open file (f.Chmod, as the branch's writer now does), never by path. Every helper in safefile should carry that list in its doc comment so call sites stop re-deriving it.
+
+User settings file: schema and precedence
+One file, ~/.config/entire/settings.json, hand-editable, documented as stable. Blocks are independent so a block can be strict without the file being brittle.
+
+{
+  // exists today on feat/global-trust — unchanged
+  "global": {
+    "enabled": true,
+    "exclude_paths": ["~/scratch/**"],
+    "trust_all": false,
+    "trusted_origins": ["github.com/entireio/cli"]
+  },
+
+  // NEW — how OPF runs on THIS machine. "enabled"/"categories" stay in the
+  // team's .entire/settings.json (what to redact is policy; how to run it is local).
+  "redaction": {
+    "openai_privacy_filter": {
+      "command": "/opt/homebrew/bin/opf",
+      "timeout_seconds": 120,
+      "prompt_default": "ask"
+    }
+  },
+
+  // NEW — machine-wide developer defaults (were per-worktree in settings.local.json)
+  "review_profiles": { "quick": { "agent": "claude-code", "skills": ["/review"] } },
+  "review_default_profile": "quick",
+  "investigate": { "agents": ["claude-code", "codex"], "max_turns": 2 },
+  "summary_generation": { "provider": "claude-code" },
+
+  // NEW — per-repository overrides, keyed like trusted_origins
+  "repos": {
+    "github.com/entireio/cli": {
+      "review_default_profile": "pr-toolkit",
+      "review_profiles": { "pr-toolkit": { "agent": "claude-code", "skills": ["/pr-review-toolkit:review-pr"] } },
+      "strategy_options": { "checkpoint_remote": { "provider": "github", "repo": "peyton-alt/cli-checkpoints" } }
+    },
+    // no-origin repos key by canonical path, same rule as trusted_paths
+    "/Users/me/code/notes": { "review_default_profile": "quick" }
+  }
+}
+Decode rule
+Top level: tolerant. Unknown top-level keys are kept as json.RawMessage, round-tripped on write, and reported once by entire doctor ("key foo is not understood by this version"). This is what lets a 0.11 binary and a 0.12 binary share a machine.
+Inside global and redaction: strict, fail that block closed — exactly #2030's current behaviour, scoped to the blocks where an unrecognized key could mean an unrecognized exclusion or an unrecognized command option.
+Inside preferences blocks (review_*, investigate, summary_generation, repos.*): strict on the known struct, but a failure drops the block with a warning rather than the file. Losing a review preference must never disable tracking.
+Precedence (lowest → highest)
+<worktree>/.entire/settings.json — team
+User file, top-level blocks — me, every repo
+User file, repos["<key>"] — me, this repo, every worktree of every clone
+<worktree>/.entire/settings.local.json — me, this worktree only. Kept for what is genuinely per-worktree (enabled for enable --local, an experiment in one checkout). Exec-bearing keys are no longer read from here.
+Consent stays where #2030 put it: global.trust_* is the only egress switch, a committed enabled: false still vetoes, and nothing in the repository can open the sync path. The per-repo checkpoint_remote moving to the user tier actually strengthens CheckpointRemoteIsLocalOnly: "the developer chose this remote" becomes a fact about which file it came from, with no tracked-file probe needed.
+
+Migration 1 — OPF out of the worktree
+Smallest useful slice; ships independently of #2030 landing, because the user file's loader can be lifted into settings on its own.
+
+Loader. settings.Load reads the user file after the project file and before the local file. enforceOPFCommandTrust gains a first case: command came from the user file → accept, no probe. The existing local-file path stays for one release.
+Deprecate the local path. When command is found in settings.local.json, honor it (probe and all) but print once per day: "OPF command is read from ~/.config/entire/settings.json from v0.13; run entire configure --opf-command <path> to move it." entire doctor lists the file and the fix.
+Remove. Next minor: drop the local-file case, delete classifyLocalSettingsDeep and the HEAD probe. The shallow index probe remains only until the local layer stops being a security input at all (it still gates CheckpointRemoteIsLocalOnly today; that goes with Migration 2).
+Windows. The command is exec'd directly (never via cmd.exe, per CLAUDE.md); accept opf.exe, paths with spaces, and %LOCALAPPDATA%-style values only if expanded by the user's shell — do not expand env vars in the setting. Reject a relative command (it would resolve against the repo CWD) unless it is a bare name resolved on PATH with exec.ErrDot protection, as today.
+Docs. docs/security-and-privacy.md "Why command is local-only" becomes "Why command is user-only" — the argument gets shorter, which is the point.
+What this buys: one OPF setting per machine instead of per worktree; the pre-push trust gate no longer reads the git index or HEAD; the exec boundary is expressible in one sentence ("Entire only executes what ~/.config/entire names").
+
+Migration 2 — dissolving preferences.json
+The file has three kinds of content; each has a better home. Once they move, ClonePreferences and its loader delete outright.
+
+Content    Lifetime    Move to    Why
+review_profiles, review_default_profile, legacy review, review_fix_agent    Durable preference    user repos["<key>"].review_*, falling back to top-level review_*    Survives re-clone; shared across clones and worktrees; the picker writes one place. The one-shot migration prompt in review/picker.go already knows how to move keys between files — point it at the new destination.
+review_migration_dismissed    Durable flag    user top-level    A user's answer, not a clone's.
+trails_enabled*, trails_agent_help_*    1 h cache / 5 min backoff    user ~/.cache/entire/repos/<key>/trails.json    Already keyed by repo_key + api_base + auth_key — user-scoped by construction. No git rev-parse on the write path; one answer per repo per machine; safe to delete; entire clean can sweep it.
+GlobalSetupCompleted (feat/global-writer)    Stamp    clone <git-common>/entire/…    It records that this clone was set up; #2030's later heads already replaced it with the derived primary-ref-ready stamp in the runtime root.
+Order of work
+Trails cache first — it is a cache, so the migration is "start writing the new location, stop reading the old". Zero user-visible change.
+Review prefs second, behind the existing picker migration prompt: on first entire review with a populated preferences.json, copy into repos["<key>"] and rename the old file to preferences.json.migrated. Read the old file as a fallback for one release.
+Delete ClonePreferences, applyClonePreferences, and the preferencesFileAbs parameter of loadMergedSettings. settings.Load stops shelling out to git rev-parse --git-common-dir on every call (it does today, via clonePreferencesPathForWorktreeRoot, purely to find this file).
+Repo key for repos without an origin
+Reuse #2030's TrustIdentity rule exactly: origin present and every fetch/push URL normalizes → keyed by host/owner/repo; otherwise keyed by canonical worktree path. One rule, already documented, already tested for Windows drive letters and case folding.
+
+Migration 3 — logs and tmp
+Three candidate homes for .entire/{metadata,logs,tmp}; the choice is about layout, not trust, since all three are Entire-owned and gitignored or outside the tree.
+
+A · Keep <worktree>/.entire/… for repo-enabled repos (status quo)
+No migration; doctor bundle and docs unchanged. Cost: two layouts to reason about once #2030 lands (global repos use B), and the runtime dir sits inside a tree the repository controls, so it needs the #2154/#2156 guard forever.
+
+B · <git-common>/entire/worktree/<key>/… for every active repo ← recommended
+#2030 already builds this for global mode; adopting it for local mode gives one layout, one os.Root anchor, byte-clean git status in every repo, and takes runtime data out of the repository-controlled tier. Cost: a one-time move of existing logs (or just start fresh — full.jsonl is regenerated per Stop), and the temp file for an atomic write must be on the same filesystem as its destination (it will be — same .git).
+
+C · ~/.local/state/entire/repos/<key>/… (XDG state; %LOCALAPPDATA% on Windows)
+Right for logs that are not about one repo (login, version check, the future session-binding records currently in ~/.config/entire/sessions/). Wrong for metadata/tmp: hooks would write across filesystems, and two clones of one repo would collide on the key.
+
+So: B for repo runtime, C as a new userdirs.State() for the handful of things that are genuinely per-user (move sessions/ there from ~/.config — config directories should hold things a user might edit). doctor bundle learns both roots; doctor logs keeps its --worktree semantics by resolving through RuntimeRoot().
+
+Windows checklist
+Each item is a real failure mode seen in this repo's history or a documented platform difference; the convention is only worth having if these are encoded in the primitives, not remembered by reviewers.
+
+Location. Keep config at %USERPROFILE%\.config\entire. It is non-idiomatic, but contexts.json and tokens.json are already there for every Windows user, and git-remote-entire reads the same path; moving it means a coordinated migration across two binaries for a cosmetic gain. New Data()/State() surfaces should use %LOCALAPPDATA%\entire as plugin_store.go already does. Document the asymmetry once in userdirs.
+Permissions. 0600/0700 are no-ops; Chmod toggles read-only. EnsurePrivateDir already skips; ReadOwned's mode check must skip too. Privacy comes from the profile directory's inherited ACL, which is the norm for every other CLI (gh, aws, git).
+Rename over an open file fails (ERROR_SHARING_VIOLATION). Any concurrent reader — a second hook, Defender, an editor — makes WriteFileAtomic's rename fail. Retry with backoff (a few attempts over ~250 ms) inside the primitive; #455 was this in go-git's object store.
+No directory fsync. Already best-effort; the branch's syncdir_windows.go whitelists ERROR_INVALID_FUNCTION/ERROR_NOT_SUPPORTED/ERROR_ACCESS_DENIED. Keep that list in one place.
+Locks leave .lock files behind. LockFileEx needs a real file; they already litter ~/.config/entire and .git/entire. Fine, but entire clean should know they are ours.
+os.Root and junctions. A Root refuses to traverse an absolute symlink, and Windows junctions are reported as symlinks. A user whose ~/.config is a junction (Scoop users, OneDrive-redirected profiles) would get every user-tier read rejected if we anchored a Root above it. This is why the user tier resolves first, then opens, and never uses os.Root for its own files. The worktree tier keeps os.Root, where refusing junctions is the desired behaviour.
+Reserved names and separators. os.Root rejects NUL, COM1… by itself; filepath.Join does not. paths.ValidateID is the one place that rejects them for plain joins, so an ID like con from a checkpoint can never create .entire/metadata/con.
+Case folding. Repo keys and path exclusions fold on darwin/windows (repopolicy.caseInsensitivePaths); the repos map in the user file must be looked up with the same fold, or C:\Code\Cli and c:\code\cli become two entries.
+MSYS/Git-Bash paths. Hooks run under Git for Windows' bash, which hands us /c/Users/...; paths.normalizeMSYSPath exists — every resolver that compares a hook-supplied path to a stored key must route through it.
+Long paths. <git-common>\entire\worktree\<64-bit key>\metadata\<session>\tasks\<toolUseID>\agent-<id>.jsonl approaches MAX_PATH under a deep %USERPROFILE%. Go enables long-path awareness for \\?\-prefixed paths only when the manifest allows it; keep the key short (the branch already moved to 64-bit) and prefer opening through a Root handle, which sidesteps path-length limits for the relative part.
+CI. #1843 added a Windows job; make safefile's tests the ones that exercise rename-under-open-handle, junction refusal in the worktree tier, and junction tolerance in the user tier, so the platform is tested where the rules live.
+Decisions the team needs to make
+Does OPF's enabled/categories stay team-level? Proposal says yes — what gets redacted before it leaves a machine is a policy the repo owner sets; only how the binary is found is per-machine. The alternative (everything user-level) means a teammate without OPF installed silently pushes un-filtered content; the fail-closed pre-push already handles "enabled but missing binary", which is the right outcome.
+Per-block tolerant decoding of the user file vs. #2030's whole-file strictness. Needed before any key is added to the file, otherwise a nightly and a stable on one machine fight. Suggest folding it into the #2030 stack now, since that is where the loader lives.
+Runtime layout B for repo-enabled repos. One layout is a real simplification but a visible change (.entire/logs disappears from worktrees; docs and doctor hints move). Could ship behind the global-tier work or as its own follow-up.
+How hard to fence with lint. The os.UserHomeDir ban with an agent/** allow-list is cheap and catches the next stray resolver. Banning os.ReadFile in four packages is more work (many test helpers) but is what turns "please use the safe primitive" into something CI enforces, the way Worktree.Status is enforced today.
+Where ~/.config/entire/sessions/ (#1959) should live. If userdirs.State() is added, land #1959 on it rather than migrating later.
+Windows config location. Stay at ~\.config\entire (recommended) or migrate to %APPDATA% in lockstep across entire and git-remote-entire.
+Suggested first PR
+User-tier loader in settings (lifted from repopolicy/user_settings.go, per-block decode), safefile.ReadOwned/ReadConfined/WriteAtomic extracted from their current homes with no behaviour change, the os.UserHomeDir lint fence, and OPF command honored from the user file. Everything else layers on top, and that PR alone deletes the HEAD probe from the pre-push path.
+
+Sources: cmd/entire/cli/settings/{settings,opf_command_trust}.go, internal/entireclient/userdirs, cmd/entire/cli/trail_context_cache.go, cmd/entire/cli/plugin_store.go, cmd/entire/cli/internal/flock, cmd/entire/cli/jsonutil/write.go; branch fix/global-takeover-migration: settings/repopolicy/*, settings/global.go, paths/invisible.go, docs/architecture/global-tracking.md; GHSA-hqjp-v5g5-vxvf, GHSA-2h46-9x5w-4wf7 (CVE-2026-57208); PRs #1365 #1449 #2030 #2154 #2156 #2163; go doc os.Root (go1.26.6).
 
 ---
 
-there is a finding on the trail for 1174, and what exactly does the follow up do?
+sorry lol, here it is
+
+Where the Entire CLI puts its files
+Local state is scattered across the working tree and eleven ad-hoc entries in the git directory. This proposes two roots, five lifecycle buckets, and one rule for deciding where anything new goes.
+
+Repo entireio/cli
+Status Proposal — one decision open
+Date 2026-08-28
+01
+Goals
+Two things, stated plainly, because everything below is judged against them.
+
+Local files live outside the working tree. Nothing the CLI writes at runtime should appear in git status, be reachable by git clean -xdf, or need an ignore rule to stay invisible.
+A structure, not a list. A contributor adding a new file should be able to derive its path from a rule, and a reviewer should be able to tell whether it is safe to delete without reading the code.
+02
+Current state
+Every path the CLI writes today, split by whether git tracks it and by which checkouts can see it.
+
+committed to the repo
+local, shared by all worktrees
+local, this worktree only
+problem
+Working tree
+.entire/
+.entire/settings.json            # committed
+.entire/runners/                 # committed
+.entire/redactors/               # committed
+.entire/.gitignore               # committed
+
+.entire/settings.local.json      # ignored
+.entire/metadata/<sessionID>/    # ignored
+.entire/logs/entire.log          # ignored
+.entire/tmp/                     # ignored
+.entire/redactors/local/          # ignored
+
+.entire/worktrees/               # untracked, often unignored
+Git directory
+11 top-level entries
+entire/preferences.json
+entire/trail-refresh-spawn       (+ .lock)
+entire/session-sweep-spawn       (+ .lock)
+entire-sessions/
+entire-session-locks/
+entire-shadow-locks/
+entire-investigations/<runID>/
+entire-review/manifests/
+entire-checkpoint-push-queue.jsonl (+ .lock)
+entire-redact-cache/
+entire-checkpoint-sync-remotes.json (+ .lock)
+
+All resolved against `git rev-parse
+--git-common-dir`, never `.git`.
+.entire/worktrees/ holds trail worktree checkouts (trail_checkout_worktree.go:26). ensureTrailWorktreeIgnoreRule appends its rule to the root .gitignore, and only if one already exists — so in a repo without a root .gitignore the checkouts are both untracked and unignored.
+
+entire-sessions/ also carries per-session sidecars (.trail-scope.json, .model, .warn-stale-ended). Two orphan refs, entire/checkpoints/v1 and entire/trails/v1, are out of scope throughout.
+
+Root resolution is already centralized: gitdir, entiredir, and worktreedir own the handles to the three trees. What is not centralized is the names — the eleven entries above are declared as constants in seven packages.
+
+03
+What's wrong
+Four problems. None of them is fixed by renaming the entries.
+
+Local files in the working tree are hostile to git
+git clean -xdf deletes .entire/metadata/<sessionID>/ — the copied transcript and prompt.txt for every session in flight (lifecycle.go:748-813) — along with entire.log and tmp/. A routine cleanup silently destroys unfinished checkpoint work and the log that would explain it. Everything under a git directory is immune by construction.
+
+Scattered paths leave nothing to secure
+The eleven entries are declared as constants in seven packages — session/state.go:28, strategy/session_state.go:838, strategy/checkpoint_sync_capture.go:23, checkpoint/shadow_ref.go:139, checkpoint/pushqueue.go:26, checkpoint/redact_cache.go:72, investigate/state.go:25, review/manifest.go:759. Each package joins its own path onto a git root, so each has to defend that path itself.
+
+It shows. The same session-ID traversal guard is written out seven times across three packages (session/state.go:952,997,1053, strategy/session_state.go:886, checkpoint/ephemeral.go:68,287, checkpoint/persistent.go:73) because there is no single owner of the join to put it in — and the names being guarded come from agent-supplied session IDs, tool-use IDs, and investigation run IDs, feeding directories that get RemoveAll'd.
+
+The deeper cost is that there is no directory whose contents are all ours. entire-sessions/ is a sibling of HEAD, config, and hooks/, so nothing can be scoped to Entire's files as a unit: not a containment root, not a permission mode, not an audit, not a single RemoveAll. A bucket layout gives one root per tree and makes the bucket the only join, which is what containment can actually be anchored on.
+
+Scattering also drifts silently. entire-checkpoint-push-queue.jsonl is already declared in two places — checkpoint/pushqueue.go:26 and integration_test/multi_pushurl.go:31 — so renaming it in one leaves the other pointing at a file that no longer exists.
+
+The scoping axis is invisible
+All eleven git-directory entries resolve against the git common dir, so every linked worktree shares them — and review/marker_fallback.go:42 depends on exactly that. Nothing in the paths says so. Writing the target as .git/entire/… erases the distinction and is literally wrong inside a linked worktree, where .git is a file. The bug seed is already in the tree: strategy/common.go:356 defines gitDir = ".git" as a plain string.
+
+.entire/metadata/ means two different things
+paths.EntireMetadataDir is both an on-disk staging directory and a path inside the orphan-branch tree, read through go-git in manual_commit_hooks.go:1816,2817,2871, manual_commit_condensation.go:1444, and ephemeral.go:367. The in-tree layout is committed history on entire/checkpoints/v1.
+
+Any move must split this constant first. Otherwise a rename to .git/entire/metadata changes the on-disk path and the tree path together, and the tool stops finding its own history.
+
+04
+Target layout
+Two roots, chosen by whether a second worktree needs to see the file. Five buckets, chosen by lifecycle.
+
+Working tree — committed content only
+tracked
+.entire/
+├── settings.json            project settings
+├── runners/*.json           trail runner configs
+└── redactors/*.yaml         shared redaction packs
+
+Deleted: .gitignore — nothing left to ignore.
+Relocated: worktrees/ — destination open, see §08.
+git rev-parse --git-common-dir
+shared by every worktree
+<git-common-dir>/entire/
+├── config/                              user-authored, must survive
+│   ├── preferences.json
+│   ├── settings.local.json               ← from .entire/
+│   ├── checkpoint-sync-remotes.json
+│   └── redactors/local/                  ← from .entire/
+├── state/                               derived but not reproducible
+│   ├── sessions/<sessionID>.json
+│   │             <sessionID>.trail-scope.json
+│   ├── investigations/<runID>/
+│   ├── review/manifests/
+│   └── checkpoint-push-queue.jsonl
+├── cache/                               rebuilt on demand
+│   └── redact-cache/
+└── run/                                  process-scoped, dead on reboot
+    ├── session-locks/<sessionID>.lock
+    ├── shadow-locks/<branch>.lock
+    ├── checkpoint-push-queue.lock
+    ├── checkpoint-sync-remotes.lock
+    ├── trail-refresh-spawn              (+ .lock)
+    └── session-sweep-spawn              (+ .lock)
+git rev-parse --git-dir
+this worktree only
+<git-dir>/entire/
+├── logs/entire.log                       ← from .entire/
+├── metadata/<sessionID>/                 ← from .entire/ (on-disk staging only)
+└── tmp/                                  ← from .entire/
+Why these three are per-worktree
+All three are scoped to one checkout by their content, and merging them would be a regression. Two agents in two worktrees interleave into one entire.log, making it unreadable exactly when you need it. metadata/<sessionID>/ stages the transcript for the checkpoint of this checkout's HEAD. tmp/ already collides on fixed names such as the pi hook cache (agent/pi/lifecycle.go:285).
+
+redactors/local/ is config/, not cache/ — it is user-authored, not derived, and deleting it loses work.
+
+05
+Tradeoffs
+What each change buys, and what it costs. None of the costs are blocking; two of them need a decision baked in from the start.
+
+Moving local state out of the working tree
+Everything the CLI writes at runtime leaves .entire/ for a git directory.
+
+Gains
+git clean -xdf can no longer destroy in-flight session data or the log that would explain the loss.
+.entire/ becomes purely committed content, so "is this directory fully tracked?" is a one-line test assertion and .entire/.gitignore disappears.
+Nothing the CLI does shows up in git status, so it can't be accidentally staged or land in a PR diff.
+Costs
+Paths get harder for a human to find by hand, especially in a linked worktree where the git dir is .git/worktrees/<name>/. Bug-report collection has to go through entire doctor bundle rather than a known path.
+git clean stops resetting CLI state, so a user reaching for it to "start fresh" no longer gets that. entire clean becomes the only route.
+Any external tooling or muscle memory pointing at .entire/logs breaks.
+Two roots instead of one
+Common dir for anything shared between worktrees; git dir for anything scoped to one checkout.
+
+Gains
+Makes the sharing axis explicit, and correct inside linked worktrees and submodules — where the single-root shorthand is simply wrong.
+Retires the gitDir = ".git" string literal, the seed of the class of bug this fixes.
+Fixes two live defects at once: interleaved logs from concurrent agents, and fixed-name collisions under tmp/.
+Costs
+Every new file needs a scoping decision, and a wrong one fails silently — a shared file placed per-worktree only misbehaves once someone adds a second worktree.
+Two places to look when debugging, and migration has to handle both.
+Five lifecycle buckets
+config, state, cache, run, plus logs and tmp on the per-worktree side.
+
+Gains
+entire clean collapses from a hand-maintained path list into three RemoveAll calls that can't fall behind the code.
+"Is this safe to delete?" is answerable from the path alone, by a reviewer who has not read the package.
+A new file has a derivable home, so the layout stops accreting names.
+Costs
+Some files are genuinely ambiguous. checkpoint-sync-remotes.json is captured rather than authored, and sits in config/ only because losing it changes behaviour.
+Locks move away from the data they guard, so a stale .lock is no longer next to the file it belongs to.
+One more path segment everywhere.
+One package owns every path, enforced by test
+The name of every local file moves behind a typed accessor; a test forbids filepath.Join onto a git root anywhere else.
+
+Gains
+The layout cannot drift back. This is the only part of the proposal that is self-enforcing.
+One place to validate an agent-supplied ID before it becomes a path, replacing the guard currently repeated across seven call sites.
+Migration and the legacy-path fallback live in exactly one place, so they can be added and later removed cleanly.
+Test helpers stop hardcoding .git/entire-sessions.
+Costs
+Seven feature packages gain a dependency on one path package — real coupling, in exchange for the guarantee.
+The forbidding test needs an allowlist, and will occasionally block someone doing something legitimate.
+Staged migration with a one-release fallback
+Relocate once on first command of the new version, under a flock; read the legacy path for one minor release.
+
+Gains
+An upgrade landing mid-session doesn't lose state or strand a running agent's hooks.
+Each of the four steps ships on its own, so a problem is bisectable to one release.
+entire doctor can report leftovers instead of leaving them to rot.
+Costs
+Two path resolutions coexist for a release, which is exactly the ambiguity this proposal removes — so the fallback has to be deleted on schedule, not left in.
+A rename across filesystems is not atomic and needs a copy fallback for the large redact-cache.
+Downgrading to the previous version leaves the moved state unreadable.
+06
+The rules
+This is the part that has to survive. Each one is testable.
+
+R1
+Everything under .entire/ is committed.
+No code path writes there at runtime.
+Makes .entire/.gitignore dead weight, and makes the directory's tracked state a one-line assertion in a test.
+R2
+Every local path is <root>/entire/<bucket>/…
+root ∈ {git-common-dir, git-dir}, bucket ∈ {config, state, cache, run, logs, tmp}.
+No file sits directly under entire/. No third naming shape.
+R3
+Root is chosen by one question: does a second worktree need to see this?
+Yes → common dir. No → git dir.
+Both come from git rev-parse, never from joining .git onto the worktree root. That is what makes the layout correct in linked worktrees and submodules.
+R4
+cache/, run/, and tmp/ are deletable at any moment, by anyone, including mid-session.
+config/ and state/ are not.
+Turns entire clean from a hand-maintained path list into three RemoveAll calls, and gives a reviewer a one-glance answer to "is this safe to nuke?"
+R5
+One package owns every join onto a git directory.
+Nothing outside it calls filepath.Join(commonDir, …) or filepath.Join(gitDir, …).
+Enforced by a test, not a convention. Without this, R2 decays back to the current state within a few features. The root handles are already centralized in gitdir/entiredir/worktreedir; this extends that to the names.
+R6
+On-disk paths and in-tree paths are separate constants.
+The checkpoint branch keeps .entire/metadata/<sessionID>/ as its tree layout forever.
+Prerequisite for the metadata move. Can land on its own, before anything else here.
+07
+Path-by-path
+Every path the CLI writes, and where it lands. <common> and <git> abbreviate the two rev-parse roots.
+
+Today    Target    Scope    Life    Note
+Working tree — stays put
+.entire/settings.json    unchanged    tracked    —    Project settings.
+.entire/runners/    unchanged    tracked    —    Trail runner configs.
+.entire/redactors/*.yaml    unchanged    tracked    —    Shared packs. local/ splits off.
+.entire/.gitignore    deleted    —    —    Nothing left to ignore once R1 holds.
+.entire/worktrees/    open — §08    —    —    Only remaining R1 violation.
+Working tree → git directory
+.entire/settings.local.json    <common>/entire/config/settings.local.json    shared    config    User-editable; needs a path command and doc updates.
+.entire/redactors/local/    <common>/entire/config/redactors/local/    shared    config    LoadPacks must take two roots and merge.
+.entire/logs/entire.log    <git>/entire/logs/entire.log    worktree    logs    Per-checkout so concurrent agents don't interleave.
+.entire/metadata/<id>/    <git>/entire/metadata/<id>/    worktree    state    On-disk only. Tree path is frozen — R6.
+.entire/tmp/    <git>/entire/tmp/    worktree    tmp    Fixed subpaths collide across worktrees today.
+Git directory — regrouped
+entire/preferences.json    <common>/entire/config/preferences.json    shared    config    Already in the right root.
+entire-checkpoint-sync-remotes.json    <common>/entire/config/checkpoint-sync-remotes.json    shared    config    Captured remotes; not reproducible.
+entire-sessions/    <common>/entire/state/sessions/    shared    state    Includes .trail-scope.json, .model, .warn-stale-ended.
+entire-investigations/<runID>/    <common>/entire/state/investigations/<runID>/    shared    state    User-visible in an error string — update it.
+entire-review/manifests/    <common>/entire/state/review/manifests/    shared    state    —
+entire-checkpoint-push-queue.jsonl    <common>/entire/state/checkpoint-push-queue.jsonl    shared    state    Losing it drops unpushed checkpoints.
+entire-redact-cache/    <common>/entire/cache/redact-cache/    shared    cache    Already documented as safe to delete.
+entire-session-locks/    <common>/entire/run/session-locks/    shared    run    —
+entire-shadow-locks/    <common>/entire/run/shadow-locks/    shared    run    —
+entire-*.lock    <common>/entire/run/*.lock    shared    run    Locks leave their data's directory.
+entire/trail-refresh-spawn    <common>/entire/run/trail-refresh-spawn    shared    run    Throttle marker.
+entire/session-sweep-spawn    <common>/entire/run/session-sweep-spawn    shared    run    Throttle marker.
+08
+The open decision
+Where do trail worktree checkouts go?
+
+.entire/worktrees/ is the last thing standing between this proposal and R1, and it is the largest object in the working tree — full source checkouts, not metadata. It should leave its current location and stay out of the git common dir, so all three candidates move real checkouts somewhere a person can comfortably cd into.
+
+A. Sibling of the repo — ../<repo>.worktrees/<branch>/
+Gains
+Satisfies both constraints with no new machinery.
+Checkouts stay one cd .. away, matching what people already do by hand.
+Same filesystem as the repo, so checkout stays fast.
+Costs
+The CLI writes outside the repo it was invoked in — needs care around permissions.
+Two clones of the same repo sharing a parent directory collide.
+Cleanup on git worktree remove has to reach outside the repo too.
+B. User state directory — ~/.local/state/entire/worktrees/<repo-id>/<branch>/
+Gains
+Cleanest separation: nothing near the repo at all.
+Extends the tier that already exists in internal/entireclient/userdirs (~/.config/entire, ~/.cache/entire).
+Costs
+Paths become unguessable, so it needs an entire trail path command to be usable at all.
+Needs a stable <repo-id> that survives the repo being moved — otherwise it orphans checkouts.
+Often lands on a different filesystem from the repo: slow, and it breaks hardlink-based checkout optimizations.
+C. Configurable, defaulting to A
+Gains
+Costs the least in surprise: the default is A's familiar location.
+Lets a monorepo point every checkout at one scratch volume.
+Costs
+One more setting in .entire/settings.json to document and support.
+Needs a validation path that rejects any location inside the working tree, or it reintroduces the problem it was added to solve.
+Recommendation
+Start at A and add C only if someone asks. B's filesystem-boundary risk is real for large repos, and the <repo-id> stability problem is a genuine source of orphaned checkouts. Whichever wins, the decision is independent of the rest of this proposal and should not block it.
+
+09
+Getting there
+Order
+Four steps, each independently shippable, in this order because each removes a hazard from the next.
+
+Split the metadata constant (R6). Pure refactor, no path changes, no migration. Removes the trap.
+Move the eleven names behind typed accessors (R5) that still return today's paths, and add the test that forbids joins elsewhere. The root handles already exist; this is about the names. No behaviour change.
+Move the git-directory entries into buckets. Contained: nothing outside the accessor package changes.
+Move the working-tree entries out, delete .entire/.gitignore, add the .entire-is-fully-tracked assertion.
+Migration mechanics
+The hazard is a CLI upgrade landing mid-session: an agent is running, hooks are firing, and the session state file moves underneath it. Relocate once, on first command of the new version, under a flock in the common dir — the same mechanism recentlySpawnedMarker already uses — so concurrent hooks serialize rather than racing. Rename directories rather than copying, so it is atomic within a filesystem and cheap for a large redact-cache.
+
+Keep a read-only fallback to the legacy path for one minor release, so a session that started under the old binary and continues under the new one still resolves. Do not write to the legacy path. Drop the fallback on the following release, and have entire doctor report any legacy path still present.
+
+Also needs updating
+doctor_bundle.go:110 collects settings.local.json from .entire/.
+clean.go enumerates paths by name — becomes three RemoveAll calls under R4.
+redact.LoadPacks walks one directory recursively and finds local/ as a subdirectory; it needs two roots and a merge, and the local/ special case disappears.
+User-facing strings naming these paths: remote_topology.go:178, the --local/--project flag help in setup.go, investigate/cmd.go:527, clean.go:26-30, doctor_logs.go.
+Test helpers that hardcode .git/entire-sessions: integration_test/hooks.go:497,596,618, e2e/testutil/assertions.go:302, benchutil/benchutil.go:256.
+Out of scope, stated so nobody moves them
+In-tree checkpoint layout. .entire/metadata/<sessionID>/ on entire/checkpoints/v1 is committed history and stays exactly as it is.
+Refs. entire/checkpoints/v1 and entire/trails/v1 are unaffected.
+User-global directories. ~/.config/entire and ~/.cache/entire are a separate tier and already well-formed.
+Git's own files. .git/hooks/ and the transient state files (rebase-merge, CHERRY_PICK_HEAD, …) are git's, not ours.
+Source refs verified against entireio/cli @ eecc0b7cf.
 
 ---
 
-so are all the copilot findings addressed
+Also, this commit 7ac91dd4f on 2030, should fix the hazard you pointed out, can you check
 
 ---
 
-okay so what else is needed then for the users config then? how can we validate,etc
+well its very long, too long probably and since we already have config in 2030, maybe we don't have to make it this long/ can simplify
 
 ---
 
-there is a trail finding, https://entire.io/gh/entireio/cli/trails/1174/feat-settings-define-the-user-settings-file-preferences-per
+well its very long, too long probably and since we already have config in 2030, maybe we don't have to make it this long/ can simplify or at least create simplified plan here not artifact that i can breakdowbn
 
 ---
 
-more findnings
+is there no OPF logic in 2030 at all?
 
 ---
 
-more findnings
+can we define full structure then? as part of what paulo outlined? like i guess 2030 defines it already, but then defining structure then, like can we do this in small pr that does A(1-4),C but in code, and E- and also D if this will now replace the preferences.json?
 
 ---
 
-checks failing
-
----
-
-bad fixes, risk way up, security risk way up
+can we define full structure then? as part of what paulo outlined? like i guess 2030 defines it already, but then defining structure then, like can we do this in small pr that does A(1-4),C but in code, and E- and also D if this will now replace the preferences.json? - OR could be a draft trail if you want instead

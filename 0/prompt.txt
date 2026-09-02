@@ -1,0 +1,54 @@
+<cross-session-message from="uds:/tmp/cc-socks/70726.sock" from-name="worktree-calm-valley-6ff9-67" from-mode="prompting">
+Handoff: three follow-up fixes for `entire repo clone` ref parsing, plus authoritative entiredb research that changes how one of them should be done. Please open a new PR against main.
+
+## Context
+
+PR #2185 (`paul/clone-et`, trail 1186) added `/et/<project>/<repo>` native clone refs and merged 2026-09-02T00:06Z. PR #2223 (`paul/clone-ref-findings`, commits 0083f834d + 55e69b893) then landed to address two review findings, and it fixed both correctly — dot-only `/gh/` refs keep the parser's reason, and `git@github.com:foo/bar` now says "pass GitHub mirrors as /gh/foo/bar". Current main is ee6d53f3d. Do not redo that work. Everything below is what #2223 left, all in `cmd/entire/cli/repo_clone.go`.
+
+## Item 1 (the main one): the `/et/`-prefixed form still loses its reason
+
+`invalidCloneRefError` (repo_clone.go, added in 0083f834d) got a `mirrorCloneRefPrefixRe = ^/?gh/` branch that keeps the mirror parser's reason for malformed `gh/` refs. There is no symmetric `^/?et/` branch, so a native ref that fails the charset check falls through to the generic shape list. Verified against a binary built from ee6d53f3d:
+
+    /et/foo_bar/dogbark  ->  invalid <repo> "/et/foo_bar/dogbark": expected /et/<project>/<repo>, <project>/<repo>, /gh/<owner>/<repo>, or a full entire:// URL
+    /et/paul/dog_bark    ->  (identical)
+    /et/paul/            ->  (identical)
+
+The user typed exactly `/et/<project>/<repo>` and is told to type `/et/<project>/<repo>`. That is the same self-contradiction #2223 set out to remove, reproduced on the other side. Add an `^/?et/` branch that names the actual rule, mirroring what `parseMirrorCloneRef` now does for owner/repo ("project: lowercase letters, digits, '-'; repo: also interior '.'"). Note the existing `gh/` branch produces the ref twice in one message (`invalid <repo> "/gh/entirehq/..": repo cannot be dot-only: /gh/entirehq/..`) — worth not copying that shape.
+
+## Item 2: the native charsets are looser than the server's, and the doc comment misstates the rules
+
+I read the authoritative source in ~/Work/entire/devenv/entiredb at 2b81a3557 — `core/resource/project_name.go`, function `normalizeName`, reached from `core/coreapi/repos.go:75` (the repo-create path the CLI hits) and `core/api/admin_handlers.go:1381`. The real rules:
+
+| rule | project | repo |
+|---|---|---|
+| charset | lowercase a-z, 0-9, `-` | same plus interior `.` |
+| length | 3–32 | 1–64 |
+| leading/trailing `-` | banned | banned |
+| leading/trailing `.` | n/a | banned |
+| consecutive `..` | n/a | banned |
+| raw ULID as a name | banned | banned |
+| uppercase | rejected at create; `foldProjectName` lowercases for lookup | same |
+
+Against the CLI's `nativeProjectRe = ^[A-Za-z0-9-]+$` and `nativeRepoRe = ^[A-Za-z0-9.-]+$`, three things are wrong in the permissive direction, so refs the server can never match become a control-plane round trip instead of a local shape error: leading/trailing `-`, leading/trailing `.`, and consecutive dots. `paul/..`, `paul/.foo`, `paul/foo.`, `paul/-x` all currently parse as native refs. The mirror side already has `gitHubDotOnlyRe` for exactly this class; the native side has no equivalent. Tighten both regexes to the server shape and fix the doc comment, which currently says the project charset is "letters, digits, '-'" without noting the lowercase-at-create/fold-at-lookup split or any of the edge-character rules.
+
+Three things in that comment are CORRECT — please don't "fix" them:
+- "3–32 chars server-side" for projects is right (`projectNameMinLen`/`projectNameMaxLen`), so the `gh`/`et` two-char guard is genuinely safe. They are not in `reserved_names.txt`; the length rule is what excludes them.
+- Accepting uppercase in the CLI regex is right, because lookups fold case.
+- `resolveRepoRef`'s ULID short-circuit is safe, because `LooksLikeRawULID` (core/model/id.go:28) is banned as a name at create time, so a 26-char Crockford string in the ref position is always an ID.
+
+Also please correct one claim of mine if you see it referenced anywhere: I previously said the constraints "aren't in the contract" because `internal/coreapi/spec/core.openapi.json` has `CreateProjectInputBody.name` as minLength 1 / maxLength 100 with no pattern, and cited the live project `gh:mirrors:01KS00CRNX8HFG5PX19S2WH2F0` as a counter-example. Both were wrong. The OpenAPI schema is only the wire shape; the resource layer enforces the real rules. And `gh:mirrors:<ownerID>` is a deliberate system-namespace project (`MirrorsProjectNamePrefix`, core/resource/store.go:1452) that `CreateProject` refuses to mint because of the `:`, and that is looked up via `findProjectByExactName`, which skips the shape check on purpose. It is not a counter-example. Optional but nice: pin the resource-layer rules in the OpenAPI spec so the client isn't generated against a looser contract than the server enforces.
+
+## Item 3: `.git` suffix on a native ref
+
+`entire repo clone /et/paul/dogbark.git` parses (interior dot is legal), then fails at lookup with `no repo named "dogbark.git" in that project`, with no hint — even though the code comment on `resolveNativeCloneURL` already flags that the server strips `.git` for `/gh/` paths only, so a `/et/` path carrying it 404s.
+
+The research says do NOT strip or reject it at parse time. `foo.git` is a legal server repo name under the rules above (interior dot, no leading/trailing dot, no `..`), so a repo could genuinely be called that, and silently stripping would clone the wrong thing. `entire-trails.el` is the doc's own example of a legitimate dotted repo name. The right fix is a hint on the lookup miss: when the name ends in `.git` and the lookup returns not-found, suggest retrying without the suffix. Same treatment is worth considering for the full `entire://` passthrough branch, which forwards a `/et/...` URL with `.git` straight to `git clone` and lets the server 404.
+
+## Verification
+
+Existing tests to extend: `TestParseNativeCloneRef` and `TestInvalidCloneRefError` in `cmd/entire/cli/repo_clone_test.go`. There is currently no case covering an `/et/`-prefixed ref that fails the charset check — that gap is why item 1 shipped. Add the dot/hyphen edge cases too.
+
+Repo standard before commit is `mise run fmt && mise run lint && mise run test:ci`; treat fmt-then-lint as one sequence. On main today the clone tests pass and `mise run lint` reports 0 issues, so anything failing is yours. Two known-unrelated local failures on macOS: `TestCodexAppServerHooksList_*` (`/var` vs `/private/var`) and versioncheck tests misclassifying `/usr/local` as Homebrew.
+
+Please reference trail 1186 and PR #2185/#2223 in the PR body so the lineage is traceable, and note in the body that item 2 tightens client-side validation against rules verified in entiredb `core/resource/project_name.go` rather than inferred. Repo convention: never hard-wrap prose in PR bodies, one paragraph per line.
+</cross-session-message>

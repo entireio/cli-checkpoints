@@ -1,0 +1,117 @@
+can you give me an overview of PRs merged in the last 12h
+
+---
+
+can you review the changes in 2207
+
+---
+
+<task-notification>
+<task-id>aff72dfb5cd0b2f81</task-id>
+<tool-use-id>toolu_01CPVkN9mFHhaFBzeVvBV8Yo</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-nightly-merge/c8b7954f-4c2d-43e2-a05e-b997d72e045c/tasks/aff72dfb5cd0b2f81.output</output-file>
+<status>completed</status>
+<summary>Agent "/code-review 2207" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Reviewed PR #2207 (async mirror-request routes for `entire repo mirror create`) across all 10 finder angles plus a gap sweep.
+
+```json
+[
+  {
+    "file": "cmd/entire/cli/repo_mirror_probe.go",
+    "line": 112,
+    "summary": "Overriding the server URL to poll the home core directly strips the `afterRedirect` provenance that the cross-juris transport's bare-401 recovery depends on, so placement polling becomes unrecoverable once the exchanged token's ~4-minute cache expires.",
+    "failure_scenario": "Cross-jurisdiction create: POST /mirror-requests 421s to the home core, which returns a bare 401 (its verifier trusts only local JWKS, so no `cross_juris_token_required` hint); the transport recovers because `budget.afterRedirect` is true, exchanges, and caches the token for the home origin under `effectiveTokenTTL` (capped at `cachedTokenTTL` = 4m). `awaitMirrorPlacement` then sets `WithServerURL(homeCore/api/v1)` so every `GetMirrorRequest` goes straight to the home core with no 421 hop. If placement stays pending/processing past ~4 minutes (queued backlog), `lookupToken` misses, the poll is sent with the original login JWT, the home core returns a bare 401, and `send`'s `if !budget.afterRedirect { return resp, nil }` passes it through unrecovered. 15 consecutive 401s (~30s) later the command dies with `poll mirror request: ...401` while the placement is fine. `awaitMirrorReady` is immune only because it was *not* given the override and keeps 421ing — i.e. the optimization is strictly worse than no optimization. `TestCreateAndAwaitMirror_AsyncCrossJurisdiction` uses `noWait` and one successful poll, so it never reaches expiry."
+  },
+  {
+    "file": "cmd/entire/cli/repo_mirror_probe.go",
+    "line": 133,
+    "summary": "`awaitMirrorPlacement` synthesizes a `CreatedMirror` with only MirrorId/MirrorUrl/PublicUrl, leaving `Suspended` false, so the async path silently reports success for an admin-suspended placement.",
+    "failure_scenario": "`entire repo mirror create --no-wait &lt;url&gt; &lt;cluster&gt;` with `async_mirror_requests: true` against an existing placement an admin suspended: `created.Suspended` is false (never populated from `MirrorRequestResult`, which has no such field), so `createAndAwaitMirror` returns at `if opts.noWait` and `reportOneShotMirror` skips the `WARNING: this mirror has been suspended by an admin and won't be usable.` branch, prints \"Initial clone may still be in progress; `git clone …` will work once it completes.\" and exits 0. The sync route on identical input prints the warning and exits non-zero via `NewSilentError(errMirrorSuspended)`. A script chaining `entire repo mirror create --no-wait &amp;&amp; git clone` now proceeds and fails at the clone. The wizard has the same regression: `createOneMirror` reports `mirrorStatusRegistered` (success) instead of `mirrorStatusSuspended` + error. Without `--no-wait` the suspension is recovered only indirectly, one full `GetMirror` poll later."
+  },
+  {
+    "file": "cmd/entire/cli/repo_mirror_probe.go",
+    "line": 107,
+    "summary": "A missing or malformed `Location` header hard-fails the create even when the 202 body already reports a succeeded placement with a mirror id and URL.",
+    "failure_scenario": "`Location` is declared as an optional response header in `spec/core.openapi.json` (no `required`), and `MirrorRequest` carries `requestId` (required) plus `result`. `awaitMirrorPlacement` calls `mirrorRequestPollTarget(location)` before ever looking at `initial.Status`, so a server that omits Location — or emits `Location: /mirror-requests/&lt;uuid&gt;` without the `/api/v1` prefix, or one deployed under a path prefix so `canonicalizeMirrorRequestLocation`'s `req.URL.Path != apiBasePath+\"/mirror-requests\"` check skips the rewrite — makes the CLI return `mirror request response is missing Location` / `invalid mirror request Location` while the mirror is being created server-side. `initial.RequestId` is sufficient to poll (`GetMirrorRequestParams{RequestId: ...}` needs only the id, and the client's own base URL is the correct default target), and `initial.Result` may already hold the finished mirror. The strict `initial.RequestId != requestID` cross-check has the same shape: it rejects on a header disagreement even though the body is authoritative."
+  },
+  {
+    "file": "cmd/entire/cli/repo_mirror.go",
+    "line": 625,
+    "summary": "When placement polling fails or times out, `return mirrorCreateOutcome{}, err` discards the request id and any mirror id, leaving the user no handle to resume or inspect an in-flight placement.",
+    "failure_scenario": "Async create where placement exceeds `--wait-timeout`, or where 15 consecutive `GetMirrorRequest` errors exhaust `maxConsecutivePollErrors`: `awaitMirrorPlacement` returns `(nil, err)`, `created` is nil, and the outcome is zeroed. `reportOneShotMirror` sees `created == nil` and returns the bare error, so the user gets `timed out waiting for mirror placement: context deadline exceeded` with no `requestId` printed — even though the CLI held it in `accepted.Response.RequestId` and there is no `entire repo mirror request get` subcommand to look it up. The sync route never had this hole: `CreateMirror` is idempotent on (upstream, cluster) and always yielded a mirror id before any polling. Recovery requires blindly resubmitting and hoping server-side dedup (which `TestCreateAndAwaitMirror_AsyncResubmission` shows exists but the CLI never states)."
+  },
+  {
+    "file": "cmd/entire/cli/repo_mirror_probe.go",
+    "line": 188,
+    "summary": "`mirrorRequestPollTarget` accepts `http://&lt;any host&gt;` as the poll target with no HTTPS/loopback gate, relying entirely on an undocumented same-origin rewrite that lives in a different package and can be skipped.",
+    "failure_scenario": "The condition `locationURL.Scheme != \"https\" &amp;&amp; locationURL.Scheme != \"http\"` admits plaintext http to an arbitrary host, unlike `coreapi.isSafeOrigin`, which allows http only for loopback precisely because these paths re-target the user's login JWT. Production is saved only by `canonicalizeMirrorRequestLocation` overwriting scheme+host — but that guard is gated on `req.URL.Path == apiBasePath+\"/mirror-requests\"`, so a core served under a path prefix (`https://core/foo` → `/foo/api/v1/mirror-requests`) skips it, and then a `Location: http://evil.example/api/v1/mirror-requests/&lt;uuid&gt;` becomes the `WithServerURL` base and the control-plane bearer is sent in cleartext to that host. Neither function carries a comment naming the other as its precondition, in a file whose existing trust-anchor documentation (`isSafeOrigin`, `validateExchangeURL`, `followMisdirected`) is explicit about exactly this class of risk."
+  },
+  {
+    "file": "internal/coreapi/cross_juris_transport.go",
+    "line": 308,
+    "summary": "`canonicalizeMirrorRequestLocation` unconditionally rewrites the server's `Location` host and is gated on a hardcoded path equality, with no doc comment recording either decision.",
+    "failure_scenario": "Two silent behaviors in a file where every other helper documents its trust reasoning: (a) an intentionally off-host `Location` (a core pointing polling at the region that will process the request) is rewritten to the responding core's origin, so the poll goes to a core that may not know the request id and 404s until `maxConsecutivePollErrors` is exhausted; (b) the `req.URL.Path != apiBasePath+\"/mirror-requests\"` gate means any deployment whose core URL carries a path prefix gets no canonicalization at all — which is also the hole in finding 5. Relative-path Locations that are not root-anchored (`mirror-requests/&lt;uuid&gt;`) are additionally mangled: `url.URL.String()` re-anchors them at `/`, dropping `/api/v1`, and the poll target parse then rejects them."
+  },
+  {
+    "file": "cmd/entire/cli/repo_mirror_probe.go",
+    "line": 141,
+    "summary": "The `default:` unknown-status branch in `awaitMirrorPlacement` is unreachable — `MirrorRequestStatus` is a generated closed enum — so a future server status fails at JSON decode and is swallowed by the 15-error retry budget instead of producing the intended message.",
+    "failure_scenario": "`status` is a required 4-value enum in the spec, so ogen's `MirrorRequestStatus.UnmarshalText` errors on anything else and `MirrorRequest.Decode` fails before `awaitMirrorPlacement` ever sees the value. If the control plane adds e.g. `cancelled`, `GetMirrorRequest` returns a decode error, `consecutiveErrs` climbs, and after 15 attempts (~30s at the 2s cadence) the user gets `poll mirror request: decode response: ...` — not `mirror request returned unknown status \"cancelled\"`. The same closed-enum problem contradicts the operation's own contract text (`unknown failure codes must be treated as a generic terminal failure`), which the code honors for `failure.code` (a free string) but cannot honor for `status`."
+  },
+  {
+    "file": "cmd/entire/cli/repo_mirror.go",
+    "line": 525,
+    "summary": "The one-shot starts a brand-new spinner per phase instead of relabeling one via the existing `startUpdatableSpinner`, so a single async create emits three separate `✓` completion lines.",
+    "failure_scenario": "`opts.onPhase` calls `finishPhase(true)` on the previous spinner and then `startSpinner` again, and `startSpinner`'s `stop(true)` always writes `✓ msg\\n` on both the TTY and the non-TTY path. An async create therefore prints `✓ Queued mirror o/r into c`, `✓ Placing mirror o/r into c`, `✓ Cloning mirror o/r into c` before the result — three success claims for one operation, including in CI logs where the animation is suppressed but the completion lines are not (`TestRepoMirrorCreate_AsyncSetting` asserts two of them on stderr). It also stamps `✓` on a phase that was merely superseded: queued→placing marks Queued successful even when placement then fails. `startUpdatableSpinner` exists in `progress.go` for exactly this case (\"an operation whose status text changes while it runs\") and its `update` would give one spinner, one `✓`."
+  },
+  {
+    "file": "cmd/entire/cli/repo_mirror_create_wizard.go",
+    "line": 607,
+    "summary": "In the wizard, an async placement timeout is reported as `error` rather than `timed out`, because the `mirrorStatusTimedOut` classification is only reachable once `outcome.created` is non-nil.",
+    "failure_scenario": "`--wait-timeout` expiring during `awaitMirrorPlacement` returns `(nil, timeout err)`, so `createOneMirror` takes the `outcome.created == nil` branch (`res.status, res.err = mirrorStatusError, renderCoreError(err)`) and never reaches `nonTerminal()`'s `errors.Is(err, context.DeadlineExceeded)` check. A batch that times out waiting for placement shows `error` in the result table while an otherwise identical timeout during the clone phase shows `timed out` — the same user-visible condition rendered two ways depending on which half of the single `--wait-timeout` window it landed in."
+  },
+  {
+    "file": "cmd/entire/cli/repo_mirror.go",
+    "line": 493,
+    "summary": "Altitude: the async route is selected from the current directory's committed `.entire/settings.json`, for a command whose subject is a repo the user has not cloned.",
+    "failure_scenario": "`opts.async` comes from `LoadEntireSettings(cmd.Context())`, which resolves `.entire` relative to the cwd's worktree root (falling back to `./.entire` when no root resolves). `entire repo mirror create github.com/octocat/hello-world` is normally run *before* the repo exists locally — from `~`, from an unrelated repo, or from a repo that does not set the key — so the flag silently has no effect exactly where the command is most used, and the error is swallowed (`if ... err == nil`) so nothing says why. Conversely, because it is a project-layer scalar in a version-controlled file, any repo can flip which control-plane route every contributor's `entire repo mirror create` uses while standing in that repo. A rollout switch for a control-plane route belongs in per-user config or an env var (the `repo` group is otherwise `.entire`-exempt precisely because it does not depend on repo state), not in repo-committed settings."
+  },
+  {
+    "file": "cmd/entire/cli/repo_mirror.go",
+    "line": 539,
+    "summary": "`--no-wait` and `--wait-timeout` now mean different things depending on a settings key, and neither flag's help text says so.",
+    "failure_scenario": "`--no-wait` still reads \"Return once the placement is registered, without waiting for the initial clone\", but on the async route it blocks in `awaitMirrorPlacement` until the request reaches `succeeded`/`failed` — up to the full 30-minute default `--wait-timeout`. `--wait-timeout`'s help was broadened to \"How long to wait for mirror creation to finish\", which is now wrong for the sync route, where `waitCtx` is never given a deadline (`if opts.async &amp;&amp; opts.timeout &gt; 0`) and the timeout still covers only `awaitMirrorReady`; a sync `CreateMirror` that hangs is unbounded. So the same two flags have route-dependent semantics chosen by a repo setting the user may not know is set."
+  },
+  {
+    "file": "cmd/entire/cli/repo_mirror_probe.go",
+    "line": 82,
+    "summary": "The rationale comment for `maxConsecutivePollErrors` was replaced with three lines that no longer record why 15 is the number, the measured stale-read window, or the named server-side fix.",
+    "failure_scenario": "The deleted text documented the dominant failure mode (post-create 404 from `minimize_latency` + follower reads, ~4.8s nominal and spiking under concurrent multi-region creates), the arithmetic (15 x 2s ~ 30s, well inside the 30m `--wait-timeout`), and that this is a stopgap whose durable fix is making `GetMirror` check the grant fully-consistent and read from the CRDB leaseholder. None of that is recoverable from the replacement, so the next person to tune the constant — now shared by a second poll phase with a different failure profile — has no basis for the number and no pointer to the server-side work that would retire it."
+  },
+  {
+    "file": "cmd/entire/cli/repo_mirror.go",
+    "line": 573,
+    "summary": "`createAndAwaitMirror` lost its entire doc comment, including the error contract both callers still branch on, and the four new functions ship with no doc comments at all.",
+    "failure_scenario": "The deleted block stated the invariant `reportOneShotMirror` and `createOneMirror` both implement: \"The returned error is the create error (when outcome.created is nil) or the wait error — a status sentinel (errMirrorCloneFailed / errMirrorSuspended) or a timeout; callers read outcome.status for the state.\" With it gone, the `outcome.created == nil` branches in both callers read as defensive nil checks rather than the documented signal for \"nothing was printed yet, surface the raw error\". `awaitMirrorPlacement`, `mirrorRequestPollTarget`, `mirrorRequestFailureError`, and `canonicalizeMirrorRequestLocation` are all new and undocumented, and `classifyWaitContextErr` lost the comment explaining why a `context.Canceled` becomes a `SilentError` — the one thing about it that is not obvious from the code."
+  },
+  {
+    "file": "cmd/entire/cli/repo_mirror_probe.go",
+    "line": 178,
+    "summary": "`/api/v1` is hardcoded twice in `mirrorRequestPollTarget`, duplicating the unexported `coreapi.apiBasePath` that actually determines the client's base path.",
+    "failure_scenario": "`const prefix = \"/api/v1/mirror-requests/\"` and the returned `&amp;url.URL{..., Path: \"/api/v1\"}` both restate `coreapi.apiBasePath`. Because the constant is unexported, nothing ties them together: changing the API base path (or serving a core under a prefix) leaves this parser rejecting every Location with `invalid mirror request Location` and, in the absolute case, pointing `WithServerURL` at a base that no longer exists — a silent break in the poll rather than a compile error. The base path should be exported (or a `coreapi` helper should do the parse) so the two cannot drift."
+  },
+  {
+    "file": "cmd/entire/cli/agent/session_store_test.go",
+    "line": 144,
+    "summary": "`t.Parallel()` was dropped from an unrelated FD-regression test with no comment explaining why, in a repo whose CLAUDE.md mandates it by default.",
+    "failure_scenario": "CLAUDE.md: \"**Always use `t.Parallel()` in tests.** Every top-level test function and subtest should call `t.Parallel()` unless it modifies process-global state\". `TestSessionStore_ProbingManyDirectoriesRetainsNoDescriptors` reads `/proc/self/fd`, which *is* process-global, so removing it is correct — but nothing in the test says so, while the surviving comment (\"Some slack for anything the runtime opens concurrently\") implies the opposite. The change is also unrelated to this PR's mirror work and unmentioned in its description, so the next reader restores `t.Parallel()` for convention compliance and reintroduces a count corrupted by concurrent tests opening roots."
+  }
+]
+```</result>
+<usage><subagent_tokens>232264</subagent_tokens><tool_uses>43</tool_uses><duration_ms>714981</duration_ms></usage>
+</task-notification>
+
+---
+
+can you just do a follow up PR fixing all the things

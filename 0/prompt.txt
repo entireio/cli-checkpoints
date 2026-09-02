@@ -1,0 +1,59 @@
+<task-notification>
+<task-id>bxrvv9658</task-id>
+<tool-use-id>toolu_01U8cqeWFDXYC17Fe1iMVVXj</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-paulo-goroot-ognib/90368c3d-cfbf-49b3-a1d3-3ea2fdf0c316/tasks/bxrvv9658.output</output-file>
+<status>completed</status>
+<summary>Background command "Watch CI on the new push" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>aa2c6ba4c1d4dbb4c</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-paulo-goroot-ognib/90368c3d-cfbf-49b3-a1d3-3ea2fdf0c316/tasks/aa2c6ba4c1d4dbb4c.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Findings
+
+**1. `cmd/entire/cli/setup.go:2325` — the follow-in-repo-links retry is caller-side, and the diff itself contains the proof that the next caller won't know to do it.**
+`worktreeFileName` is the general answer to "os.Root refuses an absolute symlink target even when it resolves inside the root" but it lives in `setup.go` and serves three literal filenames. The latent instance is in this same diff: `readCapped` (`runner_gather.go:178`) reads `CLAUDE.md`, `AGENTS.md`, `README.md` through `osroot.OpenNoFollow` and returns `ok=false` on a symlink — and **this repo's own `AGENTS.md` is a symlink to `CLAUDE.md`** (`ls -la` confirms; CLAUDE.md documents it as such). So `entire runner tune` silently drops the agent doc in the repo that ships the feature, for exactly the reason the vercel path was fixed. Same class at `strategy/common.go:1461` (`readWorktreeFile`) and `content_overlap.go:525`, though those are git-status-named and no-follow by intent.
+Deeper fix: put the two-step behind the anchor — `worktreedir.OpenUserFile(worktreeRoot, name) (*os.File, bool, error)` or `StatFollowingInRepoLinks` — so "user-owned working-tree file" is one call, and the anchor's API distinguishes user-owned from Entire-owned reads rather than a doc comment doing it. Note `NameFollowingLinks` (`worktreedir.go:115`) is exported from the anchor package with a doc-comment-only "Entire's own trees must not use this" — the same doc-comment-as-precondition the diff correctly rejects for `RemoveDir` four files away.
+Blast radius: 1 new function in `worktreedir`, delete `worktreeFileName`, 3 call sites in `setup.go`; extending it to `readCapped` is +1 call site and a decision about whether symlinked docs should be read at all. In scope, and the `AGENTS.md` case argues for doing it now.
+**Recommendation: fix now** (at minimum move the helper into `worktreedir` and make `readCapped` use it; if the readCapped semantics need a product call, say so in the PR).
+
+**2. `cmd/entire/cli/agent/hook_config_file.go:184` — the `AllProtectedDirs()` blocklist fails open, and borrows a list maintained for a different purpose.**
+The guard is right that the precondition belongs in code. But it is a blocklist: anything *not* in `ProtectedDirs` is permitted. `AllProtectedDirs()` today contains `.github/hooks` but not `.github`, so a future agent with its config at `.github/foo.json` gets `RemoveDir` deleting the whole `.github` tree — workflows included. And `external.Agent.ProtectedDirs()` returns plugin-manifest data, so the safety property of a destructive filesystem call now partly rides on third-party declarations and on a list whose stated purpose (`agentSymlinkCheckPaths`' own doc comment, doctor.go:899) is "what the AGENT owns… a different set in both directions."
+Deeper fix, cheap: replace the blocklist with the positive structural invariant it is approximating — refuse any `dir` with fewer than two components (`strings.Contains(dir, "/") == false`). Every agent root is one component; pi's `.pi/extensions/entire` is three. Registry-free, fails closed, and covers the `.github` case the blocklist misses. Deeper still: make the call unrepresentable — a separate `OpenGeneratedHookConfigDir(worktreeRoot, dirRelPath, fileName)` constructor returning a type that has `RemoveDir`, so only an agent that declared a generated directory can reach it.
+Blast radius: the structural version is one line + a test row; the API-shape version is 1 type, pi's install/uninstall, ~3 files.
+**Recommendation: fix now, structural version** (swap `slices.Contains` for the component-count check, keeping the ProtectedDirs check too if you want the belt). The API-shape version is out of scope.
+
+**3. `cmd/entire/cli/doctor.go:985` — `Type() == 0` is a blocklist of one where the parallel `.entire` scan is an allowlist, and the taxonomy is diverging rather than converging.**
+`paths.unsupportedEntryType` is `t := mode.Type() &amp;^ fs.ModeIrregular; t != 0 &amp;&amp; t != fs.ModeDir` — reject anything not a regular file or directory — and CLAUDE.md spends a paragraph on why an allowlist is required ("an allowlist a rejected type can enter by setting an extra bit is not an allowlist"). The new check tests only for a regular file, so a FIFO, socket, or device node at `.claude` returns `componentScanClean` and doctor prints **nothing** — while `os.Root` traversal and every hook install fail on it. The asymmetry reads accidental, not principled: at a non-leaf position the allowlist has exactly one member, so the principled test is `info.Mode().Type() &amp;^ fs.ModeIrregular != fs.ModeDir`.
+The vocabulary is also drifting: `.entire` renders BROKEN / UNREADABLE / UNVERIFIED from exported sentinels in `paths`; the agent scan renders BROKEN / NOT READABLE / NOT CHECKED from a private `int` enum. Four conditions, three different words, two type systems, described in the code as "the same split the .entire scan makes."
+Deeper fix: (a) invert the type test to the allowlist form — one line, one test row; (b) longer-term, hoist the four conditions into one shared vocabulary (reuse `paths.ErrEntireDirNotDirectory`/`Unreadable` or a shared `pathCondition` type) so the two reports cannot describe the same fault with different words.
+Blast radius: (a) trivial, in scope. (b) touches `paths/entiredir.go`, `entiredir_guard.go`, `doctor.go` and their tests — a refactor of its own.
+**Recommendation: fix (a) now; (b) out of scope — note it in the PR as the follow-up, since this diff is the second time the split has been re-derived.**
+
+**4. `cmd/entire/cli/agent_hook_config_guard_test.go:63` — the invariant "calls OpenHookConfig ⇒ implements HookConfigLocator" is compiler-enforceable today; the grep is one refactor away from being unnecessary.**
+All nine non-test call sites already read `agent.OpenHookConfig(root, (&amp;XAgent{}).HookConfigRelPath())`. Changing the signature to `OpenHookConfig(worktreeRoot string, loc HookConfigLocator)` makes the omission the test exists to catch a **build failure**, not a test failure, and removes the grep's two stale-pattern failure modes (a re-worded method signature, a call site in a sub-package — the diff already had to add `require.NotEmpty(..., "the detection pattern has gone stale")` twice to paper over exactly that). The residual half — "registered ⇒ path reaches `AllHookConfigRelPaths`" — becomes a plain in-process registry loop over `agent.List()` with a type assertion, no `git grep` and no repo-checkout skip.
+The set-vs-count change is a real improvement over the previous revision and correctly diagnosed; this is about whether the mechanism should exist.
+Blast radius: 1 signature, 9 call sites, mechanical; plus test call sites. Deleting/shrinking one guard test.
+**Recommendation: fix now** — it is smaller than the guard test it replaces, and this PR is already touching that test.
+
+**5. `cmd/entire/cli/doctor.go:915` — "the paths Entire writes through on an agent's behalf" is three-quarters owned by `cli`, not by the agent registry — but this is close to the right altitude and I would not block on it.**
+One of the four sources is a registry method (`agent.AllHookConfigRelPaths`); the other three (`searchSkillTemplatePath`, `agentHelpSkillTemplatePath`, `legacySearchSubagentPath`) are `switch agentName` blocks in `cli`. That is not a staleness hazard the way a hand-kept list would be — doctor reads the same functions the scaffolder writes through, so a new agent given a skill is covered automatically, and a new agent given none returns `""` and needs no coverage. The intermediate-directory concern is also answered structurally: `scanForSymlinkedComponent` walks every component, so `.pi`, `.pi/extensions`, `.pi/extensions/entire` all get checked from the leaf path alone. The residual issue is location: agent-specific paths living in `cli` means the registry cannot answer "what does Entire write for this agent?", which is a question `entire status`, uninstall, and `doctor` all want.
+Deeper fix: an agent-side `ManagedWorktreePaths() []string` capability plus `agent.AllManagedWorktreePaths()`, with the three switches moved into the nine agent packages.
+Blast radius: 9 agent packages + registry + doctor + the scaffold writers. Well outside a 6-commit cleanup.
+**Recommendation: out of scope.** Interim mitigation is what the diff already did — keep all four sources as shared functions and derive intermediates by component walk. Worth one sentence in the PR naming the registry method as the intended home.
+
+**6. `cmd/entire/cli/runner_gather.go:178` — the UTF-8 handling is at the RIGHT altitude, and the short-file asymmetry is the correct contract, not an inconsistency.**
+The invariant the function now holds is "truncation does not introduce invalidity it did not find" — not "output is valid UTF-8" — and that is the only invariant this layer can honestly own. Validating whole files would mean deciding what to do with a legitimately latin-1 README, which is a product call, not a truncation concern; the bounded backup plus the `cut = maxLen` fallback is precisely the "our cut, not the file's bytes" scope, and the non-UTF-8 test pins it. `readCapped` is also the only byte-truncating source feeding the brief (`gatherGHItems`, `gatherCheckpoints`, `gatherTrails` all build from structured data), so there is no second call site that would want the same helper, and no assembly-point sanitizer would be exercised by anything else. If the requirement ever becomes "the prompt is valid UTF-8", the place for it is `buildTunePrompt` — one `strings.ToValidUTF8` — not here.
+**Recommendation: no change.**</result>
+<usage><subagent_tokens>171394</subagent_tokens><tool_uses>28</tool_uses><duration_ms>263278</duration_ms></usage>
+</task-notification>

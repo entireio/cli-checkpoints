@@ -1,0 +1,85 @@
+Start from this brief. Whoever wrote it has already explored the codebase and put the plan, paths, and context you need into it — take that as your starting point and don't re-derive the overall architecture or re-discover what the brief already covers. But DO read whatever you actually need to implement the task correctly: the files you're changing, their tests, their callers and direct dependencies. That is expected, not wasteful re-exploration. What to skip is redundant open-ended surveying — broad codebase-wide greps or re-mapping whole subsystems the brief already describes. If the brief is missing something you genuinely need, read the code to get it (or flag a real gap in the plan) — don't guess, and don't stop short.
+
+# COR-1436: entire experts re-derives the repo ULID it already has
+
+Repo: `cli`. Linear: https://linear.app/entirehq/issue/COR-1436 — read the full ticket, it has the complete trace.
+
+## The problem
+
+`entire experts --repo owner/repo` resolves the repo's ULID by fetching the caller's ENTIRE repo listing from entire-api and linear-scanning it for a matching `full_name`. It already holds that ULID: the cell-resolution step one line earlier resolved it from core and threw it away.
+
+`runExperts` (`cmd/entire/cli/experts_cmd.go`, ~line 214) does two resolutions:
+
+1. **Core, by slug** — `newExpertsAPIClient` → `NewAuthenticatedEntireAPICellClient` (`cmd/entire/cli/api_client.go`, ~66) → `resolveRepoCellTarget` (`cmd/entire/cli/cell_target.go`, ~70) → `resolveProcessingPlacement` → `lookupRepoIndexEntry`, which calls core with `ListReposParams{Filter: fullName}`, picks `Primaries.Processing`, finds it in `Placements[]`, rejects failed/suspended, and dials that cell.
+2. **entire-api, by slug again** — `resolveExpertsRepoID` (~404) → `listExpertsAccessibleRepos` (~427) → `GET /api/v1/repos` → linear scan of `repos[]` for a case-insensitive `full_name` match to get `id`.
+
+Step 2 is redundant. `resolveRepoCellTarget`'s own doc says the owner/repo path "delegates to `resolveRepoCellPlacement` ... and **discards the placement id**". And `resolveRepoCellPlacement` (`cell_target.go`, ~291) returns exactly what experts needs:
+
+```go
+type repoCellPlacement struct {
+	// RepoID is the placement id (coreapi.RepoPlacement.ID), which entire-api
+	// uses as its repo_id — verified identical to the id the old
+	// mirrors-based lookup used (coreapi.Mirror.MirrorId) for the same placement.
+	RepoID string
+	// Target is the cell hosting THIS placement.
+	Target *auth.CellTarget
+}
+```
+
+`auth.CellTarget` is only `{BaseURL, Jurisdiction}`, which is why the id is lost between the two steps.
+
+## The fix
+
+**`explain` already does this correctly — copy it.** `cmd/entire/cli/explain_repo.go`, ~line 36 calls `resolveRepoCellPlacement` and uses `placement.RepoID`. Read that first; it is the pattern.
+
+Change `experts` to resolve once:
+
+* For the owner/repo form, call `resolveRepoCellPlacement(ctx, owner, repo)` and use `placement.RepoID` as the repo id and `placement.Target` for the cell client.
+* Delete `resolveExpertsRepoID`, `listExpertsAccessibleRepos`, `expertsRepoListItem` and `expertsReposListPath`, plus their tests.
+* Keep `expertsAPIPath(repoID)` — the `POST /api/v1/repos/{id}/experts` call is unchanged.
+* The ULID form is unaffected: `repoIsULID` already short-circuits resolution and passes the id straight through. Do not change that branch.
+
+You will need the cell client built from the placement's `Target` rather than from `newExpertsAPIClient(ctx, insecureHTTP, fullName, ulid)`. Look at how `explain_repo.go` gets its client from a `repoCellPlacement` and follow it. `newExpertsAPIClient` exists as a test seam (`setExpertsClientFactoryForTest`) — keep a seam of equivalent shape so the existing tests can still substitute a stub, but it may need a different signature now.
+
+**Do NOT re-implement the id-from-placement logic.** The single most important property, from `resolveRepoCellPlacement`'s doc:
+
+> a placement id is only resolvable by the cell hosting that placement ... Taking the id from one placement and routing to a cell chosen some other way asks a cell about an id it has never seen, which comes back as an indistinguishable 404.
+
+Using the `RepoID` and `Target` from the SAME `repoCellPlacement` is exactly what preserves that. Don't split them or re-resolve either half.
+
+While you are there, update `resolveRepoCellPlacement`'s doc comment — it says the placement id is one "which `resolveRepoCellTarget` has no caller for", and that stops being true.
+
+## Behaviour changes to expect (and state in the PR)
+
+**Error messages change, for the better.** Today a miss produces `resolveExpertsRepoID`'s three-guesses message: "repo %q was not found on the entire-api cell this command reached. It may be homed in another Entire region ... not onboarded to Entire, or outside your access". Core's resolution instead distinguishes not-onboarded from a failed/suspended placement and says which. Check `errRepoNotOnboarded` and `renderRepoNotOnboarded` — `runExperts` already handles the not-onboarded render for the client-construction failure, so make sure the same handling still applies now that resolution happens earlier/differently, and that no error gets double-wrapped (`cellPlacementError` and `resolveProcessingPlacement` both deliberately avoid naming the repo twice — read those comments before adding a wrap).
+
+**A latent public-repo bug is fixed.** entire-api's `/repos` is the affiliation set (`repo/list`, which excludes the `public_viewer` wildcard), so today `entire experts --repo owner/repo` on a public repo the caller can read but does not belong to reports "not found" — even though the `POST .../experts` behind it is `repo#pull`-gated and would have succeeded. Core's filtered lookup is scoped to what the caller can read, so routing through it fixes this. This is NOT reproduced — do not claim it as fixed in the PR unless you can show it; describe it as expected.
+
+## Tests
+
+There are existing experts tests (`cmd/entire/cli/experts_cmd_test.go` or similar) using the `setExpertsClientFactoryForTest` seam, and cell-resolution tests around `cell_target.go`. Read both before changing the seam.
+
+Cover:
+* The owner/repo form resolves via `resolveRepoCellPlacement` and posts to `/api/v1/repos/{placement.RepoID}/experts` — with NO call to `GET /api/v1/repos`. That absence is the regression guard; assert it, don't just assert the happy path.
+* The ULID form still bypasses resolution entirely.
+* Not-onboarded and failed/suspended-placement errors surface with their own messages, not double-wrapped.
+
+Delete the tests that covered `resolveExpertsRepoID` / `listExpertsAccessibleRepos` along with the functions.
+
+## Verification
+
+Run the repo's checks — see `Makefile` / `CLAUDE.md` (`go test ./...`, vet/lint). Report honestly what you ran and what passed; if something can't run in the worktree, say so rather than claiming green.
+
+## Deliverable
+
+Commit on the worktree branch and open a PR. Put the handoff in the PR description — do NOT write a HANDOFF.md or any similar summary file into the repo.
+
+The PR description must state: what now resolves the repo id, what was deleted, how the test seam changed, which error messages change and why that is an improvement, and what you tested.
+
+## Context worth knowing
+
+This is the last known caller of entire-api's `GET /repos`, which we want to retire (COR-1370). The other two consumers already moved off it: entire.io's dispatch on 2026-09-01, and mcp's `list_entire_repos` on 2026-09-02. This change stops NEW CLI builds calling it; released versions in the wild will keep calling until they age out, so the endpoint can't be deleted immediately — that's tracked separately, not your concern here.
+
+---
+
+don't over-comment or reference ticket numbers in comments. self-explanitory code is sufficient

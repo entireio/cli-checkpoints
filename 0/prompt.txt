@@ -1,0 +1,324 @@
+/simplify
+
+---
+
+<task-notification>
+<task-id>a7fa37d89f762dcc6</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-repo-clone-followup/5d677c01-0e73-474c-ac40-4fd2c9a54c33/tasks/a7fa37d89f762dcc6.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Reviewed the diff against the existing code in `cmd/entire/cli/` and its subpackages. Three findings, one of which is cosmetic; the four reuse candidates you specifically named all check out as non-issues, and I list what I verified so the negatives are auditable.
+
+## Findings
+
+### 1. `nativeCloneURLGitSuffixRe` hardcodes `entire://` although the file owns a constant for it
+`cmd/entire/cli/repo_clone.go:190`
+
+```go
+var nativeCloneURLGitSuffixRe = regexp.MustCompile(`^entire://[^/]+/` + nativeCloneForge + `/[^/]+/[^/]+` + regexp.QuoteMeta(gitDirSuffix) + `$`)
+```
+
+The scheme already exists 154 lines above, in the same file, and every other user of it goes through it:
+
+- `cmd/entire/cli/repo_clone.go:36` — `const entireCloneURLScheme = "entire://"`
+- `cmd/entire/cli/repo_clone.go:41` — `return strings.HasPrefix(strings.TrimSpace(ref), entireCloneURLScheme)`
+- `cmd/entire/cli/repo_clone.go:60` — `return fmt.Sprintf("%s%s/gh/%s/%s", entireCloneURLScheme, host, owner, repo)`
+
+Cost: the scheme now has two spellings, and the new one is the one a scheme change would miss — `isEntireCloneURL` would stop matching what the regex still matches, so the note would fire on URLs the passthrough branch no longer takes (or, worse, silently stop firing). The inconsistency is visible inside the single statement, which already routes the *other* literal through `regexp.QuoteMeta(gitDirSuffix)`. Fix: `regexp.MustCompile("^" + regexp.QuoteMeta(entireCloneURLScheme) + `[^/]+/` + nativeCloneForge + …)` — `QuoteMeta` leaves `entire://` unchanged, so behaviour is identical.
+
+Related, same line: at the only production call site (`repo_clone.go:303-307`) the argument has already passed `isEntireCloneURL(ref)`, so the scheme anchor re-tests an established fact in a second implementation. Keeping it is defensible (the test at `repo_clone_test.go:542` exercises the non-URL case directly), but if it stays it should at least be built from the shared constant.
+
+### 2. `serveNativeRepoMiss` is `serveNativeRepo` with one line changed
+`cmd/entire/cli/repo_clone_test.go:264` vs `cmd/entire/cli/repo_clone_test.go:183`
+
+`func serveNativeRepo(t *testing.T, repo coreapi.Repo) *coreapi.Client` and `func serveNativeRepoMiss(t *testing.T) *coreapi.Client` are byte-identical except for two things: the `/api/v1/projects/&lt;ULID&gt;/repos` body (`ListProjectReposOutputBody{Repo: coreapi.NewOptRepo(...)}` vs the zero value `ListProjectReposOutputBody{}`), and the miss fixture omitting the `/api/v1/repos/&lt;ULID&gt;` arm it never reaches. Everything else — the `Content-Type`, `var body any`, the whole `/api/v1/projects` arm with its `Project{ID: testProjectULID, Name: "paul", …}` literal, the `default` arm, `printJSON`, `t.Cleanup(srv.Close)`, `coreapi.NewWithBearer(srv.URL, "tok")` — is restated: ~22 of the 25 lines.
+
+Cost is concrete rather than stylistic: the route strings and the `Project` literal now live twice, so a `coreapi` route or field change has to be applied to both, and the second copy fails *silently unhelpfully* — its `default` arm just reports `unexpected request` from inside a `t.Errorf`, which reads like a fixture bug rather than a stale route. A reader also has to diff 25 lines to find the one that carries the meaning of the test.
+
+Suggested shape, keeping one fixture:
+
+```go
+// repo == nil serves a repo-name miss: the project resolves, the repo lookup
+// answers with no repo.
+func serveNativeRepo(t *testing.T, repo *coreapi.Repo) *coreapi.Client
+```
+
+The `/repos` arm becomes `if repo != nil { … NewOptRepo … }` (zero value otherwise) and the `/repos/&lt;ULID&gt;` arm stays as-is (unreachable when `repo == nil`). Callers at lines 230/238/246/254 pass `&amp;r`; the two at 300/308 pass `nil`. This is a genuine reader benefit, not a `dupl` appeasement — `mise run lint` is clean at threshold 75 either way.
+
+### 3. The name rules are stated twice in prose, ten lines apart (minor)
+`cmd/entire/cli/repo_clone.go:71-76` and `cmd/entire/cli/repo_clone.go:99-100`
+
+The doc comment's bullets and the rule constants say the same thing:
+
+```
+//   - project: 3–32 characters of letters, digits and '-', no leading or
+//     trailing '-'
+…
+nativeProjectRule = "3-32 characters of letters, digits and '-', not starting or ending with '-'"
+```
+
+They have already drifted typographically (en-dash `3–32` vs `3-32`, "no leading or trailing" vs "not starting or ending with"), which is the tell: a rule change has to be made in both, and nothing catches a divergence. The comment's other content is not duplicated and is worth keeping (the entiredb source pointer, why uppercase is accepted, the RE2-lookahead note, the shorthand-ambiguity argument); it is only the two rule bullets that can go, replaced by a pointer to `nativeProjectRule`/`nativeRepoRule` as the canonical prose.
+
+Same class, same file: `repo_clone.go:182` ("it is stripped for /gh/ paths only") and `repo_clone.go:201` ("the server strips it for /gh/ paths only") state one fact in two user-facing strings, with `gitDirSuffix`'s comment at 163-168 making it three. Not worth a constant for two messages, but worth knowing they must be changed together.
+
+## Checked and clear (no change wanted)
+
+- **No existing project/repo name validator to call.** The generated `coreapi` validators are not one: `CreateProjectInputBody.Validate` (`internal/coreapi/oas_validators_gen.go:544`) has `MinLength: 1, MaxLength: 100, Regex: nil` for `name`, and `CreateRepoInputBody.Validate` (`:702`) has `MinLength: 1`, no max, `Regex: nil` — the spec does not encode the real shape. The only other name-shape message in the tree is `cmd/entire/cli/setup_github.go:1115` (`"name may only contain letters, digits, '.', '-', '_'"`), which is GitHub's charset. So `nativeProjectRe`/`nativeRepoRe` duplicate nothing.
+- **`nativeProjectRule`/`nativeRepoRule` do not duplicate `parseMirrorCloneRef`'s message** (`repo_clone.go:250`: `"… owner: letters, digits, '-'; repo: letters, digits, '.', '_', '-'"`). That is GitHub's charset — it allows `_`, carries no length or edge-character rules, and is enforced by a different regex pair. Sharing wording would be wrong, not DRY.
+- **No `.git`-suffix helper exists to reuse.** All eight sites inline the literal: `repo_mirror.go:1321`, `trail_cmd.go:2296`, `experts_cmd.go:391`, `plugin_index.go:128`, `plugin_gitremote.go:388`, `plugin_fetch.go:125`, `gitremote/gitremote.go:154` and `:247`. `gitrepo/repository.go:21` and `strategy/common.go:361` (`gitDir = ".git"`) name the *directory*, a different concept. `gitDirSuffix` is therefore new, not duplicated.
+- **`gitremote.ParseURL` cannot serve as the suffix probe.** `func splitOwnerRepo(path string) (string, string, error)` opens with `path = strings.TrimSuffix(path, ".git")` (`gitremote/gitremote.go:246-247`), so `Info.Repo` is `dogbark` for both `/et/paul/dogbark` and `/et/paul/dogbark.git` — it erases exactly the signal `warnNativeURLGitSuffix` needs. `parseMirrorCloneURL` (`repo_mirror.go:1297`) is `gh`-only and trims the same way.
+- **`gitHubDotOnlyRe = regexp.MustCompile(`^\.+$`)`** (`repo_mirror_probe.go:50`) is not a substitute for `strings.Contains(repo, "..")`: dot-only vs consecutive-dots-anywhere are different rules, and the native grammar needs the stricter one.
+- **`noRepoNamedError` follows the local typed-error convention.** `type explainTargetNotFoundError struct{ target string }` (`explain.go:543`) with a pointer-receiver `Error()` (`:545`) matched via `errors.As` (`shouldFallBackToCommitResolution`, `:553-556`) is the same shape, for the same reason (a caller needs to distinguish one specific miss). The sibling `noOrgNamedErr`/`noProjectNamedErr` staying as `fmt.Errorf` is fine — nothing matches on them.
+- **`hintDroppedGitSuffix`'s error shape matches the existing idiom**: `badMirrorRefErr` (`repo_mirror.go:1332`) is the same `fmt.Errorf("%w; &lt;advice&gt;", err)`. `hintError` (`search_v4.go:45`, `Error() string { return e.msg }`) is the wrong tool here — it *replaces* the message, whereas this hint must keep `no repo named "…"` visible.
+- **No shared note/warning writer exists**; a bare `fmt.Fprintf(w, "note: …")` is the convention (`explain_export.go:687`, `explain.go:2950`), which is what `warnNativeURLGitSuffix` does.
+- **`nativeCloneRefPrefixRe`** mirrors the pre-existing `mirrorCloneRefPrefixRe` (`repo_clone.go:208`) one-for-one, and it uses the `nativeCloneForge` constant where the older sibling hardcodes `gh`. Matching the neighbour is right here; a parameterized builder for two one-line regexes would not pay for itself.</result>
+<usage><subagent_tokens>177719</subagent_tokens><tool_uses>25</tool_uses><duration_ms>261657</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a3ab6fb465af1034d</task-id>
+<tool-use-id>toolu_0181zmmQJMVZYGYCMn8MGrei</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-repo-clone-followup/5d677c01-0e73-474c-ac40-4fd2c9a54c33/tasks/a3ab6fb465af1034d.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Worktree still clean; I edited nothing. Here's the review.
+
+## Verdict: no efficiency change warranted. One counterintuitive fact worth recording.
+
+I measured rather than guessed. Method: `GODEBUG=inittrace=1` per-package init on binaries built from `main` and `HEAD` (25 runs each, median), plus `regexp/syntax` program-size counts and compile microbenchmarks on an M4 Max.
+
+### Baseline: how much does `cli` package init actually cost?
+
+| | |
+|---|---|
+| Whole-binary init | **7.24 ms** median, 331 packages |
+| `cmd/entire/cli` package init, `main` | **68.0 µs** |
+| `cmd/entire/cli` package init, `HEAD` | **83.0 µs** |
+| **Diff's marginal init cost** | **+15.0 µs** (microbenchmark independently predicted +15.8 µs) |
+
+The `cli` package already compiles **22** package-level regexes (78 across all first-party packages). For scale, `chroma/v2/lexers` + `chroma/v2/styles` cost **5.9 ms** — 57% of all init, and ~390x the entire diff. The concern is legitimate in *kind* (`hooks` is registered in this same package at `root.go:208`, so all 22 regexes compile on every git-hook invocation), but 15 µs against the ~3 s hook p50 floor documented in CLAUDE.md is 0.0005%. Even at 1,000 hook invocations per session that is 15 ms total, once.
+
+### Finding 1 (informational — recommend no change): the cost is in the *tightened* regexes, not the new ones
+
+`cmd/entire/cli/repo_clone.go:92-93, 190, 213`. The premise that the newly-added package-level regex is the expense is backwards. Bounded repetition expands in `regexp/syntax`, so tightening `+` into `{0,62}` is far more expensive than adding a whole new pattern:
+
+| regex | instructions | compile Δ | share of the +15 µs |
+|---|---|---|---|
+| `nativeRepoRe` `{0,62}` (line 93) | 6 → **131** | +8.0 µs | **53%** |
+| `nativeProjectRe` `{1,30}` (line 92) | 6 → **65** | +4.4 µs | **28%** |
+| `nativeCloneURLGitSuffixRe` (new, line 190) | 28 | +2.8 µs | 17% |
+| `nativeCloneRefPrefixRe` (new, line 213) | 8 | +0.6 µs | 4% |
+
+So **81% of the added init cost is the two tightenings** and only 19% is the two new regexes — `{0,62}` alone costs more than both additions combined, because it expands to 131 instructions where `[A-Za-z0-9.-]+` needed 6.
+
+A cheaper spelling exists: keep `^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]?$` (~8 instructions) and move the bounds to `len(repo) &gt; 64`. That recovers ~12 of the 15 µs and arguably reads better, since `3-32` in the rule string would then match a literal `len` check instead of a `{1,30}` the reader must add two to. **But at this magnitude there is no performance case for the churn**, and the current form keeps one rule in one place. Leave it.
+
+Likewise the two trivial new regexes: `^/?et/` is expressible as `strings.HasPrefix(ref, "et/") || strings.HasPrefix(ref, "/et/")` (0 compile, 2.6 ns vs 39 ns per match). Not worth doing — it would break symmetry with the pre-existing `mirrorCloneRefPrefixRe` five lines above, and the match runs once on an error path about to exit.
+
+### Non-finding: the discarded `fmt.Errorf` values
+
+`parseNativeCloneRef` has exactly **one** production call site — `repo_clone.go:314`, inside the `RunE` of `entire repo clone`. No hook, no lifecycle handler, no loop reaches it. Every formatted-then-discarded error is one ~200 ns allocation per user-typed `repo clone`, on a command that then does control-plane round trips (tens of ms) and a `git clone` (seconds). Also note the `/gh/` and `entire://` cases named in the brief are cheaper than feared: the `entire://` path returns at line 305 before `parseNativeCloneRef` is ever called, and a `/gh/` ref fails at the `len(segs) != 2` check, formatting the shortest of the three messages. **Irrelevant. No change.**
+
+### Non-finding: redundant re-parsing
+
+Real but pre-existing and negligible. On the invalid-ref path the ref is `TrimSpace`d four times (`RunE:287`, `isEntireCloneURL`, `parseNativeCloneRef`, `parseMirrorCloneRef`) and prefix-scanned by regex twice more in `invalidCloneRefError` — plus `parseHostedGitHubURL` runs up to two more regexes. Trims 1, 2, 4 and the `mirrorCloneRefPrefixRe` rescan all exist on `main`.
+
+The diff adds exactly **one** new redundant scan: `nativeCloneRefPrefixRe.MatchString(ref)` at line 237 re-derives what `parseNativeCloneRef` already knew at line 119 (`segs[0] == nativeCloneForge`). Threading that fact out would need a fourth return value or a typed error, for 39 ns once on a path that prints and exits. **No change.**
+
+### Non-finding: closures and retained scope
+
+The `RunE` change at lines 303-308 captures nothing new. `runGitClone`'s result is bound to a local `err`, and `cmd.ErrOrStderr()` is called inline on the failure branch only — no writer is retained. `nativeErr` widening from `if`-scope to function-scope holds one interface value for the duration of one `RunE`, freed at return. `newRepoCloneCmd` is called once at tree construction; nothing here extends any object's lifetime. **No issue.**
+
+### Non-finding: blocking work on startup or hot paths
+
+Nothing added is blocking. `warnNativeURLGitSuffix` runs only after `runGitClone` already returned an error, so it is strictly after a multi-second subprocess. `hintDroppedGitSuffix` short-circuits on `errors.As` before touching strings, and adds no I/O — it decorates an error the resolver already produced, with no extra round trip. Making `noRepoNamedErr` return a `*noRepoNamedError` (`resolveref.go:573-581`) replaces one `fmt.Errorf` allocation with one struct allocation and defers the message formatting to `Error()`, so it is marginally *cheaper* on the paths that never print.
+
+One genuine efficiency *win* in the diff worth crediting: tightening the name regexes means `paul/..`, `paul/.foo`, `paul/foo.` and `paul/-x` now fail locally instead of costing a control-plane round trip — that trades ~12 µs of one-time init for eliminating tens of milliseconds of network on malformed refs.</result>
+<usage><subagent_tokens>149626</subagent_tokens><tool_uses>18</tool_uses><duration_ms>250676</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ae5ad00dc6934fbc5</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-repo-clone-followup/5d677c01-0e73-474c-ac40-4fd2c9a54c33/tasks/ae5ad00dc6934fbc5.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Verified the equivalences with scratch programs rather than by eye. Here is the review.
+
+## Findings
+
+### 1. Two prefix regexes for two fixed literal tokens — `repo_clone.go:205-213`, used at `:234-239`
+
+The diff adds `nativeCloneRefPrefixRe = ^/?et/` alongside the pre-existing `mirrorCloneRefPrefixRe = ^/?gh/`. Both are "does the ref open with this literal token, leading slash optional" — a `strings.HasPrefix` question. Cost: two package-level `regexp.MustCompile` at init plus two doc blocks (one of which exists only to say "same as the one above"), for a test with no alternation, no classes, and no captures.
+
+One predicate replaces both, and reads as the same idiom `parseNativeCloneRef` already uses one screen above (`strings.TrimPrefix(ref, "/")`):
+
+```go
+// declaresForge reports whether ref opens with a forge token (leading slash
+// optional), which is what says the user meant that grammar and so should get
+// that parser's reason rather than a list of every accepted shape.
+func declaresForge(ref, token string) bool {
+	return strings.HasPrefix(strings.TrimPrefix(ref, "/"), token+"/")
+}
+```
+
+```go
+	if declaresForge(ref, "gh") {
+		return fmt.Errorf("invalid &lt;repo&gt; %q: %w", ref, mirrorErr)
+	}
+	if declaresForge(ref, nativeCloneForge) {
+		return fmt.Errorf("invalid &lt;repo&gt; %q: %w", ref, nativeErr)
+	}
+```
+
+I checked equivalence over 17 refs (`""`, `"/"`, `"gh/"`, `"//gh/x"`, `"/GH/foo/bar"`, `"  /gh/foo/bar"`, `"ghx/y"`, `"etx/y"`, `"/et//x"`, …) — zero divergences for either token, including the double-slash and whitespace cases. `goconst` does not apply (`"gh"` is under its 3-char minimum).
+
+### 2. `nativeProjectRule` / `nativeRepoRule` are single-use constants nothing else reads — `repo_clone.go:96-101`
+
+Each is referenced exactly once, at `:127` and `:130`. Even the tests that assert on the text hardcode substrings (`project "foo_bar" must be 3-32 characters`) rather than referencing the constants, so the indirection has no second reader to justify it — it moves the string away from the only place it is used, and the reader of `fmt.Errorf("project %q must be %s", …)` now has to jump 30 lines to learn what the message says. Cost: 6 lines (2 consts + a 2-line comment explaining why the consts exist), and one more hop when reading the error path.
+
+```go
+	if !nativeProjectRe.MatchString(project) {
+		return "", "", fmt.Errorf("project %q must be 3-32 characters of letters, digits and '-', not starting or ending with '-'", project)
+	}
+	if !nativeRepoRe.MatchString(repo) || strings.Contains(repo, "..") {
+		return "", "", fmt.Errorf("repo %q must be 1-64 characters of letters, digits, '.' and '-', not starting or ending with '.' or '-', and with no consecutive dots", repo)
+	}
+```
+
+Unlike `gitDirSuffix`, these are not held in place by `goconst` (one occurrence each, threshold is 3).
+
+### 3. `nativeCloneURLGitSuffixRe` re-spells `entire://` instead of using the constant beside it — `repo_clone.go:190`
+
+The regex interpolates `nativeCloneForge` and `regexp.QuoteMeta(gitDirSuffix)` but hardcodes `entire://`, while `entireCloneURLScheme = "entire://"` sits at `:36` and is what `isEntireCloneURL` (the guard that gates this very call, `:303`) matches on. Two spellings of one wire constant in one file, in a regex whose other two tokens are already threaded — that is the drift hazard the other two interpolations exist to avoid.
+
+```go
+var nativeCloneURLGitSuffixRe = regexp.MustCompile(`^` + regexp.QuoteMeta(entireCloneURLScheme) + `[^/]+/` + nativeCloneForge + `/[^/]+/[^/]+` + regexp.QuoteMeta(gitDirSuffix) + `$`)
+```
+
+On the broader question you asked — the regex *is* the right tool here, and I would not replace it. I tried the obvious strings version (`HasPrefix(scheme) &amp;&amp; HasSuffix(".git") &amp;&amp; Contains("/et/")`) and it is not equivalent: it wrongly fires on `entire://host/gh/et/foo.git` (a GitHub owner literally named `et`), `entire://host/et/a/b/c.git` (extra segment), and `entire://host/et/paul/.git` (empty repo name). A faithful strings version needs a `CutPrefix` plus segment splitting plus a length check — longer than the regex and no clearer. The regex is the compact spelling of "exactly host/et/project/repo, ending in .git".
+
+### 4. Typed error where a sentinel does the same job in half the lines — `resolveref.go:219-231`
+
+The type + method + constructor is 8 lines, and its stated reason — "carries the name as a type … so a caller … can recognise the miss and add advice" — is not what the one consumer does: `hintDroppedGitSuffix` (`repo_clone.go:177-184`) never reads `miss.name`; it takes the name from its own `repoName` parameter and uses `errors.As` purely as a classifier. For a classifier, a sentinel is the smaller tool, and it is the dominant pattern in this package already (`errNoResumeCommit`, `errAssetNotFound`, `errCannotGenerateTemporaryCheckpoint` are all this exact `%w`-heads-the-message shape):
+
+```go
+// errNoRepoNamed is the repo-name lookup miss, wrapped rather than only
+// formatted so a caller holding context the resolver does not — `repo clone`'s
+// dropped-`.git` hint — can recognise it without matching on the text.
+var errNoRepoNamed = errors.New("no repo named")
+
+func noRepoNamedErr(name string) error {
+	return fmt.Errorf("%w %q in that project (run `entire repo list &lt;project&gt;` to see names, or pass a ULID)", errNoRepoNamed, name)
+}
+```
+
+and at the hint site, `errors.As`/`var miss` collapses to `if !errors.Is(err, errNoRepoNamed) || !strings.HasSuffix(...)`. I ran both shapes side by side: the rendered message is byte-identical, the hint fires and abstains identically, and the existing `require.ErrorIs(t, got, miss)` in `TestHintDroppedGitSuffix` still passes (the wrap chain reaches both the instance and the sentinel). It also restores symmetry with `noOrgNamedErr`/`noProjectNamedErr` directly above it. Grading this minor rather than clear-cut: `explainTargetNotFoundError` in `explain.go:543` is the same typed-classifier pattern, so the house tolerates both — the concrete defect is the 8-line form plus a comment that claims a benefit the code does not take.
+
+### 5. Judgment call: `warnNativeURLGitSuffix` is the weakest-value block in the diff — `repo_clone.go:186-203`, test `repo_clone_test.go:~318-360`
+
+~10 lines of code plus a regex, three doc paragraphs and a 5-case table, to print a hedged "if the repo was not found…" note after *any* `git clone` failure (auth, network, Ctrl-C included) on a URL the user typed in full themselves. Its prose also duplicates `hintDroppedGitSuffix`'s with variation — "a native ref keeps the `.git` suffix (it is stripped for `/gh/` paths only)" vs "a `/et/` path keeps its `.git` suffix (the server strips it for `/gh/` paths only)" — two spellings of one sentence that will drift. The lookup-path hint (`hintDroppedGitSuffix`) fires where the suffix is provably the cause and needs no hedge; this one is a guess. Dropping it removes the regex, the function, the test table and one of the two message spellings. Your call — I would not insist, but if it stays, the two messages should share their common clause.
+
+## Things I checked and would leave alone
+
+- **The two-error parameter earns itself.** The choice of which reason to show *is* the prefix test, so it cannot move to the caller; the only alternative is dropping both params and re-parsing inside `invalidCloneRefError` (which already re-parses via `parseHostedGitHubURL`), and that trades a wide signature for a function that can `%w` a nil error if either parser ever succeeds. Threading the two computed errors is the more honest shape. The caller cannot pass a nil `nativeErr` — `:314-331` returns inside the `nativeErr == nil` branch — so there is no defensive nil handling to add or remove.
+- **`!nativeRepoRe.MatchString(repo) || strings.Contains(repo, "..")` is justified.** RE2 genuinely has no negative lookahead, and the single-expression alternative (alternating `\.[A-Za-z0-9-]` groups) consumes 1 or 2 characters per iteration, which makes the 1–64 length bound unexpressible. The split is the cleaner half.
+- **`gitDirSuffix` is mechanically required, not decorative.** `".git"` appears 5 times in the file and `goconst` is enabled at its defaults (min-len 3, min-occurrences 3), so inlining it would fail lint. The only nit is the name reading as the `.git` *directory* rather than a URL suffix.
+- **Nothing is left dead by removing the `segs[0] == nativeCloneForge || segs[0] == "gh"` guard.** The 3-char project minimum subsumes it (`gh/foo` → project `"gh"` fails the length bound; `gh/foo/bar` → 3 segments), and `"forge token in the project position"` (`/et/gh/foo`) pins that. The `len(segs) &gt; 1` strip condition is doing exactly what it needs: it is what turns `/et/paul` into "got 1" (missing `&lt;repo&gt;`) instead of "project `et` is too short", and the alternative for a bare `"et"` is a worse "got 0". Documented and correct.
+- **The test table is numerous but not padded.** Nearly every added row pins a distinct anchor of the tightened regexes (leading vs trailing, project vs repo, `.` vs `-`), a distinct bound (1 vs 3 minimum, 32 vs 64 maximum, and the over-by-one on each), or a load-bearing invariant (`ab/dogbark`, `/et/gh/foo`). The one pair exercising the same mechanism is `"consecutive hyphens"` and `"hyphen beside a dot"` — both assert only that the interior class is unconstrained — and even there the comment gives them a purpose (they would fail a future per-segment regex). Not worth cutting.</result>
+<usage><subagent_tokens>167466</subagent_tokens><tool_uses>13</tool_uses><duration_ms>320946</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a2157b5f3a58c8099</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-repo-clone-followup/5d677c01-0e73-474c-ac40-4fd2c9a54c33/tasks/a2157b5f3a58c8099.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Verdict
+
+Three of the four mechanisms are at the right depth. One (`warnNativeURLGitSuffix`) is a shallow copy of a diagnosis that has an established home one layer down, and one (the name-shape tightening) puts a *validation* rule in the position of a *grammar* rule, which costs a message regression and makes the shorthand's disambiguation depend on a server constant instead of an explicit guard.
+
+---
+
+### F1. `invalidCloneRefError`'s three branches — right depth, do not table-ify
+`/Users/soph/.herdr/worktrees/cli/soph-repo-clone-followup/cmd/entire/cli/repo_clone.go:227-241`
+
+A loop over a `{token, parser}` table is not warranted at two grammars. Each branch is two lines with its own reason, and the dispatcher is the *cheapest* part of adding a grammar: a third forge would need a parser, a resolution branch in `RunE`, an entry in `cloneRefShapes`, and a prefix regex — the dispatcher branch is noise next to that.
+
+Two things do grow badly, and they name the fix for grammar #3 rather than #2:
+- the signature. `invalidCloneRefError(ref, nativeErr, mirrorErr)` becomes `(ref, nativeErr, mirrorErr, gitlabErr)` — positional error parameters, where the caller must keep argument order and branch order in agreement.
+- the token knowledge. Each grammar now states "my token is X" twice: inside its parser (`segs[0] == nativeCloneForge` at :119; `^/?gh/` inside `mirrorCloneRefRe` at :25) and again in a dispatcher-only prefix regex (:208, :213).
+
+When a third grammar lands, invert it instead of adding branch #4: each parser wraps a `errNotThisGrammar` sentinel when the ref simply wasn't its shape, `invalidCloneRefError` takes `parseErrs ...error` and prints the first one that is *not* that sentinel. That deletes both prefix regexes and stops the signature growing. Note it would touch `parseMirrorCloneRef`'s error contract, which `explain_repo.go:111` also renders verbatim — so it needs a wrapper type with a clean `Error()`, not a `%w` on a sentinel. **Verdict: no change now.**
+
+### F2. `noRepoNamedError` as a struct is over-engineered for its one consumer
+`/Users/soph/.herdr/worktrees/cli/soph-repo-clone-followup/cmd/entire/cli/resolveref.go:219-231`
+
+The doc comment justifies the type by saying it "carries the name as a type rather than only in its message" — but `name` is read only by its own `Error()`. The single consumer (`hintDroppedGitSuffix`, repo_clone.go:177) already has `repoName` as a parameter and uses `miss` purely as an `errors.As` target. So the type buys exactly what a sentinel buys, at 9 lines instead of 3, and it breaks the symmetry of its two siblings (`noOrgNamedErr`, `noProjectNamedErr`, both one `fmt.Errorf`).
+
+```go
+var errNoRepoNamed = errors.New("no repo named")
+
+func noRepoNamedErr(name string) error {
+	return fmt.Errorf("%w %q in that project (run `entire repo list &lt;project&gt;` to see names, or pass a ULID)", errNoRepoNamed, name)
+}
+```
+
+Byte-identical message, `errors.Is` at the call site, `errors` is already imported. Cost of leaving it: the odd sibling becomes the template — the next person wanting a project-level hint copies a struct instead of adding a sentinel, and the trio drifts into three shapes. **Verdict: worth doing now (5-minute change).**
+
+### F3. `warnNativeURLGitSuffix` is the shallow half of a diagnosis that has a real home
+`/Users/soph/.herdr/worktrees/cli/soph-repo-clone-followup/cmd/entire/cli/repo_clone.go:186-203` and `:303-309`
+
+This is the one place I'd subtract. It fires on **any** non-zero exit from `git clone`, so it appends "if the repo was not found, retry the URL without it" to `fatal: destination path 'dogbark.git' already exists`, to an auth failure, and to a network failure. It has to hedge precisely because it cannot see why git failed — and it pays for that hedge with a new regex (:190) that re-encodes the `entire://host/et/&lt;p&gt;/&lt;r&gt;` path shape already parsed in two other places.
+
+The layer that *can* attribute it is `git-remote-entire`, which holds both the parsed URL and the transport error: `fatalMessage(err, parsedURL)` at `/Users/soph/.herdr/worktrees/cli/soph-repo-clone-followup/cmd/git-remote-entire/main.go:244`. It already does exactly this job for the wrong-cluster case (rewrites the URL the user typed and prints `git clone &lt;corrected&gt;`), it already has the sibling `missingClusterHostMessage` for URL-shape mistakes, and its test file already builds `Path: "/et/paul/dogbark"` (main_test.go:123). A branch there would be unhedged, would name the corrected URL, and would cover the paths that actually matter for a full URL: plain `git clone entire://…`, `git remote add` + `git fetch`. `entire repo clone &lt;full URL&gt;` — the only path the current note covers — is the narrowest of the three, since anyone holding a full URL usually hands it straight to git.
+
+**Verdict: delete the note, its regex, and `TestWarnNativeURLGitSuffix` now; file the `fatalMessage` branch as the follow-up** (it needs the not-found error classified, which is why it isn't a drop-in). Shipping the hedged version in the wrong layer makes the good version harder to justify later, and the CLAUDE.md paragraph documenting it (`CLAUDE.md`, the `warnNativeURLGitSuffix` sentence) goes with it.
+
+### F4. The lookup-miss hint is in the right place — do not push it into `resolveRepoRef`
+`/Users/soph/.herdr/worktrees/cli/soph-repo-clone-followup/cmd/entire/cli/repo_clone.go:171-184`
+
+Option (iii). I checked every `resolveRepoRef` caller: `repo get`, `repo delete`, `repo visibility get`, `repo visibility set` (repo.go:302, 324, 387, 421) and `grant repo add/list/remove` (grant.go:389, 425, 460). All seven take a bare `&lt;repo&gt; --project`, not a clone ref, so the hint's text ("retry as `/et/paul/dogbark`") names a shape none of them accept. And the generic version you'd have to write instead — "repo names don't carry a `.git` suffix" — is factually false: `dogbark.git` is a legal name, which is the whole premise of this PR. `.git` is a clone-URL habit, not a name-argument habit; the caller adding caller-specific advice to a recognizable resolver error is the correct shape, and F2's sentinel is all the mechanism it needs.
+
+One pre-existing inconsistency worth an issue, not a change here: `gitremote.splitOwnerRepo` (`cmd/entire/cli/gitremote/gitremote.go:247`) strips a trailing `.git` from *every* forge path including `et/`, so a repo genuinely named `dogbark.git` is read back from its own configured remote as `dogbark`. "Who owns the `.git` question" is now answered three different ways (server: strip for `/gh/` only; `gitremote`: always strip; `repo clone`: never strip, hint instead).
+
+### F5. The name tightening conflates "is this my grammar?" with "is this name valid?"
+`/Users/soph/.herdr/worktrees/cli/soph-repo-clone-followup/cmd/entire/cli/repo_clone.go:91-101` and `:126-131`
+
+Two concrete costs, both from running validation inside the grammar test:
+
+**A message regression on the shorthand path.** `paul/.foo` used to parse as a shorthand and produce `no repo named ".foo" in that project (run entire repo list …)`. It now fails the parser, and because the dispatcher deliberately withholds the native reason from a ref that declared no token, the user gets the generic list of four accepted shapes — the PR's own test pins this (repo_clone_test.go:157). Same for `ab/dogbark` (test:93) and `paul/.dogbark` (test:100). So the length/edge/`..` rules buy a *worse* message on the bare-shorthand path in exchange for saving one HTTP call. Note that the PR's motivating case, `git@github.com:foo/bar`, is refused by the **charset alone** (`@` and `:` in the project segment) — the pre-PR rule already handled it.
+
+**Grammar disambiguation moved from explicit to implicit.** The deleted guard was `if segs[0] == nativeCloneForge || segs[0] == "gh" { not a shorthand }` — a local, self-describing fact. It is now an inferred consequence of a transcribed server minimum ("2-char names can't be projects"), and the comment at :87-90 concedes the inference breaks for a 3-char forge token. A rule that only holds because of a number copied from another repo is a weaker mechanism than the two-line guard it replaced. `gitremote.IsSupportedForge` (gitremote.go:65) is the near-miss precedent for where a shared token list belongs; `git-remote-entire` already consults it for the same "is this segment a forge?" question.
+
+**Deeper fix, and it is smaller than it sounds:** keep the grammar test as *2 segments + charset + an explicit forge-token guard*, and move lengths, edge characters and the `..` ban into a `validateNativeNames(project, repo) error` that runs **only when the ref declared `et/`** — the one path where its precise message is actually printed. Everything the PR won survives: `/et/paul` still says "(2 names, got 1)", `/et/foo_bar/x` still names the rule it broke, `git@github.com:foo/bar` still falls through to the shapes list — and `paul/.foo` gets its informative 404 back. It also shrinks the drift blast radius (below) from "every native ref" to "`/et/` refs only", which keep two escape hatches.
+
+**Verdict: worth doing now.** The test table is fresh, so re-aiming ~8 rows is cheap. If the team prefers to keep the round-trip saving, the non-negotiable half is restoring the explicit forge-token guard so shorthand disambiguation stops depending on a server length constant.
+
+---
+
+### On the duplication of server name rules (drift)
+
+Duplicating them is defensible in principle but this is the CLI's **only** client-side copy of a server name rule — `repo create` and `project create` do no such validation and let the server reject — so the precedent points the other way, and it lands on a read path rather than the write path where a pre-flight check pays best.
+
+The pinned comment (`entiredb core/resource/project_name.go`) is sufficient for a *reader* of this file and useless as a *change detector*: nobody editing `normalizeName` will ever see it. The drift failure mode is a false local rejection with a confident message naming a rule the server no longer enforces, and there is no telemetry that would surface it. Ranked by cost-effectiveness:
+
+1. **Shrink what's duplicated to what the CLI's own grammar needs (F5).** Removes most of the drifting surface rather than monitoring it.
+2. **A reciprocal one-line comment in entiredb beside `normalizeName`** naming this file. It is the only cheap thing that fires at the moment of change. Do this whether or not F5 lands.
+3. A contract test is not cheaply available — different repo, and the CLI *deliberately* deviates on case (accepts uppercase because both lookups fold), so there is no mechanical equality to assert. Don't pretend otherwise; a generated constant would require the server to publish the rules (OpenAPI or a shared module), which is the only real long-term answer if these rules start churning.
+
+Worth stating in the PR: the drift cost is bounded, because a falsely-rejected ref has two working escape hatches — `&lt;project&gt;/&lt;ULID&gt;` (a ULID passes `nativeRepoRe` and short-circuits in `resolveRepoRef`) and the full `entire://` URL passthrough.</result>
+<usage><subagent_tokens>176698</subagent_tokens><tool_uses>24</tool_uses><duration_ms>357434</duration_ms></usage>
+</task-notification>

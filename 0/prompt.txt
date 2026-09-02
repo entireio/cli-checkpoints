@@ -1,0 +1,147 @@
+/simplify
+
+---
+
+<task-notification>
+<task-id>aa980f2fbdcbfcdfc</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-calm-cloud-bb89/092ca239-b8cd-4642-8364-2a44101becbc/tasks/aa980f2fbdcbfcdfc.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Findings from investigating the diff at `/private/tmp/claude-501/.../scratchpad/review.diff` against existing helpers in the repo:
+
+**1. Streamed git subprocess (question 1) — clean, no duplicate found.**
+No existing helper wraps "run a git subprocess with `Stdin`/`Stdout`/`Stderr` streamed to caller-supplied writers." I checked `cmd/entire/cli/execx/` (only `NonInteractive`/`TerminateOnCancel`/`SpawnDetached` — TTY-detachment and cancellation helpers, not stdio wiring), `cmd/entire/cli/agent/foreground.go`'s `NewForegroundCommand` (closest analog, but it hardcodes `os.Stdout`/`os.Stderr`, deliberately runs on `context.Background()` ignoring the caller's ctx — wrong semantics for a function that must honor `trailBranchPushTimeout`), and `cmd/entire/cli/plugin.go:runPlugin` (inline, plugin-specific, not exported/reusable). `pushBranchToRemote` doesn't set `cmd.Dir`/`-C` (same as the file's sibling functions `fetchBranchFromRemote`, `remoteHasBranch`, `deleteBranchFromRemote`), and it's reached only from the user-invoked `entire trail create` path, so per the CLAUDE.md rule `gitrepo.EnvWithoutRepoOverrides()` is correctly *not* required here.
+
+**2. Pre-push-hook test helper (question 2) — clean, no duplicate found.**
+`integration_test/testenv.go:1923` `(*TestEnv) InstallRealPrePushHook()` is the only existing pre-push-hook installer, but it writes a fixed script that execs the real compiled `entire hooks git pre-push` binary — a different package (`integration_test`, not `cli`) and a different purpose (exercising the production hook) than the new `writeTrailCreatePrePushHook(t, localDir, script string)` in `cmd/entire/cli/trail_cmd_test.go:2769`, which installs an arbitrary caller-supplied script for unit-level accept/reject scenarios. No prior helper in the `cli` package (non-integration `*_test.go`) wrote an arbitrary pre-push hook — this was previously inlined once in the test the diff refactors. The extraction is a legitimate, non-duplicating helper.
+
+**3. `trailBranchPushTimeout` constant (question 3) — clean, no duplicate found.**
+Grepped all `*Timeout`/`time.Minute`/`time.Second` constants in `cmd/entire/cli/`. Nearest neighbors are `browserLoginTimeout = 5*time.Minute` (`login.go:44`, unrelated: browser OAuth flow) and `strategy.checkpointPushBudget = 2*time.Minute` (`push_common.go:156`, a different package/purpose: internal checkpoint-ref batch push+recovery, not the branch-push-plus-OPF-bootstrap scenario this constant documents). No existing constant covers "push + pre-push hook (incl. OPF bootstrap rewrite)."
+
+**4. `gitBranchExistsTrailTest` vs `testutil.BranchExists` (question 4) — pre-existing duplication, not introduced by this diff.**
+`cmd/entire/cli/testutil/testutil.go:226` already has `func BranchExists(t *testing.T, repoDir, branchName string) bool` (opens via `gitrepo.OpenPath`, matches `ref.Name().Short() == branchName`) — same signature shape as the local `gitBranchExistsTrailTest(t, repoDir, branch string) bool` (`trail_cmd_test.go:371`, `git show-ref --verify refs/heads/&lt;branch&gt;`), and `testutil` is already imported in this file. However, `gitBranchExistsTrailTest` predates this diff and is already used by sibling tests in the same file (lines 337-338, 2798), so the new test's two calls (lines 2828-2829) are consistent with existing local convention, not new duplication. Worth a follow-up cleanup (replace the local helper file-wide with `testutil.BranchExists`), but out of scope for this diff — not flagging as a diff-introduced issue.
+
+Overall: no genuine reuse violations introduced by this diff. The one relevant pre-existing duplication (finding 4) is unchanged in scope by this diff and is low priority.</result>
+<usage><subagent_tokens>146068</subagent_tokens><tool_uses>15</tool_uses><duration_ms>135831</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a4efa1966d4043324</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-calm-cloud-bb89/092ca239-b8cd-4642-8364-2a44101becbc/tasks/a4efa1966d4043324.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Reviewed the diff plus surrounding context in `cmd/entire/cli/trail_cmd.go`, `cmd/entire/cli/trail_cmd_test.go`, and cross-checked comment/hint/script-literal conventions elsewhere in the repo. Findings, ranked:
+
+**1. `file: cmd/entire/cli/trail_cmd.go:2458-2459` (doc comment) and `2468-2469` (inline comment) — the same rationale is stated twice.**
+Summary: the doc comment's closing paragraph ("git prints its own diagnostics to the stderr now reaching the user, so the returned error carries the exit status alone rather than a second copy") says exactly what the inline comment 8 lines later says ("git's own message already reached errOut, so this names the command and carries the exit status rather than repeating the diagnostic").
+Cost: same fact documented in two places that will need to be kept in sync if the reasoning ever changes; readers spend time confirming the second copy isn't saying something subtly different.
+Simpler form: drop the doc-comment paragraph (lines 2458-2459) and keep only the inline comment, which sits right at the `return` it explains:
+```go
+// git prints its own diagnostics to the stderr now reaching the user, so the
+// returned error carries the exit status alone rather than a second copy.
+```
+→ delete these two lines from the doc comment; leave the inline comment at line 2468-2469 as the single source of that fact.
+
+**2. `file: cmd/entire/cli/trail_cmd_test.go:2789-2792` — hook script built by escaped string concatenation instead of a raw string literal.**
+Summary: `writeTrailCreatePrePushHook`'s first caller assembles the script as `"#!/bin/sh\n" + "printf '%s\\n' \"$1\" &gt; \"$(git rev-parse --git-dir)/trail-create-pre-push-ran\"\n" + "echo 'hook-said-this' &gt;&amp;2\n"`, needing `\"` and `\\n` escapes throughout.
+Cost: harder to read/edit than the script it produces; the repo's established convention for exactly this case (multi-line shell scripts with embedded double quotes) is a backtick raw string — used in `setup_test.go:168/217`, `explain_test.go:984/2243`, `session_adopt_test.go:1477/1510`, `agent/external/external_test.go` (7 occurrences), `strategy/hooks.go:309`, etc. This call is the outlier.
+Simpler form:
+```go
+writeTrailCreatePrePushHook(t, localDir, `#!/bin/sh
+printf '%s\n' "$1" &gt; "$(git rev-parse --git-dir)/trail-create-pre-push-ran"
+echo 'hook-said-this' &gt;&amp;2
+`)
+```
+The second, simpler caller at line 2817 (`"#!/bin/sh\necho 'refusing this push' &gt;&amp;2\nexit 1\n"`) has no embedded double quotes, so it's minor there, but converting both keeps the two calls visually consistent.
+
+**3. `pushBranchToRemote`'s `out io.Writer` parameter — justified, not flagged as unnecessary.** (point 1 of the brief) `w`/`errW` at the sole call site (`trail_cmd.go:1127`) are `cmd.OutOrStdout()`/`cmd.ErrOrStderr()` — genuinely distinct writers in production, not one derived from the other — and the doc comment correctly identifies a real failure mode (a pre-push hook's own TUI prompt rendering to stdout) that a single shared writer wouldn't fix. One writer would not do here; no simplification recommended. Minor aside: neither new test (`TestPrepareTrailCreateBranchRunsPrePushHook`, `TestPrepareTrailCreateBranchFailsWhenPrePushHookRejects`) has the hook script write to stdout or asserts on `out.String()`, so the `out` path itself is currently unexercised — worth a follow-up test, not a simplification issue.
+
+**4. Error-hint string at `trail_cmd.go:1134` — long line, but not new complexity from this diff.** (point 3 of the brief) The single `fmt.Errorf` with embedded `\n` bullets and repeated `branch, remote` args is the pre-existing, established pattern in this file (same shape at `trail_cmd.go:293,300,722` and `trail_review_cmd.go:522,529`) — the diff only appends a third bullet to an already-two-bullet string, it doesn't introduce the pattern or add new repeated args. Not flagging; it's consistent with house style, if verbose.
+
+**5. `trailBranchPushTimeout` const (`trail_cmd.go:2420-2429`) — appropriately named, not redundant state.** A single-use constant, but the value (10 minutes vs. the previous 2) needs the justification the comment gives (OPF bootstrap cost), so pulling it out of the `context.WithTimeout` call and naming it is clearer than an inline magic number, not added complexity.
+
+**6. Test duplication (`TestPrepareTrailCreateBranchRunsPrePushHook` / `TestPrepareTrailCreateBranchFailsWhenPrePushHookRejects`) — no further collapsing warranted.** (point 5 of the brief) The shared setup was already extracted into `writeTrailCreatePrePushHook`; what's left differs in hook script, branch name, and — more importantly — in assertions (hook-ran marker + stderr passthrough vs. error-hint content + stderr passthrough + branch absence on both remote and local). Table-driving would force those materially different assertions into a shared branch, reducing clarity rather than improving it. Leave as-is.
+
+No other issues found in the diff (the unrelated one-line `contexts_test.go` change is a harmless dead-code removal, not something the diff under review needs to justify).</result>
+<usage><subagent_tokens>132855</subagent_tokens><tool_uses>15</tool_uses><duration_ms>156264</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a885dd3be7271dbcb</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-calm-cloud-bb89/092ca239-b8cd-4642-8364-2a44101becbc/tasks/a885dd3be7271dbcb.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Efficiency review: `trail_cmd.go` push-streaming change
+
+I read the diff, then traced the caller chain for `w`/`errW` from `runTrailCreate` (trail_cmd.go:972-975) through `prepareTrailCreateBranch` to `pushBranchToRemote` (trail_cmd.go:2460), confirmed cobra's `OutOrStdout`/`ErrOrStderr` default resolution in the vendored `spf13/cobra@v1.10.2` source, confirmed Go's `os/exec` `writerDescriptor` behavior in `$GOROOT/src/os/exec/exec.go`, and grepped the whole `cmd/entire` tree for any `SetOut`/`SetErr`/`MultiWriter` that could change the dynamic type reaching the child process.
+
+**Overall result: clean.** The change does not add wasted work on the production path; it's actually structured to hit Go's zero-copy fast path deliberately.
+
+### 1. (Verified, most important) Production `w`/`errW` are `*os.File`, so no extra goroutines/pipes are introduced
+
+- `cmd/entire/cli/trail_cmd.go:974-975`: `w := cmd.OutOrStdout()`; `errW := cmd.ErrOrStderr()` — used unmodified all the way down to `pushBranchToRemote`.
+- Cobra's `getOut`/`getErr` (`command.go:412-430` in `spf13/cobra@v1.10.2`) return `c.outWriter`/`c.errWriter` only if explicitly set on that command or an ancestor, otherwise fall through to the literal `os.Stdout`/`os.Stderr` defaults passed to `OutOrStdout`/`ErrOrStderr` (`command.go:393-405`).
+- I grepped the whole `cmd/entire` tree for `.SetOut(`/`.SetErr(`/`.SetOutput(`/`io.MultiWriter`: the only hit is `cmd/entire/cli/corecmd.go:328-330`, on an unrelated command node, which cannot affect `trail create`'s own writer chain (cobra only walks a command's own parent chain).
+- `trail_cmd.go` itself has no pager/tee wrapping around `w`/`errW` (`grep pager` returns nothing).
+- So in the real binary, `w`/`errW` passed into `cmd.Stdout`/`cmd.Stderr` (`trail_cmd.go:2465-2466`) are dynamically `*os.File`. Go's `writerDescriptor` (`os/exec/exec.go:580-606`) type-asserts for `*os.File` and, when it matches, hands the fd straight to the child (`exec.go:590-592`) — no `os.Pipe`, no `io.Copy` goroutine. This also means the child's stdout/stderr fd is the real terminal, which is exactly the correctness property the doc comment claims (isatty-sensitive pre-push hook rendering, e.g. the OPF bubbletea prompt). **Verified, not inferred** — confirmed by reading both the cobra and exec.go source, not assumed from the doc comment.
+
+### 2. `Cmd.Wait()`'s "wait for copying goroutines" clause is a non-issue here
+
+Go's doc (`os/exec/exec.go:918`): *"If any of c.Stdin, c.Stdout or c.Stderr are not an `*os.File`, Wait also waits for the respective I/O loop..."* Since production `Stdin`/`Stdout`/`Stderr` are all `*os.File` (`os.Stdin` assigned directly, `os.Stdout`/`os.Stderr` per point 1), `cmd.Run()` in `pushBranchToRemote` blocks purely on the child process exiting — no extra goroutine-join tax on a long-running hook. In tests, `out`/`errOut` are `*bytes.Buffer`, which *does* force the pipe+goroutine path, but the hook scripts in both tests exit in milliseconds, so this is negligible test-only cost, not a hot-path or startup concern.
+
+### 3. 10-minute timeout: no unnecessarily-held resource
+
+`trailBranchPushTimeout` (`trail_cmd.go:2429`) and its `context.WithTimeout`/`defer cancel()` (`trail_cmd.go:2461-2462`) are scoped to the single `pushBranchToRemote` call and released immediately after `cmd.Run()` returns. The only thing alive for up to 10 minutes is the `git push` child process itself, which is the intentional blocking work (delivers commits + runs pre-push hooks, possibly an interactive OPF prompt) — not a spurious goroutine, context, or handle left over.
+
+### 4. Tests: no redundant I/O beyond what the assertions need
+
+- `writeTrailCreatePrePushHook` (new helper) removes duplicated hook-install code between the two tests — a net reduction, not an addition.
+- `TestPrepareTrailCreateBranchFailsWhenPrePushHookRejects` calls `gitBranchExistsTrailTest` twice (`originDir` and `localDir`), each spawning one `git show-ref` subprocess — necessary because the assertion is about two different repos (remote didn't get the branch; local cleanup removed it), not a repeated check of the same fact.
+- No repeated file reads or duplicate `git` invocations beyond what each assertion requires.
+
+No findings to fix. If anything is worth a follow-up note (not a defect): the doc comment's guarantees (no extra goroutine, real terminal fd) hold only because nothing between `main.go`/`root.go` and `trail create` calls `cmd.SetOut`/`SetErr`; a future change that wraps stdout (e.g., adding a pager or output tee to the root command) would silently reintroduce the pipe+goroutine path and break the "child sees a real tty" property this diff relies on. Nothing in this diff does that today — flagging only as something to keep in mind if `root.go`/`corecmd.go` output wiring changes later.</result>
+<usage><subagent_tokens>124250</subagent_tokens><tool_uses>19</tool_uses><duration_ms>161957</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a421bec81089e5a75</task-id>
+<tool-use-id>toolu_01AuhnNGNGXFeygvoG24mhvo</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-calm-cloud-bb89/092ca239-b8cd-4642-8364-2a44101becbc/tasks/a421bec81089e5a75.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I've read the diff and traced each of the four questions through the actual code. Here is the altitude review.
+
+## Finding (ranked #1 — the one real issue)
+
+**file**: `cmd/entire/cli/trail_cmd.go:2420-2429` (the `trailBranchPushTimeout` const and its doc comment)
+**summary**: The hardcoded 10-minute ceiling is sized against a mental model of OPF cost ("bounded only by history … the bootstrap walks everything unpushed") that doesn't match how OPF actually runs, and it ignores a real, unbounded, user-configurable setting that determines the true worst case.
+
+Verified: both OPF rewrite paths (`cmd/entire/cli/strategy/manual_commit_opf_rewrite.go:354` and `manual_commit_opf_refs.go:128`, both literally commented "make exactly ONE OPF shell-out for the whole push") make a single shell-out per push, not one per commit — so the wall-clock cost is not driven by "history" the way the comment frames it. It's driven by the single call's configured timeout: `redact/opf.go:28` (`Timeout int // seconds; 0 defaults to 30`) is set from `openai_privacy_filter.timeout_seconds`, which `settings/settings.go:1522` validates only as `&gt;= 0` — there is no upper bound. A user who sets this to, say, 20 minutes (a legitimate, supported config for a slow local classifier) gets a `pushBranchToRemote` that SIGKILLs `git push` at 10 minutes, mid-OPF-rewrite — precisely the failure mode the doc comment says it exists to avoid. Compounding this: I confirmed the pre-push hook itself (`hooks_git_cmd.go`, `newHooksGitPrePushCmd`) runs on an undeadlined context — a plain `git push` typed by a human has no timeout at all, so `entire trail create`'s internal orchestration is the *only* place imposing a ceiling on this operation, and it does so with a number invented independently of the one setting that actually governs the operation's duration.
+
+**Why this is a depth problem, not just a bug**: this is exactly the "special case layered on shared infrastructure where the underlying mechanism should have generalized" pattern — `trailBranchPushTimeout` should be derived from (or validated against) `settings.Load()`'s `openai_privacy_filter.timeout_seconds` plus margin, the way the repo already does elsewhere (`checkpointPushBudget` is at least computed once and shared across sub-steps; `BootstrapTooLargeError`'s limit is read from an env var specifically so operators can raise it when they know their config is slow). Here, nothing connects the two numbers, so the fix is fragile precisely for the users who configured OPF away from its default.
+**Deeper fix**: import `settings` in `trail_cmd.go` (it currently doesn't), read the configured OPF timeout, and size `trailBranchPushTimeout` as `max(fixedFloor, opfTimeout + margin)` — or at minimum note in the comment that the bound assumes default OPF timeout and will truncate a longer configured one.
+
+## The other three questions: altitude is correct, with reasoning
+
+**1. Shared push helper (`setup_github.go` / `checkpoint/remote/git.go` / `trail_cmd.go`)** — verified by grep: `setup_github.go:1055` and `checkpoint/remote/git.go:434` both use `--no-verify` for load-bearing, already-documented reasons (first push of a fresh repo; the checkpoint push itself, where running the hook would recurse). `pushBranchToRemote` is the *only* production call site that needs "real push, streaming, hook-running" semantics. A shared helper would have exactly one caller today, generalizing nothing — correct to keep this as a one-off, matching the repo's stated preference for one-off fixes over premature abstraction.
+
+**2. `out`/`errOut` writer threading** — verified: `prepareTrailCreateBranch` already took `w, errW io.Writer` before this diff, and every sibling function in the file (`runTrailShow`, `runTrailListAll`, `runTrailUpdate`, `runTrailCheckout`) follows the same `w, errW io.Writer` parameter convention. There's also existing precedent for threading those writers straight into a subprocess's `Stdout`/`Stderr` (`plugin_gitremote.go:136`). The diff adds no new plumbing — it reuses the file's established convention rather than reaching for `os.Stdout`/`os.Stderr` directly (which would break the tests that already assert on `bytes.Buffer` output) or inventing a new `gitPush` type for a single call site. Correct depth.
+
+**3. The error hint bullet** — verified: the `hint: ...` bullet-list pattern embedded directly in `fmt.Errorf` is the established idiom throughout this file and `trail_review_cmd.go` (e.g. `trail_cmd.go:293`, `:300`, `:722`) for *every* kind of user-facing trail error, not something invented for this change. True classification (a typed sentinel like `V1DivergedError`) isn't practically available here anyway: those sentinels live in the `strategy` package and are produced inside the pre-push *hook*, a separate OS process invoked by git — `pushBranchToRemote` only ever sees that subprocess's exit code and already-streamed stderr text, not a Go error value. Classifying by sniffing hook stderr would be the fragile move; pointing at the already-streamed output ("see its output above") and offloading diagnosis to the human is consistent with the design's own stated reasoning ("git's own message already reached errOut … the returned error carries the exit status alone"). Correct depth — `SilentError` is orthogonal here (it only controls whether Cobra double-prints), not a classification mechanism this case is missing.
+
+**Files touched, for reference**: `cmd/entire/cli/trail_cmd.go`, `cmd/entire/cli/trail_cmd_test.go`. Unrelated to this feature: `internal/entireclient/contexts/contexts_test.go` has a one-line dead-code removal (`return` after `t.Fatal`) bundled into the same diff — harmless and out of scope for this altitude review, but worth flagging to the author as a stray inclusion if they want a clean diff.</result>
+<usage><subagent_tokens>151834</subagent_tokens><tool_uses>34</tool_uses><duration_ms>265057</duration_ms></usage>
+</task-notification>

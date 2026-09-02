@@ -1,0 +1,354 @@
+<cross-session-message from="uds:/tmp/cc-socks/77882.sock" from-name="worktree-brave-harbor-f520-8a" from-mode="prompting">
+Handoff from the triage session. Soph will write the PR themselves; this is the context so it isn't re-derived.
+
+## The defect
+
+`PushQueuedCheckpointRefs` (`cmd/entire/cli/strategy/manual_commit_push.go:428`) flushes the checkpoint-ref push queue with no OPF (OpenAI Privacy Filter) gate. Its only production caller is the migration command's opt-in push (`cmd/entire/cli/doctor_migrate.go:100`), so with `redaction.openai_privacy_filter.enabled` set, answering yes to the "Push N migrated checkpoint ref(s) now?" prompt sends 8-layer content to the remote, untagged.
+
+The pre-push path a few lines above does gate it:
+
+```go
+// prePushCheckpointRefs, manual_commit_push.go:399
+if redact.OPFEnabled() && !runOPFForCheckpointRefs(ctx, repo) {
+    return nil
+}
+```
+
+`PushQueuedCheckpointRefs` goes straight from the checkpoint-policy check to `flushCheckpointRefsQueue`, and that function has no OPF or redaction call of its own, so nothing downstream compensates.
+
+## Why it matters, stated precisely
+
+Un-OPF'd content reaching the remote is not itself the bug. `runOPFForCheckpointRefs` (`manual_commit_push.go:239`) has three outcomes: `OPFRun` rewrites, `OPFAbort` withholds, and `OPFSkip` deliberately flushes 8-layer content as-is and untagged when the user opts out for that push. The bug is that this path hard-codes the skip outcome without the decision ever being resolved or surfaced. A user who enabled OPF and never chose to skip gets the skip anyway.
+
+The two answers to one prompt have opposite safety:
+- No: "Refs stay queued for the next push", and the next `git push` goes through `prePushCheckpointRefs`, which applies OPF.
+- Yes: they go now, without it.
+
+## Scope
+
+- git-refs checkpoint backend only. The `entire/checkpoints/v1` branch has its own OPF rewrite at pre-push and is unaffected.
+- Needs `redaction.openai_privacy_filter.enabled` plus an interactive confirmation, so not unprompted. But the prompt says nothing about redaction, so there is nothing for the user to notice.
+- Pre-existing. Not introduced by any currently open PR. Found while security-reviewing #2211, which is unrelated to it.
+
+## Verified vs not
+
+Verified by reading current `origin/main`: the gate exists at `:399` and is absent at `:428`; `flushCheckpointRefsQueue` contains no OPF/redact reference; `doctor_migrate.go:100` is the sole production caller; the four existing tests (`strategy/refs_push_test.go:208,230,258,285`) cover push-disabled, policy-blocked, and failure-leaves-refs-queued, none cover OPF.
+
+NOT verified: no end-to-end run was done proving un-redacted bytes land on a remote. Worth doing before the PR claims it.
+
+## Suggested fix, and a caveat about it
+
+Give `PushQueuedCheckpointRefs` the same gate as `prePushCheckpointRefs`, but keep the asymmetry in what failing closed means: the pre-push path must never block the user's `git push`, so it withholds the flush and returns nil; this path is an explicitly requested push and can return an error with the refs left queued, matching how it already handles a blocking checkpoint policy. Plus a test that enables OPF and asserts the flush is withheld when the rewrite fails.
+
+Caveat worth taking seriously: in a recent issue (#2197) the triage session prescribed a fix that turned out to be unsafe, and a contributor implemented it faithfully before anyone caught it. Treat the paragraph above as a starting hypothesis to check against the code, not a spec. In particular confirm that returning an error here cannot break `doctor_migrate.go`'s own error handling at `:100-115`.
+
+Constraints: do not post to GitHub, do not push. Do not use `git stash` (shared stack across worktrees). Work in your own worktree.
+</cross-session-message>
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>ab7158bef02c59cc2</task-id>
+<tool-use-id>toolu_01G2QKZP5oK7xztE6NPB9Pte</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-calm-harbor-6f61/85ecab7e-d8bc-41ca-8ea8-ba1e4be837da/tasks/ab7158bef02c59cc2.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Read the diff and the surrounding code. Findings, ranked by reduction:
+
+**1. `manual_commit_push.go:406-411, 454-458` — fold `redact.OPFEnabled()` into the gate; both call sites collapse to one `if`.**
+The nested `if OPFEnabled { if err := gate(); err != nil {…} }` now appears twice. `opfGateForCheckpointRefs` must not be called with OPF off (it would reach `resolveOPFDecisionForPrePush` and can prompt), so move the check inside — it is then impossible for a caller to forget, which is exactly what the doc's "every path that flushes the queue must pass through here" is asking for. Nothing is lost at the call site: the fast path is still one bool read, and the function name says what it gates on.
+
+```go
+func opfGateForCheckpointRefs(ctx context.Context, repo *git.Repository) error {
+	if !redact.OPFEnabled() {
+		return nil
+	}
+	decision, err := opfPrePushDecision(ctx)
+	…
+```
+```go
+// prePushCheckpointRefs
+if opfErr := opfGateForCheckpointRefs(ctx, repo); opfErr != nil {
+	warnOPFCheckpointRefsWithheld(ctx, opfErr)
+	return nil
+}
+// PushQueuedCheckpointRefs
+if opfErr := opfGateForCheckpointRefs(ctx, repo); opfErr != nil {
+	return 0, false, fmt.Errorf("OPF did not run, so checkpoint refs stay queued: %w", opfErr)
+}
+```
+(`redact` stays imported — the v1 path at :139 still uses it.)
+
+**2. `manual_commit_push.go:448-453` — delete the entire 6-line call-site comment.**
+Every clause is already stated elsewhere in the diff: "reporting belongs to the caller / pre-push warns, explicit push surfaces" is the gate's own doc paragraph (:246-248), "errors with the refs left queued" is the updated `PushQueuedCheckpointRefs` doc (:435-437), and "OPF did not run, so checkpoint refs stay queued" is the error string on the next line. Delete :448-453 outright; the doc-comment edit above it is the keeper.
+
+**3. `manual_commit_push.go:243-244` — cut the history sentence from the gate's doc.**
+Delete "That is the shape the migration command's opt-in push had before this was shared." — it narrates the change, not the code, and the sentence before it already states the invariant. Keep the rest of that paragraph ("Every path that flushes the queue must pass through here… having never asked") and paragraph 3; those are load-bearing.
+
+**4. `refs_push_test.go:350-355, 397` — drop the hash round-trip and the redundant `NotEmpty`.**
+`remoteRefHash` already ends in `require.NotEmpty(t, fields, "ref %s not found on remote", ref)`, so :352 re-asserts what the previous line required. And `git log -1 --format=%B` takes the full ref name directly, so the hash hop is unnecessary — presence is still asserted by `remoteCommitMessage`'s own `require.NoError`. Replace the loop body with:
+
+```go
+for _, ref := range refs {
+	assert.True(t, trailers.HasOPFApplied(remoteCommitMessage(t, bareDir, ref.String())),
+		"content reaching the remote must be OPF-applied, not 8-layer-only")
+}
+```
+and rename `remoteCommitMessage`'s `hash string` param to `rev string`.
+
+**5. `refs_push_test.go:348` — delete `assert.Equal(t, 1, fake.batchCallCount(), "exactly one OPF invocation for the whole flush")`.**
+Batching is already pinned by `TestRewriteQueuedCheckpointRefsWithOPF_RewritesThenIsIdempotent` (`manual_commit_opf_rewrite_test.go:941`, same message). This test's subject is whether the gate runs at all, which the trailer assertion proves. Minor companion: `assert.False(t, pushDisabled)` at :380 can become `_` for the `pushDisabled` return, matching the neighbouring `TestPushQueuedCheckpointRefs_PolicyBlocked`.
+
+**6. `refs_push_test.go:363-366` — trim the failure test's doc comment to its first sentence.**
+"Unlike the pre-push path — which withholds silently … surfaced as an error with the refs left queued" is the fourth statement of the same contrast (gate doc :246-248, `PushQueuedCheckpointRefs` doc :435-437, call-site comment :448-453). Keep only: "…is the fail-closed half: when OPF is enabled but the rewrite cannot run, nothing may reach the remote." Same treatment for :330-331 in the success test — "Without the gate the 8-layer commits were pushed verbatim and untagged" is past-tense history the first sentence already covers.
+
+**7. `refs_push_test.go:387-393` — the ls-remote block is a verbatim copy of `TestPushQueuedCheckpointRefs_PolicyBlocked:277-283`.**
+Extract once and call from both (net −6 lines), keeping the property the security gate deserves:
+
+```go
+// assertRefsAbsentFromRemote fails if any ref reached the bare remote.
+func assertRefsAbsentFromRemote(t *testing.T, bareDir string, refs []plumbing.ReferenceName, msg string) {
+	t.Helper()
+	lsCmd := exec.CommandContext(context.Background(), "git", "ls-remote", bareDir)
+	lsCmd.Env = testutil.GitIsolatedEnv()
+	out, err := lsCmd.CombinedOutput()
+	require.NoError(t, err, "ls-remote failed: %s", out)
+	for _, ref := range refs {
+		assert.NotContains(t, string(out), ref.String(), msg)
+	}
+}
+```
+
+No dead code was left behind — `runOPFForCheckpointRefs` has no remaining references, and `warnOPFCheckpointRefsWithheld` / `errOPFAbortedByUser` are both still used.</result>
+<usage><subagent_tokens>143894</subagent_tokens><tool_uses>20</tool_uses><duration_ms>186219</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a053ba18d25ed95ad</task-id>
+<tool-use-id>toolu_015nrWyq88HvrvWSSCdPKHMp</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-calm-harbor-6f61/85ecab7e-d8bc-41ca-8ea8-ba1e4be837da/tasks/a053ba18d25ed95ad.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Read the diff, both touched files, the sibling OPF test file, and `cmd/entire/cli/testutil`. Four reuse findings, ranked.
+
+## 1. `remoteCommitMessage` re-implements `testutil.RunGit` — and the shell-out isn't needed at all
+
+**File:** `cmd/entire/cli/strategy/refs_push_test.go:396-404` (new helper)
+
+The 9-line helper hand-rolls `exec.CommandContext` + `testutil.GitIsolatedEnv()` + `CombinedOutput` + `require.NoError`. That is exactly `testutil.RunGit`:
+
+```go
+// cmd/entire/cli/testutil/testutil.go:181
+func RunGit(t *testing.T, dir string, args ...string) string
+```
+
+Its body (`gitenv.Run`, `cmd/entire/cli/testutil/gitenv/gitenv.go:153-163`) sets `cmd.Dir`, `cmd.Env = Isolated()`, runs `CombinedOutput`, and `t.Fatalf`s on error — byte-for-byte the same behaviour. The whole helper collapses to one line:
+
+```go
+return testutil.RunGit(t, bareDir, "log", "-1", "--format=%B", hash)
+```
+
+`RunGit` is already imported and used twice in this same file (lines 56, 135).
+
+Better still: drop the shell-out. Every other OPF-trailer assertion in the package reads the commit through go-git — `repo.CommitObject(h)` then `trailers.HasOPFApplied(commit.Message)` (`manual_commit_opf_rewrite_test.go:946-948`) — and opening the bare remote with `git.PlainOpen(bareDir)` and calling `bareRepo.Reference(...)` is the established in-package pattern (`push_common_test.go:179-182`). Doing that also removes the second `ls-remote` round trip the new test makes via `remoteRefHash` just to get a hash to feed back to `git log`.
+
+## 2. The two new tests hand-roll a setup `setupGitRefsOPFRepo` already provides
+
+**File:** `cmd/entire/cli/strategy/refs_push_test.go:333-342` and `367-376`
+
+Both tests repeat a 5-statement preamble: `setupRepoWithCheckpointRefs` → `t.Chdir` → `paths.ClearWorktreeRootCache()` → `git.PlainOpen` → `enqueueRefs`. The OPF half of the package already has a single-call equivalent:
+
+```go
+// cmd/entire/cli/strategy/manual_commit_opf_rewrite_test.go:826
+func setupGitRefsOPFRepo(t *testing.T, cpIDs ...string) (bareDir string, repo *git.Repository, refs []plumbing.ReferenceName)
+```
+
+It does init+commit, the git-refs backend setting, a bare origin, the `origin` remote, `t.Chdir`, `paths.ClearWorktreeRootCache()` **plus the `t.Cleanup` the new tests omit** (line 846), and queues every ref by doing a real backend write. It is what `TestRewriteQueuedCheckpointRefsWithOPF_*` and `TestPrePushCheckpointRefs_OPF*` (lines 932, 959, 973) all use. `PushQueuedCheckpointRefs(ctx, repo, bareDir)` takes the target as a plain string, so the returned `bareDir` drops straight in.
+
+Concrete cost beyond the ~10 duplicated lines: `setupRepoWithCheckpointRefs` points the refs at a plain `README.md` commit, so the new "OPF applied" test can only assert the trailer. `setupGitRefsOPFRepo` writes sessions containing the `PERSONABC` sentinel the fake redacts, which is how the sibling test also asserts the content was actually scrubbed (`require.NotContains(treeContents(...), "PERSONABC")`, line 949).
+
+The one thing it doesn't return is the `*checkpoint.PushQueue` handle. That is already solved too:
+
+```go
+// cmd/entire/cli/strategy/manual_commit_opf_rewrite_test.go:923
+func queuedRefs(t *testing.T, repo *git.Repository) []plumbing.ReferenceName
+```
+
+Non-destructive (`Peek`), and it is what `TestPrePushCheckpointRefs_OPFDisabledFlushesUnchanged:1004` uses for the identical "pushed refs leave the queue" assertion — replacing the `queue.Drain()` pair in both new tests.
+
+## 3. The inline `ls-remote` + `NotContains` block is the third verbatim copy in the package
+
+**File:** `cmd/entire/cli/strategy/refs_push_test.go:387-393`
+
+Identical to `refs_push_test.go:277-283` (same file, 110 lines up, differing only in the `lsErr` variable name and the assert message), and a near-copy of `manual_commit_opf_rewrite_test.go:987-991`. It sits below the `dupl` threshold, so nothing will flag it.
+
+There is no existing named "assert refs absent from remote" helper — I checked. But `testutil.RunGit` (`testutil.go:181`, signature above) already replaces four of the five lines:
+
+```go
+out := testutil.RunGit(t, bareDir, "ls-remote", bareDir)
+for _, ref := range refs {
+    assert.NotContains(t, out, ref.String(), "withheld push must not reach the remote")
+}
+```
+
+The right move is to extract one `assertRefsAbsentFromRemote(t, bareDir, refs...)` next to the existing `remoteRefHash`/`remoteRefFiles` helpers (`refs_push_test.go:305-325`) and point all three call sites at it.
+
+## 4. Production side: the withheld-push sentence now exists twice in one file
+
+**File:** `cmd/entire/cli/strategy/manual_commit_push.go:452-454` (new)
+
+```go
+return 0, false, fmt.Errorf("OPF did not run, so checkpoint refs stay queued: %w", opfErr)
+```
+
+duplicates the user-facing wording already in `warnOPFCheckpointRefsWithheld`, 165 lines earlier in the same file:
+
+```go
+// manual_commit_push.go:281-282
+"[entire] OPF did not run, so checkpoint refs were not pushed and stay queued for your next push: %v\n"
+```
+
+Same condition, two hand-maintained phrasings of the same sentence — the exact drift the refactor was meant to avoid on the decision side. I found no reusable sentinel or constructor: `warnOPFCheckpointRefsWithheld` prints and returns nothing, and there is no `ErrOPFCheckpointRefsWithheld`. So this needs a small new shared piece (a message const, or an `opfCheckpointRefsWithheldErr(err) error` that the warn function formats), not a call to something existing. Lowest-value finding of the four; flagging it because the diff is what created the second copy.
+
+## Correctly reused, no finding
+
+The new tests reuse `configureFakeOPF` / `fakeOPFForRewrite` / `fakeRuntimeAlwaysFails` / `batchCallCount` (`manual_commit_opf_rewrite_test.go:34-107`) and `enqueueRefs` (`refs_push_test.go:199`) rather than building new fakes — that part is clean. No duplication found on the `opfGateForCheckpointRefs` refactor itself.</result>
+<usage><subagent_tokens>148671</subagent_tokens><tool_uses>20</tool_uses><duration_ms>205608</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a83ffd6aaeee3389f</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-calm-harbor-6f61/85ecab7e-d8bc-41ca-8ea8-ba1e4be837da/tasks/a83ffd6aaeee3389f.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Efficiency-only review of the diff. Four findings, ranked. The headline: **the pre-push hot path costs exactly the same as before**; everything I found is on the migrate path or in tests.
+
+---
+
+**1. (Medium) Queue resolve + ref partition now run twice on the migrate path — the caller with the largest N**
+`/Users/soph/.herdr/worktrees/cli/worktree-calm-harbor-6f61/cmd/entire/cli/strategy/manual_commit_push.go:454-458` (new gate) feeding `manual_commit_opf_refs.go:36-84` and then `manual_commit_push.go:476-492`.
+
+With OPF enabled, one flush now does the queue work twice and the ref lookups three times, over the identical ref set:
+
+| work | `RewriteQueuedCheckpointRefsWithOPF` | `flushCheckpointRefsQueue` |
+| --- | --- | --- |
+| `checkpoint.PushQueueForRepo` | yes (`opf_refs.go:36`) | yes (`push.go:477`) — cheap, `resolveGitCommonDir` is memoized |
+| queue file lock + read + parse | `Peek()` (`opf_refs.go:41`) | `Drain()` (`push.go:481`) |
+| `partitionLocalRefs` → N × `repo.Reference` | `opf_refs.go:84` | `push.go:492` |
+| a further N × `repo.Reference(name, true)` | `opf_refs.go:86-92` | — |
+
+Concrete cost per flush of N queued refs: **2 flock+read cycles instead of 1, and 3N `repo.Reference` calls where N would do.** On a reftable repo that is not a file read — `gitrepo.reftableStorer.Reference` (`gitrepo/reftable.go:259-292`) spawns up to two git subprocesses per lookup with no cache, so **6N subprocesses instead of 2N**. For a migration backfill of 200 refs that is ~800 wasted spawns.
+
+Magnitude honesty: the duplication is **pre-existing** on the pre-push path — `runOPFForCheckpointRefs` already did all of it — so the diff introduces no new work per push there. What the diff does is land the same pattern on `doctor migrate`'s "push now" (`doctor_migrate.go:100`), which is precisely the largest-N caller, since it fires right after migrating every historical checkpoint (`len(result.Migrated)`).
+
+Cheaper alternative: `opfGateForCheckpointRefs` already computes `existing` inside the rewrite. Resolve the queue and partition **once** in the two callers and pass `(queue, existing, stale)` into both the rewrite and `flushCheckpointRefsQueue` (which would take them instead of calling `PushQueueForRepo`/`Drain`/`partitionLocalRefs` itself). That drops one flock+read and 2N ref lookups per flush. Second-best, cheap and local: have `partitionLocalRefs` return the resolved `*plumbing.Reference` values it already fetched, killing the redundant lookup at `opf_refs.go:86`.
+
+**2. (Low — do not fix) `PushQueuedCheckpointRefs` now loads settings twice**
+`manual_commit_push.go:440` (`resolvePushSettings` → `settings.Load`) and `:455` → `opfGateForCheckpointRefs` → `opfPrePushDecision` → `settings.Load` (`:227`).
+
+Delta is **+1 `settings.Load` per invocation, and only when `redact.OPFEnabled()`**. `settings.Load` is genuinely uncached, but the expensive parts underneath it are all memoized by the time the second call runs: `paths.WorktreeRoot` (`paths/paths.go:87-92`), `gitdir.CommonDir` (`gitdir/gitdir.go:69-75`), and the tracked-file probe (`settings/opf_command_trust.go:206-222`). So the second load is ~3 small `readConfined` reads plus a JSON parse and merge — **no subprocess** — on a once-per-command, TTY-gated path (`doctor_migrate.go:80-100`) that is about to spawn a network `git push`. Tens of microseconds against seconds.
+
+For the pre-push path the delta is **zero**: `runOPFForCheckpointRefs` already called `opfPrePushDecision`, so pre-push still does exactly 2 loads (one in `prePush`'s `resolvePushSettings`, one in the gate).
+
+The cheaper alternative exists but is not worth it: thread the loaded settings through by adding `opfCfg *settings.OPFSettings` to `pushSettings` (which `resolvePushSettings` currently loads and discards) and giving `opfGateForCheckpointRefs` a settings parameter. That widens a struct and a shared signature to save three file reads on a path that runs once per migration. Leave it.
+
+**3. (Informational) No new blocking work on the pre-push hook**
+`manual_commit_push.go:406-410`. The rewrite of `runOPFForCheckpointRefs` → `opfGateForCheckpointRefs` is strictly a bool→error signature change; the same `opfPrePushDecision` and the same `RewriteQueuedCheckpointRefsWithOPF` run in the same order, and `warnOPFCheckpointRefsWithheld` simply moved from callee to caller. When OPF is off, both call sites are still short-circuited by the cheap global read `redact.OPFEnabled()`. Nothing to flag — recording it because it was the specific risk asked about.
+
+**4. (Low — negligible) Two subprocesses per ref in the new test loop**
+`refs_push_test.go:350-354`. Each iteration spawns `git ls-remote` (`remoteRefHash`, `:315`) plus `git log -1 --format=%B` (`remoteCommitMessage`, new at `:391`) — 4 subprocesses for the fixture's 2 refs, growing 2× per ref.
+
+Cheaper alternative: one `git -C &lt;bare&gt; for-each-ref --format='%(refname)%0a%(contents)' refs/entire/` returns every ref name *and* its full commit message in a single spawn, so the whole loop becomes one substring assertion per ref against one captured output. (Alternatively, mirror the sibling test at `:380-386`, which correctly hoists a single bare `git ls-remote` out of its loop, then batch the messages with one `git log --no-walk --format=%B &lt;h1&gt; &lt;h2&gt;`.)
+
+Magnitude: the test already spawns roughly a dozen git processes in `setupRepoWithCheckpointRefs` plus the real push, so this saves ~2 spawns out of ~15 — call it noise. Worth doing only if `remoteCommitMessage` is touched again; not worth a round trip on its own.
+
+---
+
+Nothing else in the diff adds work: both new gates are behind `redact.OPFEnabled()`, so an OPF-disabled repo pays nothing on either path, and both `Peek` and the rewrite return immediately on an empty queue.</result>
+<usage><subagent_tokens>159115</subagent_tokens><tool_uses>33</tool_uses><duration_ms>234183</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a34097421b1dc4945</task-id>
+<tool-use-id>toolu_01MrT6QfiPfo5PjgoK9uy5Dp</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-calm-harbor-6f61/85ecab7e-d8bc-41ca-8ea8-ba1e4be837da/tasks/a34097421b1dc4945.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Altitude review: OPF gate for the checkpoint-ref push queue
+
+**Verdict: the fix is correct but one level too shallow.** It closes the specific hole and it correctly extracts the shared gate, so it is not a bandaid in the "papered over" sense. But it leaves the invariant ("nothing un-OPF'd leaves the queue") as a *convention two callers must remember* rather than a property of the code that owns the queue — and the one-level-deeper version is cheap, feasible, and fixes a second defect for free.
+
+---
+
+### 1. `manual_commit_push.go:406-411, 454-458` — the gate is at both call sites of `flushCheckpointRefsQueue`, not inside it; move it inside with a required failure-policy argument
+
+`flushCheckpointRefsQueue` (line 476) already takes exactly what the gate needs — `(ctx, repo, ps)`, with `repo` used on the very next line — so moving the gate to the top of that function is a no-op signature-wise. The only real objection is the one the diff's own comments raise: the two callers need opposite failure behaviour. That is an argument for a **parameter**, not for two call-site checks.
+
+**Recommendation:** `flushCheckpointRefsQueue(ctx, repo, ps, opfPolicy)` where `opfPolicy` is an unexported enum with two values (`opfWithholdQuietly` for pre-push, `opfSurfaceError` for the migrate path). The gate runs inside; on failure the function either warns via `warnOPFCheckpointRefsWithheld` and returns `(0, nil)`, or returns `(0, wrappedErr)`. A future third caller **cannot compile** without stating its policy, which is strictly stronger than any comment or guard test.
+
+Two behavioural deltas to accept deliberately, both benign:
+- Pre-push currently returns early on withhold and so skips `cleanupPushedShadowBranches` (line 426). Inside-flush, cleanup would run — harmless, since it only deletes shadow branches for refs already delivered.
+- `pendingCapture` is already keyed on `flushed &gt; 0` (line 416), so a withheld flush returning `0` naturally declines to move the election. No change needed.
+
+**Tradeoff:** `flushCheckpointRefsQueue` gains one knob and a `redact` dependency it does not have today. In exchange, the queue's own function owns its egress invariant instead of two (later N) callers.
+
+---
+
+### 2. `manual_commit_push.go:454` — the gate resolves the OPF *decision* above the empty-queue check, so the diff propagates a prompt-with-nothing-to-push into a new, interactive command
+
+`opfGateForCheckpointRefs` calls `opfPrePushDecision` → `askOPFPrompt` (a `huh` form) **before** anything knows whether the queue has entries; `flushCheckpointRefsQueue` returns `0` on an empty queue (line 485), and `RewriteQueuedCheckpointRefsWithOPF` peeks and returns nil (opf_refs.go:45). `doctor_migrate.go:110` gates the whole push-now path on `CanPromptInteractively()`, so a TTY is guaranteed there — meaning with OPF enabled and no persisted `prompt_default`, the user is now asked *"Run OpenAI Privacy Filter on these checkpoints? Adds ~30s"*, answers yes, and gets `"No queued refs to push (they may have already been pushed)."` — the exact race `doctor_migrate.go:113-115` documents. On the pre-push side the same misplacement prints the `→ OpenAI Privacy Filter: scanning… (~30s)` line on every non-TTY push with an empty queue.
+
+This is the concrete payoff of finding 1, not a separate fix: put the gate after `flushCheckpointRefsQueue`'s `len(queued) == 0` / `len(existing) == 0` early returns (lines 485, 499) and the class disappears for both callers at once.
+
+**One tension to resolve explicitly, not silently:** `OPFNoCategoriesError`'s doc (opf_rewrite.go:~230) states the v1 decision gate runs "with no knowledge of whether anything is unpushed, so a misconfigured repo aborts every push — including one with nothing to rewrite." Moving the decision below the empty check gives up that for the refs backend. **Take that trade** — a push that ships nothing cannot ship unscanned content, and the fail-closed no-categories check is already independently enforced inside the rewrite at `opf_refs.go:52`. Say so in the doc rather than leaving the two backends' stated rationales contradicting each other.
+
+---
+
+### 3. `push_common.go:58` and `:168` — a genuine cross-backend chokepoint exists, and the invariant worth enforcing there is a *postcondition on the trailer*, not "was the gate called"
+
+Both backends converge: git-refs goes `flushCheckpointRefsQueue` → `batchPushRefs` (push_common.go:58); git-branch goes `prePush` → `pushRefIfNeeded` → `doPushRef` → `tryPushRefCommon` (push_common.go:168, 364) → `remote.Push`. Both bottom out in `checkpoint/remote.PushWithOptions` (git.go:428). So the egress is single, but `PushWithOptions` is the wrong altitude for the check: it has no repo handle, no notion of the decision, and it also carries the checkpoint-*policy* ref, which is not checkpoint content. `push_common.go` is the right one — both functions live in that one file and are the only two ways checkpoint content leaves.
+
+The check that belongs there is not "did someone call a gate" but the property the gate is supposed to produce, which the data already self-describes: every commit OPF has processed carries `Entire-OPF-Applied: true`, and `trailers.HasOPFApplied` already serves as the watermark in `unappliedAncestry` (opf_refs.go:192). So: `assertOPFAppliedIfRequired(ctx, repo, refs)` — when `redact.OPFEnabled()` and this process did not record an explicit `OPFSkip`, refuse to push a checkpoint ref whose tip lacks the trailer. One commit-object read per ref, negligible next to a network round-trip, and backend-agnostic by construction.
+
+**Recommendation:** do finding 1 now (small, closes the refs backend); file the egress assertion as the follow-up that closes it for both. **Tradeoff:** the assertion needs a memoized per-process decision so an intentional `OPFSkip` is distinguishable from a missing gate — that plumbing is the real cost, and it is why this is a follow-up and not a blocker on this diff.
+
+Note the asymmetry the diff creates in the meantime: the refs backend now has a named, documented gate whose comment says *"Every path that flushes the queue must pass through here"*, while the v1 backend's identical logic is still 35 lines inline in `prePush` (lines 139-174). Either extract the symmetric `opfGateForV1` or say in the doc that v1 keeps its own copy — as written, a reader can reasonably read `opfGateForCheckpointRefs` as *the* OPF gate.
+
+---
+
+### 4. `manual_commit_push.go:246-248` — the asymmetric failure behaviour lives in prose in a doc comment, one level away from the two branches that implement it
+
+The gate's doc says *"Reporting belongs to the caller: the pre-push hook warns and carries on… while an explicitly requested push surfaces the error instead."* Nothing in any signature or type says that. A future reader has to hold three files open — the gate's doc (246), the pre-push caller's `return nil` (409), and the migrate caller's `fmt.Errorf` (456) — and reconstruct that the difference is intended rather than an oversight. That is precisely the reconstruction the original bug represents: someone read `PushQueuedCheckpointRefs` and did not reconstruct that a gate was owed at all.
+
+**Recommendation:** name the two behaviours as the policy values from finding 1 (`opfWithholdQuietly` / `opfSurfaceError`), each with a one-line doc carrying the *reason* ("a checkpoint failure must never block the user's git push" / "this push was explicitly requested"). The asymmetry then appears at the call site as a word the reader can look up, and the prose in the gate's doc shrinks to a pointer. **Tradeoff:** two more identifiers; in exchange the invariant and its two sanctioned failure directions are stated once, in the type, where they cannot drift apart.
+
+---
+
+### 5. Guard test: **not warranted here** — the repo's guard-test precedent exists for constraints the type system cannot express, and this one it can
+
+`TestGitStatusCallSitesPassNoOptionalLocks` (gitrepo/gitstatus_guard_test.go), `TestRootBasesAreTrusted` (osroot/rootbase_guard_test.go), and `TestEntireDirCheckExemptions` all guard things a signature cannot: a string flag buried in a variadic argv, an allowlist of files permitted to call a constructor, a set of annotations. A "did you call the gate" grep-guard for `flushCheckpointRefsQueue` would be strictly weaker than the required parameter in finding 1 — it fails after the fact instead of at compile time, it needs its own staleness detector (the `checked == 0` bail-out), and it would be defeated by any caller that wraps the flush in a helper.
+
+If a source-level guard is wanted anyway, the practical shape is not "callers pass through the gate" but the finding-3 property expressed as a **behavioural** test in `refs_push_test.go`, alongside the two the diff already adds: a table over every exported entry point that can push checkpoint content (`PrePush`, `PrePushFromGitHook`, `PushQueuedCheckpointRefs`) asserting that with OPF enabled and a failing OPF the remote receives nothing, and with a working OPF everything on the remote carries the trailer. Adding an entry point without a row is visible in review in a way an omitted call-site check is not; and unlike a grep-guard it survives refactoring the internals. **Tradeoff:** it costs a real git fixture per row (the diff's two new tests already pay that), versus a grep-guard's near-zero runtime and near-zero value here.
+
+---
+
+### What the diff gets right, so it is not re-litigated
+
+The extraction itself is the correct decomposition: error-returning gate, reporting owned by the caller, `OPFSkip` deliberately falling through with the "not the same as a missing gate" distinction spelled out (lines 240-244) — that comment names the actual bug class rather than restating the code. The two new tests test the *observable property* (what reached the bare remote, what stayed queued) rather than that a function was called, which is why they will survive the deeper refactor above unchanged.</result>
+<usage><subagent_tokens>156038</subagent_tokens><tool_uses>22</tool_uses><duration_ms>232842</duration_ms></usage>
+</task-notification>

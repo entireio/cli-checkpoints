@@ -1,0 +1,22 @@
+ok, cann you review 2211 again, also with these findings again:
+
+1. exec.CommandContext's default cancel is SIGKILL, and the transaction is held prepared across a full git symbolic-ref fork. I reproduced against git 2.55.0: SIGKILL in that window leaves .git/refs/<name>.lock behind and every later writer — including plain git update-ref — fails with cannot lock ref … File exists. Git has no stale-lock recovery for ref locks. Closing stdin instead exits 0 and cleans up. Since the root ctx cancels on SIGINT/SIGTERM, Ctrl-C during a pre-push OPF rewrite persistently wedges the checkpoint ref. The repo already has procutil.TerminateOnCancel and execx for exactly this.
+2. The new 2 s persistentRefCASLockWait doesn't delay the push — it aborts it. manual_commit_push.go:164 returns the rewrite error straight out of the pre-push hook, and the resulting DeadlineExceeded is classified by nothing and retried by nothing. The constant's own comment names "another writer's potentially expensive checkpoint build" as the expected holder, so it fires in precisely the scenario it was written for. Before this PR the push waited and succeeded.
+
+Also worth the author's attention: flock.AcquireContext silently changed from deadline-gated kernel blocking to cancelability-gated 25 ms LOCK_NB polling, which affects every CLI caller including turn-end condensation — the opposite of what the comment it deletes documented. No commit message mentions it.
+
+---
+
+please post short and condenses comments to the PR, and we should aim to get 2211 in first?
+
+---
+
+can yxou close / resolve the comments on 2236 if they are addressed
+
+---
+
+can you look at these:
+
+1. Commit 3 is half-done. It removed the "OPF did not run" mis-blame from PushQueuedCheckpointRefs, but warnOPFCheckpointRefsWithheld (manual_commit_push.go:292,296) still makes the identical claim for the identical set of causes — including the post-scan CAS race where OPF did run — on the higher-traffic pre-push channel.
+2. Verified regression on --dry-run. The new unconditional PreRunE runs before the read-only early returns. With all secret scanners disabled, I measured --dry-run returning nil on main and a scanner-config error on this PR. Narrow and fails safe, but the read-only paths never needed the gate's precondition.
+3. The redaction test pins the fix's shape, not its behavior. It executes the subcommand detached from its parent. I confirmed that moving EnsureRedactionConfigured to doctor's PersistentPreRunE fails that test while a parent-tree probe passes under both placements — and the parent tree is the path users actually take. Persistent wiring would also cover trace, logs, bundle, and future subcommands instead of leaving each to rediscover the trap.

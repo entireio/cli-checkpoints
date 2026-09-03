@@ -1,0 +1,254 @@
+/simplify
+
+---
+
+<task-notification>
+<task-id>ad51e324534c24571</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-repo-clone-followup/5d677c01-0e73-474c-ac40-4fd2c9a54c33/tasks/ad51e324534c24571.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Verified all five bullets against the code at HEAD. Four findings, three of the six questions answer "nothing worth changing".
+
+## Findings
+
+### 1. `repo_clone_test.go:186-215` — the new subtest re-implements `runCoreCmd`
+
+`t.Run("the command refuses before the control plane or git")` hand-rolls: swap `activeCoreClient`, register the restore, `newRepoCloneCmd()`, two `bytes.Buffer`s, `SetOut`/`SetErr`/`SetArgs`, `ExecuteContext`, then read `err` + `errOut`. That is precisely the package-level helper already used from four other files:
+
+`cmd/entire/cli/corecmd_delete_test.go:46`
+```go
+func runCoreCmd(t *testing.T, newCmd func() *cobra.Command, srvURL string, args ...string) (stdout, stderr string, err error)
+```
+
+`newRepoCloneCmd` matches `func() *cobra.Command` exactly, and the loop body collapses to:
+```go
+_, errOut, err := runCoreCmd(t, newRepoCloneCmd, srv.URL, ref)
+```
+I checked the two things that could have made it unusable, and neither does: `runCoreCmd`'s doc caveat about `cmd.Print*` resolving to stdout does not apply here — `repo_clone.go:604` writes "Cloning" through `cmd.ErrOrStderr()` explicitly, so the returned `stderr` is the right stream; and swapping the seam once per loop iteration nests correctly (cleanups run LIFO back to the original). The test still owns its own `srv`/`dialed` counter, which is correct — no existing *server* fixture provides "must never be dialed", so `serveRepoCreate`/`serveNativeRepo` are rightly not reused. Only the seam+exec wrapper is the duplication.
+
+Cost: this makes 9 copies of `prev := activeCoreClient` in the package (`repo_mirror_test.go:430,480,510,1331`, `repo_test.go:309,459`, `list_pagination_test.go:44`, `corecmd_delete_test.go:48`, and the new one), one of which (`repo_mirror_test.go:1331`, the local `seamActive` closure) already exists because someone hit the same wall. Any change to how the seam is restored has to find all nine.
+
+### 2. `repo_mirror_probe.go:50` — the fourth regex makes the owner/repo pair a 5-way duplication
+
+`gitHubHostedBareRe` cannot be *composed* out of `gitHubBareRe` (you can't make an optional group mandatory), so the new pattern itself is justified. But it takes `gitHubOwnerPat + "/" + gitHubRepoPat` to five verbatim copies: `repo_mirror_probe.go:40,41,42,50` and `repo_clone.go:23`. Four of those five also repeat `(?:\.git)?$`.
+
+Concrete fix — extract the shared pair beside the two existing pattern constants at `repo_mirror_probe.go:34-37`:
+```go
+const gitHubOwnerRepoPat = gitHubOwnerPat + `/` + gitHubRepoPat
+```
+then `^https?://github\.com/` + pair + `(?:\.git)?$`, `^git@github\.com:` + pair + …, `^github\.com/` + pair + …, `^(?:github\.com/)?` + pair + …, and `^/?` + `mirrorCloneForge` + `/` + pair + `$` in `repo_clone.go:23`. String concatenation, so the compiled patterns are byte-identical — behaviour-preserving by construction.
+
+Cost: the charset comment at `repo_mirror_probe.go:26-33` explains a security boundary (owner/repo flow unescaped into the STS audience and the clone URL). Five copies is five places to miss when that boundary moves, and the diff just demonstrated the risk in the adjacent policy: `.git` handling changed globally this PR and these four `(?:\.git)?` groups were the one spelling that did not get the new named treatment.
+
+An alternative that makes the fourth regex earn itself outright: narrow `gitHubBareRe` to the host-less form (`^` + pair + `(?:\.git)?$`) and give `parseGitHubURL` all four regexes. Same count, but the "optional host" subtlety the new comment has to explain disappears.
+
+### 3. `gitremote.go:75` vs `repo_clone.go:30,70` — the forge token now lives in two packages with nothing pinning them together
+
+`pathForges` (new) keys on `"gh"`/`"et"`; `mirrorCloneForge = "gh"` (new, `repo_clone.go:30`) and `nativeCloneForge = "et"` (`repo_clone.go:70`) spell the same two literals in `cli`. `gitremote` exports no token value — only `IsSupportedForge(string) bool` and `ForgePathLabels(string) string` — so the `cli` side cannot obtain them and no test relates the two sets.
+
+This matters because of what the two ends do jointly: `cmd/git-remote-entire/main.go:293-300` gates on `gitremote.IsSupportedForge(seg[0])` and then prints `entire repo clone /&lt;seg&gt;`, i.e. `pathForges` decides which refs get *suggested* while `nativeCloneForge`/`mirrorCloneForge` decide which get *accepted*. That is exactly the invariant `pathForges`'s own doc comment invokes when it excludes `/git/` ("admitting it would have callers suggest a command that then fails") — enforced by omission for `git`, unenforced for a future rename of either token.
+
+Cheapest fix, no import change: a guard assertion in `repo_clone_test.go` next to the existing token tests —
+```go
+require.True(t, gitremote.IsSupportedForge(nativeCloneForge))
+require.True(t, gitremote.IsSupportedForge(mirrorCloneForge))
+```
+Structural fix: export `gitremote.ForgeGitHub`/`ForgeNative`, build `pathForges` from them, and define the two `cli` constants as those (no cycle — `gitremote` imports stdlib only, and `cli` already imports it from ten files including `trail_cmd.go`, which is where `nativeCloneForge` is now consumed at `trail_cmd.go:2291`).
+
+### 4. `repo_clone.go:184` — `gitDirSuffix` lives in `cli`, but its documented owner is `gitremote`
+
+Not re-litigating whether the constant should exist. The reuse point is placement: the constant's doc comment (`repo_clone.go:175-177`) names `gitremote.splitOwnerRepo` as the reason the policy holds CLI-wide — and that function is one of the sites still spelling the literal:
+
+- `cmd/entire/cli/gitremote/gitremote.go:279` — `path = strings.TrimSuffix(path, ".git")` (the cited authority)
+- `cmd/entire/cli/gitremote/gitremote.go:186` — same trim on the SCP branch
+- `cmd/entire/cli/trail_cmd.go:2318`, `experts_cmd.go:407`, `repo_mirror.go:1321` — same repo-name trim, all literal
+
+So the policy's authority is the one file that can't see the constant. Fix: move it to `gitremote` as `GitDirSuffix` (plus optionally `TrimGitDirSuffix(string) string`) and have `repo_clone.go:129,276`, `repo.go`'s new check, and the three `cli` sites above call it.
+
+Explicitly do **not** fold in `gitrepo/repository.go:21` or `strategy/common.go:361` (`gitDir = ".git"`) — those are directory names, a different concept that happens to share bytes.
+
+### 5. `repo_clone.go:116,191,206` — three spellings of "strip the optional leading slash"
+
+`parseNativeCloneRef` (116) and `bareRefSuggestions` (206) both use `strings.TrimPrefix(strings.TrimSpace(ref), "/")`; `declaresForge` (191) uses `strings.TrimPrefix(ref, "/")`, without the `TrimSpace`. No existing helper is being re-implemented — this is duplication inside the new code — but the omission is what makes the three disagree: for `" et/paul/x"`, `parseNativeCloneRef` produces a native reason that `invalidCloneRefError`'s `declaresForge(ref, nativeCloneForge)` branch then declines to show, and the ref falls through to the generic shapes list. One private `trimRefPrefix(ref string) string` used by all three removes the class.
+
+## Checked, no finding
+
+- **`nativeRefParses` / `mirrorRefParses` (`repo_clone.go:220-228`)** — earn their place. The `_, err := f(); return err == nil` wrapper is an established idiom in this exact package, not an invention: `ghAvailable`/`ghAuthenticated` (`setup_github.go:975,981`), `checkEntireDirExists` (`setup.go:2668`), `branchExistsLocally` (`resume_picker.go:249`), `fileExists` (`utils.go:62`), `canDelegate` (`login.go:583`), `transcriptHasSummaryContent` (`explain.go:1187`). No prior "does this ref parse" predicate exists to reuse, and the two parsers' differing arity (3 vs 4 returns) rules out one shared wrapper.
+- **`declaresForge` vs `gitremote`** — no reuse available. `splitForgePrefix` (`gitremote.go:220`) is unexported, and `IsSupportedForge` is set-membership on an already-split token: it answers "is this *a* forge" but not *which*, which is what selecting between `nativeErr` and `mirrorErr` requires. Rewriting the two branches as `strings.Cut` + `switch` on the token would not touch a gitremote helper.
+- **`repo create`'s `.git` check (`repo.go:135-146`) vs `nativeRepoRe` / `validateRepoName`** — correctly not unified. `validateRepoName` (`setup_github.go:1101`) is GitHub-side (100 chars, allows `_`), a different namespace. And `repo create` deliberately checks only the one rule the server does *not* enforce; reusing `nativeRepoRe` there would duplicate server-side validation the create call already performs.
+- **`.git`-in-regex vs `.git`-trimmed-in-code** — do not unify these two mechanisms. Folding `(?:\.git)?` into `mirrorCloneRefRe` to match the probe regexes would regress: the lazy `gitHubRepoPat` plus an optional suffix group accepts `/gh/o/.git` as repo `".git"`, which `gitHubDotOnlyRe` does not catch. The new code-level trim plus the empty check at `repo_clone.go:276-279` is genuinely stricter than the pattern-level idiom.
+- **`git-remote-entire` re-deriving "is this ref suggestible" (`main.go:293`)** vs the new `nativeRefParses`/`mirrorRefParses` — real overlap (its `len(seg)==3 &amp;&amp; non-empty &amp;&amp; IsSupportedForge` is a laxer version of "would `repo clone` accept this"), but not actionable: `cmd/git-remote-entire` would have to import the whole `cmd/entire/cli` package to reach them.
+- **`execRepoCreateNamed` (`repo_test.go:325`)** — reuse-positive; it parameterises the existing `execRepoCreate` rather than copying it.</result>
+<usage><subagent_tokens>197277</subagent_tokens><tool_uses>30</tool_uses><duration_ms>324857</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a89a2606c0e5197fc</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-repo-clone-followup/5d677c01-0e73-474c-ac40-4fd2c9a54c33/tasks/a89a2606c0e5197fc.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Read everything. Here's the complexity-only review.
+
+## Findings
+
+### 1. `nativeRefParses` / `mirrorRefParses` are single-use return-value adapters — inline them
+`/Users/soph/.herdr/worktrees/cli/soph-repo-clone-followup/cmd/entire/cli/repo_clone.go:220-228`
+
+Two package-level functions, each with exactly one call site (in `bareRefSuggestions`, immediately above), whose entire body is discarding extra return values. Cost: two more names in a package that already has `parseNativeCloneRef`/`parseMirrorCloneRef`/`declaresForge`/`bareRefSuggestions`/`invalidCloneRefError`, and a reader who greps `nativeRefParses` needs two hops to learn it means `err == nil`.
+
+```go
+func bareRefSuggestions(ref string) []string {
+	trimmed := strings.TrimPrefix(strings.TrimSpace(ref), "/")
+	if strings.Count(trimmed, "/") != 1 {
+		return nil
+	}
+	var out []string
+	native := "/" + nativeCloneForge + "/" + trimmed
+	if _, _, err := parseNativeCloneRef(native); err == nil {
+		out = append(out, native)
+	}
+	mirror := "/" + mirrorCloneForge + "/" + trimmed
+	if _, _, _, err := parseMirrorCloneRef(mirror); err == nil {
+		out = append(out, mirror)
+	}
+	return out
+}
+```
+
+Same behaviour, same stable order, one function instead of three, nine fewer lines. So: **one function is enough**, and the "one candidate per grammar, stable order" requirement doesn't need the helpers — it needs two `if`s.
+
+### 2. The `.git` policy and the namesquatting rationale are each stated 4–6 times
+`repo_clone.go` adds **100 comment lines to 64 code lines**; `CLAUDE.md` adds 62 more restating them. Most of the individual comments carry real reasoning — these four copies do not:
+
+- **`repo_clone.go:92-97`** — the last sentence of the `nativeProjectRe` block ("What they still buy is a local error instead of a control-plane round trip for a ref the server could never match") is a verbatim restatement of paragraph 3 at lines 88-90 ("what keeps a ref the server can never match from costing a control-plane round trip"). **Keep line 88-90** (it's phrased as mechanism and lists the refused examples); delete the final sentence. The historical half of ¶4 (the 3-char minimum no longer carries the disambiguation job) is worth its one sentence — keep that.
+- **`repo_clone.go:143-145`** — `resolveNativeCloneURL`'s "…only by its ULID or a full entire:// URL" is the closing paragraph of `gitDirSuffix` (lines 182-183) said again. **Keep the `gitDirSuffix` copy** (policy home); here reduce to `repoName arrives with any `.git` suffix already dropped by the parser (see gitDirSuffix).`
+- **`repo_clone.go:108-114`** — `parseNativeCloneRef` ¶2 (7 lines) is the same fact as `invalidCloneRefError`'s ¶2 (lines 245-247) and `declaresForge`'s doc (186-189): "declaring a token is what selects a parser's reason". Three copies. **Keep `invalidCloneRefError`'s** — that's where the ladder is implemented — and shrink this one to: `A non-nil error is not necessarily user-facing: for a ref that never named `et/` it only means "try the mirror grammar" (see invalidCloneRefError).` Note the deleted sentence is also the least reliable one: "the token check below IS that test, the two agree by construction" isn't true of `declaresForge` as written (it has no `TrimSpace`, the parser does), so the agreement rests on `RunE` trimming first, not on construction — an argument for cutting rather than fixing it.
+- **`CLAUDE.md:86-160`** — now carries the regex bounds, the RE2-lookahead reason, the trim-before-validate ordering, the four-branch ladder, the escape hatches, and the trails `resolvableTrailsHosts` detail, i.e. mechanism-level reasoning that already lives in code where it's checkable. Cost here is not disk: this file is injected into every agent turn in this repo. **Keep in CLAUDE.md**: the invariants (every ref names its forge; `.git` is never part of a name; `pathForges` is the one token map) plus the identifier pointers (`gitDirSuffix`, `invalidCloneRefError`, `bareRefSuggestions`). Drop the regex bounds, the ordering note, and the four-branch enumeration — three code comments already own them, and now they must be kept in sync in two places.
+
+### 3. `gitDirSuffix`'s 17-line comment claims a policy the constant doesn't hold
+`repo_clone.go:168-184`
+
+The comment says "Every ref parser drops it" and "the whole CLI drops it", and cites `gitremote.splitOwnerRepo` as the authority that trims unconditionally. But the constant has two uses (`repo_clone.go`, `repo.go`), while three same-package suffix trims still spell the literal — `cmd/entire/cli/trail_cmd.go:2318`, `cmd/entire/cli/experts_cmd.go:407`, `cmd/entire/cli/repo_mirror.go:1321` — and `splitOwnerRepo` itself hardcodes `".git"` in another package (`cmd/entire/cli/gitremote/gitremote.go:186,279`), which it must, since `gitremote` cannot import `cli`. The next reader believes the constant is authoritative and it isn't.
+
+Two honest fixes, either is fine: use `gitDirSuffix` at the three `cli`-package sites above (mechanical), or narrow the comment to what the code does ("both clone-ref parsers and `repo create` use it; `gitremote` trims the same suffix independently"). If the policy really is repo-wide, the constant belongs in `gitremote` next to the function the comment defers to, exported — but that's a separate PR, not something to assert in a comment here.
+
+### 4. `TestCloneRefAlwaysRequiresItsForgePrefix` subtest 3 is same-layer duplication
+`cmd/entire/cli/repo_clone_test.go:218-226`
+
+Subtests 1 and 2 earn their keep, and I'd defend both against a redundancy charge: **1** is the only place the *mirror* parser is asserted to reject a bare pair (`TestParseMirrorCloneRef` has no bare-pair row) and it states the two-grammar property jointly, which no table can; **2** is the only end-to-end test that the command refuses without dialling or shelling out — a genuinely different layer from the parsers.
+
+**3** is not a different layer. It calls `invalidCloneRefError` directly, exactly as `TestInvalidCloneRefError` does, and asserts the same mechanism as that test's row `{name: "bare pair is offered both forges", ref: "paul/dogbark", want: "did you mean /et/paul/dogbark or /gh/paul/dogbark?"}` — only the names differ. Drop subtest 3 and let the table row carry it (the row is the stricter of the two: it pins the exact phrasing). If the security test must read as self-contained, drop the table row instead — but not both.
+
+### 5. The dial-counting httptest seam can be a stub that fails if called
+`cmd/entire/cli/repo_clone_test.go:187-197, 215`
+
+A live server plus `atomic.Int32` plus a 500 handler plus `require.Zero` (11 lines, and the file's only use of `sync/atomic`) to prove a negative:
+
+```go
+prev := activeCoreClient
+activeCoreClient = func(context.Context) (*coreapi.Client, error) {
+	t.Error("a ref without a forge prefix must never reach the control plane")
+	return nil, errors.New("unexpected control-plane dial")
+}
+t.Cleanup(func() { activeCoreClient = prev })
+```
+
+Simpler *and* stronger: it trips on client construction, not just on a request reaching the wire, and it names the failing ref's iteration in place rather than at the end of the loop. The 5-line `prev`/`Cleanup` swap is the established pattern in this package (`repo_test.go:310`, `repo_mirror_test.go:431`), so keeping it hand-rolled is consistent — it's only the server and counter that are surplus.
+
+### 6. `TestParseNativeCloneRef` rows that pin no distinct mechanism
+`cmd/entire/cli/repo_clone_test.go:88-97`
+
+The token check is first and short-circuits, so every "no forge token" row exercises the same single branch. Most are still worth having as regression statements (`gh ref is not native`, `ssh github url`, `single segment` and `empty` — those last two also guard the `segs[0]` access that precedes the length check, `double leading slash` pins that `TrimPrefix` is single). These three add nothing over an adjacent row, because the extra character never gets read:
+
+- `{name: "bare dotted pair", ref: "/paul/entire-trails.el"}` — the dot is irrelevant; identical to `bare pair with leading slash`.
+- `{name: "ssh github url with .git", ref: "git@github.com:foo/bar.git"}` — the `.git` trim runs after the token check, so this is `ssh github url`.
+- `{name: "truncated gh ref", ref: "/gh/entirehq"}` — same token-check failure as `gh ref is not native`; the table asserts only error/no-error, so it can't distinguish the message a reordering would produce.
+
+Weaker candidates, listed for completeness rather than pushed: `host-qualified pair` (same branch, and covered mirror-side by `TestParseHostedGitHubURL`), `bare pair with leading slash`, and `forge token in the project position` (same regex bound as `two-char project cannot exist server-side`, though it documents intent).
+
+### 7. Minor
+- `repo_clone.go:120-123` — `len(segs)-1` plus the two-line comment justifying the subtraction is more machinery than naming the thing being counted: `names := segs[1:]`, then `if len(names) != 2` / `len(names)` in the message / `project, repo = names[0], names[1]`. The comment shrinks to one clause. (Answering the question directly: `len(segs)-1` is not clearer than the alternative — it needs a comment, and the alternative doesn't.)
+- `cmd/entire/cli/repo.go:139-142` — `%w`-wrapping your own freshly built error to append `(use %q)` buys nothing (no `errors.Is` target); build the message once with a `suffix` string, or drop the conditional and accept that a name of exactly `.git` gets no suggestion.
+
+## Where the answer is "already about as simple as it can be"
+
+- **`invalidCloneRefError`'s four-branch ladder.** Four genuinely different messages, four early returns, in decreasing confidence order; the two-error signature and not-table-driving are settled. Nothing to collapse — a `switch` or a dispatch table would be longer and less readable.
+- **`parseNativeCloneRef`'s check sequence.** No redundancy: token → count → trim → project shape → repo shape are four distinct user-facing statements, the `..` check is separate for a documented RE2 reason, and folding the whole thing into one regex (like the mirror side) would destroy the "which rule you broke" property that the `et/` branch exists to deliver.
+- **`strings.Count(trimmed, "/") != 1`.** Fine, and clearer than splitting here, because the function reuses the whole `trimmed` string rather than the segments — splitting would just be re-joined. Worth knowing: it's behaviourally redundant today (any candidate built from a non-pair is rejected by both grammars anyway, since neither charset admits `/`), so it functions as a documentation guard against future parser laxity. Keep or drop is a wash; not worth churning either way.
+- **`pathForges` + `IsSupportedForge` + `ForgePathLabels`.** Warranted. The map is unexported, both accessors have real non-test callers (`IsSupportedForge` ×3, `ForgePathLabels` ×1), and the alternative — a `switch` on the forge in `cmd/git-remote-entire/main.go` — would split token knowledge across two packages, which is the exact failure the `pathForges`-vs-`forgeToHost` comment documents. The one trim available: `IsSupportedForge`'s third paragraph (the trails caveat) is a third copy of a fact owned by `trail_cmd.go:2280-2289` and repeated again in `CLAUDE.md`; the one-line pointer it already contains is enough, and the CLAUDE.md paragraph is the copy to cut.
+- **`parseTrailRepoArg` / `parseTrailRepoShape` split.** Correct call, not bureaucracy: the shape parser has two success-return points, so a wrapper is the only way to apply one post-condition without duplicating the 3-line message twice.</result>
+<usage><subagent_tokens>190290</subagent_tokens><tool_uses>24</tool_uses><duration_ms>378780</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a6382f39539108a8c</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-soph-repo-clone-followup/5d677c01-0e73-474c-ac40-4fd2c9a54c33/tasks/a6382f39539108a8c.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Worktree is clean (probe removed, nothing edited). Here is the review.
+
+## Verdict by question
+
+**Q1 — namesquatting layer: the parser is the right layer, and the guarantee is genuinely clone-local for a reason the PR doesn't record.**
+
+Right layer: the constraint *is* the grammar, and `TestCloneRefAlwaysRequiresItsForgePrefix` pins it at the cobra boundary (zero control-plane dials, no `git clone`), not just in the parser — that is the correct defense against a future refactor routing around it.
+
+I swept every other place a repo string becomes a concrete repo or a remote. About eight surfaces still take a bare pair and mean GitHub (`search --repo`, `experts --repo` `/Users/soph/.herdr/worktrees/cli/soph-repo-clone-followup/cmd/entire/cli/experts_cmd.go:398`, `explain --repo` `explain_repo.go:108`, `dispatch --repos`, `mirror get|create|remove`, `mirror use`). **None can cross into the native namespace** — the control plane stores native rows *prefixed* in the same `full_name` index (`cmd/entire/cli/search_cmd_test.go:862` pins `FullName: "et/myproj/backend"`; `search_cmd.go:636` and `search_v4.go:278` strip only `gh/`). A bare pair addresses only the unprefixed half, so the shadowing cannot reproduce there. Removing the shorthand is still right — the prefix convention disambiguates the *lookup*, never the *user's intent*, which is exactly the PR's stated reason.
+
+That prefix convention is the load-bearing fact and appears nowhere in the PR. Worth one sentence in CLAUDE.md, because `cmd/entire/cli/repo_mirror.go:1169-1171,1215` already holds a branch written on the opposite assumption (rendering a native repo matched by a bare filter) — dead code resting on an invariant the CLI never checks. One residue: `repo mirror use &lt;owner&gt;/&lt;repo&gt;` (`repo_mirror_use.go:366-373` → `:501` → `:535`) accepts the exact shorthand `clone` just deleted and writes a remote URL into `.git/config`. Provider-pinned to github, so no hole, but undocumented — `Use:` and every example show `github.com/...`. Follow-up at most.
+
+**Q4 — `bareRefSuggestions` re-running the parsers: right depth. No change.** Not an inversion. The parsers are pure, total, allocation-cheap string functions and this runs only on the error path; asking the grammar "would this parse?" is the only way a suggestion is guaranteed not to fail next, and re-deriving charsets is the documented bug. The one blemish — `invalidCloneRefError` is half push (errors handed in) and half pull (parsers called) — unifies only via the classify-and-render refactor already ruled premature.
+
+**Q5 — `ForgePathLabels`: right depth for the map, one naming nit.** Fusing token-set and label into one map is the right call — the set becomes the keys, so a new forge cannot be added without deciding its label, and there is one list. Nit: the name is plural but returns one pre-joined string, so the single caller inherits gitremote's `/` and angle-bracket conventions; `ForgePathTemplate`, or two return values, would decouple that. Cosmetic.
+
+## Findings
+
+**F1 — worth doing NOW. `cmd/entire/cli/trail_cmd.go:2278-2295` vs `:2203-2212`: the `et` refusal is on the argument, but the condition is on the repo, so half the entry points are uncovered.**
+
+`resolveTrailRepoOrRemote` (`:2217-2222`) forks two ways. With `--repo` it calls `parseTrailRepoArg`, which now refuses `et`. Without `--repo` it calls `resolveTrailRemote`, which checks only `forge == ""` and never consults `IsSupportedForge`. I verified `ParseURL("entire://aws-us-east-2.entire.io/et/paul/dogbark")` returns `Forge="et"`. So a developer standing in a native Entire clone who runs plain `entire trail list` sends `/api/v1/trails/et/paul/dogbark` and gets precisely the existence-hiding 404 the new comment says the check exists to prevent. Same target: refused when named, accepted when inferred — and inferred is the common path. `resolveTrailRemote`'s own doc comment claims it "ensures the forge is known to the trails API"; it does not.
+
+Cost: the PR's stated benefit ("the only way the user hears the real reason") lands for `--repo` users only. Deeper fix at the same cost: hoist the check into `resolveTrailRepoOrRemote`, or a `trailsResolvableForge(forge) error` called by both branches — one predicate, both spellings, both entry points. It also removes the trails path's odd cross-file reach for `repo_clone.go`'s `nativeCloneForge`. About five lines.
+
+**F2 — worth doing NOW, cheap. `cmd/entire/cli/gitremote/gitremote.go:80-92`: `IsSupportedForge`'s name now asserts more than it means.**
+
+The branch widened it from `{gh}` (via `forgeToHost`) to `{gh, et}` (via `pathForges`). Correct for the git-remote-entire caller, which asks a syntactic question. But the name reads as a capability check, and the only capability-needing caller (`trail_cmd.go:2315`) must remember to narrow afterwards — the doc comment says the safety rests on a reader noticing that. Not theoretical: this PR's own test comment records that `et` in the wrong branch produced "two false statements", and F1 is a second caller in the same file that already skipped the narrowing. Fix: rename to `IsForgePathToken`. Two non-test call sites (`cmd/git-remote-entire/main.go:94,293`, `trail_cmd.go:2315`) plus one test; internal package, no external consumers. Cheapest durable version of the invariant, inside API surface this PR is already reshaping.
+
+**F3 — follow-up, but file it now. `cmd/entire/cli/repo.go:136-146`: the client-side `.git` refusal cannot deliver the invariant `gitDirSuffix` states.**
+
+The CLI is one of at least three creation paths. A `foo.git` created via API or web UI does not merely become unaddressable — it *aliases*: `resolveRepoRef` (`cmd/entire/cli/resolveref.go:197`) looks up the trimmed name, so in a project holding both `foo` and `foo.git`, `entire repo clone /et/p/foo.git` silently clones `foo`; where only `foo.git` exists, the error names a repo the user never typed. Right depth is entiredb's `normalizeName` — the same function this PR now mirrors for the length and edge rules, and which already refuses a trailing `.`; refusing a trailing `.git` there makes the rule true for every client. Keep the CLI check as the fast local error. Credit where due: the guard sits where the gap actually is — the server is laxer than the CLI's addressing for repos (interior dot legal) but not for projects (`nativeProjectRe` bans dots because the server does), so there is no matching hole on `project create`. That asymmetry reads as considered.
+
+**F4 — follow-up (doc). CLAUDE.md's "`gitremote.pathForges` is the one place that knows them" overstates.**
+
+It owns the token *set*. The spellings also live at `repo_clone.go:30`, `:70`, inline at `:65` (deliberate, documented), `repo_mirror_use.go:350`, `gitremote.go:47`, and are compared literally in `experts_cmd.go:401`, `explain_repo.go:141`, `repo_mirror.go:1312`, `trail_resume_cmd.go:285`, `api_cmd.go:245`, `entireapi_client.go:59`. Not all duplicates — `mirrorUseForge` is a capability claim, `mirrorCloneForge` a syntax claim — but CLAUDE.md is what future agents read as ground truth, and a refactor on that premise would be wrong in about nine places. Either soften to "the one place that knows the set", or export the two tokens from gitremote and alias them (honest price: `repo_clone.go` gains a gitremote import it currently lacks).
+
+## Q2 — client-side validation of server rules: right idea, asymmetric placement
+
+The pattern is established here (several files already say "mirrors entire-api's X") and the comment is unusually honest that the bounds are "server parity and nothing more". The thing to name is that the drift is one-directional. Server tightens: CLI merely laxer, one wasted round trip, harmless. Server loosens — 2-char projects, underscores, longer names, all plausible product asks — the CLI hard-refuses a ref that resolves, the error confidently asserts a rule the server no longer makes (`project %q must be 3-32 characters…`), the only workaround is a ULID or a full `entire://` URL, and nothing detects it.
+
+The charset half earns its keep: it is what tells a native ref from `git@github.com:foo/bar`, and it narrows `bareRefSuggestions` (`ab/dogbark` correctly suggests only `/gh/`). The bounds and edge rules buy only the saved round trip, by the comment's own admission.
+
+Placement is inverted. The strict rules live on the *read* path, where being wrong costs a clone the user cannot perform; they are absent from the *write* paths, where a client check would save a real 422 and being wrong costs nothing — I verified `project create` (`cmd/entire/cli/project.go:34-56`) does no name validation at all, and `repo create` now validates only `.git`. Cheapest improvement without changing depth: phrase the bounds failure as a statement about the server rather than a rule of its own, so it degrades into merely unhelpful instead of false. One string, follow-up.
+
+## Q3 drift containment (beyond F1)
+
+The `et` refusal's depth is right — the alternative is a 404 the CLI would have to explain wrongly. But it fails *stuck*: after entire-api gains native resolution it keeps refusing, silently, with no test that would fail. It is also the second place encoding "entire-api does not do native repos" — `forgeToMirrorProvider` (`cmd/entire/cli/entireapi_client.go:54-63`) is the first, and it fails soft. Cheap containment: cross-reference the two sites so removal is one grep, and word the message as a claim about this CLI rather than about the product.
+
+## Checked and sound — not findings
+
+I probed the "the two agree by construction" claim on `declaresForge`: the parser trims whitespace and `declaresForge` does not, so they disagree on `" et/…"` and on bare `"et"`. But `repo_clone.go:313` already trims once up front, making the whitespace case unreachable in production, and for a lone `et` the fall-through to the shapes list is arguably the better message. The comment overstates by a hair in a direction with no cost.
+
+`parseHostedGitHubURL` gaining `gitHubHostedBareRe` has exactly one caller (`repo_clone.go:249`), and keeping the bare form in `parseGitHubURL` for its five GitHub-only callers is correctly motivated.
+
+`go build ./...`, the full `cmd/entire/cli` package, `gitremote`, and `git-remote-entire` all pass.</result>
+<usage><subagent_tokens>204494</subagent_tokens><tool_uses>36</tool_uses><duration_ms>663641</duration_ms></usage>
+</task-notification>

@@ -559,3 +559,48 @@ One addition to the report: confirm the two call sites in `Install-Entire` end u
 <status>completed</status>
 <summary>Background command "Run test:ci in the background" completed (exit code 0)</summary>
 </task-notification>
+
+---
+
+<cross-session-message from="uds:/tmp/cc-socks/6240.sock" from-name="uninstall-ext-1b" from-mode="prompting">
+Task 6 accepted — reproduced 24/10, fake-scoop clean, diff reviewed, and I confirmed `(Get-Command New-Item).Parameters.ContainsKey('LiteralPath')` → False, so the roundup bullet was wrong and `[IO.Directory]::CreateDirectory` is the right substitute. Commit task 6 now (one commit, don't push, same gates), then plan task 7 before implementing.
+
+## Task 7 — stop inferring from rendered text, and name the real cause (two roundup bullets from 01M1KE7Z9ZDDWZVQ0VMHBR6MSH)
+
+### 7a. `Install-EntireWithScoop` regexes `Out-String` table output (install.ps1:140-153)
+Bullet: "The `bucket list` check regexes `Out-String` table output. If scoop's bucket listing gains a fifth property, PowerShell switches to list format, the match silently fails, `bucket add` returns 'already exists' non-zero, and the install throws. Tolerating an already-exists exit code is more durable than matching rendered text."
+
+Evidence I pulled from Scoop's `lib/buckets.ps1` (`add_bucket`, master):
+- bucket dir already exists → `warn "The '$name' bucket already exists. To add this bucket again, first remove it by running 'scoop bucket rm $name'."` → **`return 2`**
+- same repo already added under another name → `warn "Bucket $bucket already exists for $repo"` → **`return 2`**
+- every real failure (bad URL, git missing, clone failed) → **`return 1`**
+So "already exists" is distinguishable by exit code, in current Scoop. Two things to verify before building on it: (1) that `libexec/scoop-bucket.ps1` actually `exit`s with `add_bucket`'s return value rather than swallowing it; (2) **when `return 2` was introduced** — check the file's history (GitHub API commits/blame on that line). If an older Scoop still in the wild returned 1 or 0 for "exists", the exit-code-only approach misclassifies on it, and the plan needs a fallback (e.g. on a non-0/2 exit, re-check whether the bucket dir now exists under `scoop prefix`/`$env:SCOOP`, or match the warning text as a last resort). Evidence first, then decide; report what you found.
+
+Recommended shape: drop the `bucket list` pre-check entirely. Call `bucket add`; treat exit 0 and 2 as success; on anything else throw with the captured output as details (the current "Failed to add the Entire Scoop bucket." throws with no details — include them). That removes the rendered-text dependency and one round-trip.
+
+Worth knowing while you're in there: the reason the regex is on `Out-String` at all is that `scoop` from a PowerShell session resolves to the `scoop.ps1` shim and runs in-process, so `bucket list` returns **objects** (Name/Source/Updated/Manifests), and `Invoke-Scoop`'s `2>&1` mixes ErrorRecords into that array. If you find you still need a list check anywhere, check `.Name` on the objects, never the rendered table. I don't think you'll need it.
+
+### 7b. Wrong cause named at install.ps1:234-235
+```powershell
+if ($null -eq $release -or [string]::IsNullOrWhiteSpace([string] $release.tag_name)) {
+    throw "Failed to fetch the latest $ReleaseChannel version from GitHub. Check your internet connection."
+}
+```
+Bullet: this blames the network when the real cause is no nightly in the last 20 releases. Look at the control flow: `Invoke-GitHubApi` is called *above* this line, so if the network had failed we'd have thrown there with `Invoke-RestMethod`'s own error and never reached this check. Reaching it means the API **succeeded** and returned nothing usable. So the message is wrong for both channels:
+- nightly: no release tagged nightly among the page fetched → say that, and how many were checked
+- stable: `releases/latest` answered but with no `tag_name` → say that
+Confirm what `Invoke-GitHubApi` actually surfaces on a network failure (does the raw `Invoke-RestMethod` error reach the user, or is it wrapped?) and whether *that* path is where "Check your internet connection" belongs. If so, move the sentence there rather than deleting it.
+
+## Tests — all any-OS via dot-source + Mock, this is what task 3 was for
+- 7a: `Mock Invoke-Scoop` keyed on the args: `bucket add` → exit 0 / exit 2 / exit 1-with-output; assert the first two proceed to the install step and the third throws with the output in the message. Also assert `bucket list` is **not** invoked (`Should -Invoke Invoke-Scoop -ParameterFilter { $ScoopArgs[0] -eq 'bucket' -and $ScoopArgs[1] -eq 'list' } -Times 0`) — that pins the removal. You'll need `Test-ScoopAppInstalled` and the install/update calls mocked too so the function runs to completion; keep those mocks minimal.
+- 7b: `Mock Invoke-GitHubApi` returning `$null` for nightly → message names "no nightly release" not the network; returning an object with empty `tag_name` for stable → its message; a real-looking release → the tag comes back. If you relocate the network sentence, mock `Invoke-GitHubApi` to throw and assert where the sentence lands.
+
+## Scope
+`Install-EntireWithScoop`'s bucket step and `Get-ReleaseVersion`'s failure message(s). Not the timeout (task 8), not the update/install calls' behaviour beyond what the mocks need, not the PATH-conflict report.
+
+## Report back with
+- the plan, including the `return 2` history finding and the resulting fallback decision (or the case for none)
+- what `Invoke-GitHubApi` surfaces on network failure, and where the network sentence ended up
+- the exact new messages
+- verification as usual; these tests should all *run* on macOS, so the skip count should stay at 10
+</cross-session-message>

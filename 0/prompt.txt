@@ -694,3 +694,39 @@ Report as usual, including the alias-filter measurement.
 <status>completed</status>
 <summary>Background command "Run test:ci in the background" completed (exit code 0)</summary>
 </task-notification>
+
+---
+
+<cross-session-message from="uds:/tmp/cc-socks/6240.sock" from-name="uninstall-ext-1b" from-mode="prompting">
+Task 8 accepted — reproduced 38/10, fake-scoop clean, diff reviewed. The user and I agreed to leave 7.0–7.3 without a fallback cap (EOL; keeping the cap there would keep the original bug). Commit task 8 now with the compressed measurements in the message as you drafted (one commit, don't push, same gates), then plan task 9 before implementing.
+
+## Task 9 — E2E: a real install on a real Windows runner (Scoop's `.github/scripts/e2e-test.ps1` is the model)
+
+Everything so far runs offline with stubs. This job runs `install.ps1` for real against GitHub Releases on `windows-latest`, in both shells, and asserts the outcomes tasks 5-8 promised. It's the only place the registry write, the `Add-Type` broadcast, the running-image swap, and the Scoop exit codes meet the real thing on 5.1.
+
+**Facts you'll need:**
+- `Invoke-GitHubApi` already sends `Authorization: Bearer $env:GITHUB_TOKEN` when set (install.ps1:209-211). Pass `${{ secrets.GITHUB_TOKEN }}` in the job env — runners share egress IPs and the unauthenticated limit is 60/hr per IP, so without it this job is a flake generator.
+- `windows-latest` has no Scoop, so `-Channel stable` takes the direct-install branch. The existing `.github/workflows/e2e-windows.yml` is `workflow_call`/`workflow_dispatch` only (agent E2E, needs `ANTHROPIC_API_KEY`) — don't put this in there; it must run on PRs.
+- The install pulls the *released* binaries, not this PR's build. That's correct: the thing under test is install.ps1.
+- Upstream's script starts with `if ($env:CI -ne $true -or $env:GITHUB_ACTIONS -ne $true) { throw '...CI only' }` because it mutates the user's PATH. Do the same.
+
+## Where it lives — my lean, argue if you disagree
+A new workflow `.github/workflows/install-ps1-e2e.yml`, triggered on `pull_request`/`push` with `paths:` limited to `scripts/install.ps1`, `scripts/test/**`, and the workflow file itself, plus `workflow_dispatch` and a weekly `schedule` (the releases side can drift under us — a renamed asset, a missing nightly — and a weekly run catches that between installer changes). Two steps in one job, `shell: powershell` and `shell: pwsh`, each calling the same script. Keep the offline suite in `ci.yml` where it is; this is the network job. Timeout ~15 min.
+
+The script itself: `scripts/test/e2e.ps1` (next to the suite, so `-Recurse` lints it) or `.github/scripts/` per upstream — your call, say why.
+
+## Phases, in order, each asserting before the next
+0. **Guard + snapshot.** CI-only guard. Dot-source `install.ps1` (inert, thanks to task 3) so the script can reuse `Get-UserEnvironmentValue`/registry helpers. Snapshot the raw user `Path` and its `GetValueKind`; restore both in a `finally` even though the runner is ephemeral — it documents that the script knows it's mutating shared state.
+1. **Stable, documented iex shape:** `Get-Content -Raw .\scripts\install.ps1 | Invoke-Expression`. Assert: `entire.exe` and `git-remote-entire.exe` exist under `$env:USERPROFILE\.local\bin`; raw user `Path` now *starts* with that literal dir and the remainder is byte-identical to the snapshot (task 5's "we own one entry" promise, end to end); value kind unchanged from the snapshot unless the snapshot had no `%` and ours added none (state the expected kind, don't just assert "unchanged"); `& "$dir\entire.exe" version` exits 0. Also `$env:Path` in-process has the dir first (task 5's in-process update).
+2. **Reinstall while the binary is running** (task 6 for real): start `entire.exe mcp` in a way that keeps it alive — `[Diagnostics.Process]::Start` with `RedirectStandardInput = $true` and simply never write to or close the stream is the reliable way; `Start-Process -RedirectStandardInput <file>` hits EOF and the process exits. Precondition: `Copy-Item -Force` over the running exe throws (proves the scenario). Run the installer again via the scriptblock shape `& ([scriptblock]::Create((Get-Content -Raw ...)))` → succeeds; `entire.exe.old` exists; `entire.exe version` still exits 0. Kill the process; run once more → no `*.old` remains. Raw PATH still byte-identical to the end of phase 1 (a second install must not touch it).
+3. **Nightly to a custom dir:** `& ([scriptblock]::Create(...)) -Channel nightly -InstallDir "$env:USERPROFILE\entire-nightly"`. Read the PATH-conflict block in `Install-Entire` first and assert what it actually does when a previous install is already on PATH — I believe this is the "Other Entire CLI installations remain on PATH" warning path with exit 0 and the new dir now first, but verify against the code and assert that, including that the phase-1 dir is still present in the raw value (moved, not removed). `entire.exe version` from the nightly dir reports a nightly tag.
+4. **Optional, and I'd like your view:** install Scoop on the runner (`irm get.scoop.sh | iex`, ~20 s) and run `-Channel stable` once more, so task 7's exit-code contract meets real Scoop (`bucket add` exits 0 the first time). Complication: the direct-install dir is first on PATH, so the Scoop branch should hit its own "shim does not take priority on PATH" throw — which is *also* a real path worth pinning, with the expected non-zero exit and the named remedy in the output. Decide whether phase 4 earns its runtime and flake surface, and say why either way.
+
+## What's out of scope
+No changes to `install.ps1`. If a phase fails because the installer is wrong, report it as a finding — don't fix it inside this task.
+
+## Report back with
+- the plan: file locations, trigger shape, phase list with the exact assertions for phase 3 after reading the conflict block, and the phase-4 decision
+- what you can and can't verify locally (I expect: script parses and lints, the guard refuses to run on this Mac, nothing else)
+- the linter's view of the new script
+</cross-session-message>

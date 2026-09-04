@@ -1,0 +1,674 @@
+<task-notification>
+<task-id>a3a6b87f3b701bcd5</task-id>
+<tool-use-id>toolu_01AGCrtk4EENAJVZb9mfM4KE</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-Documents---Peyton-s-MacBook-Pro-entire-devenv-entireio-cli--worktrees-tokens/0321cdd8-aa32-4c13-869b-38d8625ce4f4/tasks/a3a6b87f3b701bcd5.output</output-file>
+<status>completed</status>
+<summary>Agent "Review PR 2 plan chunks" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Plan Review (r1)
+
+**Status:** Issues Found
+
+The rewrite genuinely resolves all six blocking issues — I verified each against the code rather than taking the summary's word for it. Four new problems came in with the changes, three of them in Task 5, which is where most of the new surface is.
+
+---
+
+### Verification of the six original blockers — all genuinely resolved
+
+1. **Base branch** — resolved. The new section states the departure and the reason; I re-verified `git cat-file -e main:cmd/entire/cli/token_cost.go` fails, so off-`main` really is impossible. Chunk 0's verification commands produce exactly the stated output: `.worktrees/pr2` now exists on `pr2-session-tokens-block` at `87291b4b0`, and `rev-list --count pr1-token-class-breakdown..HEAD` → `0`. Good that it says "verify, don't re-create."
+2. **Six rename sites** — resolved and accurate. All six confirmed at the stated lines (`checkpoint_tokens.go:649`; `checkpoint_tokens_classes_test.go:222,254,277,299,392`; `sessions_test.go:2016`), and the five test-function renames are now called out with the right constraint ("renaming tests is permitted; changing what they assert is not").
+3. **Duplicate subagent output** — resolved as a design decision (Decision 3), with the deletions enumerated and both test assertions named. `sessions_test.go:1075` and `:2280` do assert `"Subagents: … tokens"`; the checkpoint contributor append is at `:233-241`, matching "near :233". The new exactly-once test is the right guard. (One consequence went unhandled — see B3.)
+4. **Checkpoint-worded reasons** — mostly resolved, one string still wrong (see B4). I confirmed which existing tests the reword touches: `token_cost_test.go:352-358` and `checkpoint_tokens_classes_test.go:167` all compare against the *constants*, not literals, so they keep passing without edits — Step 4's "if a checkpoint test fails on the wording" is a safe no-op, not a lurking break.
+5. **Live/checkpoint pricing divergence** — resolved, and the delegation is behaviour-preserving. I traced it: today `checkpointTokenWeights` calls `subagentModelsMatch(meta.TokenUsage, resolved.Family)` where `resolved` is the *first* session's family, but it returns early on cross-session family mismatch, so `resolved.Family == weights.Family` whenever that line runs. Delegating to `tokenWeightsForSession(meta.Model, meta.TokenUsage)` — which checks against the meta's own family — is therefore equivalent. `TestCheckpointTokensReport_Classes_SubagentOnAnotherProviderIsUnpriced` and `_SubagentInSameFamilyStaysPriced` will genuinely hold unmodified, as Step 4 claims. Task 4's reason-overwrite snippet also correctly mirrors the identical pattern that already exists at `checkpoint_tokens.go:226-231`.
+6. **Task 6 duration** — resolved. No placeholders; Decision 5 settles the source, two full tests, real implementation, and the `report.Duration` carry-through is spelled out. Field facts check out (`StartedAt` `session/state.go:153`, `LastInteractionTime *time.Time` `:211`, precedent at `:832`).
+
+Line-number corrections all verified: `:328`, `:59`, `:127`/`:146`, `session_tokens.go:36`, `:186-194`, `:619/:620`, `sessions_test.go:2077`, `agent/types.go:53`. The `t.Parallel()` exception note is correct (`setupStopTestRepo` calls `t.Chdir` at `sessions_test.go:47`).
+
+---
+
+### Issues
+
+**[Blocking] Task 5, Step 3 — `subagentTotalOf` is undefined and never specified**
+
+The session call site is given as `writeTokenClasses(w, report.Classes, subagentTotalOf(report.Tokens))`. No such function exists in the package and the plan never defines it. It also needs a nil guard: `report.Tokens` is `*sessionTokensUsage` and is nil whenever no usage was recorded. Both commands need the same helper (the checkpoint side is `report.Tokens.SubagentTotal` too, under the same nil condition), so define it once — three lines — rather than leaving an implementer to invent it and get the nil case wrong.
+
+**[Blocking] Task 5, Step 3 — the shortened label does not fit the width it was shortened to fit**
+
+`"of which subagents"` is **18 characters**; the format string is `%-14s`. `%-14s` is a *minimum* width, so an 18-char label overflows by 4 and pushes the token column four spaces right of every row above it. The line will be misaligned — exactly the defect Step 6 exists to catch, except the plan asserts as established fact that it fits ("shortened to `of which subagents` to fit the existing 14-column label width").
+
+For reference, every existing label does fit: `Fresh input` 11, `Cache write` 11, `Cache read` 10, `Output` 6, `Total` 5.
+
+This makes the wording override buy nothing, which bears directly on your second question — see Recommendations.
+
+**[Blocking] Task 5 — deleting the contributor entry is a breaking `--json` change, and Chunk 4 Step 4 says it must not happen**
+
+The `"subagents"` contributor is not a text-only artifact: it is an element of `report.Contributors`, which is serialized as `contributors` in both `session tokens --json` and `checkpoint tokens --json`. Removing it deletes an element from an existing array in both commands' JSON.
+
+Chunk 4 Step 4's stated expectation is "`classes` and `duration` added; no existing key removed, renamed, or changed in value." That check will fail on the plan's own change. The spec is also explicit that PR 1 allowed "no `--json` contract changes beyond additive breakdown rows."
+
+I checked: **no test asserts the contributors subagents entry** (only `Tokens`/`SubagentTotal` and the text lines are covered), so nothing will catch this — the break would surface only in Step 4's manual diff, where the plan tells the implementer to treat it as a violation.
+
+Pick one and say so: (a) drop the entry from the *text* renderer only and keep it in the JSON report, (b) accept the JSON removal, correct Step 4's expectation, and call it out in the PR description. The figure itself survives either way as `tokens.subagent_total`, which argues for (b) — but it has to be a stated decision, not a contradiction between two chunks. Note this affects `checkpoint tokens --json` too, whose JSON PR 1 just shipped.
+
+**[Blocking] Task 2, Step 3 — `unpricedMixedModels`'s new wording is still false on the live path**
+
+The reword is `"these sessions use models with different price ratios"`. On `session tokens` there is exactly one session, and after Task 3 the live trigger for this reason is a *subagent* on another provider — not multiple sessions. So the string remains untrue of the case it names on the very command Task 2 exists to fix.
+
+The scope-neutrality test cannot catch it: it only greps for the literal substring `"checkpoint"`. Something like `"models with different price ratios were used"` or `"more than one model's price ratios apply here"` is true of both triggers. Worth strengthening the test beyond a `"checkpoint"` substring check while you're there, since a second false-noun slip would pass again.
+
+**[Minor] Task 7, Step 1 — the command invocation uses a flag that does not exist**
+
+`cmd.SetArgs([]string{"--session", "cmd-billed"})` would fail with `unknown flag: --session`. `newTokensCmd` (`session_tokens.go:80-118`) declares only `--json`, `--current`, `--agent-brief`, with `Args: cobra.MaximumNArgs(1)` and `Use: "tokens [session-id]"` — the session ID is positional. Correct form is `[]string{"cmd-billed"}`, matching `sessions_test.go:1053`. The plan does flag it ("it may be positional"), which is honest, but this is a one-grep fact in a plan that otherwise insists on verified line numbers; ship the right line.
+
+**[Minor] Task 6, Step 3 — the suggested search will miss the in-package helpers**
+
+`grep -rn "func formatDuration" cmd/entire/cli/` returns only `investigate/tui_model.go:541` and `review/tui_model.go:722` — different packages, unusable — and **misses** `formatRelativeDuration` (`status.go:435`) and `formatSummaryDuration` (`explain.go:1107`), which are in package `cli`. Neither produces `2h 14m` (they give `"2h ago"` and `d.String()`), so a new helper is genuinely warranted — but the recommended grep is the discovery failure CLAUDE.md's duplication rule is written against. Use `grep -rn 'time.Duration) string' cmd/entire/cli/*.go` and state the conclusion in the plan so the implementer doesn't re-derive it.
+
+---
+
+### Recommendations (advisory)
+
+**On your first judgment call — `writeTokenClasses(w, classes, subagentTotal int)`: yes, that is the right seam.** The line is a share of `classes.Total` and must sit between the `Total` row and the omission line; rendering it outside the block cannot produce that ordering, and the alternative you rejected would have put a statement about the total *after* "Cost share omitted", which reads as part of the omission. The plan also did the honest thing and restated the file's responsibility as "the billed block" rather than "format a `tokenClassBreakdown`", so the doc comment and the signature agree. Two small refinements: a bare trailing `int` reads ambiguously at the call sites (`writeTokenClasses(w, report.Classes, 54000)`), so consider a named type or a two-field struct; and the `classes == nil` early return silently swallows a non-zero `subagentTotal` — only reachable via a subagent chain deeper than `types.MaxSubagentDepth` (which the unbounded `totalTokens` counts and the bounded flattening does not), so it is acceptable, but it is the same class of exposure your Out-of-scope list already tracks.
+
+**On your second judgment call — the label wording: revert to the spec's agreed wording and widen the column.** Not because overriding a spec wording for alignment is illegitimate, but because as written the override *doesn't achieve alignment* (B2 above: 18 chars in a 14-wide field), so it trades away a wording Peyton agreed on 2026-09-01 and gets nothing back. Two clean options: keep `Of the total, subagents used` (27) and widen the label field to `%-28s` across the four class rows, the `Total` row and the new line — the priced table is ~44 columns today, ~58 with a subset note, so it lands near 72 and stays well inside 100; or, if you want the narrow table, use a label that genuinely fits 14, e.g. `Subagents` (9), which reads naturally directly under `Total`. Either way the plan should state the resulting rendered width, and a wording change agreed with Peyton should be surfaced as his call rather than settled in a Note.
+
+- The exactly-once test works, but for a subtle reason worth a comment: with that fixture (`SubagentTotal` 54000 of 347000) the `subagent-heavy` recommendation fires and prints "Scope **subagent** tasks tightly; give each **subagent** a narrow objective…" — singular, so `strings.Count(out, "ubagents")` still returns 1. The assertion silently depends on the plural/singular split. One line of comment prevents a maintainer "fixing" it later. (I confirmed the agent-brief path reads `Recommendations`, not `Contributors`, so removing the contributor entry breaks nothing there.)
+- Test-file imports: Task 4 lists `bytes, strings, testing, agent, strategy` and Task 6 adds `time`, but Task 7's command-level test also needs `context` and `github.com/entireio/cli/cmd/entire/cli/session` (for `session.PhaseActive`). Add them to the list so the file compiles first try.
+- Task 2 Step 1's map literal is not gofmt-aligned (`"mixed models"` is longer than the other keys, so gofmt re-columns all three values). Harmless — `mise run fmt` fixes it — but Step 2 runs the test before any fmt/lint step, so the implementer sees a diff they didn't make.
+- Chunk 0 Step 2's stale-`nolintlint`-cache note and the "PR 1 tested the installed 0.10.1" warning in Chunk 4 Step 2 are both good additions; keep them.
+- Chunk sizes are fine (910 lines across five chunks, largest ~290), checkbox syntax is on every step including the previously-empty Task 6, and the `git diff --numstat` budget checks at Task 1 Step 7, Task 5 Step 7 and Chunk 4 Step 5 satisfy spec Rule 6 properly.</result>
+<usage><subagent_tokens>176263</subagent_tokens><tool_uses>10</tool_uses><duration_ms>217908</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a3a6b87f3b701bcd5</task-id>
+<tool-use-id>toolu_01NJCWXqvtjRGnNngrnizJZD</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-Documents---Peyton-s-MacBook-Pro-entire-devenv-entireio-cli--worktrees-tokens/0321cdd8-aa32-4c13-869b-38d8625ce4f4/tasks/a3a6b87f3b701bcd5.output</output-file>
+<status>completed</status>
+<summary>Agent "Review PR 2 plan chunks" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Plan Review (r2)
+
+**Status:** Issues Found — one blocking defect plus the leftover contradictions you asked me to hunt for. Everything else is clean; this is close.
+
+---
+
+### Verification of the four r1 findings
+
+1. **`subagentTotalOf`** — resolved. Defined at lines 713-722 with the nil guard, in `token_classes_render.go`, with both call sites named. Correct: `report.Tokens` is `*sessionTokensUsage` and is nil whenever `buildSessionTokensUsage` returned nil.
+2. **The label** — resolved, with one measurement slip (see I3). The `%-14s` → `%-28s` change is applied to all rows with an explicit "do not widen only the new line" warning, and the r1 mistake is recorded rather than quietly dropped. You were right to widen rather than shorten.
+3. **The `--json` break** — **your option (a) is the better call, and I was wrong to lean (b).** Your reasoning holds: the duplication was a rendering artifact of a report that has a "block" and a "contributors list"; JSON has neither, so `contributors[].kind=="subagents"` and `tokens.subagent_total` are two named fields, not two answers under one label. Breaking a contract PR 1 just shipped for a text-only gain is a bad trade. Chunk 4 Step 4 now stays honest instead of contradicting the plan. But the *mechanism* the plan prescribes for (a) is wrong — see I1.
+4. **`unpricedMixedModels`** — resolved. `"more than one model's price ratios apply here"` names the fact, not either trigger's scope, and the two-trigger paragraph explains why. The test now checks `"checkpoint"` and `"sessions"`. Both existing assertions (`token_cost_test.go:352-358`, `checkpoint_tokens_classes_test.go:167`) compare against the constants, so they still pass untouched.
+
+Minors all confirmed fixed: positional `SetArgs([]string{"cmd-billed"})` with the real flag set stated (`session_tokens.go:80-118`); the duration-helper conclusion recorded with the working grep; imports list complete; the plural/singular comment is in the test.
+
+---
+
+### Issues
+
+**[Blocking] Task 5, Step 3 — deleting the `case "subagents":` branch does not silence it; it falls through to `default:` and prints a worse line**
+
+`writeTokenContributors` (`session_tokens.go:613-630`) is:
+
+```go
+switch contributor.Kind {
+case "subagents":
+    fmt.Fprintf(w, "- %s: %s tokens\n", contributor.Label, formatTokenCount(contributor.Tokens))
+case "context_pressure":
+    ...
+default:
+    fmt.Fprintf(w, "- %s\n", contributor.Label)
+}
+```
+
+Under option (a) the append stays, so the contributor is still in the slice. Delete the `case` and `Kind == "subagents"` matches `default:`, which prints `- Subagents` — the label with the token count now stripped. That is not silence, it is a regression, and it breaks the plan's own guard: `TestSessionTokens_SubagentFigureAppearsOnlyOnce` counts `"ubagents"` and would find **2**, so Step 4 fails with a message pointing at the wrong cause.
+
+The instruction needs to be "keep the case, empty its body":
+
+```go
+case "subagents":
+    // Rendered inside the billed block, with its share of the total.
+    // The report entry stays for --json (Decision 3); only the text moves.
+```
+
+Worth saying explicitly in the plan, because "delete the branch" and "make the branch print nothing" look identical at a glance and only one of them works.
+
+**[Blocking] Five leftover statements still describe option (b) — the executor would delete the appends and break the JSON**
+
+You asked me to check for these, and they are there:
+
+| Line | Says | Should say |
+|---|---|---|
+| 122 | `checkpoint_tokens.go` — "drop the subagents contributor entry" | checkpoint's append at `:233-241` **stays**; its only Task 5 change is the `writeTokenClasses` call site at `:649` |
+| 124 | `session_tokens.go` — "drop the subagents contributor entry" | the append at `:186-194` **stays**; only the render branch at `:619-620` changes |
+| 599 | Task 5 Files: `session_tokens.go` "(call the renderer; drop the contributor entry)" | "(call the renderer; stop rendering the contributor)" |
+| 600 | Task 5 Files: `checkpoint_tokens.go` "(drop the same contributor entry)" | there is no contributor change in this file at all — and this line directly contradicts Step 3's own correct note at 728-729 ("Both commands render contributors through this one function, so this is the only deletion needed") |
+| 65 | table: "**Task 5 replaces this**" | "replaces this in the text; the report/JSON entry stays" |
+
+I confirmed 728-729 is right: `writeTokenContributors` has exactly two call sites (`checkpoint_tokens.go:654`, `session_tokens.go:459`), both reaching the one function, so the render change is genuinely single-site.
+
+Also worth a clause in the commit message at 761 — "Replaces the 'Likely contributors' subagents entry rather than joining it" reads as a report change, and the commit message is the durable record. Add "in the text; the JSON entry is unchanged."
+
+**[Minor] Stray code fence at line 310 breaks the rendering of Task 2 Steps 4-5**
+
+The file has 47 `^```` fences — an odd number. The ```go block at 296 closes correctly at 303, then the prose at 305-309 is followed by an unmatched ``` at 310. Consequence: lines 312-320 (Step 4's Run/Expected text) render as a code block, and every subsequent fence in Chunk 2 is inverted — 321's ```bash closes rather than opens. Delete line 310. Worth fixing because an agentic executor parsing fenced blocks will mis-attribute Step 4's commands.
+
+**[Minor] The label is 28 characters, not 27 — `%-28s` leaves exactly zero margin**
+
+`printf 'Of the total, subagents used' | wc -c` → 28. It still aligns, because the format string is `"  %-28s %10s %8s\n"` with a literal space after the field, so a 28-char label fills the field exactly and the separator space does its job. But there is no slack: any future wording tweak overflows and reintroduces the r1 misalignment. Use `%-30s` (table ~60 cols, ~74 with a subset note — still well inside 100) and correct the stated length.
+
+**[Minor, new] A session whose only contributor is subagents now prints a bare "Likely contributors" header**
+
+The section guard is `if len(contributors) &gt; 0`, not "any contributor that renders something". Once the subagents branch prints nothing, a session with subagent usage but no context data and no skill events emits the blank header with no rows under it. This shape is pre-existing in kind — `context_pressure` already prints nothing when `contextInfo` is nil — but the change makes it reachable in a common case rather than a rare one. Either add a "has anything to render" check, or drop the `Duration`-style guard down a level. Not worth blocking on, but Step 6's by-hand render should be told to look for it, since no test covers an empty section.
+
+---
+
+### Recommendations (advisory)
+
+- **On the bare `subagentTotal int` — your call, not mine. Don't adopt my suggestion.** You are right that it is one int at two call sites in the same package, both reading it through `subagentTotalOf(report.Tokens)`, which is self-documenting at the point of use. A named type or options struct here is abstraction ahead of the second shape, which is exactly what spec Rule 3 forbids. My concern was call-site ambiguity, and `subagentTotalOf(...)` answers it without a type.
+- **On `classes == nil` swallowing a non-zero subagentTotal — agreed, it does not need its own line.** The Out-of-scope entry for the unbounded `totalTokens` walk names the mechanism, and the new snippet's `classes.Total &gt; 0` guard means the change introduces nothing. Leave it.
+- Task 5 Step 3's "Verify the JSON really is unchanged: `contributors` must still contain the `"subagents"` element" is the right instruction, but nothing asserts it in-package — I checked, no test touches the contributors subagents entry. If you want the decision to survive the next refactor, one three-line assertion on `buildSessionTokensReport(...).Contributors` would pin it far more cheaply than Chunk 4 Step 4's manual binary diff.
+- Everything else holds from the r1 pass: base-branch section and Chunk 0 verify clean (`.worktrees/pr2` on `pr2-session-tokens-block` at `87291b4b0`, `rev-list --count` → 0), the Task 3 delegation is behaviour-preserving as analysed, the six rename sites are accurate, and the exactly-once test's plural/singular dependency is now documented. 977 lines across five chunks, largest ~310, checkboxes throughout, real `--numstat` counts at three points.
+
+Fix I1 and I2 and this is ready for execution; I3-I5 are cheap enough to fold into the same pass.</result>
+<usage><subagent_tokens>207505</subagent_tokens><tool_uses>5</tool_uses><duration_ms>119314</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a3a6b87f3b701bcd5</task-id>
+<tool-use-id>toolu_01HKu3G1ZF3TyYzUcdGuFGzZ</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-Documents---Peyton-s-MacBook-Pro-entire-devenv-entireio-cli--worktrees-tokens/0321cdd8-aa32-4c13-869b-38d8625ce4f4/tasks/a3a6b87f3b701bcd5.output</output-file>
+<status>completed</status>
+<summary>Agent "Review PR 2 plan chunks" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Plan Review (r3)
+
+**Status:** Issues Found — one instruction defect (a one-line fix), plus two trivia. Both of your specific questions check out clean.
+
+---
+
+### Your two questions, answered empirically
+
+**The comment-only empty case is valid Go, gofmt-clean, and behaves as intended.** I compiled and ran the exact shape:
+
+```go
+case "subagents":
+    // Rendered inside the billed block, with its share of the total.
+    // The report entry stays for --json (Decision 3); only the text moves.
+case "context_pressure":
+    ...
+default:
+    fmt.Printf("- %s\n", label)
+```
+
+`gofmt -l` → no output; `go run` with `kind == "subagents"` printed **nothing** and did not reach `default:` (only the `"other"` call printed `- Other`). Go has no implicit fallthrough, so an empty case clause is silence, not pass-through.
+
+It will not trip this repo's lint config either. The nearest candidate is `revive`'s `empty-block` (revive is enabled at `.golangci.yaml` with no rule overrides, so its default set applies), but that rule walks `*ast.BlockStmt`; a case clause is `*ast.CaseClause` with a `[]ast.Stmt` body, so it is out of scope. `gocritic`'s switch checkers (`emptyFallthrough`, `caseOrder`, `dupCase`, `dupBranchBody`, `singleCaseSwitch`) don't cover an empty body, and `exhaustive` won't fire because `contributor.Kind` is a plain `string`, not a named enum type.
+
+**Step 6b's test compiles and passes.** `sessionTokensContributor` has `Kind` (`session_tokens.go:44-52`), and `report.Contributors` is `[]sessionTokensContributor`, so `for _, c := range report.Contributors { if c.Kind == ... }` is right. The fixture also genuinely reaches the append: `totalTokens` (`status_style.go:132`) recurses into `SubagentTokens` and sums `InputTokens`, so `SubagentTotal` = 500 &gt; 0, and the flattened total (1500) is non-zero so `buildSessionTokensUsage` returns non-nil — both conditions the append at `:186-194` needs. `t.Parallel()` is correct here (no `t.Chdir`).
+
+---
+
+### I1 and I2: both genuinely resolved
+
+**I1** — resolved, and thoroughly. Step 3 now says keep the label and empty the body, gives the default-arm reason with the line reference, states the test would count 2, carries the "look identical at a glance" warning, and shows the code. Both `writeTokenContributors` call sites are named and correct (`checkpoint_tokens.go:654`, `session_tokens.go:459` — verified), as is the claim that this is the only render change needed.
+
+**I2** — resolved. `grep` for all three old phrasings returns zero hits. Line 74's table row now reads "in the text only; the report entry and its `--json` output stay". The `checkpoint_tokens.go` file-structure bullet correctly says its append at `:233-241` stays untouched; the `session_tokens.go` bullet says "stop *rendering*… (the append stays)"; Task 5's Files list says the checkpoint file has "no contributor change in this file". No contradiction remains anywhere I can find.
+
+**I3** — resolved: 48 fences, even. **I4** — resolved: `%-30s`, length corrected to 28, widths restated as ~60 / ~74. **I5** — resolved: Step 6 cites the `len(contributors) &gt; 0` guard at `:614` (verified exact) and tells the implementer to fix it in this task if the bare header appears.
+
+---
+
+### Issues
+
+**[Blocking, one line] Task 5 Step 3's row enumeration omits both header rows — widening only the rows it lists reproduces the misalignment the note exists to prevent**
+
+The plan says widening means changing `%-14s` → `%-30s` on "the four class rows, the `Total` row, and this new line." There are **five** `%-14s` sites in `writeTokenClasses`, and two of them are the column-title rows:
+
+```
+669:  fmt.Fprintf(w, "  %-14s %10s %8s %7s\n", "", "tokens", "volume", "cost")   ← priced header
+671:  fmt.Fprintf(w, "  %-14s %10s %8s\n",     "", "tokens", "volume")           ← unpriced header
+686:  fmt.Fprintf(w, "  %-14s %10s %8s %7s",  row.label, ...)                    ← class row, priced
+690:  fmt.Fprintf(w, "  %-14s %10s %8s",      row.label, ...)                    ← class row, unpriced
+698:  fmt.Fprintf(w, "  %-14s %10s\n",        "Total", ...)                       ← Total row
+```
+
+Follow the enumeration literally and `tokens` / `volume` / `cost` stay at label-width 14 while every data row moves to 30 — the titles end up 16 columns left of their columns. Step 6's by-hand look would catch it, but the plan's own instruction is what sends the implementer there. (Also worth noting: "the four class rows" is really two format strings, priced and unpriced — the four rows come from the `rows` slice at `:678-683`.)
+
+Suggested replacement: *"Change all five `%-14s` occurrences in `writeTokenClasses` — two header rows (`:669`, `:671`), two class rows (`:686`, `:690`) and the `Total` row (`:698`) — plus the new line. Verify with `grep -c '%-14s'` → 0 afterwards."* That is mechanically checkable, which the prose enumeration is not. My miss in the r2 pass, not a regression you introduced.
+
+**[Trivial] The default-arm citation is off by one.** Step 3 says the `- %s\n` print is at `session_tokens.go:626-627`; `default:` is at **625** and the `Fprintf` at **626** (627 is the switch's closing brace). The `:614` guard and `:619-620` case references are both exact.
+
+**[Trivial, helpful] I5 will surface in Step 4, not just Step 6.** The exactly-once fixture sets no `ContextTokens`/`ContextWindowSize` and no `SkillEvents`, so `report.Contributors` holds only the subagents entry — meaning that test is itself the bare-header case, and its failure output will print `Likely contributors` with nothing under it. Worth a clause in Step 6b or Step 4 so the implementer recognises it rather than hunting.
+
+---
+
+### Recommendations (advisory)
+
+- Fix the row enumeration and this is approved. Nothing else in r3 needs another round; the two questions you flagged are both sound, and I verified them by execution rather than inspection.
+- Everything previously verified still holds: base branch and Chunk 0 (`.worktrees/pr2` on `pr2-session-tokens-block` at `87291b4b0`, `rev-list --count` → 0), the six rename sites, the Task 3 delegation equivalence, the four reason constants and their two existing constant-comparing assertions, `parseBilledShares`' whitespace-agnostic parsing (so the widening does not touch it), and the positional `SetArgs`.
+- Step 6b was the right addition. It converts Decision 3 from prose plus a manual binary diff into something CI enforces, which matters because that decision is the one a future refactor would most plausibly undo "for consistency".</result>
+<usage><subagent_tokens>227034</subagent_tokens><tool_uses>8</tool_uses><duration_ms>136964</duration_ms></usage>
+</task-notification>
+
+---
+
+okay proceed then
+
+---
+
+okay proceed then
+
+---
+
+<task-notification>
+<task-id>adb84efa0a1e35594</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-Documents---Peyton-s-MacBook-Pro-entire-devenv-entireio-cli--worktrees-tokens/0321cdd8-aa32-4c13-869b-38d8625ce4f4/tasks/adb84efa0a1e35594.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement Task 1: move renderer" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Good — `pr1-token-class-breakdown..HEAD` contains exactly my one commit, confirming the diff stat (106 added, 95 deleted, net +11) reflects only this move.
+
+## Report
+
+**Changes:**
+- Created `cmd/entire/cli/token_classes_render.go` with `writeTokenClasses` (renamed from `writeCheckpointTokenClasses`), `formatSharePercent`, `formatCostSharePercent`, `subsetNote` — moved verbatim, doc comments intact, plus the new file-level comment specified in the plan.
+- `cmd/entire/cli/checkpoint_tokens.go`: removed the four functions, updated the one call site (line 649 → now calls `writeTokenClasses`).
+- `cmd/entire/cli/checkpoint_tokens_classes_test.go`: renamed 5 test functions (`TestWriteCheckpointTokenClasses_*` → `TestWriteTokenClasses_*`) and updated 5 call sites (lines 222, 254, 277, 299, 392) — confirmed via diff that no assertion body changed, only names.
+- `cmd/entire/cli/sessions_test.go:2016`: updated the comment naming the old function.
+
+**Verification:**
+- Step 1 (before move): `TestWriteCheckpointTokenClasses_{Priced,ZeroCostClassIsNotUnderOnePercent,UnpricedOmitsCostColumn,NilRendersNothing,StatesTheRealReason}` and `TestFormatSharePercent` — all 6 PASS.
+- Step 4 (after move): same 6 tests under new names `TestWriteTokenClasses_*` and `TestFormatSharePercent` — all 6 PASS, `go build ./...` clean.
+- Step 5: `go test ./cmd/entire/cli/ -count=1` → `ok` (80.8s). `mise run fmt` made no additional changes beyond the edits I'd already made (confirmed via `git status --porcelain` before/after). `mise run lint` → `0 issues.` (no stale-cache `nolintlint` issue encountered).
+- Self-review: `git show --stat HEAD` → 4 files changed, 106 insertions(+), 95 deletions(-). `git diff HEAD~1` confirms the move is byte-for-byte identical aside from the single required rename (`writeCheckpointTokenClasses` → `writeTokenClasses`); no logic, formatting, or comment content was altered beyond that.
+- Step 7: `git diff --numstat pr1-token-class-breakdown...HEAD` → **106 added, 95 deleted** (net +11 — near zero, as expected for a move). `git log --oneline pr1-token-class-breakdown..HEAD` shows this range contains exactly the one new commit (`00a088324`), so the stat reflects only this task's diff.
+
+**Commit:** `00a088324` — "refactor(tokens): move the class renderer out of the checkpoint command", trailer included.
+
+Nothing unanticipated: all stated line numbers and call sites matched the actual files exactly, and the plan's expectations held at every checkpoint.
+
+DONE</result>
+<usage><subagent_tokens>95741</subagent_tokens><tool_uses>23</tool_uses><duration_ms>244647</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a4a9237c7aa489634</task-id>
+<tool-use-id>toolu_01Q5N4CyYzRVy8kfJuxR4eQt</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-Documents---Peyton-s-MacBook-Pro-entire-devenv-entireio-cli--worktrees-tokens/0321cdd8-aa32-4c13-869b-38d8625ce4f4/tasks/a4a9237c7aa489634.output</output-file>
+<status>completed</status>
+<summary>Agent "Review spec compliance Task 1" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Header matches the spec's exact required text verbatim.
+
+## Spec Compliance Review — Task 1
+
+**Status:** ✅ Spec compliant
+
+**Missing requirements:** none. All six reference sites updated (`checkpoint_tokens.go:649` call site; five in `checkpoint_tokens_classes_test.go` at 222/254/277/299/392; one comment in `sessions_test.go:2016`). All five `TestWriteCheckpointTokenClasses_*` → `TestWriteTokenClasses_*` renames present. New file `token_classes_render.go` begins with `package cli`, the two-import block, then the exact specified header comment verbatim.
+
+**Extra/unrequested work:** none. `grep -rn "writeCheckpointTokenClasses\b"` across `cmd/` returns zero hits — no stray old-name references left anywhere. The four functions (`writeTokenClasses`, `formatSharePercent`, `formatCostSharePercent`, `subsetNote`) exist exactly once each, only in the new file. No new helpers, no additional renames beyond the one required, no changes to any other file.
+
+**Behaviour differences in moved code:** none — verified mechanically. Extracted the four function bodies from `pr1-token-class-breakdown:cmd/entire/cli/checkpoint_tokens.go` (lines 658–740) and from `token_classes_render.go` (lines 9–94), ran `sed 's/writeCheckpointTokenClasses/writeTokenClasses/g'` on the old extract, then `diff`'d against the new extract. The only diff output was the required header comment block (present only in the new file, as specified) and a trailing-blank-line artifact from the old file's section boundary (not a content difference). No format-string, guard, ordering, comment-body, or exported-ness change beyond the specified rename.
+
+**Altered assertions:** none. Diff of `checkpoint_tokens_classes_test.go` shows exactly 10 changed lines: 5 test-function-name declarations and 5 call-site invocations (`writeCheckpointTokenClasses(...)` → `writeTokenClasses(...)`). Every assertion body, table-driven case, and error message is untouched. `sessions_test.go` diff is a one-line comment-text change only (old function name → new), not an assertion.
+
+**Verification reproduced:**
+- `go test ./cmd/entire/cli/ -run 'TestWriteTokenClasses|TestFormatSharePercent' -count=1 -v` → all 6 tests PASS (`TestWriteTokenClasses_Priced`, `_ZeroCostClassIsNotUnderOnePercent`, `_UnpricedOmitsCostColumn`, `_NilRendersNothing`, `_StatesTheRealReason`, `TestFormatSharePercent`).
+- `go test ./cmd/entire/cli/ -count=1` → `ok` (88.6s, full package).
+- `mise run fmt` → no files rewritten (tree already clean).
+- `golangci-lint cache clean` then `mise run lint` → `[lint:go] 0 issues.` No stale `nolintlint` artifacts observed in `agent/architecture_test.go`.
+
+**Commit hygiene:** Commit `00a088324` exists on `pr2-session-tokens-block`, touches exactly the four specified files (`checkpoint_tokens.go`, `checkpoint_tokens_classes_test.go`, `sessions_test.go`, `token_classes_render.go`), carries the `Co-Authored-By: Claude Opus 5 (1M context) &lt;noreply@anthropic.com&gt;` trailer, and `git diff --numstat pr1-token-class-breakdown...HEAD` = 106 insertions / 95 deletions (net +11), matching the implementer's claim. The +11 is fully accounted for by the new file's mandatory `package cli` clause, import block, and the specified header comment (7 lines of boilerplate + 4 lines of header not present in the old file) — consistent with "near zero net, this is a move."
+
+**Issues:** none found.</result>
+<usage><subagent_tokens>90346</subagent_tokens><tool_uses>14</tool_uses><duration_ms>234731</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a411649d19daea46b</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-Documents---Peyton-s-MacBook-Pro-entire-devenv-entireio-cli--worktrees-tokens/0321cdd8-aa32-4c13-869b-38d8625ce4f4/tasks/a411649d19daea46b.output</output-file>
+<status>completed</status>
+<summary>Agent "Code quality review Task 1" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Strengths
+
+- **The model/view split is the right one, and it's clean.** `token_cost.go` owns the domain (`tokenClassBreakdown`, `tokenClassShare`, the `unpricedNoModel` reason string); `token_classes_render.go` now owns only its presentation and imports nothing but `fmt` and `io`. A 94-line, two-import view file over a model that lives in a third file is a better shape than what it replaced, independent of whether Task 4 ever lands.
+- **The rename is complete, not half-applied.** Function, five test names, and the one stale prose reference in `sessions_test.go:2016` all moved together, so there is no intermediate state where the old name survives in a comment as a trap for grep.
+- **The doc comments came across intact, including their reasoning.** `formatSharePercent`'s "274.8k tokens beside 0% reads as broken" and `formatCostSharePercent`'s "several families bill no cache writes whatsoever" are the two comments most worth preserving in this cluster, and they moved verbatim. A move that drops the *why* and keeps the *what* is the common failure here; this one didn't.
+- **`checkpoint_tokens.go` is better off, not just smaller.** The removed block sat contiguously between `writeCheckpointTokensText` (line 620) and `writeCheckpointTokensAgentBrief` (line 658), and it was the only run of generically-named symbols in a file where essentially everything else carries a `checkpoint` prefix. Answering your question 2 directly: the removal exposed no seam — it closed one.
+
+## Issues
+
+### Important
+
+**1. The stated principle is now applied to one of five shared token renderers, so the move establishes an exception rather than a rule.**
+
+`writeCheckpointTokensText` (`/Users/peytonmontei/dev/entire/devenv/entireio/cli/.worktrees/pr2/cmd/entire/cli/checkpoint_tokens.go:648-655`) calls four writers that *already* have two or more command callers, and all four live inside `session_tokens.go`:
+
+| Writer | Defined | Callers |
+| --- | --- | --- |
+| `writeTokenUsageSection` | `session_tokens.go:591` | session, checkpoint, `tokens_profile.go:382` (via `…WithTitle`) |
+| `writeTokenRecommendations` | `session_tokens.go:583` | session, checkpoint, tokens profile |
+| `writeTokenContributors` | `session_tokens.go:613` | session, checkpoint |
+| `writeTokenLimitations` | `session_tokens.go:632` | session, checkpoint, tokens profile |
+
+So "a function two commands call should not live inside one command's file" was already false in this package before this commit, and three commands — not two — are affected. After Task 4, `writeSessionTokensText` will call four shared writers from `session_tokens.go` and one from `token_classes_render.go`; a reader asking "where do the shared token writers live?" gets two answers.
+
+The package's existing answer is visible in `checkpointAgentBriefSessionReport` (`checkpoint_tokens.go:688`), which converts a checkpoint report into a `sessionTokensReport` *specifically* so the checkpoint command can reuse session-side helpers. That's a deliberate "shared token rendering lives on the session side" convention, and this file dissents from it. The dissent is the better design — I'd keep it — but the plan should say whether the other four follow later or whether this file is scoped to the billed block only. Left unstated, the next person to add a shared writer has no rule to follow.
+
+**2. Task 5's `subagentTotalOf` does not belong in this file, and its natural home already has a twin sitting in it.**
+
+Answering your question 1: the file is one coherent responsibility *today*, and the signature change is fine — better than the alternative, actually. Taking `subagentTotal int` keeps the renderer's input "the breakdown plus one scalar," so the file stays a pure view over a `token_cost.go` model and never learns about `session_tokens.go` types. Passing a `*sessionTokensUsage` instead would be the version that breaks the file.
+
+The accessor is the part that doesn't fit, and it's not a close call, because the sibling already exists:
+
+```go
+// session_tokens.go:262
+func topLevelSessionTokenTotal(tokens *sessionTokensUsage) int {
+	if tokens == nil {
+		return 0
+	}
+	...
+}
+```
+
+`subagentTotalOf` would be exactly this shape — nil-safe accessor over `*sessionTokensUsage`, returning `int`, reading the `SubagentTotal` field that already exists at `session_tokens.go:35`. It belongs immediately beside `topLevelSessionTokenTotal`. Put it in `token_classes_render.go` and that file becomes the only place that touches a `session_tokens.go` value type while claiming to render a `token_cost.go` one, and it acquires a function that no `checkpoint tokens` code path calls. So: yes, the accessor is a sign of a second responsibility — but it's a plan issue to settle before Task 5, not a defect in this commit.
+
+**3. There is no `token_classes_render_test.go`; the render tests kept a filename naming the command they just left.**
+
+The five `TestWriteTokenClasses_*` tests stayed in `checkpoint_tokens_classes_test.go`. Leaving them there in a zero-behaviour-change task is the right call — moving them is churn the plan forbade — but it should not survive Task 5. Note this is a *split*, not a move: that file also holds `TestCheckpointTokensReport_Classes_CarrySubsets` and `TestCheckpointTokenWeights_NilMetaIsUnpriced`, which are genuinely checkpoint-report tests and should stay. Only the five render tests travel.
+
+### Minor
+
+**4. The header comment's first sentence asserts as fact something Task 4 has not made true.** Answering question 3: it's half-durable. "It is shared by `checkpoint tokens` … and `session tokens`" is false right now — `checkpoint_tokens.go:649` is the only caller. The second sentence, "so the two commands cannot drift into two different tables for the same four classes," is the half that earns its keep and would justify the file on its own. Rot risk is low in practice since Task 4 lands in the same PR and a grep verifies the claim cheaply; the real exposure is if the PR gets split and the file's entire reason for existing is left standing as a comment that lies. Separately, "the same four classes" hardcodes a count that the `rows` literal already enumerates — a fifth billing class would rot the prose and not the code.
+
+**5. `writeTokenClasses`'s doc comment didn't reflow after the name shortened**, leaving "renders the billing-class breakdown. The cost / column is present only when…" wrapping oddly. `gofmt` won't touch it.
+
+**6. Three generically-named helpers are now in a file whose name invites reuse, in a package with five near-neighbours.** Answering question 4: no actual visibility widened — all three were already package-scoped in `package cli`; what changed is discoverability. `formatSharePercent` now sits one file-open away from a caller reaching for "format a percent," alongside `formatPercent(float64)` (`session_tokens.go:415`), `roundedPercent` (`:282`), `tokenPercent` (`:408`), and `exactPercents`/`exactPercentsFloat` (`token_cost.go:278`/`:289`). `formatSharePercent` is the one with the `&lt;1%` special case that is only correct for a billed-block share column, and it carries no note saying so. `subsetNote` is the most generically named and least generic of the three — its `(label 12.3k)` output format is specific to this table. Not worth churning now; worth a scope note when the file next changes.
+
+One residual in the source file for completeness: `formatPlainCount` (`checkpoint_tokens.go:736`) and `absFloat` (`:740`) are the same class of generic formatter left behind, but both have exactly one caller (`formatCheckpointMetricDelta`, line 714/733), so they are correctly local and not candidates for the same treatment.
+
+## Assessment
+
+**Approve.** This is a well-executed preparatory refactor: it does exactly one thing, it does it verbatim, it leaves both files more coherent than it found them, and the decomposition it picks is the right one — the file is a view over `token_cost.go`'s model with no other job.
+
+Three things to settle, none blocking this commit:
+
+- **Before Task 5:** put `subagentTotalOf` in `session_tokens.go` beside `topLevelSessionTokenTotal`, not in `token_classes_render.go`. Keep the `subagentTotal int` parameter as planned.
+- **Plan-level:** state whether the four shared writers in `session_tokens.go` follow `writeTokenClasses` out, or scope the new file's header comment to the billed block so the convention isn't ambiguous.
+- **After Task 4:** split the five `TestWriteTokenClasses_*` tests into `token_classes_render_test.go`, leaving the two report/weights tests behind.
+
+Relevant paths: `/Users/peytonmontei/dev/entire/devenv/entireio/cli/.worktrees/pr2/cmd/entire/cli/token_classes_render.go`, `.../checkpoint_tokens.go`, `.../session_tokens.go`, `.../checkpoint_tokens_classes_test.go`, `.../tokens_profile.go`.
+
+Note: I could not locate `docs/superpowers/plans/2026-09-03-pr2-session-tokens-block.md` in this worktree (the `docs/superpowers/plans/` directory is empty here), so my reading of Tasks 4–5 comes entirely from your summary rather than the plan text.</result>
+<usage><subagent_tokens>92574</subagent_tokens><tool_uses>14</tool_uses><duration_ms>166037</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a2a0531cd0f6fc4fb</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-Documents---Peyton-s-MacBook-Pro-entire-devenv-entireio-cli--worktrees-tokens/0321cdd8-aa32-4c13-869b-38d8625ce4f4/tasks/a2a0531cd0f6fc4fb.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement Task 2: scope-neutral reasons" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Report
+
+**RED** (before the fix, `go test ./cmd/entire/cli/ -run TestUnpricedReasons_AreScopeNeutral -count=1 -v`):
+```
+session_tokens_classes_test.go:24: no model reason is printed by both commands and must not say "checkpoint": "no verified price ratios for this checkpoint's model"
+session_tokens_classes_test.go:24: mixed models reason is printed by both commands and must not say "checkpoint": "this checkpoint's sessions use models with different price ratios"
+session_tokens_classes_test.go:24: mixed models reason is printed by both commands and must not say "sessions": "this checkpoint's sessions use models with different price ratios"
+session_tokens_classes_test.go:24: no cost reason is printed by both commands and must not say "checkpoint": "this checkpoint's classes carry no priced tokens"
+--- FAIL: TestUnpricedReasons_AreScopeNeutral (0.00s)
+```
+Failed exactly as predicted — three "checkpoint" hits (no model, mixed models, no cost), plus the expected bonus "sessions" hit on mixed models.
+
+**GREEN** (after the reword): `go test ./cmd/entire/cli/ -count=1` → `ok github.com/entireio/cli/cmd/entire/cli 79.596s`. The new test alone also passes.
+
+**Existing tests**: Neither `token_cost_test.go` (`TestTokenClassShares_UnpricedReasonsAreSpecific`) nor `checkpoint_tokens_classes_test.go` needed edits — both compare against the constants, not literals, exactly as the task predicted. `git add` on `checkpoint_tokens_classes_test.go` was a no-op (nothing changed).
+
+**Lint**: `mise run fmt` → no rewrites beyond the intended edits; `mise run lint` → `0 issues`. No stale-cache `nolintlint` gotcha encountered.
+
+**Diff self-review** (`git diff HEAD~1`): Exactly the specified 3-constant reword in `cmd/entire/cli/token_cost.go` (`unpricedNoModel`, `unpricedMixedModels`, `unpricedNoCost`), `unpricedUnknownTTL` untouched, plus the new `cmd/entire/cli/session_tokens_classes_test.go` matching the given test verbatim. No assertion weakened.
+
+**Commit**: `bc7e244e2` — "fix(tokens): withheld-cost reasons must be true on both commands"
+
+**Running total** (`pr1-token-class-breakdown...HEAD`): 141 added, 98 deleted (cumulative through Task 1 + Task 2).
+
+DONE</result>
+<usage><subagent_tokens>88318</subagent_tokens><tool_uses>15</tool_uses><duration_ms>192930</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a41c82c99e31b5b19</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-Documents---Peyton-s-MacBook-Pro-entire-devenv-entireio-cli--worktrees-tokens/0321cdd8-aa32-4c13-869b-38d8625ce4f4/tasks/a41c82c99e31b5b19.output</output-file>
+<status>completed</status>
+<summary>Agent "Review spec compliance Task 2" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Commit trailer matches spec requirement.
+
+## Spec Compliance Review — Task 2
+
+**Status:** ✅ Spec compliant
+
+**Missing requirements:** none
+
+**Extra/unrequested work:** none — diff touches exactly `token_cost.go` (3 constants reworded) and the new `session_tokens_classes_test.go`, nothing else (`git diff --stat` confirms only these two files).
+
+**`unpricedUnknownTTL` preserved:** yes. Read directly from `token_cost.go:119`:
+`unpricedUnknownTTL = "this checkpoint predates the cache-write TTL split, which changes the rate"` — byte-identical to the pre-change value.
+
+**Assertions weakened:** none — verified by reading `token_cost_test.go:352-358` and `checkpoint_tokens_classes_test.go:167-168`, both of which compare against the named constants (`unpricedNoModel`, `unpricedUnknownTTL`, `unpricedMixedModels`), not string literals, so the reword flows through automatically. `git diff` confirms neither file was touched (no-op as claimed). Two pre-existing `strings.Contains(out, "no verified price ratios")` checks at `checkpoint_tokens_classes_test.go:289,395` still pass because that substring survives in the reworded `unpricedNoModel` ("no verified price ratios for this model") — not weakened, just untouched and still valid. One comment at `checkpoint_tokens_classes_test.go:165-166` still quotes the old wording ("this checkpoint's model") — cosmetically stale but not an assertion, and not in scope per the task (which named assertions, not comments).
+
+**New test matches spec:** yes, byte-for-byte identical to the specified test — both comment blocks, `t.Parallel()`, the two-loop structure over `{"checkpoint","sessions"}`, and the final `unpricedUnknownTTL` assertion are all present verbatim.
+
+**Verification reproduced:**
+- `go test ./cmd/entire/cli/ -run 'TestUnpricedReasons_AreScopeNeutral|TestTokenClassShares_UnpricedReasonsAreSpecific' -count=1 -v` → both PASS.
+- `go test ./cmd/entire/cli/ -count=1` → `ok`.
+- Reverted `token_cost.go` to the pre-change (`00a088324`) version and reran the new test in isolation → reproduced the claimed RED exactly: 4 failures — "checkpoint" on no-model, "checkpoint" and "sessions" on mixed-models (that constant contains both words), "checkpoint" on no-cost. Restored the file afterward.
+- `mise run fmt` → no rewrites (clean diff before/after).
+- `mise run lint` → `[lint:go] 0 issues.` No stale `nolintlint` artifact observed, so no cache-clean was needed.
+- Grepped `token_cost.go`, `token_classes_render.go`, and the session/checkpoint tokens command files for any remaining `"checkpoint"` string reachable from `session tokens` — found none beyond the intentional TTL constant and one harmless doc comment.
+
+**Issues:** none of substance. Minor nit (not a defect against the spec): the comment at `checkpoint_tokens_classes_test.go:165-166` still paraphrases the old constant text ("this checkpoint's model") rather than the new wording — purely cosmetic staleness in an untouched file, outside the task's declared scope, and does not affect correctness or the exactness of any assertion.</result>
+<usage><subagent_tokens>85520</subagent_tokens><tool_uses>15</tool_uses><duration_ms>177656</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a23494f4e59f605ab</task-id>
+<tool-use-id>toolu_011jgBZZnPMnSVy4Z1DPnQUq</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-Documents---Peyton-s-MacBook-Pro-entire-devenv-entireio-cli--worktrees-tokens/0321cdd8-aa32-4c13-869b-38d8625ce4f4/tasks/a23494f4e59f605ab.output</output-file>
+<status>completed</status>
+<summary>Agent "Code quality review Task 2" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Strengths
+
+- **Sequencing is right.** Fixing the wording before the second caller exists means there is never a build in which `session tokens` can print a false statement. The alternative order would have shipped a known-false string and relied on a follow-up.
+- **`unpricedUnknownTTL` is left alone *and pinned positively*.** The test's second half asserts it still contains "checkpoint". That guards against over-correction (someone bulk-scrubbing the word) as well as under-correction, which is more thought than this class of test usually gets.
+- **The test comment captures the non-obvious trap.** "`sessions` (plural) is the one the obvious reword introduces, since session tokens has exactly one" is genuinely the second-order mistake a careless fix makes. Recording it in the test, where the next editor will read it, is the right place.
+- **No literals anywhere.** Every existing assertion compares against the constants (`/Users/peytonmontei/dev/entire/devenv/entireio/cli/.worktrees/pr2/cmd/entire/cli/token_cost_test.go:352-358`, `checkpoint_tokens_classes_test.go:167`), so the reword needed no test churn. That is a property of the earlier design paying off, but it is worth noting it was not broken here.
+
+## Issues
+
+### Important
+
+**1. `unpricedMixedModels` lost the causal fact, not just the presuming noun.**
+`/Users/peytonmontei/dev/entire/devenv/entireio/cli/.worktrees/pr2/cmd/entire/cli/token_cost.go:118`
+
+Old: "…use models with **different** price ratios". New: "more than one model's price ratios apply here."
+
+The trigger is family *divergence* (`resolved.Family != weights.Family`), not model multiplicity — two models in the same family do not fire it. So the new string asserts the wrong property: multiplicity, which is true but not the reason, instead of disagreement, which is. Read mid-table it invites exactly the wrong follow-up question: "more than one model — so add them up." The old string answered that; the new one does not. This is the one of the three where the reword traded away information rather than only shedding a scope noun. Something like "these tokens span models with different price ratios" keeps both properties and stays scope-neutral.
+
+**2. `unpricedMixedModels` is outright false in one of its triggers.** (Pre-existing, but this PR is the wording audit.)
+`/Users/peytonmontei/dev/entire/devenv/entireio/cli/.worktrees/pr2/cmd/entire/cli/checkpoint_tokens.go:367-378`
+
+```go
+weights, ok := tokenWeightsForModel(u.Model)
+if !ok || weights.Family != family { return false }
+```
+
+`subagentModelsMatch` returns false when a subagent recorded a model with **no price row at all**, not only when families differ — and that path lands on `unpricedMixedModels`. In that case "more than one model's price ratios apply here" asserts ratios exist for both models; the true reason is nearer `unpricedNoModel`. The new phrasing makes the false assertion slightly more explicit than the old one did ("apply" vs. "use models with"). Given the const block's own rule — each reason must be true of the case it names — this is the natural moment to either split the reason or widen it to cover "or has no verified ratios."
+
+**3. The test is non-exhaustive over the constant set, in precisely the direction it exists to guard.**
+`/Users/peytonmontei/dev/entire/devenv/entireio/cli/.worktrees/pr2/cmd/entire/cli/session_tokens_classes_test.go:17-21`
+
+The three constants are hardcoded in the map literal. A *fifth* reason added to the const block — `unpricedFoo = "this checkpoint's …"` — passes silently. That is a bigger leak than the forbidden-word bluntness you asked about: the word list at least fires on the observed regression, while the member list simply does not see the new member. Two cheap exhaustive formulations:
+
+- read `token_cost.go` in the test and assert over every `unpriced*` constant in the block except `unpricedUnknownTTL` (a source-grep test — ugly, but genuinely closed);
+- or assert on **rendered** `writeTokenClasses` output for each reason. That tests the artifact the rule is actually about, and would additionally cover the renderer's silent fallback at `token_classes_render.go:55-61`, where an empty `UnpricedReason` becomes `unpricedNoModel` — currently untested and a place a wrong reason can reach the user.
+
+### Minor
+
+**4. "this model" has no on-screen referent in the motivating case.** `session_tokens.go:449-450` prints `Model:` only when non-empty; `unpricedNoModel` fires whenever the family is empty, which includes `state.ModelName == ""`. So the model-less live session — the exact example cited as the reason for this task — prints "no verified price ratios for this model" with no model anywhere above it. "the recorded model" or "the model in use" reads correctly with or without the line.
+
+**5. In the subagent-triggered mixed case the second model is unnameable from the output.** `checkpointModelLabels` (`checkpoint_tokens.go:405-419`) walks `metas` only, so subagent models never reach `report.Models`. The user sees one model listed and is told more than one applies. Worse on `session tokens`, which prints singular `Model:`. Related to #1; the deliberate decision not to distinguish subagent from multi-session (documented at `checkpoint_tokens.go:346-348`) is defensible — the user's action is identical either way — but the wording could at least not imply the models are enumerated above.
+
+**6. "here" is a second vocabulary for a referent the block already has.** `unpricedNoCost` says "these classes" for the same scope. "…apply to these tokens" or "…to these classes" would be consistent and concretely anchored; "here" works only by table adjacency and is the weakest of the three strings.
+
+**7. "no priced tokens in these classes" collides with the numbers directly above it.** It sits under a table showing real, nonzero counts in those classes, so it scans as contradicting them. The meaning is the `!anyCost` branch: this provider bills none of these classes. The old wording had the same collision — the change did not create it, but it was the moment to fix it. "this provider bills none of these classes" says the same thing without appearing to deny the table.
+
+**8. Test hygiene.** Map iteration is nondeterministic and buys nothing over a slice-of-struct table; `strings.Contains` is case-sensitive, so a capitalized "Checkpoint" would pass (low risk — all four constants are mid-sentence lowercase by construction — but `strings.ToLower` is free).
+
+**9. Placement.** Two assertions on these same constants already live in `token_cost_test.go:352-358`, and the plan's r5 revision creates `token_classes_render_test.go` in Task 5b. A pure-constant test about a *shared renderer* invariant sitting in a file the plan documents as "the live path's unit tests" is misfiled; either of the other two homes is better.
+
+**10. Stale comment — yes, worth fixing, and it is the only one.** `checkpoint_tokens_classes_test.go:165-166` quotes "no verified price ratios for this checkpoint's model", a string that no longer exists. It is the comment explaining *why* the assertion below it exists, so a future reader grepping the quoted text finds nothing. I grepped `checkpoint's model`, `checkpoint's sessions`, and `checkpoint's classes` across all `.go` and `.md` in the worktree: that line is the only hit (plus one unrelated `CLAUDE.md:1293` mention of token scoping). No doc under `docs/` references the reason strings or "Cost share omitted". Two lines, same blast radius as the edit that stranded it — I would not call this scope creep.
+
+**Interim-state note (not a defect):** the session path does not render classes yet (`grep` for `Classes`/`writeTokenClasses` in `session_tokens.go` finds nothing; that is Task 4). So for this PR's duration these strings are printed only by `checkpoint tokens`, where they are strictly *less* specific than before with no compensating benefit. That is still the correct order — just don't be surprised by it in review of the intermediate commit.
+
+## Direct answers
+
+1. **Copy quality:** `unpricedNoModel` is good (modulo the dangling referent, #4). `unpricedNoCost` scans, but fights the table above it (#7). `unpricedMixedModels` is the weak one on two counts: "here" is vaguer than the "these classes" the block already uses (#6), and the sentence lost the "different" that made it explanatory (#1).
+2. **Test shape:** blunt-but-cheap is the right call for the word list — your reasoning holds, and the words chosen are the right two. But the *member* list is the real gap, not the word list (#3). Fix exhaustiveness, keep the bluntness.
+3. **Mixed-models coverage:** it covers both triggers, and deliberately not distinguishing subagent from multi-session is defensible. But it is *false* in the sub-case where the subagent's model has no price row (#2), and it drops the disagreement fact both triggers share (#1).
+4. **Stale comment:** worth fixing, and it is the tree's only stale reference.
+
+## Assessment
+
+Correct change, correct time, minimal footprint. Nothing here blocks. Two findings are worth acting on before this lands: `unpricedMixedModels`' new wording is the one string that came out weaker than it went in (#1), and the new test does not close the regression class it was written for once a fifth constant appears (#3). Both are a few lines. #2 is a genuine falsehood under the block's own stated rule and predates the diff — flag it to whoever owns the next task rather than absorbing it here. The stale comment (#10) should just go in with this commit.</result>
+<usage><subagent_tokens>97222</subagent_tokens><tool_uses>12</tool_uses><duration_ms>196423</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a2a0531cd0f6fc4fb</task-id>
+<tool-use-id>toolu_012xJh1ewFF2DqCpYiWoYgUg</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-Documents---Peyton-s-MacBook-Pro-entire-devenv-entireio-cli--worktrees-tokens/0321cdd8-aa32-4c13-869b-38d8625ce4f4/tasks/a2a0531cd0f6fc4fb.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement Task 2: scope-neutral reasons" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Report
+
+**Fix 1** — reworded `unpricedMixedModels` → `"these tokens span models with different price ratios"` and `unpricedNoCost` → `"this provider bills none of these classes"` in `cmd/entire/cli/token_cost.go`. Left `unpricedNoModel` and `unpricedUnknownTTL` untouched.
+
+**Fix 2** — converted `TestUnpricedReasons_AreScopeNeutral`'s map to a slice of structs, and added `TestWriteTokenClasses_UnpricedReasonIsScopeNeutral` in `cmd/entire/cli/session_tokens_classes_test.go`, table-driven over the three scope-neutral reasons, the empty-reason fallback, and the TTL positive control. It builds an unpriced `tokenClassBreakdown`, calls `writeTokenClasses`, and checks the lowercased output. Note: the current `writeTokenClasses` signature is `writeTokenClasses(w io.Writer, classes *tokenClassBreakdown)` — there's no "subagent total" parameter to pass, so I called it as the real signature requires; flagging this in case the "zero subagent total" phrasing referred to a different/future signature.
+
+- Ran it immediately: it **passed** with no code change (renderer was already correct), so per your fallback instructions I mutation-checked the fallback line in `writeTokenClasses` (temporarily changed `reason = unpricedNoModel` → `reason = unpricedMixedModels`). Result: the `empty_reason_falls_back_to_no-model` subtest failed as expected:
+  ```
+  session_tokens_classes_test.go:81: rendered output missing "cost share omitted: no verified price ratios for this model", got:
+    ...
+    Cost share omitted: these tokens span models with different price ratios.
+  --- FAIL: TestWriteTokenClasses_UnpricedReasonIsScopeNeutral/empty_reason_falls_back_to_no-model (0.00s)
+  ```
+  Restored the line; `git diff` confirms `token_classes_render.go` has zero net changes.
+
+**Fix 3** — updated the stale comment in `cmd/entire/cli/checkpoint_tokens_classes_test.go:165-166` from `"this checkpoint's model"` to `"this model"`.
+
+**GREEN**: `go test ./cmd/entire/cli/ -count=1` → `ok github.com/entireio/cli/cmd/entire/cli 74.415s` (run twice, both clean).
+
+**Lint**: `mise run fmt` touched only the three intended files (no drift into `token_classes_render.go` or elsewhere); `mise run lint` → `0 issues`. No stale nolintlint cache issue encountered.
+
+**Untouched as instructed**: `subagentModelsMatch` in `checkpoint_tokens.go` — verified via `git diff` that it does not appear in this commit's changes.
+
+**Commit**: `60b67ee01` — "fix(tokens): say why cost was withheld without losing the reason", on top of `bc7e244e2`.
+
+**Running total** (`pr1-token-class-breakdown...HEAD`): 208 added, 99 deleted.
+
+DONE</result>
+<usage><subagent_tokens>111842</subagent_tokens><tool_uses>25</tool_uses><duration_ms>352127</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a23494f4e59f605ab</task-id>
+<tool-use-id>toolu_011G31ja94ztjhRstMQgy7MZ</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-Documents---Peyton-s-MacBook-Pro-entire-devenv-entireio-cli--worktrees-tokens/0321cdd8-aa32-4c13-869b-38d8625ce4f4/tasks/a23494f4e59f605ab.output</output-file>
+<status>completed</status>
+<summary>Agent "Code quality review Task 2" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Verified against the follow-up commit. Full package `go test ./cmd/entire/cli/` passes (75s), `go vet` clean, `gofmt -l` clean on all three touched files, and the five new subtests pass individually.
+
+## Confirmed resolved
+
+- **#1 — resolved, and better than my suggestion needed to be.** `"these tokens span models with different price ratios"` names the divergence, which is the actual trigger (`resolved.Family != weights.Field` divergence), and "these tokens" reuses the referent vocabulary the block already had. #6 falls out with it.
+- **#8 — resolved.** Slice-of-structs, `strings.ToLower` in the rendered test.
+- **#10 — resolved.** `checkpoint_tokens_classes_test.go:165-166` now quotes the live string. Re-grepped `checkpoint's model` / `checkpoint's sessions` / `checkpoint's classes` across `.go` and `.md`: zero hits.
+- **#3 — the rendered-output half is real.** Confirmed independently rather than taking the mutation report on faith: `tokenClassShares` sets a reason in *every* unpriced branch (`token_cost.go:212,214,228`), and `checkpoint_tokens.go:227-230` overwrites only when `unpricedReason != ""`. So `Priced == false` with an empty `UnpricedReason` is **currently unreachable in production** — the fallback at `token_classes_render.go:55-61` was, and is, purely defensive. That makes the subtest more valuable, not less: Task 4 adds the second site that constructs a `tokenClassBreakdown`, and that is exactly where an empty reason can first appear for real. Worth a word in the test so nobody later deletes it as covering dead code.
+
+## New findings
+
+### Important
+
+**N1 — `unpricedNoCost` is now clear but slightly overclaiming, and that is my error, not yours.** `token_cost.go:120`
+
+I recommended the wrong replacement. The trigger is `!anyCost` — every class *that has tokens* prices to zero. `shares.Total &gt; 0` guarantees at least one class is non-empty, but the others can be empty, and the string asserts the provider bills none of the four. Reachable: the Gemini rows have a zero cache-write ratio by design (`token_cost.go:48-50`, "every Gemini row has a zero cache-write ratio"), so a Gemini checkpoint whose only recorded tokens are cache writes trips `!anyCost` and prints "this provider bills none of these classes" — false for input, output and cache read, which Gemini bills; they simply have no tokens.
+
+The old string ("carry no priced tokens") was *precise* about this and only confusing. My swap fixed the confusion and lost the precision. A wording that keeps both, and still does not fight the table above it:
+
+&gt; `"this provider bills none of these tokens"`
+
+It explains the visible counts rather than appearing to deny them, and says nothing about classes with nothing in them. One word from what is committed. You asked whether both reworded strings are true of every case that reaches them — this is the one that is not.
+
+### Minor
+
+**N2 — the TTL positive control in the new test is dead.** `session_tokens_classes_test.go:88-93`
+
+`wantReason` for that row is `unpricedUnknownTTL`, so the `wantLine` assertion above already requires the substring "checkpoint" to be present. The subsequent `if !strings.Contains(out, "checkpoint")` cannot fail unless `wantLine` failed first. It is shaped like an assertion and carries no information. (The equivalent control in `TestUnpricedReasons_AreScopeNeutral` *is* load-bearing, because that test never asserts the full string.) Deleting the branch and keeping the `return` is the honest version.
+
+**N3 — what the rendered test actually buys is narrower than its comment implies.** For the three constant rows, `wantLine` asserts the renderer prints the string it was handed — near-tautological plumbing — and the scope-word loop duplicates `TestUnpricedReasons_AreScopeNeutral` for those same constants. The genuinely new coverage is exactly two things: the fallback branch, and the fact that the scan covers the *whole* block. That is worth having; the comment's "asserts on what the renderer actually prints" just promises more than it delivers.
+
+**N4 — the whole-output scan is stronger than its error message claims, and that is good.** The loop scans `buf.String()`, not just the omitted line, so it would also catch a scope-presuming *header* or row label — a real property for a two-command renderer. But the message says "rendered line must not say %q". When it eventually fires on a header, that message will read as a false positive and someone will narrow the assertion to the reason line, silently discarding the stronger check. Say "rendered block" in the message.
+
+**#4 — I accept not taking it, but there is a third option you may not have weighed.** Your reasoning is right that the constant straddles "no model recorded" and "model recorded but unrecognised", and that both of my suggestions are wrong in one of them. `"no model with verified price ratios"` is true in both: no model at all, and a model with no verified row, are both "no model with verified ratios". It also stops depending on a `Model:` line that `session_tokens.go:449-450` suppresses when empty. Still minor; status quo is defensible and I would not hold the PR for it.
+
+**#2 — routing to Task 3 is right, and the reword already softened it.** "more than one model's price ratios apply" asserted both ratio sets exist; "span models with different price ratios" reads as loosely true even when one model has no row at all. So the falsehood is now a stretch rather than a flat contradiction, which is the right state for something a later task owns. Agreed a wording task should not edit `subagentModelsMatch`.
+
+## On your two open questions
+
+**Is dropping the member-list gap the right trade?** Yes. Reflection cannot enumerate untyped string constants, and source-parsing a `.go` file inside its own package test is the kind of cleverness that outlives its reason and confuses the next reader. You made the right call.
+
+**Does the comment say it plainly enough?** The comment itself is plain — "A fifth `unpriced*` constant added later would not be covered here automatically" is unambiguous. But it is attached to the test that needs it *less*. `TestUnpricedReasons_AreScopeNeutral` has the identical gap, carries no note, and its name — plural, unqualified — is precisely what invites the assumption of exhaustiveness. A reader who greps for the invariant finds that one first. Two cheap fixes, both better than a longer comment:
+
+1. Put the same limitation note on `TestUnpricedReasons_AreScopeNeutral`, or rename it to say its scope.
+2. **More valuable:** add the rule to the const block's own doc comment at `token_cost.go:113-115`. It already carries "each one must be true of the case it names"; one more clause — *and must not name one command's scope; only the TTL reason is checkpoint-specific* — reaches the author **at the moment they write the fifth constant**, which no test can do. Zero machinery, closes the human half of the gap that the member list leaves open.
+
+**#9 — yes, add them to 5b, but split them.** The rendered-output test belongs in `token_classes_render_test.go`. The pure-constant test belongs in `token_cost_test.go`, beside `TestTokenClassShares_UnpricedReasonsAreSpecific` (`token_cost_test.go:346`), which already asserts on these same constants — two tests about one const block in two files is the same misfiling in a new place. Neither belongs in the live path's file.
+
+**On the seven call sites:** agreed, and the plan's correction is the right one. An enumerated call-site list for a signature change in a package this size rots between the writing and the executing; "grep, then count" is the only durable instruction. Nothing for me to check there — it lands in Task 5.
+
+## Assessment
+
+All five fixes are genuinely resolved, and #3's resolution is better than a passing test alone would suggest — I verified the fallback is production-unreachable today, which is the fact that makes the subtest worth keeping through Task 4. The new test's assertions are load-bearing in two places (fallback branch, whole-block scan), tautological in three, and dead in one (N2).
+
+One thing needs a second pass before this lands, and it is on me: `unpricedNoCost` as I recommended it is not true of every case that reaches it (N1), with a reachable Gemini cache-write-only trigger. `"this provider bills none of these tokens"` fixes it for one word. Everything else here is polish that can ride along or wait.</result>
+<usage><subagent_tokens>115489</subagent_tokens><tool_uses>6</tool_uses><duration_ms>234444</duration_ms></usage>
+</task-notification>

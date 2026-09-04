@@ -1,0 +1,370 @@
+fech all the trail findings
+
+---
+
+group them by same similar fix
+
+---
+
+Send to implementer all the context you've got to analyze E
+
+---
+
+<cross-session-message from="uds:/tmp/cc-socks/8913.sock" from-name="implementer" from-mode="prompting">
+Group E analysis: bullet 1 is worth doing and is worse than "Low" — recommend (c), a goos-split fallthrough that deletes canAutoInstall entirely; bullet 2 is Windows-only, the other two fences are fine.
+
+I read the real files rather than working from your summary. Everything below is verified against them; two of your premises turned out to be slightly off and I say where.
+
+## Bullet 1 — recommendation: (c), narrower than either (a) or (b)
+
+**Reject (a), detection.** Two independent reasons, either fatal:
+1. The install.ps1 default destination is `$HOME/.local/bin`, which after `normalizedExecPath()` is character-for-character the same as an `install.sh` install on macOS/Linux. Any `strings.Contains(normalizedPath, "/.local/bin/")` arm would reclassify every POSIX `~/.local/bin` install as a PowerShell install. To avoid that you must gate the arm on `goos == goosWindows` — at which point the detection contributes nothing that the goos check alone doesn't.
+2. `-InstallDir` is a real parameter (`install.ps1:7`), so detection is unsound for exactly the users it would need to serve. There is no marker file, registry key, or path convention to key off.
+
+**Reject (b) as stated** — widening `canAutoInstall()` doesn't survive contact with the code, because once install.ps1 exists there is no Windows case left that `canAutoInstall()` returns false for. Widening it makes it `return true` unconditionally, and a predicate that is always true is not a predicate.
+
+**(c), the actual shape.** The stale claim is not "we can't detect the installer", it is "there is no Windows-native installer" — so the fix belongs in the *fallthrough*, which is the one place that currently hardcodes a POSIX assumption:
+
+```go
+// versioncheck.go, replacing the current fallthrough at ~line 474
+if goos == goosWindows {
+    if releaseChannel(currentVersion) == installChannelNightly {
+        return powershellNightlyInstallCmd
+    }
+    return powershellInstallCmd
+}
+if releaseChannel(currentVersion) == installChannelNightly {
+    return "curl -fsSL https://entire.io/install.sh | bash -s -- --channel nightly"
+}
+return "curl -fsSL https://entire.io/install.sh | bash"
+```
+
+Then delete `canAutoInstall()` (versioncheck.go:410-418, doc comment included), delete the `!canAutoInstall()` branch in `MaybeAutoUpdate` (autoupdate.go:64-68), and reduce `UpdateCommandForCurrentBinary` to `return updateCommand(currentVersion)`. Keep the `downloadsURL` const — `releaseNotesURL` (versioncheck.go:339) still uses it. No other callers: `canAutoInstall` has exactly the two call sites above.
+
+## This is not cosmetic, and that's the one place I'd push back on the finding
+
+The finding frames it as a worse *hint*. It is also a **wrong message**, in five places. `UpdateCommandForCurrentBinary` is interpolated into `checkpointpolicy.UnsupportedPolicyMessage` (policy.go:87):
+
+```
+[entire] Upgrade Entire, then rerun the command:
+[entire]   https://github.com/entireio/cli/releases
+```
+
+A URL in a slot that literally says "the command". Call sites: `checkpoint_policy_write.go:40`, `checkpoint_policy_warning.go:52`, `hooks_git_cmd.go:94`, `hook_registry.go:319` and `:334`, `strategy/checkpoint_policy.go:102`. On Windows this fires for a checkpoint-policy block, i.e. a hard stop, not a background nudge. I'd call the whole group Medium on that basis. Nothing else in the finding looked wrong to me.
+
+## The one-liners, and the shell question
+
+Bare PowerShell forms (identical to README:140-141):
+- stable: `irm https://entire.io/install.ps1 -UseBasicParsing | iex`
+- nightly: `& ([scriptblock]::Create((irm https://entire.io/install.ps1 -UseBasicParsing))) -Channel nightly`
+
+**Neither pastes into cmd.exe** — `irm`, `iex` and `[scriptblock]::Create` are all PowerShell. That matters because the Windows print branch says only "run the following when entire is not running", with no shell named, and that sentence is currently true for both shells: the Scoop case was deliberately wrapped in `cmd.exe /D /C` for exactly this reason, and its comment states the rule as a design constraint on this path ("return a self-contained command users can paste into either cmd or PowerShell").
+
+I'd follow that precedent and wrap:
+
+```
+powershell -NoProfile -Command "irm https://entire.io/install.ps1 -UseBasicParsing | iex"
+powershell -NoProfile -Command "& ([scriptblock]::Create((irm https://entire.io/install.ps1 -UseBasicParsing))) -Channel nightly"
+```
+
+Verified reasoning on the quoting: the nightly form contains **no double quotes**, so it nests cleanly in one pair; inside a cmd.exe double-quoted argument neither `|` nor `&` is a separator, and `(`/`)` are literal. In PowerShell the same line parses as one string argument to `powershell.exe`. So both paste in both shells. Do **not** add `-ExecutionPolicy Bypass`: `iex` of a downloaded string is not a script file and execution policy never applies, so it would be a security-posture change smuggled in as syntax.
+
+Two caveats to state rather than hide: `powershell` is always Windows PowerShell 5.1 even for a pwsh 7 user (harmless — install.ps1 supports 5.1+), and it fails on a system where legacy PowerShell has been removed (rare; the bare form is the fallback there).
+
+Alternative if you'd rather keep the README's exact spelling in the CLI: print the bare form and add two words to the message — "run the following **in PowerShell** when entire is not running". Cheaper and self-documenting, but it diverges from the Scoop case's stated rule and gives a cmd.exe user `'irm' is not recognized`. I lean wrapped; it's a close call and either is defensible.
+
+## Rewritten doc comments
+
+`MaybeAutoUpdate`, replacing the final paragraph (autoupdate.go:59-61) — the whole paragraph goes, since the branch it describes goes with it. What remains needs one sentence added to the paragraph above it, because "every install manager that supports auto-installation (brew, mise, scoop, curl-bash)" no longer enumerates the set:
+
+> The same 3-option prompt (update / skip / skip until next version) is
+> shown on every platform and for every install manager: brew, mise,
+> scoop, and the script installers (`install.sh` on Unix, `install.ps1`
+> on Windows). The only thing that varies is the shell command
+> interpolated into option 1.
+
+Then the existing `goos == goosWindows` comment inside the function stays as-is; it is still accurate and is now the *only* Windows special case. Its first sentence ("Windows can't replace a running executable") already carries the reason the widened fallthrough is safe — enabling install.ps1 here prints a command, it never auto-runs one.
+
+`updateCommand` doc comment — the fallthrough now branches, so say so:
+
+> updateCommand returns the appropriate update instruction based on how the
+> binary was installed. When the install manager can't be identified it falls
+> back to the script installer for the platform: `install.ps1` on Windows,
+> `install.sh` elsewhere. The Windows commands are wrapped in `powershell
+> -NoProfile -Command` so they paste into either cmd or PowerShell, matching
+> the Scoop case above; the Windows updater is print-only, so nothing here is
+> ever executed by Entire.
+
+And the `canAutoInstall` comment at 410-413 needs no rewrite because the function is deleted. If you'd rather keep the function (I wouldn't), the honest version is: "canAutoInstall reports whether updateCommand(currentVersion) is safe to execute on the current OS. Always false on Windows, where no installer can replace the running entire.exe — see MaybeAutoUpdate" — but that is a different predicate from the current one and would flip the Scoop/mise cases, so it's a real behaviour change, not a comment fix. Deleting is cleaner.
+
+## Bullet 2 — Windows-only, and the finding overstates the scope
+
+Your note that all three fences share the bare-`#` shape is not quite right, and it changes the answer. brew (README:53-55) and install.sh (:59-61) both carry inline labels:
+
+```
+brew install --cask entire            # stable
+# brew install --cask entire@nightly  # or nightly
+```
+
+The Windows fence is the only one with **no labels at all**, which is the whole defect — a reader has no way to know the commented line is the nightly variant rather than a stray alternative. So: fix Windows only, adopting the same labelling the other two already use. Touching all three would be churn on two fences that are already correct.
+
+```powershell
+irm https://entire.io/install.ps1 -UseBasicParsing | iex  # stable
+# or nightly:
+# & ([scriptblock]::Create((irm https://entire.io/install.ps1 -UseBasicParsing))) -Channel nightly
+```
+
+Two comment lines rather than a trailing `# or nightly`, because the nightly command is already 98 chars and a trailing label pushes it past 110 inside a line that is itself a comment. The prose paragraph at :72-76 already explains why nightly takes the archive path, so nothing more is needed. README:140-141 stays untouched — it's the reference wording and it's correct.
+
+## Tests
+
+Existing, and what each needs:
+
+- **`TestUpdateCommand`** (versioncheck_test.go:408) — its table has **no `goos` field**, because `updateCommand` currently has no goos dependency. Adding the split means adding the field (and pinning it per row, or the two existing `unknown path …` rows start failing on Windows CI hosts). That's the one structural test change in the group. New rows: windows+unknown+stable → wrapped ps1 stable; windows+unknown+nightly → wrapped ps1 nightly; and keep a non-Windows unknown row for each channel so the curl side stays pinned.
+- **`TestUpdateCommandForCurrentBinary`** (:490) — already has `goos`. The row "windows unknown installer returns releases URL" inverts: rename to "windows unknown installer returns PowerShell installer" and expect the wrapped stable command. This is the test that pins the checkpoint-policy message no longer being a URL.
+- **`TestMaybeAutoUpdate_WindowsUnknownInstallerNoAutoRun`** (autoupdate_test.go:181) — its two download-page assertions go, but **keep** `if strings.Contains(out, "curl -fsSL")` — that assertion is now the guard on the goos split itself, and it's the only thing standing between a future refactor and re-shipping the POSIX command to Windows. Cleanest move is to fold this test into `TestMaybeAutoUpdate_WindowsNeverAutoRuns`'s table (:216) as a third row `{name: "unknown installer prints PowerShell installer", setup: useUnknownWindowsExecutable, wantCmd: <wrapped stable>}`, since it now asserts the same three things the other rows do (no auto-run, plain skip, printed command). If you fold it, hoist the no-curl assertion into the shared loop body.
+- **`pinNonWindowsGOOS`** (:94) — the helper **stays**, its doc comment does not. It currently cites `canAutoInstall()`; the real reason after the change is the `goos == goosWindows` print-only branch, which still short-circuits the four `AllInstallers` prompt tests on a Windows host. Rewrite to: "pins the goos seam to a non-Windows value so the table-driven tests below pass on Windows hosts. MaybeAutoUpdate never prompts on Windows — it prints the command instead — so without this pin those cases would short-circuit to the print-only path." Failing to update this leaves a comment pointing at a deleted function.
+- **`TestMaybeAutoUpdate_AllInstallers_*`** (:351, :375, :401, :420) and their `unknown_curl_bash` row (:342) — unchanged, all four already run under `pinNonWindowsGOOS`.
+
+New cases beyond the above: none needed. In particular don't add a test for "custom `-InstallDir` install gets the default one-liner" — the behaviour is correct-by-design (see below) and asserting it would just pin a tautology.
+
+## One residual behaviour worth being explicit about in the PR
+
+A user who installed with a custom `-InstallDir` gets the *default* one-liner, which installs a second copy into `$HOME\.local\bin`. That is not silent breakage: install.ps1's PATH-conflict block (lines 526-580, the code your recent three commits added) detects the other copy, names both paths, and either declares the new install the winner or throws "Installation completed, but PATH needs adjustment" — and on a machine-PATH conflict it prints the `-InstallDir <that dir>` remedy that installs over the existing copy instead. So the degradation is a loud warning with an actionable fix, which is strictly better than today's zip-from-the-releases-page. Worth one sentence in the PR body so a reviewer doesn't discover it as a surprise.
+
+No files touched in that worktree.
+</cross-session-message>
+
+---
+
+before giving recomendations learn how scoop installs scoop -> https://github.com/ScoopInstaller/Install
+
+---
+
+so, what are the actions for each group we have to do based on your new learning ?
+
+---
+
+also to consider, did you see how scoop has implemented testing over that install script. Can we do similar approach so we can run test over our script?
+
+---
+
+I want to address it all in this PR. Talking about risks:
+- function leakage. what real risk is it a part from just being able to run the methods one by one. tbh, if scoops does in that way, I won't be concern
+- I would do the same as scoop which is, if it is executed with no iex, install won't continue. So, only one way to install therefore, only one way to throw the error.
+
+---
+
+send one by one to implementer who should plan the task before implementint it
+
+---
+
+<cross-session-message from="uds:/tmp/cc-socks/8913.sock" from-name="implementer" from-mode="prompting">
+Task 1 done and verified locally on both Pester 6.1 and a CI-shaped Pester 5.9; nothing committed. Chose (a-lite): harness + one permanent ExcludeRule + 4 behaviour-neutral lines in install.ps1. Worktree is yours again.
+
+## Analyzer output on the pre-change install.ps1 (pwsh 7.6.5, PSScriptAnalyzer 1.25.0, all severities)
+
+```
+TOTAL: 49        [Parser]::ParseFile errors: 0
+ 41  Warning     PSAvoidUsingWriteHost
+  4  Warning     PSReviewUnusedParameter          L21-24, the `& { param(...) }` wrapper params
+  1  Warning     PSUseBOMForUnicodeEncodedFile    one em dash in a comment (L607) — the only non-ASCII byte in the file
+  1  Warning     PSUseCmdletCorrectly             L391 `Write-Output -NoEnumerate $results`
+  1  Warning     PSUseSingularNouns               L299 `Test-PathContains`
+  1  Information PSAvoidUsingPositionalParameters L125 `Invoke-Scoop bucket add entire $url`
+```
+48 at Error+Warning; 41 of them are one rule. After the changes below: **0**.
+
+## Why (a-lite), not (b)/(c)
+Your concern with (a) was scale. The real fix surface is four lines, because 41/48 is a single rule that is a false positive for this file by design (below). (b) would have meant suppressing five rules globally, four of which are exactly the rules you want live while task 3 adds code; (c) leaves install.ps1 unlinted through the restructure this harness exists to catch.
+
+## Dispositions
+- **`PSAvoidUsingWriteHost` — the one ExcludeRule (permanent).** Justification (also in the psd1): the installer runs as `irm | iex` and its only channel to the user is the host; `Write-Output` would return text into the caller's pipeline, and the coloured status lines need `Write-Host`. The rule's own escape hatch (`Show-*` verb) doesn't help — 27 of the 41 are inline in `Install-Entire`'s PATH-conflict block, not in the four `Write-*` helpers. Upstream Scoop avoids the rule by writing through `$host.UI.RawUI` (their `Write-InstallInfo`); that's a task-3 option if you want it.
+- **`PSReviewUnusedParameter` ×4 — script-level `SuppressMessageAttribute` on line 1's `param()` block, with Justification.** False positive: the params *are* read, inside nested functions (`$SelectedChannel` at L448 etc.), which PSSA doesn't follow. Tested: the attribute on the wrapper scriptblock's own `param()` does NOT suppress it; script-level does. Task 3 deletes the wrapper and this attribute with it — the suppression lives in the code it excuses.
+- **`PSUseBOMForUnicodeEncodedFile` — fixed:** `—` → `--` in the L607 comment. Kept the rule: a non-ASCII *string literal* would print garbled under Windows PowerShell 5.1 reading a BOM-less file as ANSI, which is exactly what this rule guards.
+- **`PSUseCmdletCorrectly` — fixed:** `Write-Output -NoEnumerate -InputObject $results`. Same behaviour, named binding.
+- **`PSUseSingularNouns` — function-level `SuppressMessageAttribute` on `Test-PathContains`.** "Contains" is a verb form; suppressing a wrong heuristic beats renaming a private function to satisfy it.
+- **`PSAvoidUsingPositionalParameters` — nothing.** Information-level, below the `Severity = Error, Warning` floor. I did not copy either upstream exclude: this one is moot, and `PSUseDeclaredVarsMoreThanAssignments` (their #636 workaround) — I hit exactly that false positive in my first draft of the test (variables set in `BeforeAll`, read in `It`) and restructured the test to have no cross-block variables instead of excluding the rule, so it stays live for install.ps1.
+
+## Files
+- `scripts/PSScriptAnalyzerSettings.psd1` — Severity Error+Warning, the one exclude with its justification.
+- `scripts/test/Linter.Tests.ps1` — Pester 5 syntax; `Invoke-ScriptAnalyzer -Path scripts -Recurse -Settings …`, prints each finding as `Severity Rule File:Line Message` via Write-Warning before `Should -HaveCount 0`. `-Recurse` means the harness lints itself.
+- `scripts/test/run.ps1` — single entry point for CI and mise: `New-PesterConfiguration` (Detailed, PassThru), `exit $result.FailedCount`. **Deliberately not upstream's `#Requires -Modules`**: I measured that under `pwsh -File`, a `#Requires -Modules` line makes the script's `exit N` come back as 0 (minimal repro: `#Requires -Modules …` + `exit 2` → 0; `#Requires -Version 5.1` + `exit 2` → 2), so a failing suite would have passed CI. Replaced with `$ErrorActionPreference='Stop'` + `Import-Module Pester -MinimumVersion 5.2.0` / `PSScriptAnalyzer -MinimumVersion 1.17.1`, which also picks the highest satisfying version (matters on Windows next to the OS-bundled Pester 3.4.0) and aborts with exit 1 if a module is missing. Comment in the file explains it.
+- `scripts/install.ps1` — the four lines above (+9/−2). Separable into its own commit if you want the harness commit pure.
+- `.github/workflows/ci.yml` — kept the two-step job shape (it already *is* the powershell/pwsh matrix). Added `.\scripts\test\run.ps1` after the `-Help` smoke in both steps; renamed the steps "… installer syntax and lint". **No new action and no module install**: `windows-latest` (Windows 2025) preinstalls PSScriptAnalyzer 1.25.0 and Pester 5.9.0 (checked `actions/runner-images` Windows2025-Readme.md), so `potatoqualitee/psmodulecache` would only add a third-party SHA to maintain. Dropped upstream's `!linter` flag and BuildHelpers changed-file skip — the run takes ~2s.
+- `mise-tasks/lint/ps1` — `mise run lint:ps1`. POSIX sh so `lint:shellcheck` covers it (passes). Not in `check` or `lint` depends, per your instruction.
+
+## Verification (all on this machine)
+- Suite passes: Pester 6.1 exit 0; **CI-shaped run with only Pester 5.9 + PSSA 1.25 on PSModulePath → "Pester v5.9.0", 2 passed, exit 0**.
+- Negative: removing the L1 suppression → 4 `PSReviewUnusedParameter` warnings printed with file:line, 1 failed, **exit 1**. Restored and re-verified exit 0.
+- `install.ps1 -Help` still prints usage.
+- `mise run lint:ps1` no-ops cleanly: with PATH scrubbed of pwsh → "lint:ps1: pwsh not available, skipping", exit 0; also exit 0 when the mise shim existed but no version was activated (the task probes with a real `pwsh -Command 'exit 0'`, not just `command -v`, for exactly that case). With pwsh active → runs the suite, exit 0.
+- `mise run lint:shellcheck` and `mise run lint:mise` pass.
+
+## Toolchain note
+No pwsh existed here (Homebrew no longer ships a stable `powershell` cask, only `powershell@preview`). With the user's approval: pwsh 7.6.5 via `mise install powershell@7.6.5` + `mise use -g powershell@7.6.5`; PSScriptAnalyzer 1.25.0, Pester 6.1.0 and 5.9.0 in the user module path. So later tasks can lint locally with `mise run lint:ps1`.
+
+## Heads-up for your commit sequencing
+`git status` also shows `README.md` modified — that's the group-E bullet-2 fix from earlier today (labels on the Windows install fence), already reported to you; it's unrelated to task 1, so keep it out of this commit.
+</cross-session-message>
+
+---
+
+<cross-session-message from="uds:/tmp/cc-socks/8913.sock" from-name="implementer" from-mode="prompting">
+Applied the targeted suppressions and the canary and re-verified — but the diagnosis was wrong: the untargeted attribute never suppressed anything beyond its rule. Your zeros were PSScriptAnalyzer auto-loading our settings file. Details and final numbers below; worktree is yours again, nothing committed.
+
+## What actually produced the 0
+`Invoke-ScriptAnalyzer` with `-Settings` omitted looks for `PSScriptAnalyzerSettings.psd1` in the analyzed path's directory and uses it. `-Verbose` says so outright:
+
+```
+Settings not provided. Will look for settings file in the given path .
+Found /Users/…/uninstall-ext/scripts/PSScriptAnalyzerSettings.psd1. Will use it to provide settings for this invocation.
+```
+
+So every "no settings" run against `scripts/install.ps1` was in fact a with-settings run, and `-IncludeRule PSAvoidUsingWriteHost` → 0 because the auto-loaded ExcludeRules wins over IncludeRule. The same bytes copied outside `scripts/` report 42. Your 46 after deleting the line was presumably measured from a copy or a different cwd, which is why the comparison looked like a suppress-all. Reproducible either way:
+
+```
+old untargeted attribute, file copied to /tmp, all rules, no settings:  42
+new targeted attributes,  file copied to /tmp, all rules, no settings:  42
+new targeted attributes,  -Settings scripts/PSScriptAnalyzerSettings.psd1: 0
+pre-task-1 file (git HEAD) copied to /tmp:                               49
+```
+
+Both attribute forms remove exactly the 4 `PSReviewUnusedParameter` findings (46 → 42) and nothing else. My earlier "0 after the changes" was a genuine with-settings 0, and the negative test (drop the suppression → 4 warnings, exit 1) was a valid test of exactly what it claimed.
+
+Where I did go wrong is smaller: my first probe of the function-level attribute filtered on the message text, which is empty under `-ScriptDefinition`, so it "confirmed" nothing. Redone properly below.
+
+## Kept anyway, because they're better
+- **Per-parameter suppressions** at line 1 (`'SelectedChannel'`, `'SelectedInstallDir'`, `'SkipPathUpdate'`, `'ShowHelp'`): a fifth unused parameter now reports instead of riding along. Comment says that and only that — I removed my draft sentence claiming an empty target suppresses every rule, since it's false.
+- **Canary test** in `Linter.Tests.ps1`: writes `try { Get-Item . } catch { }` into `$TestDrive` and asserts `PSAvoidUsingEmptyCatchBlock` comes back under our settings file. Verified it fails when the catch block is given a body (Pester marks `[-] reports a known-bad script under the same settings`). Rationale in the comment is the true one: a green suite with zero findings looks the same whether the analyzer evaluated every rule or none.
+
+## Re-verification on the final tree
+- all rules, no settings (copy outside scripts/): **42** = 41 `PSAvoidUsingWriteHost` + 1 Information `PSAvoidUsingPositionalParameters`
+- with settings: **0**
+- No "should be string constants" output on stderr or the warning stream (checked with `-WarningVariable` and `2>` capture) on the final file. I did hit that error once — inside a throwaway in-memory probe whose quoting I got wrong, not in the tree.
+- Function-level attribute is rule-scoped: a `Write-Host probe` inserted after `Test-PathContains`'s param block raises `PSAvoidUsingWriteHost` from 41 to 44 on the no-settings copy (the injected call is reported at its line), while `PSUseSingularNouns` stays suppressed.
+- `[Parser]::ParseFile` clean; `LC_ALL=C grep '[^ -~\t]'` finds nothing.
+- Suite: 3 passed, `run.ps1` exit 0, ~2.4s wall. One earlier run hit my 5-minute tool timeout while three pwsh/PSSA processes were running concurrently (suite, lint:ps1, and a probe); alone it's 2.4s and I couldn't reproduce it, so I'm reporting it rather than acting on it.
+- `mise run lint:ps1` exit 0; `install.ps1 -Help` prints usage.
+
+## For task 3 and later
+Two measurement gotchas worth keeping in mind for anyone linting by hand on this branch: (1) any `Invoke-ScriptAnalyzer` on a path under `scripts/` silently picks up our settings unless you pass `-Settings` explicitly (or copy the file elsewhere) — pass it explicitly so the invocation says what it does; (2) `-ScriptDefinition` yields findings with an empty `ScriptName`, so don't filter on it.
+
+README.md left alone.
+</cross-session-message>
+
+---
+
+uhm, implementer has not received the second task
+
+---
+
+<cross-session-message from="uds:/tmp/cc-socks/8913.sock" from-name="implementer" from-mode="prompting">
+Task 2 plan (implementing now; shout if you want a change). Trigger: shadow Invoke-RestMethod, not an illegal path. All tests live in scripts/test/Installer.Tests.ps1 under the existing run.ps1; mise task renamed lint:ps1 -> test:ps1.
+
+## Trigger: a session function named Invoke-RestMethod that throws
+Command resolution is alias > function > cmdlet, so `function Invoke-RestMethod { throw 'entire-test: network blocked' }` defined in the calling session shadows the cmdlet inside the script's `& { }` scope and its nested functions (dynamic scoping), and will keep doing so after task 3's unboxing. Measured on pwsh 7.6.5: with the registry read also stubbed (macOS has no HKLM:), the script prints "Installing", "Detected platform", "Fetching latest stable version..." and then fails with `Error: entire-test: network blocked` — i.e. the entire offline prefix runs and the very first network call is intercepted. No bytes leave the machine; no 21MB download.
+
+Why not the illegal-`-InstallDir` candidate: (1) it depends on .NET path validation that differs between Framework and Core — exactly the shell-divergence you flagged; (2) the one character both reject, NUL, cannot be passed through argv, which rules it out for the `-File` case; (3) it fails at line 461 and proves nothing about the 30 lines after it. The stub fails one call later and proves them.
+
+On macOS the stub is belt-and-braces: Get-PlatformArchitecture throws first ("Cannot find drive HKLM"), which still exercises the identical catch block, so every contract assertion runs on macOS too. Only one assertion is Windows-only: "the caught message contains the sentinel", which proves the script got all the way to the network call. Skip expression is `-Skip:($env:OS -ne 'Windows_NT')` — `$env:OS` is `Windows_NT` in both 5.1 and pwsh on Windows and unset elsewhere, so no `$IsWindows`/5.1 trap.
+
+## Contract cases (each in a child process of the *same* shell: `(Get-Process -Id $PID).Path`, so the 5.1 CI step spawns 5.1 and the pwsh step spawns pwsh)
+1. **iex shape**: child runs `function Invoke-RestMethod {...}; try { Get-Content -Raw <script> | Invoke-Expression } catch { "CAUGHT:" + $_.Exception.Message }; "ALIVE"; exit 7`. Assert: output contains "Installing Entire CLI" (params bound to defaults and the installer ran), CAUGHT line starts `Error: `, **zero** stdout lines start with `Error:` (message appears once, via the throw, not Write-Host), `ALIVE` printed, **child exit code 7** — the session ran to its own `exit`, which is the "host survived" proof. Windows-only: CAUGHT contains the sentinel.
+2. **scriptblock shape**: same child, but `& ([scriptblock]::Create((Get-Content -Raw <script>))) -InstallDir <TestDrive path>` — proves parameter binding through the scriptblock form on the error path too. Same assertions.
+3. **file shape**: child `<shell> -NoProfile -File <script> -InstallDir <TestDrive path>` (must be -File: I measured that `exit 1` inside `& script` from a `-Command` session exits only the script, and the parent continues). Assert: exit code **1**, exactly one line matching `^Error: `, no `At line:` / `CategoryInfo` / `FullyQualifiedErrorId`, "Installing Entire CLI" present. Windows-only: the Error line contains the sentinel.
+
+## Invocation-shape cases (in-process, run on macOS too — measured: `-Help` returns before the registry read)
+4. `& ([scriptblock]::Create($src)) -Help` prints "Usage: install.ps1" and does not throw.
+5. `& ([scriptblock]::Create($src)) -Channel nightly -Help` likewise — the documented nightly form, proving `-Channel` binds through the scriptblock.
+The plain `irm | iex` shape takes no parameters so it cannot be run to -Help; its parse/bind/run is what case 1 pins.
+
+## Housekeeping
+- `mise-tasks/lint/ps1` -> `mise-tasks/test/ps1` (`mise run test:ps1`). One task, one entry point, and the suite is now tests that include a linter, not a linter. Same skip-without-pwsh behaviour. Not added to `check` or `test` depends.
+- ci.yml: step names "… installer syntax and lint" -> "… installer tests"; run lines unchanged.
+- run.ps1 comment updated to name test:ps1.
+- Linter.Tests.ps1 unchanged; -Recurse will lint the new test file.
+
+Caveat I can't remove: I have no Windows PowerShell 5.1 here, so the 5.1 leg is verified by CI, not by me. Everything in the plan is chosen to have no 5.1-specific dependency (no $IsWindows, no .NET path validation, Get-Process/Path and $env:OS exist on both).
+</cross-session-message>
+
+---
+
+<cross-session-message from="uds:/tmp/cc-socks/8913.sock" from-name="implementer" from-mode="prompting">
+Task 2 done: scripts/test/Installer.Tests.ps1, 9/9 green locally, negative check fails as it should, nothing committed. Your -File hole didn't exist in the file as written, but your drive trigger earned its own case, so both shapes of "from a file" are now pinned.
+
+## On the hole
+The `-File` child was in my plan text but not in the code: the implemented "from a file" case runs `& '<script>' -InstallDir <TestDrive>` *inside* the stubbed `-Command` session — same process, so the Invoke-RestMethod stub is visible — and reads the script's `exit 1` through `$LASTEXITCODE` (measured: 1). `$MyInvocation.MyCommand.Path` is set for `& '<path>'`, so it takes the same `$InvokedFromFile` branch. So on Windows it fails at the stub sentinel, no network.
+
+That said, an in-session `exit 1` and a `-File` process exit code are different contracts, and users hit both (`.\install.ps1` at a prompt vs `powershell -File`). So I added your drive trigger as a fourth error-path case rather than swapping it in. Confirmed on macOS pwsh: `-InstallDir 'entiretestnodrive:\bin'` fails in Get-NormalizedPath before the HKLM read, message `Error: Exception calling "GetUnresolvedProviderPathFromPSPath" … Cannot find drive. A drive with the name 'entiretestnodrive' does not exist.`, exit 1. A comment on that case says why its trigger differs from the other three, per your note.
+
+## What the suite now holds (scripts/test/Installer.Tests.ps1)
+Shapes, in-process, run everywhere:
+- `& ([scriptblock]::Create($src)) -Help` → first line `Usage: install.ps1*`
+- `& ([scriptblock]::Create($src)) -Channel nightly -Help` → same (proves -Channel binds through the scriptblock form)
+
+Error path, each in a child of `(Get-Process -Id $PID).Path` with the IRM stub, via one helper `Invoke-InstallerChild` and one shared `Assert-ThrowsWithoutExiting`:
+- iex shape (`Get-Content -Raw | Invoke-Expression`, no params)
+- scriptblock shape with `-InstallDir <TestDrive>`
+  Both assert: `==> Installing Entire CLI...` printed (defaults/params bound, installer ran); exactly one `CAUGHT:Error: *` line and **zero** lines starting `Error:` (thrown once, never Write-Host'd); `ALIVE` printed; child exit **7**. Windows only (`if ($env:OS -eq 'Windows_NT')`): CAUGHT line is the sentinel `entire-test: network blocked`.
+- from a file, in-session (`& '<script>'`, stub visible): one `Error: *` line, no `At line:|CategoryInfo|FullyQualifiedErrorId`, `$LASTEXITCODE` → **1**. Windows only: Error line carries the sentinel.
+- from a file, `-File` (drive trigger, no stub): one `Error: *` line matching `*Cannot find drive*entiretestnodrive*`, no exception formatting, process exit **1** — identical assertions on both OSes.
+
+Structure note: helpers live in BeforeAll and each It does its own child run, because a `$run` set in BeforeAll and read in It trips `PSUseDeclaredVarsMoreThanAssignments` in our own linter (that's the #636 pattern) — same reason Linter.Tests.ps1 is shaped the way it is. Windows-only assertions are `if`-guards inside the It rather than `-Skip` on separate Its for the same reason.
+
+## Housekeeping
+- `mise-tasks/lint/ps1` → `mise-tasks/test/ps1` = `mise run test:ps1`, description "Run the PowerShell installer tests and linter (skips when pwsh is absent)". Skip behaviour unchanged; still not in `check`/`test` depends.
+- ci.yml step names → "Windows PowerShell 5 installer tests" / "PowerShell 7 installer tests"; run lines unchanged.
+- run.ps1 comment names test:ps1. Linter.Tests.ps1 untouched; it lints the new file (clean).
+
+## Verification (macOS, pwsh 7.6.5, Pester 6.1)
+```
+[+] runs as a scriptblock with -Help
+[+] binds -Channel nightly through the scriptblock form
+[+] throws and leaves the session running when piped to Invoke-Expression
+[+] throws and leaves the session running when run as a scriptblock with parameters
+[+] prints one Error: line and exits 1 when run from a file
+[+] exits the process with 1 when run with -File
+[+] has a settings file
+[+] reports a known-bad script under the same settings
+[+] reports no findings under scripts/
+Tests Passed: 9, Failed: 0        run.ps1 exit 0, ~6.5s wall
+```
+- `mise run test:ps1` exit 0; `install.ps1 -Help` prints usage; `lint:shellcheck` + `lint:mise` pass on the moved task.
+- Negative: changed the expected child exit 7→8 in the shared assertion → the two in-session cases fail with "Expected 8, but got 7.", suite exit **2**; restored (grep confirms one `Should -Be 7`).
+
+What runs where: everything runs on macOS; on macOS the three stub cases fail one step earlier (HKLM: read) than on Windows and only the two sentinel assertions are Windows-gated. The 5.1 leg is CI's to prove; nothing in the file uses `$IsWindows`, .NET path validation, or anything else 5.1-divergent.
+
+README.md untouched.
+</cross-session-message>
+
+---
+
+<cross-session-message from="uds:/tmp/cc-socks/8913.sock" from-name="implementer" from-mode="prompting">
+PATH scrub done in Installer.Tests.ps1, and proven load-bearing with a fake scoop on PATH: with the scrub, 9/9; without it, all four error-path cases fail showing "FAKE SCOOP INVOKED: bucket list". Nothing committed.
+
+## Change
+All four error-path cases now go through one helper, `Invoke-InstallerChild`, whose `-Command` preamble is:
+```
+$env:PATH = '<dir of the shell>'; 'SCOOP:' + [bool](Get-Command scoop -ErrorAction SilentlyContinue); function Invoke-RestMethod { throw 'entire-test: network blocked' }
+```
+The child prints `SCOOP:False`/`SCOOP:True`, and a shared `Assert-DirectInstallBranch` requires `SCOOP:False` plus `==> Installing Entire CLI...` in every case — so the scrub is asserted on each run, not assumed. Comment on the helper says why PATH is scrubbed and that it is what pins these cases to the direct-install branch; the Scoop branch would be its own case.
+
+The `-File` case is now spawned *from inside* the scrubbed child (`& '<shell>' -NoProfile -NonInteractive -File '<script>' -InstallDir 'entiretestnodrive:\bin'; exit $LASTEXITCODE`), so it inherits the cut-down PATH by env inheritance and there is no parent `$env:PATH` mutation to restore — Pester's own environment is never touched, which answers your leak concern by construction rather than with a `finally`. Its comment explains the nested spawn and why it asserts the provider message instead of the sentinel.
+
+## Proof (macOS, pwsh 7.6.5; fake `scoop` = a shell script that logs `FAKE SCOOP INVOKED: $*` to stderr and exits 99, prepended to PATH)
+- Parent: `Get-Command scoop` → **True**.
+- Suite with fake scoop, scrub in place: **9 passed**, no "FAKE SCOOP" line anywhere.
+- Suite with fake scoop, scrub line deleted: **4 failed**, each with
+  `Expected 'SCOOP:False' … @('SCOOP:True', '==> Installing Entire CLI...', '==> Scoop detected; installing Entire CLI with Scoop...', 'CAUGHT:Error: Failed to list Scoop buckets. FAKE SCOOP INVOKED: bucket list', 'ALIVE')` — i.e. exactly the path you described, caught before `bucket add`. Restored; back to 9/9.
+- Suite with normal PATH: 9 passed, exit 0. `mise run test:ps1` exit 0.
+- Negative check (shared assertion 7→8): the two in-session cases fail "Expected 8, but got 7.", suite exit 2; restored.
+
+Structure: three small assertion helpers in BeforeAll (`Assert-DirectInstallBranch`, `Assert-ThrowsWithoutExiting`, `Assert-NoExceptionFormatting`); Its still do their own child run, same `PSUseDeclaredVarsMoreThanAssignments` reason as before. Linter over the new file is clean (it's part of the 9).
+
+Tree: `scripts/test/{Installer.Tests.ps1, Linter.Tests.ps1, run.ps1}`, `scripts/PSScriptAnalyzerSettings.psd1`, `mise-tasks/test/ps1` new; `install.ps1` (+11/−2), `ci.yml` (+4/−2) modified; `README.md` is the task-10 change, untouched since.
+</cross-session-message>
+
+---
+
+great, send it to implementer but ask him to commit what is already done before the big refactor.

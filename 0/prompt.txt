@@ -1,0 +1,288 @@
+Hi there, I'm just going through the Trails enablement instructions, and when running the entire runner setup -y command in the docs, I ended up with a giant wall of text in the terminal.
+
+Is this required?
+
+---
+
+but is it also writing them without "--run" ?
+
+---
+
+ok setup -y writes just the default ones?
+
+---
+
+hmm, ok this is super confusing, I feel:
+
+- `entire runner setup` - do you want to have defaults, or adapted? (yes/no)
+- `entire runner setup -y` - you get adapted
+- `enhtire runner setup --dry-run` - gives you a preview of adapted
+
+---
+
+yes, please implement
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>a833c7d47a64dcca4</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-calm-stone-4ef1/2dd1ef82-5b58-4327-b6ad-a3626e16e9e4/tasks/a833c7d47a64dcca4.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I've read the diff and the full post-change files. Here are the simplification findings, highest value first.
+
+## Findings
+
+**1. `cmd/entire/cli/runner_setup.go:150-152, :159, :186` — three copies of the same "Created N defaults" sentence, one per mode**
+Three near-identical messages that differ only in an adjective and a trailing hint: `"Created %d default runner(s); tailoring them to this repo…"`, `"\nCreated %d generic default runner(s) (untracked). They are functional as-is; run \`entire runner setup -y\`…"`, `"\nCreated %d working default runner(s) (untracked). They are functional as-is; paste the prompt above…"`. A fourth variant already exists in `runner_apply.go:156-158` ("kept as working defaults").
+*Cost:* the same fact ("we scaffolded the generic set, here's how to tailor it") is spelled four ways in three files; wording has already drifted (default / generic default / working default), and a fifth mode means finding all of them.
+*Simpler:* one stem plus a per-mode tail — `const createdDefaultsMsg = "Created %d default runner(s) (untracked, functional as-is); %s\n"` and a `switch mode` for the tail, in a small `reportCreatedDefaults(errW, n, mode)`. The call sites must stay where they are (print-prompt's tail says "the prompt above"), but the sentence lives once.
+
+**2. `cmd/entire/cli/runner_setup.go:134` + `runner_init.go:29` — `runnerConfigsExist` is computed by the caller and re-derived by the callee**
+`runRunnerSetup` computes `haveRunners := runnerConfigsExist(repoRoot)` and then calls `ensureRunnersPresent`, whose first act is the same call (a second `.entire` root open + `ReadDir`). `ensureRunnersPresent` has exactly one production caller.
+*Cost:* two sources of truth for "does this repo have runners", so a future change to one leaves the other stale; plus a redundant directory scan on every invocation. The "ensure" naming also hides that the caller has already answered the question the function re-asks.
+*Simpler:* rename to `createDefaultRunners(w, repoRoot)`, drop its internal existence check, and let the one caller guard it: `if mode != setupModeDryRun &amp;&amp; !haveRunners { created, err = createDefaultRunners(...) }`. The invariant moves next to `haveRunners`, where the mode decision already reads it. (`TestEnsureRunnersPresent_NoopWhenRunnersExist` then becomes a caller-level assertion — a hint the check belongs there.)
+
+**3. `cmd/entire/cli/runner_apply.go:167-170` — `previewTunedRunners`'s `haveRunners` parameter exists only to print a line about a decision the caller made**
+The parameter's whole use is `if !haveRunners { print "…the preview is against the %d embedded default(s)" }`. The reason that message is true is the `loadRunners` swap at `runner_setup.go:165-168`, in the caller.
+*Cost:* a 6-parameter function where one parameter carries no data the function needs, and the explanation of "why the preview source differs" sits one file away from the code that made it differ.
+*Simpler:* print that notice at `runner_setup.go:168`, immediately after `loadRunners = defaultTuneRunners`, and drop the parameter. After that, `runners` is used only for `len(runners)`, so the signature tightens further to `previewTunedRunners(w, errW io.Writer, changes []tunedRunner, inScope, skipped int)` — 4 params, and `changes`/`skipped` are the only real inputs left.
+
+**4. `cmd/entire/cli/runner_apply.go:48` — `agent.Get` bypasses the package's existing injectable seam, and the new tests pay for it**
+`explain_summary_provider.go:26` already has `var getSummaryAgent = agent.Get` with exactly this signature, and `stubTextAgent` exists to fill it. `runTuning` calls `agent.Get(provider.Name)` directly (a pre-existing call, but newly relevant now that `runTuning` is the tested unit).
+*Cost:* the only stub the new tests can install is an *unresolvable* provider, so three of the four `TestRunRunnerSetup_*` tests assert `"expected the stubbed provider to fail the tailoring step"` plus a comment explaining why a failure is the pass condition — and `setupModeAdapt`/`setupModeDryRun` never actually run to completion in any test.
+*Simpler:* `getSummaryAgent(provider.Name)`. The three failure-dance blocks and their comments collapse into real happy-path assertions (a `stubTextAgent` variant returning `{"trail-risk": "…"}` is a one-field addition).
+
+**5. `cmd/entire/cli/runner_setup_test.go:109-114, :133-138, :162-167` — the glob-and-count block is pasted three times, with `6` hardcoded**
+Identical `filepath.Glob(filepath.Join(repoRoot, ".entire", "runners", "*.json"))` + `if err != nil { t.Fatal(err) }` in three tests; `&lt; 6` appears at :113, :137 and again at :179.
+*Cost:* 18 lines of harness for three assertions, and a magic default-set size in three places that nothing derives from the embed.
+*Simpler:* `func runnerFiles(t *testing.T, repoRoot string) []string` next to the other helpers, and `wantAll := len(mustDefaults(t))` (or just `len(runnerdefaults.Files())`) instead of `6`. Do *not* table the four `TestRunRunnerSetup_*` tests — they differ in opts, error expectation and assertion, so a table would need a per-case assert closure and read worse than four named tests.
+
+**6. `cmd/entire/cli/runner_prompt.go:63, :84` — `runnerdefaults.File` used as a generic on-disk carrier**
+`loadTuneRunners` builds `[]runnerdefaults.File` values for files read off disk, from a type documented as "one *default* runner config", purely to hand them to `parseTuneRunners`.
+*Cost:* the embed package's DTO becomes a shared interchange type it was not designed to be — it can no longer change shape without touching the disk reader — and the throwaway slice exists only to satisfy the signature.
+*Simpler:* declare the pair locally where it's the shared currency — `type runnerFile struct{ Name string; Data []byte }` in `runner_prompt.go` — and have `defaultTuneRunners` map the embedded files into it (three lines). If you'd rather have no carrier at all: split into `parseTuneRunner(name string, data []byte, dir string) (tuneRunner, error)` plus a shared `selectRunners(runners []tuneRunner, dir, filter string)` for the filter/sort/empty checks, and let each loader append directly.
+
+**7. `cmd/entire/cli/runner_setup_test.go:39-47` — the inner `haveRunners` loop doubles every flag-precedence assertion to prove a parameter is unused**
+None of the four flag branches in `resolveRunnerSetupMode` reads `haveRunners`, so the `for _, haveRunners := range []bool{false, true}` runs all 7 cases twice and prefixes every failure message with `haveRunners=%v:`.
+*Cost:* 14 assertions where 7 are load-bearing, and the extra prefix in three format strings.
+*Simpler:* pass `false`. If "flag precedence is independent of repo state" is worth pinning, one dedicated case says it once.
+
+**8. `cmd/entire/cli/runner_setup.go:41-51` and `:207-222` — four booleans whose precedence order is unreachable through the CLI** *(judgement call, roughly line-neutral)*
+`MarkFlagsMutuallyExclusive("defaults-only", "print-prompt", "dry-run")` (`:115`) already makes any two of those three impossible, so the ordering of the first three `case`s in `resolveRunnerSetupMode` can only be observed by constructing `runnerSetupOptions` directly — which is what `runner_setup_test.go:32-34` does for three of its seven cases. Only `assumeYes` vs an explicit mode is a reachable conflict.
+*Cost:* the struct admits states the command cannot produce, the resolver must define behaviour for them, and the test table then freezes that behaviour as if it were a contract.
+*Simpler:* one field — `mode runnerSetupMode` (`""` = none named) — set in `newRunnerSetupCmd`'s `RunE` from the three locals, leaving the resolver as `if opts.mode != "" { return opts.mode, nil }` / `if opts.assumeYes { return setupModeAdapt, nil }` / prompt / error. Be aware this is about removing impossible states, not saving lines: the switch moves rather than disappears. Answering the question directly: the command layer **cannot** resolve the mode entirely on its own, because `chooseRunnerSetupAction` needs `haveRunners`, which needs `repoRoot`, which is resolved inside `runRunnerSetup` — so some flag state has to reach that function either way.
+
+**9. `cmd/entire/cli/runner_setup.go:220` vs `:69-78` — the non-interactive error re-explains all four flags that `--help` just explained**
+The 300-character single-string error spells out what each of the four flags does, in different words from the `Long` help six lines above it.
+*Cost:* two places to keep the four flag descriptions in sync, and the test at `runner_setup_test.go:63` only requires the flag *names* to appear.
+*Simpler:* `errors.New("no terminal to ask what setup should do: pass one of --yes, --defaults-only, --print-prompt or --dry-run (see --help)")`. Same test passes, one place owns the descriptions.
+
+**10. `cmd/entire/cli/runner_prompt.go:100-106` + `runner_apply.go:133-135` — `tuneRunner` stores the same location three ways** *(pre-existing, but the diff makes it visible)*
+`Name` (root-relative) and `Path` (absolute) are now assigned from `f.Name` two lines apart, and `applyTunedRunners` uses `Path` only for one error string and for `filepath.Base(c.runner.Path)` — which is `f.Name` again.
+*Cost:* three spellings of one location per runner, and a reader has to work out which one each I/O call needs (`entiredir.WriteFile` needs `Name`; messages want the other two).
+*Simpler:* keep `Name` only (it is the one the root-anchored I/O requires) and derive display paths where needed — `filepath.Join(dir, f.Name)` inside `parseTuneRunners` for parse errors, `filepath.Join(runnersDir(repoRoot), c.runner.Name)` in `applyTunedRunners`, `filepath.Base` straight off `Name`.
+
+## Checked and already about as simple as it can be
+
+- **`renderTemplateDiff` (`runner_apply.go:202-226`)** — three diff cases, one collapse rule, no state carried between chunks. `DiffPrettyText` is char-level and wouldn't do the job, so the custom renderer earns its place, and the collapse is the minimum shape (`&lt;= 2*context` → print all, else head/marker/tail). No finding. One nit: `splitLines` (`:238-244`) is a 9-line helper (with doc comment) for what `strings.Split(strings.TrimSuffix(s, "\n"), "\n")` does in one line — identical output for every input diffmatchpatch can emit, and the same idea already exists as `splitLines` in `strategy/common.go:1478`. Worth collapsing to a one-line body, not worth more.
+- **`loadRunners := loadTuneRunners; if … { loadRunners = defaultTuneRunners }` (`runner_setup.go:165-168`)** — clearer than the if/else alternative, which would duplicate `(repoRoot, opts.runner)` and the `err` check across both arms for one more line. The signatures are identical, which is exactly when a function variable is the right tool. Keep it.
+- **`runnerSetupMode` as a string (`runner_setup.go:24`)** — right choice. `""` is a natural "unresolved" for the two error returns in `resolveRunnerSetupMode` and `chooseRunnerSetupAction`, which an int enum would need an explicit `setupModeUnset` for; `huh.NewSelect[runnerSetupMode]` works either way; and `%q` in test failures prints something readable. Nothing depends on the literal values (they are never parsed, printed, or persisted).
+- **Sequential mode branches in `runRunnerSetup`** — the ordering is forced by the data, not chosen: `defaults` must return before the load (it has no runners to tailor), `print-prompt` after the prompt is built, `dry-run` after the provider call. Each is a one-line early return. No shape improvement available beyond finding 1.
+- **Dead code from the removed confirmations** — clean. `confirmCreateRunners`, `confirmTuneExisting` and `applyTuneWithAgent` are fully gone; `interactive` and `huh` imports are still each used exactly once; `runnerSetupLimitErrorMessage` still has its test. `go build ./...` passes.
+- **The parallel 3-branch summary switches in `applyTunedRunners` (`:139-150`) and `previewTunedRunners` (`:177-188`)** — they look like copy-paste but only share the string `"No runner changes proposed."`; one branch returns an error, the other prints. Merging them would need a flag parameter to choose. Leave them.</result>
+<usage><subagent_tokens>165697</subagent_tokens><tool_uses>18</tool_uses><duration_ms>304963</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a3816e8786870a44b</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-calm-stone-4ef1/2dd1ef82-5b58-4327-b6ad-a3626e16e9e4/tasks/a3816e8786870a44b.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Benchmarked everything on this machine (Apple M4 Max, `go test -bench` against the real embedded runner set) rather than estimating, then removed the temp benchmark files. `git status` is back to the diff's own files only.
+
+**Verdict up front: only one finding has magnitude, and it is an ordering the diff inherited rather than introduced. Everything the review brief asked me to check is real but measures in microseconds — I've given the numbers so you can dismiss them with confidence.**
+
+## Findings
+
+### 1. Seconds of gathered signal are thrown away when the provider can't resolve — and the provider prompt comes *after* the wait
+- **file** `cmd/entire/cli/runner_setup.go`
+- **line** 174-176 (gather) vs. `runner_apply.go:44` (provider resolution inside `runTuning`, called at `runner_setup.go:192`)
+- **cost** `gatherTuningContext` runs 2 sequential `gh` subprocesses, a `strategy.ListCheckpoints` git walk, and up to 9 sequential trail API round trips (`gatherTrails` → `listTrailResources` + `fetchAllTrailReviewComments` for ≤8 trails). Only *then* does `runTuning` call `resolveCheckpointSummaryProvider`, which can (a) fail outright with "no summary-capable provider is available", (b) probe `$PATH` for external `entire-agent-*` plugins, or (c) **prompt the user interactively** (`promptSummaryProvider`, `explain_summary_provider.go:100`) when several providers are installed. So in the failure case the entire gather — the seconds-to-tens-of-seconds part of the command — is wasted, and in the multi-provider case the user sits through "Gathering repository signal" before being asked the question that gates it. The diff's own tests exercise exactly this path: `TestRunRunnerSetup_DryRunCreatesNothing` and `..._YesCreatesDefaultsBeforeTailoring` stub an unresolvable provider and still pay the gather.
+- **cheaper** Split `runTuning` in two: resolve the provider + `agent.AsTextGenerator` before the gather spinner, pass the resolved `textGen` into the generate half. Cheap-and-fallible first, expensive-and-slow second. The diff already created the seam that makes this a small change — `runTuning`'s first 20 lines are the resolve half, with no dependency on `prompt` or `runners` beyond `len(runners)` for the spinner label.
+- **honesty** This ordering is pre-existing: `applyTuneWithAgent` resolved the provider at its top too, after the same gather. The diff preserved it and extended it to a second mode (`--dry-run`). Not introduced, but this is the right patch to fix it in.
+
+### 2. `runnerConfigsExist` runs twice (three ReadDirs of the same directory) — negligible
+- **file** `cmd/entire/cli/runner_setup.go`
+- **line** 134, then again inside `ensureRunnersPresent` (`runner_init.go:29`), and `loadTuneRunners` does its own `ReadDirNoSymlinks` of the same directory a third time (`runner_prompt.go:47`)
+- **cost** Measured: **36.7 µs, 4.6 KB, 53 allocs** per `runnerConfigsExist` call on a populated 6-file directory. The `entiredir` root is memoized via `osroot.Shared`/`SharedChild`, so the per-call cost is just `OpenChild("runners")` (Lstat + OpenRoot + Stat + SameFile), a getdents, and a close. The duplicate costs ~37 µs against a command whose cheapest mode does a git-walk and whose main mode does an LLM round trip. Also worth knowing: for `--yes`, `--defaults-only` and `--print-prompt` the line-134 value is **dead** — `resolveRunnerSetupMode` reads `haveRunners` only on the `CanPromptInteractively()` branch, and the only other consumers are the dry-run loader swap (line 166) and `previewTunedRunners`.
+- **cheaper** Have `ensureRunnersPresent` return the existence it already computes (`created == nil` doesn't distinguish "existed" from "created nothing"), or compute `haveRunners` lazily in the two branches that use it. Do it for clarity, not for speed.
+
+### 3. `runnerdefaults.Files()` called three times, once purely to produce an integer — negligible
+- **file** `cmd/entire/cli/runner_init.go`
+- **line** 86 (`chooseRunnerSetupAction`, for the count in the form title), 33 (`ensureRunnersPresent`), and `runner_prompt.go:74` (`defaultTuneRunners`)
+- **cost** Measured: **2.1 µs, 7.95 KB, 21 allocs** per call. It is not free-of-copy — `embed.FS.ReadFile` returns `[]byte(ofile.f.data)`, a fresh copy — so each call duplicates the whole 6,844-byte default set. Three calls ≈ 6.4 µs and 24 KB. Line 86 copies all six files to print `%d`, and it does so on the interactive path immediately before a `huh` form that will block on human input.
+- **cheaper** A `runnerdefaults.Count()` doing only `fs.ReadDir(runnersFS, "runners")` — saves the six `ReadFile` copies. Genuinely cosmetic at this size; I'd only bother because the call site reads as if `Files()` were free.
+
+### 4. `--dry-run` builds `newRaw` for every accepted proposal and never uses it — negligible, and arguably correct
+- **file** `cmd/entire/cli/runner_apply.go`
+- **line** 106 (`replaceRunnerTemplate` in `classifyTuneProposals`), consumed only by `applyTunedRunners:132`; `previewTunedRunners` reads only `.runner` and `.template`
+- **cost** Measured: **13.6 µs, 5.3 KB, 51 allocs** per runner (2 `json.Unmarshal`, an encode, a `bytes.Count`, a `bytes.Replace`, a `json.Valid`). At ≤6 runners that is ~82 µs and ~32 KB discarded per dry run.
+- **cheaper** Nothing worth doing. `replaceRunnerTemplate` is also the check that a rewrite *is* appliable, and a preview that shows a change which would later fail to apply is worse than 82 µs. Leave it — I'm listing it only because the brief asked whether anything is computed and discarded.
+
+### 5. diffmatchpatch: the deadline and the fold limit are both real but ~4 orders of magnitude away — no action
+- **file** `cmd/entire/cli/runner_apply.go`
+- **line** 202-209
+- **cost/facts** `diffmatchpatch.New()` does set `DiffTimeout: time.Second` (v1.4.0 `diffmatchpatch.go:38`) and `DiffMain` derives a deadline from it, so a pathological input degrades **silently** to a crude single delete+insert rather than hanging. Measured against that: a real runner template (`trail-risk`, 395-byte template, ~12 lines) renders in **1.55 µs**. A 100%-distinct-lines worst case scales roughly quadratically — 50 lines 27 µs, 200 lines 160 µs, 500 lines 671 µs, 2000 lines **7.1 ms** — so the 1 s deadline needs on the order of 20,000 fully distinct lines, which a model-generated prompt template cannot reach (it's bounded by output tokens). On the fold limit: v1.4.0's `DiffLinesToChars` encodes line indices as runes via `intToRune` over a `uint32` `index` (`index.go`, `stringutil.go:96`), giving ~1.1M distinct lines — **not** the 65,535 of the older JS-style `DiffLinesToRunes`. No line limit to hit, no timeout to set, and `checklines=false` is the right argument since the input is already line-folded.
+
+### 6. `gatherTuningContext` is never called for a mode that doesn't need it — correct as written
+`setupModeDefaults` returns at `runner_setup.go:158` before the gather; the three modes that reach line 175 (`adapt`, `print-prompt`, `dry-run`) all consume `brief` via `buildTunePrompt`. No wasted gather by mode. (The sequential `gh`/trail I/O *inside* `gatherTuningContext` is the obvious concurrency win in this command — 2 subprocesses and ≤9 HTTP round trips that are mutually independent except for `client.SetTrailRoute`'s shared mutation — but `runner_gather.go` is not in this diff, so it's out of scope here.)
+
+### 7. The `opts` closure: no lifetime concern, and the diff improves it
+`opts` is captured by both the flag registrations (`&amp;opts.assumeYes` …) and the `RunE` closure, so it heap-escapes and lives as long as the command tree — process lifetime. That's ~7 words plus two strings and a `[]string`, identical in kind to every other command in the tree, and the diff **reduces** the escaping variable count from five (`run`, `assumeYes`, `debugDir`, `sources`, `limit`) to one struct plus `deprecatedRun`. Nothing large is captured — no readers, buffers, `*os.Root`, or `[]tuneRunner` in the closure.
+
+### 8. Nothing new at command-construction time
+`newRunnerSetupCmd` adds only in-memory work: `MarkDeprecated` (a flag lookup + string field) and `MarkFlagsMutuallyExclusive` (cobra `flag_groups.go:65` — `mergePersistentFlags` on a parentless command, then 3 `Lookup` + 3 `SetAnnotation`). No I/O, no embed read, no settings load. `runnerInsecureHTTP(cmd)` correctly stayed inside `RunE`.
+
+### 9. No O(n²), and the map building is right
+`byID` (`runner_apply.go:83`) and `tailored` (`:130`) are both single-pass over ≤6 elements with capacity hints. `slices.Sorted(maps.Keys(templates))` (`:90`) adds one allocation and a sort of ≤6 keys to buy deterministic message/diff ordering — the right trade, and a strict improvement over the old randomized map iteration. `untailoredRunners` is one map lookup per created ID.
+
+### 10. `Raw` retention, precisely: one trivial over-retention from the in-place filter
+- **file** `cmd/entire/cli/runner_prompt.go`
+- **line** 104 (`Raw: f.Data`) and 111 (`filtered := runners[:0]`)
+- **cost** `Raw` aliases `f.Data` — no copy, so `loadTuneRunners`' new intermediate `[]runnerdefaults.File` (line 54) costs 6 extra 24-byte struct headers versus the old read-and-parse-in-one-pass loop, dropped after `parseTuneRunners` returns. Fine. The one genuine over-retention: the `--runner` filter compacts in place, so a filtered result has `len 1, cap 6` and the backing array keeps all six `tuneRunner` structs — and therefore all six `Raw` slices — reachable for the command's lifetime instead of just the selected one. **~7 KB.** Separately, each `tunedRunner` stores the new template twice (as `template` and JSON-escaped inside `newRaw`), ~50 KB for six 4 KB tailored templates; both fields are legitimately live on the apply path.
+- **cheaper** `slices.DeleteFunc`, or allocate a fresh slice for the filtered result. Not worth a commit on its own.</result>
+<usage><subagent_tokens>169441</subagent_tokens><tool_uses>25</tool_uses><duration_ms>305773</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aabf7a6f22a9b7193</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-calm-stone-4ef1/2dd1ef82-5b58-4327-b6ad-a3626e16e9e4/tasks/aabf7a6f22a9b7193.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have everything. Here is the altitude review.
+
+## Verdict
+
+The core of this change is at the right altitude. Collapsing two ad-hoc confirmations into one mode decision, and making `-y` mean "yes to everything", fixes the actual root cause — consent was previously scattered across two functions in two files, each deciding independently whether it was allowed to act. `resolveRunnerSetupMode` is the right shape and the right size. The extraction of `runTuning` / `classifyTuneProposals` / `applyTunedRunners` out of the old `applyTuneWithAgent` is also a real depth improvement, not a shuffle: the accept/reject rules are now testable without a provider call, which is why the new test file can pin them.
+
+Three findings, one of which I'd change now.
+
+---
+
+### 1. SHOULD CHANGE NOW — the mode's write authority is asked three times, in three spellings, and its zero value authorizes the most invasive path
+
+- **file**: `cmd/entire/cli/runner_setup.go` lines 143, 165–168, 196–200; `cmd/entire/cli/runner_init.go` lines 22–27
+- **summary**: "may this invocation write?" is spelled `mode != setupModeDryRun`, then `mode == setupModeDryRun`, then implicitly as "everything that reached the tail applies" — and an unknown mode passes all three as *write*.
+- **concrete cost**: `runnerSetupMode` is a string with no valid zero value. Trace `mode == ""` through `runRunnerSetup`: line 143 `!= setupModeDryRun` → scaffolds; 154/183/196 all miss → line 200 `applyTunedRunners` → writes the runner files. The zero value of the consent token is the full destructive action. That is the hole the `ensureRunnersPresent` doc comment ("Callers must not reach here without it.") is currently plugging with prose, and it is also why a fifth mode has to be remembered at three sites, two of them phrased negatively.
+- **deeper change**: put the authority on the type and gate at the writing layer, not the call site.
+  1. `func (m runnerSetupMode) writesRunnerFiles() bool` as a `switch m` with `default: return false`. This repo already has the precedent — `session.Phase` is a string enum with predicate methods (`IsActive()`) and a fail-safe normalizer (`PhaseFromString`, `session/phase.go:29`) — and `exhaustive` is enabled in `.golangci.yaml:25` with no `default-signifies-exhaustive`, so a `switch` over the mode gets *machine* enforcement that a fifth mode is handled. The current `if` chain is invisible to that linter.
+  2. Pass the mode into `ensureRunnersPresent(w, repoRoot, mode)` and let it return `nil, nil` when `!mode.writesRunnerFiles()`. That turns the comment into code, and it matches the repo's own dry-run convention: `agentimport.Run` takes `Options{DryRun: ...}` (`agentimport/agentimport.go:107`, honored at `:262`/`:296`) and `checkpoint.MigrateBranchToRefs(ctx, repo, dryRun)` takes it as a parameter — the writer honors it; the command does not gate the call.
+  3. Make the tail a positive `switch mode { case setupModeDryRun: preview; case setupModeAdapt: apply; default: return fmt.Errorf("unhandled setup mode %q", mode) }` instead of `if dryRun { preview }; return apply`.
+- **on the phantom-type idea from the brief**: I'd argue against it. `ensureRunnersPresent` has exactly one caller and is package-private (verified — the only non-test reference is `runner_setup.go:144`). A `consent` token type for a single-caller private helper is ceremony that buys nothing the fail-closed predicate doesn't. The mode value *is* the consent token; the defect is only that it has no invalid state.
+
+### 2. SHOULD CHANGE NOW — `previewTunedRunners(..., haveRunners)` is the loader swap leaking upward, and the two booleans agree only by coincidence
+
+- **file**: `cmd/entire/cli/runner_apply.go:167` (and its use at `:172`), called from `runner_setup.go:197`
+- **summary**: the preview is handed a *repo* fact (`haveRunners`) and uses it to make a claim about the *runner set* ("the preview is against the N embedded default(s)").
+- **concrete cost**: those are different propositions. `!haveRunners` implies "we swapped in `defaultTuneRunners`" only because `setupModeDryRun` happens to be the one mode that both reaches the preview *and* triggers the swap at line 166. Any fourth/fifth mode that previews, or any change to when the swap fires, makes the message lie, and nothing in the signature says the two must stay in step. The `haveRunners` local is threaded through 60 lines of `runRunnerSetup` to get there.
+- **deeper change**: let the runner set carry its own provenance. `parseTuneRunners` (`runner_prompt.go:84`) is already the shared constructor for both loaders, so it is one field: return a small `tuneRunnerSet{runners []tuneRunner; fromDefaults bool}` (or stamp it in `defaultTuneRunners`), and have `previewTunedRunners` read `set.fromDefaults`. The preview then states a fact it actually knows, and `haveRunners` stops crossing the function boundary.
+- **stronger version, worth considering**: fold the scaffold and the load into one `prepareRunners(w, repoRoot, filter, mode) (tuneRunnerSet, created []string, err error)`. That collapses *both* dry-run special cases (lines 143 and 165–168) into one place, since "we did not write, therefore we read the embedded set" is one decision expressed twice today. Honest tradeoff to name: `--defaults-only` would then parse six JSON files it doesn't need, and its early return at line 154 would move after the load. Cheap, but it is a real behavioural shuffle, so I'd take finding 1 first and treat this as the follow-up.
+
+### 3. NOTE — `runner setup` conflates two operations; two subcommands would be the deeper fix, but the current shape is defensible
+
+- **file**: `cmd/entire/cli/runner_setup.go:62–118`, `cmd/entire/cli/runner_group.go`
+- The evidence that the conflation costs something is concrete, not aesthetic:
+  - The file layout has *already* found the seam the command surface hides: `runner_init.go` is the scaffold, `runner_prompt.go`/`runner_apply.go` are the tailoring. CLAUDE.md's command-layout section names exactly this convention (`&lt;noun&gt;_&lt;verb&gt;.go`, noun groups owning verbs), and `runner` is a group with one subcommand — adding a second is cheap and idiomatic here.
+  - `--defaults-only` needs no provider, no network, no `--sources`, no `--limit`, no `--debug-dir`, yet inherits all of them *and is validated against them*: `runRunnerSetup` rejects `--limit 0` (line 121) and a bad `--sources` (line 124) **before** the mode is resolved at line 135. So `runner setup --defaults-only --limit 0` fails for a reason with nothing to do with what it was asked to do.
+  - `chooseRunnerSetupAction` offers only 2 of the 4 modes. The picker's own question is "generic defaults, or tailored?" — i.e. the interactive path already treats this as *init vs tune*, and `--print-prompt`/`--dry-run` are flag-only variants of the tune half. That is the two-subcommand decomposition, discovered by the UI and then flattened back into one flag namespace (hence the `MarkFlagsMutuallyExclusive` at line 115 and the four-flag error string at line 220).
+  - Under `runner init` + `runner tune`, the four modes become one command plus one verb with two output flags (`--dry-run`, `--print-prompt`), and both the exclusion group and the "which flag do I pass" message disappear.
+- **Why the current shape is still defensible**: the modes form a genuine prefix chain (defaults ⊂ print-prompt ⊂ {dry-run, adapt}) that shares nearly all machinery, `setup` is the better onboarding affordance to type once, and the group is `Hidden`/experimental so the surface is cheap to revise later. **You asked for the four-mode shape, so I am not recommending the split.**
+- **Cheap middle ground if you keep four modes**: move the `limit`/`sources` validation below the mode resolution so the offline mode isn't rejected for tailoring-only inputs. Three lines, and it removes the sharpest edge of the conflation.
+
+---
+
+### Explicitly at the right altitude — no change
+
+- **`--run` → `assumeYes` in the RunE closure** (`runner_setup.go:86–88`, `110–113`). This is the correct layer. Cobra has no flag-alias mechanism (`MarkDeprecated` only warns), and translating a retired *surface* into the current surface at the surface boundary means `runnerSetupOptions` and `resolveRunnerSetupMode` never learn that `--run` existed — the whole deprecation deletes as five contiguous lines in one file. Pushing it into `resolveRunnerSetupMode` would add a legacy field to the options struct and a legacy arm to the resolver, which is strictly worse. The `panic` on `MarkDeprecated` error matches the established pattern for init-time flag-registration errors (`runner_group.go:34`, `auth.go:105`, `dispatch.go:116`).
+- **The remaining identity comparisons** (`mode == setupModeDefaults` at line 154, `== setupModePrintPrompt` at line 183). These are terminal stages of the prefix chain, and a full dispatch table would duplicate the shared prefix into four handlers while still not absorbing the per-mode summary messages — it would buy about half and cost more than it buys. Leave them as `if`s; only the *capability* question in finding 1 wants to be a predicate.
+- **`resolveRunnerSetupMode` as the single consent point** — the right abstraction, and it mirrors `sessionOutputModeFromFlags` (`sessions.go:509`), whose doc comment states the same rationale almost verbatim ("Cobra enforces mutual exclusion at the flag layer; the enum makes the trichotomy total in code so we can't accidentally combine modes by passing two booleans").
+- **Agent-Safe CLI Fallbacks compliance** — improved, not regressed. Every mode is reachable by flag, the TUI is a `huh` select that only appears with a TTY, and the non-interactive `default:` arm names all four flags instead of the old behaviour of printing a 40KB prompt nobody asked for or returning `nil` with a hint. Worth being aware that the no-flag non-interactive default changed from "print the prompt" to "error", but erroring with an actionable flag list is the right call and the read-only path (`--print-prompt`) is named in the error.
+
+### Minor, not worth a change on its own
+
+`runnerConfigsExist` is probed twice per invocation — once at `runner_setup.go:134` for `haveRunners`, once inside `ensureRunnersPresent` at `runner_init.go:29`. Defensible as idempotence in the writer, and it collapses for free if you take the `prepareRunners` variant of finding 2.</result>
+<usage><subagent_tokens>155410</subagent_tokens><tool_uses>16</tool_uses><duration_ms>302707</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a3713270824305f43</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-calm-stone-4ef1/2dd1ef82-5b58-4327-b6ad-a3626e16e9e4/tasks/a3713270824305f43.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## REUSE review — `entire runner setup`
+
+### 1. `runner_apply.go:48-55` — re-derives the text generator the provider already carries
+
+`runTuning` calls `agent.Get(provider.Name)` + `agent.AsTextGenerator(ag)` to get a `TextGenerator`, but `resolveCheckpointSummaryProvider` already returned one: `checkpointSummaryProvider.TextGenerator` (`cmd/entire/cli/explain_summary_provider.go:40`) is set to exactly `agent.AsTextGenerator(getSummaryAgent(name))` in `buildCheckpointSummaryProviderWithEffectiveModel` (`explain_summary_provider.go:201-224`) and is guaranteed non-nil — the constructor errors out otherwise. The doc comment justifies not using `provider.Generator`, but overlooks `provider.TextGenerator`.
+
+- **Call instead:** `provider.TextGenerator.GenerateText(ctx, prompt, provider.Model)`. Precedent: `cmd/entire/cli/dispatch.go:93` (`opts.TextGenerator = provider.TextGenerator`).
+- **Cost:** 8 lines plus two error branches that cannot fire, and the entire `agent` import in `runner_apply.go` (`agent.` appears only on those two lines — verified). It also re-does the lookup through `agent.Get` rather than the package's `getSummaryAgent` seam (`explain_summary_provider.go:26`), which is why the new tests cannot stub it (see finding 3).
+- Note: this block is moved verbatim from the deleted `applyTuneWithAgent`, so the duplication is inherited, not invented — but it is being lifted into a new function with new tests around it, which is the moment to drop it.
+
+### 2. `runner_setup_test.go:303` — `writeRunnerConfig` duplicates `writeRunner` + `setupRunnersDir`
+
+Same package, same test binary: `writeRunner(t, dir, id, template)` at `cmd/entire/cli/runner_prompt_test.go:12` already writes `{"id":…,"prompt":{"template":…}}`, and the `os.MkdirAll(.entire/runners, 0o755)` half is `setupRunnersDir` at `runner_prompt_test.go:28-37`.
+
+- **Call instead:** `os.MkdirAll(runnersDir(repoRoot), 0o755)` then `writeRunner(t, runnersDir(repoRoot), strings.TrimSuffix(name, ".json"), template)`.
+- **Cost:** a second hand-rolled JSON-literal builder, which also drops the escaping the existing one gets from `mustJSONString` (`runner_prompt_test.go:20`) → `encodeJSONString`. Any template containing `"` or `\` silently produces invalid JSON in the new helper.
+
+### 3. `runner_setup_test.go:292` — `stubUnavailableSummaryProvider` stubs 1 of the 5 seams the package exposes
+
+`explain_summary_provider.go:22-33` defines `loadSummarySettings`, `getSummaryAgent`, `isSummaryCLIAvailable`, `discoverSummaryProviders`, `discoverSummaryProvidersAlways` precisely so tests can pin provider resolution; `explain_summary_provider_test.go:112-140` and `dispatch_test.go:598-650` are the established shape, and `stubTextAgent` / `stubNonTextAgent` (`explain_summary_provider_test.go:58-88`) are the ready-made agent doubles.
+
+The new helper only replaces `loadSummarySettings` with a bogus provider name. That name then flows into `discoverSummaryProviderIfMissing` → `discoverSummaryProvidersAlways` = `external.DiscoverAndRegisterAlways`, whose `discoverAndRegister` (`cmd/entire/cli/agent/external/discovery.go:132-...`) globs the real `$PATH` for `entire-agent-*` and execs each match under a discovery timeout. The three tests using it therefore depend on the developer's PATH.
+
+- **Call instead:** in addition to `loadSummarySettings`, stub `getSummaryAgent` (return an error or `&amp;stubNonTextAgent{}`) and `discoverSummaryProvidersAlways` to a no-op — `explain_summary_provider_test.go:112-140` even asserts `t.Fatal` if discovery is reached, which is the guard worth copying.
+
+### 4. `runner_init.go:108-109` — bespoke form-cancellation wrap instead of `handleFormCancellation`
+
+`chooseRunnerSetupAction` does `form.Run()` and wraps any error as `"runner-setup prompt cancelled: %w"`. The shared helper is `handleFormCancellation(w, action, err)` at `cmd/entire/cli/utils.go:35-42` (17 production call sites: `sessions.go:754`, `repo_clone.go:568`, `trail_cmd.go:1067`, `plugin_group.go:408`, …); it maps `huh.ErrUserAborted`/`ErrTimeout`/`context.Canceled` to "X cancelled." + `nil`, so Ctrl+C exits 0 instead of printing an error. `plugin_group.go:388` is also the precedent for `form.RunWithContext(ctx)` over `form.Run()`.
+
+- **Lower confidence / needs a small signature change:** the helper returns `nil` on cancel, and `resolveRunnerSetupMode` returning `("", nil)` would fall through to `mode != setupModeDryRun` and scaffold the defaults. The fit is to thread `errW` down and handle cancellation in `runRunnerSetup`, or keep a sentinel. Also note the deleted `confirmCreateRunners`/`confirmTuneExisting` had the same bespoke wrap, so this is carried over rather than newly introduced.
+
+### 5. `runner_setup_test.go:272` — `t.Chdir` without the `paths.ClearWorktreeRootCache` pairing every other fixture uses
+
+`newRunnerSetupRepo` chdirs but does not call `paths.ClearWorktreeRootCache()` (`cmd/entire/cli/paths/paths.go:225`), which the comparable fixtures do both before the chdir and in `t.Cleanup`: `attribution_test.go:713-724`, `trail_review_cmd_test.go:1079-1090` (248 references repo-wide).
+
+- **Caveat, stated honestly:** the cache is keyed on cwd (`paths.go:88-89`), so this is defensive rather than load-bearing today. Worth adding for consistency, not a bug I can demonstrate.
+
+---
+
+### Checked and found nothing to reuse (so the new code is justified)
+
+- **`renderTemplateDiff` / `writeDiffLines`:** there is no line-diff renderer anywhere in the repo. The only other `sergi/go-diff` user is `strategy/manual_commit_attribution.go:122` `diffLines`, which returns `(unchanged, added, removed int)` counts — not reusable for rendering. No `go-git plumbing/format/diff` / `UnifiedEncoder` usage exists; `trail_review_patch.go` only *parses* unified diffs. The duplicated part is the 3-line `DiffLinesToChars`/`DiffMain`/`DiffCharsToLines` idiom, which the comment already cross-references and which would need exporting across the `cli`/`strategy` boundary to share — not worth it.
+- **`splitLines` (`runner_apply.go:238`):** no such helper exists. `stringutil` (`CollapseWhitespace`, `TruncateRunes`, `CapitalizeFirst`) and `textutil` have nothing close. It is, however, the 4th copy of "split on `\n`, drop the trailing empty element": `trail_review_patch.go:293` (SplitAfter variant), `agentimport/claude.go:157`, `strategy/manual_commit_condensation.go:1556`. If you want it shared, `stringutil` is the home — but there is nothing to call today, so this is a "consider extracting", not a "call X instead".
+- **The `--dry-run` / mode-flag pattern:** no shared mode-resolution or consent helper exists. `clean.go:87`, `import_cmd.go:113` and `doctor_migrate.go:122` each own their dry-run branch inline. `confirmPluginAction` + `errConfirmNeedsTerminal` (`plugin_group.go:372-393`) and `addForceFlag`/`forceRequested` (`corecmd.go:68-82`) are yes/no confirmations and do not fit a four-way `huh.NewSelect`. `MarkFlagsMutuallyExclusive`, `MarkDeprecated`, and the `panic(fmt.Sprintf(...))` on a flag-marking error all match existing convention (`auth.go:104`, `runner_group.go:33`, `corecmd.go:623`). `slices.Sorted(maps.Keys(...))` matches `dispatch_wizard_scope.go:74`.
+- **`parseTuneRunners`:** no JSON-file-loading helper covers it (`jsonutil` is marshal/atomic-write only, no load side), and there is no canonical runner-config struct in the CLI — the anonymous `{ID, Prompt.Template}` struct at `runner_prompt.go:89` is the only one. The refactor is itself a de-duplication (on-disk and embedded paths now share one parser) and correctly reuses `runnerdefaults.File`/`Files()`.
+- Very minor: the new test file spells `filepath.Join(repoRoot, ".entire", "runners")` six times (lines 88, 109, 133, 162, 187, 305) where `runnersDir(repoRoot)` (`runner_prompt.go:22`) exists — but `runner_prompt_test.go:31` hard-codes it too, so the literal is the local test convention for pinning layout. Not worth changing.</result>
+<usage><subagent_tokens>181705</subagent_tokens><tool_uses>54</tool_uses><duration_ms>353632</duration_ms></usage>
+</task-notification>

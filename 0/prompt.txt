@@ -3,144 +3,362 @@
 ---
 
 <task-notification>
-<task-id>affee9ad3923bd3ff</task-id>
-<tool-use-id>toolu_01WBnQd1rWHjUHhbhAdkHBM6</tool-use-id>
-<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-green-meadow-d9ab/f6847120-2db3-4501-ab09-281451876d12/tasks/affee9ad3923bd3ff.output</output-file>
-<status>completed</status>
-<summary>Agent "Reuse review of sentinel diff" finished</summary>
-<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
-<result>No pre-existing helper being duplicated there — `clearAgentSubprocessEnv` is genuinely new in this diff, not a re-implementation of something already in the file.
-
-I've verified all three angles directly against the code (not speculation). Summary of what I checked and found:
-
-**Finding: none.**
-
-Details of verification:
-
-1. **Canonical env-var registry in `agent/`**: grepped every per-agent package (`geminicli`, `copilotcli`, `cursor`, `opencode`, `pi`) for `Getenv`/env-const declarations. None declares `GEMINI_CLI`, `COPILOT_CLI`, `CURSOR_AGENT`, or `OPENCODE` as subprocess-detection sentinels — those packages' env vars serve different purposes (test overrides like `ENTIRE_TEST_CURSOR_PROJECT_DIR`, home-dir overrides like `PI_CODING_AGENT_DIR` in `cmd/entire/cli/agent/pi/pi.go:31`, nesting markers like `ENTIRE_PI_NESTED` in `cmd/entire/cli/agent/pi/hooks.go:47`). `PI_CODING_AGENT` (no `_DIR` suffix) does not exist anywhere else in the codebase as a constant. So there is no existing sentinel registry this diff bypasses.
-
-   Also confirmed the import-cycle claim in the diff's own comments: `cmd/entire/cli/agent/external/discovery.go` already imports `cmd/entire/cli/interactive`, and `cmd/entire/cli/strategy` imports `cmd/entire/cli/agent`. If `interactive` imported `agent` to source these sentinels, that would close a cycle (`agent/external` → `interactive` → `agent`). So sourcing the list from `agent` is not legal, and the package-doc comment in `interactive.go:1-3` ("without inducing an import cycle") is accurate — the duplication here is structurally required, not an oversight.
-
-2. **"Any of these env vars is set" helper**: grepped `cmd/entire/cli/execx/*.go` and the whole repo for `AnyEnv`/`EnvSet`/`EnvPresent`/`LookupAny`-shaped helpers. None exists. `execx` only has path-scanning and spawn helpers (`pathscan.go`, `spawn_detached.go`, `execx_unix.go`), nothing for env-var presence checks.
-
-3. **Test env-clearing helper**: `cmd/entire/cli/testutil/testutil.go` and `cmd/entire/cli/testutil/gitenv/gitenv.go` only provide git-config isolation (`IsolateGitConfigEnv`, `gitenv.Isolated`/`IsolateProcess`), which target git-specific env vars (`GIT_*`, `HOME`, etc.) for a different purpose. No generic "clear a set of named env vars" helper exists there or elsewhere in the repo (`grep -rln "func clear.*Env|func Clear.*Env|func unset.*Env"` matched only the new `interactive_test.go` itself). `clearAgentSubprocessEnv` is new, not a duplicate of an existing helper.
-
-No reuse findings to report.</result>
-<usage><subagent_tokens>109023</subagent_tokens><tool_uses>10</tool_uses><duration_ms>51921</duration_ms></usage>
-</task-notification>
-
----
-
-<task-notification>
-<task-id>a29c45c74887db7ae</task-id>
+<task-id>a2105cb5456a7db9c</task-id>
 <tool-use-id>REDACTED</tool-use-id>
-<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-green-meadow-d9ab/f6847120-2db3-4501-ab09-281451876d12/tasks/a29c45c74887db7ae.output</output-file>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-green-meadow-d9ab/f6847120-2db3-4501-ab09-281451876d12/tasks/a2105cb5456a7db9c.output</output-file>
 <status>completed</status>
-<summary>Agent "Efficiency review of sentinel diff" finished</summary>
+<summary>Agent "Efficiency review of caller-session diff" finished</summary>
 <note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
-<result>I read the diff and the full `interactive.go` file, then traced every call site of `CanPromptInteractively` (76 hits) to establish how hot this path actually is.
+<result>## Efficiency review — `strategy.ResolveCallerSession` and `agent.CallerSessionCandidates`
 
-**Path established:** `isAgentSubprocessEnv` is reached from `CanPromptInteractively` on essentially every non-test invocation (it sits after the cheap `EnvTestTTY`/`testing.Testing()` checks, before which nothing short-circuits it in production). The two call sites inside git-hook code are:
-- `strategy/manual_commit_hooks.go:405` (`tryAgentCommitFastPath`) and `:485`, both inside `PrepareCommitMsg`, which fires once per `git commit` (agent or human) — not once per agent turn/tool call.
-- `hooks_git_cmd.go:90,110` and `strategy/checkpoint_policy.go:59,69,79,107`, all gated behind error/degraded-policy branches (checkpoint policy unreadable/unsupported), so they don't fire on the ordinary hook path at all.
+Scope: `cmd/entire/cli/strategy/caller_session.go`, `cmd/entire/cli/agent/caller_session.go`, plus the call site in `cmd/entire/cli/hooks_git_cmd.go`. Findings below are EFFICIENCY only, each checked against the actual hot-path evidence rather than asserted.
 
-So the hottest realistic frequency is "a small constant number of calls per `git commit`," not per keystroke/tool-call.
+### 1. `proclive.CurrentAncestry()` is called at most once per resolution — the "twice" premise does not hold
 
-**Findings against the four angles:**
+Checked `ResolveCallerSession` (`cmd/entire/cli/strategy/caller_session.go:103-125`) against `resolveCallerFromEnv` (`caller_session.go:145-195`) and `sessionIDByOwnerAncestry` (`caller_session.go:225-253`).
 
-1. **Loop vs `||` chain cost** — no efficiency finding. Each `os.Getenv` is a linear scan of Go's cached environ slice (tens of entries, string compares), on the order of 100ns–1µs; 5 lookups plus the `GIT_TERMINAL_PROMPT` check is a few microseconds at most, once or twice per `git commit`. This repo's own documented hook-performance work (CLAUDE.md's "Hook performance" section: redaction at 99.7% of blob-write cost, hook p50 floor ~3s dominated by `process_sessions`/`write_temporary_checkpoint`, git subprocesses in milliseconds) puts every other cost in the same hook 3-6 orders of magnitude above this. Not measurable against the rest of `PrepareCommitMsg`, which also opens the repo, reads session state, and computes checkpoint IDs. The added sentinels (`CURSOR_AGENT`, `OPENCODE`) are a functional change (2 more vendors to detect), not a loop-vs-chain artifact — same conclusion applies to them.
+`resolveCallerFromEnv` returns `ok=false` (which is the only condition under which `ResolveCallerSession` goes on to call `sessionIDByOwnerAncestry`, line 116) exclusively via the early `if len(candidates) == 0 { return ResolvedSession{}, false }` at line 148 — **before** `proclive.CurrentAncestry()` is called at line 157. Once `len(candidates) &gt; 0`, the function always sets `best.SessionID` (tracked or not) inside the loop and `best.Found()` is always true afterward, so it always returns `ok=true` and `ResolveCallerSession` returns immediately without reaching tier 2. So the two calls are mutually exclusive: tier 1's `CurrentAncestry()` runs only when at least one agent published an env var, tier 2's runs only when none did. No hoisting is needed because there is nothing to hoist — a single call already covers every path.
 
-2. **Slice allocation** — no finding. `agentSubprocessEnvVars` is a package-level `var`, so its backing array is built once at program init, not per call to `isAgentSubprocessEnv`. This is not a per-call allocation, and is at least as cheap as the previous hard-coded chain.
+`proclive.CurrentAncestry()` itself (`cmd/entire/cli/proclive/proclive.go:235-261`) costs: one `os.Hostname()`, one `bootID()` (darwin: no-op, returns immediately, `proc_darwin.go:40-42`; Linux: one `/proc/sys/kernel/random/boot_id` read, `proc_linux.go:60-73`), then up to `maxAncestorDepth=12` (`proclive.go:80`) `procStat` calls — each one `unix.SysctlKinfoProc` syscall on darwin (`proc_darwin.go:16-31`) or one `/proc/&lt;pid&gt;/stat` read on Linux (`proc_linux.go:19-28`). That's on the order of 10-15 syscalls/file-reads total, roughly 100-300µs, well short of a shell-out.
 
-3. **Ordering** — no finding. The alphabetical order (`COPILOT_CLI, CURSOR_AGENT, GEMINI_CLI, OPENCODE, PI_CODING_AGENT`) versus a "most-likely-first" order would change iteration count by at most a few loop steps over 5 entries, each a sub-microsecond `os.Getenv`. Same magnitude argument as (1) — not measurable at this call frequency. (Note: I did not flag the pre-existing double call to `CanPromptInteractively()` within one `PrepareCommitMsg` invocation — `tryAgentCommitFastPath` at line 405 and the switch at line 485 — because that duplication predates this diff and the diff doesn't touch either call site; it's out of scope for "cost the diff introduces.")
+**No finding.** Nothing to hoist; the existing structure already guarantees a single call per resolution.
 
-4. **Long-lived closures/captured scope** — no finding. `clearAgentSubprocessEnv(t *testing.T)` is a plain helper taking `t` as a parameter, not a closure capturing it; it's invoked from within short-lived `t.Run` subtests and nothing outlives the test.
+One sub-case worth naming but not elevating: in `resolveCallerFromEnv`, the ancestry snapshot at line 157 is taken unconditionally whenever `len(candidates) &gt;= 1`, even when there is exactly one candidate — where `depth` is computed but never compared against anything (the loop's first iteration always wins via `!best.Tracked`). That is a wasted ~100-300µs proc walk in the common single-agent case, but per point 2 below it is not measurable against what else runs on this path, so it does not clear the bar for a finding.
 
-**No efficiency findings.** The diff replaces a 4-branch `||` chain with a loop over a 5-element package-level slice, on a path that fires at most a handful of times per `git commit` (confirmed via the 76 `CanPromptInteractively` call sites; the only non-error-path hits are inside `PrepareCommitMsg`). The added `os.Getenv` calls are sub-microsecond and dwarfed by every other documented cost in these same hooks (redaction, git subprocesses). This is a 5-element env scan on a cold-relative-to-hook-total path — exactly the case where "no efficiency finding" is the right answer rather than a manufactured one.</result>
-<usage><subagent_tokens>112295</subagent_tokens><tool_uses>10</tool_uses><duration_ms>98042</duration_ms></usage>
+### 2. Path hotness: confirmed hot, but the added cost is not measurable against it
+
+Callers of `withHookSession` (`cmd/entire/cli/hooks_git_cmd.go:130`, call to `ResolveCallerSession` at line 133):
+- `cmd/entire/cli/hooks_git_cmd.go:181` — `entire hooks git`'s `PersistentPreRunE`, covering `prepare-commit-msg`, `commit-msg`, `post-commit`, `post-rewrite`, `pre-push`. Fires per `git commit`/`git push`/rebase-rewrite, not per keystroke.
+- `cmd/entire/cli/hook_registry.go:69` — `newAgentHooksCmd`'s `PersistentPreRun`, which covers **every** hook subcommand of every built-in agent, including Claude Code's `PreToolUse`/`PostToolUse` and Gemini's `before-tool`/`after-tool`. I confirmed via `cmd/entire/cli/agent/geminicli/lifecycle.go:92-93` that `before-tool`/`after-tool` are acknowledged-but-no-op lifecycle events (`ParseHookEvent` returns `nil, nil`), yet `withHookSession` still runs for them — so this is genuinely a per-tool-call path, not just per-turn.
+
+So the path is real and hot, up to dozens of invocations per agent turn. CLAUDE.md's "Hook performance" section documents the actual cost floor here: redaction is "~99.7% of the metadata-walk blob write," and even after the #2002 fix the "~3s p50 floor is STILL OPEN," attributed to `process_sessions`/`write_temporary_checkpoint`. Against that baseline:
+- `ListSessionStates(ctx)` (one directory scan + JSON parse per session file) was **already** being paid on this exact path before this diff, via the old `strategy.FindMostRecentSession(ctx)` — the diff does not add this cost, it relocates the same single call into `ResolveCallerSession` (`caller_session.go:104`).
+- The diff's net addition is: `agent.CallerSessionCandidates()` (§3, ~microseconds) plus at most one `proclive.CurrentAncestry()` proc walk (§1, ~100-300µs).
+- Each of these hook invocations is itself a spawned `entire` subprocess (`entire hooks gemini before-tool`), whose own process-spawn/exec overhead for a Go binary is typically several milliseconds — one to two orders of magnitude larger than the added proc walk.
+
+**No efficiency finding.** The added cost (env reads + a registry scan + at most one proc walk) is sub-millisecond and is dominated both by the pre-existing session-state listing on the same path and by the subprocess-spawn cost of invoking the hook at all, let alone the multi-second redaction floor CLAUDE.md documents as the actual bottleneck.
+
+### 3. `CallerSessionEnvVars()` and `CallerSessionCandidates()` are never both called in production code
+
+`grep` for non-test callers of both functions (`cmd/entire/cli/agent/caller_session.go:50` and `:97`) shows `CallerSessionEnvVars()` is called only from test/harness files (`caller_session_test.go`, `hooks_git_cmd_test.go`, `session_current_test.go`, `sessions_test.go`, `integration_test/setup_test.go`, `e2e/tests/main_test.go`) — all `clearCallerSessionEnv` / `TestMain` isolation helpers, never a runtime code path. The only production caller of either is `strategy/caller_session.go:146`, which calls `CallerSessionCandidates()` alone.
+
+`Get(name)` (`cmd/entire/cli/agent/registry.go:34-43`) does `factory()`, and I verified one concrete constructor (`claudecode.NewClaudeCodeAgent`, `claude.go:36-38`) is a bare struct literal with a function-pointer field — no I/O, no allocation beyond the struct. This matches the registry's own documented cost model at `registry.go:190` ("~400ns worst case... Called infrequently... Only optimize if agent count exceeds 100"). `CallerSessionCandidates()` calls `Get()` once per registered agent (currently 8) regardless of whether that agent implements the interface, since the type assertion needs an instance first — roughly 8 × 400ns ≈ 3µs.
+
+**No finding.** Neither the "both functions called" scenario nor the per-agent `Get()` cost is present or material in production.
+
+### 4. No redundant `ListSessionStates` calls, no wasted map construction
+
+`ResolveCallerSession` (`caller_session.go:104`) calls `ListSessionStates` exactly once and threads the same `states` slice through all four tiers (`resolveCallerFromEnv`, `sessionIDByOwnerAncestry`, the two `mostRecentSessionID` calls) — no tier re-reads session-state files. The `byID` map built in `resolveCallerFromEnv` (`caller_session.go:151-154`) is constructed only after the `len(candidates) == 0` early return, so it is built exactly when it will be used for the lookup at line 163, never wastefully.
+
+**No finding.**
+
+### 5. No closures or long-lived captured state
+
+Reviewed both files end to end: no goroutines, no closures stored beyond the enclosing function's stack frame, no captured `ctx` or session-state slices retained past the call. `logging.Debug` calls take value arguments and return immediately.
+
+**No finding.**
+
+---
+
+**Summary: no efficiency findings.** The task's own suspicion (a double `proclive.CurrentAncestry()` call) does not materialize — the tier structure makes the two call sites mutually exclusive by construction. The call path is genuinely hot (confirmed per-tool-call via Gemini's before-tool/after-tool), but every cost this diff adds (a handful of env reads, up to 8 trivial `Get()` calls, at most one ~100-300µs proc walk) is sub-millisecond and is dwarfed by costs that already exist on the same path before this diff (the session-state directory listing) and by the subprocess-spawn overhead of invoking the hook itself, let alone the multi-second redaction floor CLAUDE.md documents as the real budget concern here.</result>
+<usage><subagent_tokens>174041</subagent_tokens><tool_uses>17</tool_uses><duration_ms>198904</duration_ms></usage>
 </task-notification>
 
 ---
 
 <task-notification>
-<task-id>ab93ca09f173747c5</task-id>
-<tool-use-id>toolu_01PU675CwxC5CDYio6QHttqe</tool-use-id>
-<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-green-meadow-d9ab/f6847120-2db3-4501-ab09-281451876d12/tasks/ab93ca09f173747c5.output</output-file>
+<task-id>a101481a672130b3b</task-id>
+<tool-use-id>toolu_0121Fuaaq9tUaAngzfzkECRT</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-green-meadow-d9ab/f6847120-2db3-4501-ab09-281451876d12/tasks/a101481a672130b3b.output</output-file>
 <status>completed</status>
-<summary>Agent "Simplification review of sentinel diff" finished</summary>
+<summary>Agent "Reuse review of caller-session diff" finished</summary>
 <note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
-<result>## Simplification Review — `isAgentSubprocessEnv` sentinel refactor
+<result>I have everything needed. Here are the REUSE findings.
 
-I read the diff and the full current `interactive.go` / `interactive_test.go`, and cross-checked comment density against `cmd/entire/cli/paths/entiredir.go` to calibrate house style (which runs dense/explanatory by design, including deliberate cross-referencing between adjacent doc comments).
+## Finding 1 (primary): `sessionIDByOwnerAncestry` re-implements `findSessionByCommitAncestry`'s loop almost line-for-line
 
-### Finding (minor, debatable)
+- `cmd/entire/cli/strategy/caller_session.go:225-253` (`sessionIDByOwnerAncestry`)
+- duplicates `cmd/entire/cli/strategy/session_identity.go:84-112` (`(*ManualCommitStrategy).findSessionByCommitAncestry`)
 
-- **file**: `cmd/entire/cli/interactive/interactive.go`
-- **line**: 76 vs. 103
-- **summary**: The "presence check" semantics of `agentSubprocessEnvVars` are stated once in the slice's own doc comment ("Presence alone is the signal…", line 76) and restated in `isAgentSubprocessEnv`'s doc comment eight lines later ("…where the others are presence checks.", line 103).
-- **cost**: Low — six words, adjacent comments, not actually confusing. A reader scanning either symbol independently still gets a correct, self-contained explanation.
-- **simpler form**: The function comment's closing clause could drop to `"GIT_TERMINAL_PROMPT stays outside the list because only the exact value "0" counts — the user may legitimately set it to "1"."` and rely on the slice comment (already directly above) to have established that the others are presence checks.
-- **counter-argument**: This mirrors a pattern the codebase already uses on purpose — `entiredir.go`'s `ErrEntireDirUnsupportedEntry` comment explicitly restates and contrasts against `ErrEntireDirNotDirectory` ("which is the same shape... but not the same sentence") specifically to make each sentinel's comment self-contained. The clause here is doing the same contrastive work (why GIT_TERMINAL_PROMPT is excluded), not blind restatement. I'd call this a stylistic judgment call, not a real complexity cost — flagging it because the task asked me to check for it, not because it materially hurts readability.
+The ranking loops are near-identical:
 
-### Everything else: no simplification findings
+```
+session_identity.go:91-102                          caller_session.go:232-243
+for _, state := range states {                       for _, state := range states {
+  if state.WorktreePath == "" ||                        if state.Owner == nil ||
+     state.Kind.IsImported() ||                             state.Kind.IsImported() ||
+     state.AdoptedIntoWorktreePath != "" ||                 state.AdoptedIntoWorktreePath != "" {
+     state.Owner == nil { continue }                        continue
+  depth := ancestry.Depth(*state.Owner)                  }
+  if depth &lt; 0 { continue }                              depth := ancestry.Depth(*state.Owner)
+  if best == nil || depth &lt; bestDepth ||                 if depth &lt; 0 { continue }
+     (depth == bestDepth &amp;&amp;                               if best == nil || depth &lt; bestDepth ||
+      interactedAfter(state, best)) {                        (depth == bestDepth &amp;&amp;
+    best, bestDepth = state, depth                             interactedAfter(state, best)) {
+  }                                                          best, bestDepth = state, depth
+}                                                            }
+                                                        }
+```
 
-1. **Slice + loop vs. the old `||` chain** — justified, not ceremony. Pre-diff the list was hand-spelled in three code locations (the `||` chain, the test's `cases` table, and a hand-written `t.Setenv(..., "")` clear-list in `TestIsAgentSubprocessEnv_GitTerminalPromptOnIsNotAgent`), which is exactly the kind of drift this repo's conventions call out repeatedly (e.g. the settings/metadata-dir sections in CLAUDE.md). The refactor is the minimum shape that fixes it: one `[]string`, one `range` loop in the function, and the tests iterate the same slice instead of re-copying it. No generics, no map, no reflection — appropriately plain.
+The only substantive difference is one extra guard clause (`state.WorktreePath == ""`, relevant to commit-linking, dropped for caller resolution). The new file's own doc comment even names the old function ("It is the same match commit linking performs (`findSessionByCommitAncestry`)"), so the duplication was noticed and not acted on.
 
-2. **Test structure** (`TestIsAgentSubprocessEnv`, `_AnyNonEmptyValueCounts`, `_GitTerminalPromptOnIsNotAgent`) — three tests earn their keep as three distinct axes: (a) enumerate-the-slice + the GIT_TERMINAL_PROMPT positive case, (b) presence-not-equality semantics across varied values ("1"/"true"/"0"/"no") on one representative var, (c) the GIT_TERMINAL_PROMPT negative case. None subsumes another — (b) in particular is the one test guarding against a future accidental `== "1"` instead of `!= ""`, which the enumerate loop (fixed at `"1"`) wouldn't catch. This also matches the file's existing convention of several small, narrowly-scoped `Test*` functions per behavior (see the four `TestCanPromptInteractively_*` tests already in the file, untouched by this diff).
+**Is the method receiver a real obstacle? No — verified, not assumed.** `findSessionByCommitAncestry`'s receiver `s *ManualCommitStrategy` is never referenced in its body (only `ctx` and `states` are used). It is a method purely by file placement, not because it needs strategy state. Nothing prevents it from being a free function callable from both sites today.
 
-3. **Doc comments generally** — appropriately dense for this file's style; only the one marginal overlap above.
+**Cost of the two copies**: the ranking rule (owner-ancestry filter, depth comparison, `interactedAfter` tiebreak) now has two independently-editable implementations. A future change to the tiebreak or the imported/adopted-session exclusion (both already fragile invariants per the surrounding doc comments) has to be made twice and can silently drift — exactly the "same match ... performs" comment flags but doesn't fix.
 
-4. **Dead code / leftovers** — none found. The old `||` chain and the old hand-written clear-list are fully removed, nothing orphaned.
+**Existing helper to extract to / call**: a shared free function, e.g. `nearestSessionByOwnerAncestry(ctx context.Context, states []*SessionState, requireWorktreePath bool) *SessionState` (natural home: `session_identity.go`, since that's where the concept originates). `findSessionByCommitAncestry` (session_identity.go:89-102) would collapse to a call with `requireWorktreePath=true`; `sessionIDByOwnerAncestry` (caller_session.go:230-243) would collapse to a call with `requireWorktreePath=false` plus `.SessionID`. Each caller keeps its own `logging.Debug` call (they use different `logging.WithComponent` tags — `"checkpoint"` vs `"session"` — and slightly different fields), so only the ranking loop itself needs to move.
 
-5. **`clearAgentSubprocessEnv` also clearing `GIT_TERMINAL_PROMPT`** — right shape, not an awkward seam. Since exactly one sentinel (`GIT_TERMINAL_PROMPT`) is deliberately excluded from `agentSubprocessEnvVars`, hardcoding its single extra `t.Setenv(..., "")` line after the loop is simpler than inventing a second slice or a generalized "all sentinels including exact-value ones" abstraction for a set of one. The naming (`clearAgentSubprocessEnv`, mirroring `isAgentSubprocessEnv`, not `clearAgentSubprocessEnvVars`) already signals it clears everything the function checks, not just the slice.
+## Finding 2: `isNearerCaller` overlaps the inline ranking condition but is not a drop-in replacement — same underlying comparator, currently a third copy
 
-**Files reviewed**: `/Users/soph/.herdr/worktrees/cli/worktree-green-meadow-d9ab/cmd/entire/cli/interactive/interactive.go`, `/Users/soph/.herdr/worktrees/cli/worktree-green-meadow-d9ab/cmd/entire/cli/interactive/interactive_test.go`, `/Users/soph/.herdr/worktrees/cli/worktree-green-meadow-d9ab/cmd/entire/cli/paths/entiredir.go` (style calibration only).</result>
-<usage><subagent_tokens>115997</subagent_tokens><tool_uses>4</tool_uses><duration_ms>164338</duration_ms></usage>
+- `cmd/entire/cli/strategy/caller_session.go:201-212` (`isNearerCaller`)
+- vs. the inline condition at `session_identity.go:99` and `caller_session.go:240` (both: `depth &lt; bestDepth || (depth == bestDepth &amp;&amp; interactedAfter(...))`)
+
+`isNearerCaller` generalizes the same comparison to also handle unresolved depths (`depth == -1`), which the other two never see because they `continue` before reaching the comparison when `depth &lt; 0`. Where the domains overlap (`depth &gt;= 0 &amp;&amp; bestDepth &gt;= 0`), `isNearerCaller` returns `depth &lt; bestDepth` and stops — it does not reach the `interactedAfter` tiebreak that the other two apply on an exact-depth tie (that branch of `isNearerCaller` is reached only when both depths are unresolved). So verbatim substitution of `isNearerCaller` into the other two call sites would change tie-break behavior for equal-depth ties, and I'm not asserting that's a bug — only that it means the three are not currently interchangeable despite being the same idea. Extracting one shared comparator that all three call would need that tie case reconciled first; as-is, this is a third, partially-overlapping implementation of "which ancestry candidate is nearer" rather than a clean call target for finding 1's duplication.
+
+## Finding 3: `CallerSessionEnvVars`/`CallerSessionCandidates` don't follow the registry's established "copy factories under one lock" pattern
+
+- `cmd/entire/cli/agent/caller_session.go:50-62` (`CallerSessionEnvVars`) and `:97-120` (`CallerSessionCandidates`)
+- vs. `cmd/entire/cli/agent/registry.go:208-229` (`AllProtectedDirs`), `:234-263` (`AllHookConfigRelPaths`), `:264-293` (`AllProtectedFiles`)
+
+All three existing `All*` aggregators share one explicit idiom (comment at registry.go:209 and :265: *"Copy factories under the lock, then release before calling external code"*): take `registryMu.RLock()` once, copy the `[]Factory` slice, `RUnlock()`, then instantiate/iterate outside the lock. That's one lock acquisition per aggregation call.
+
+The two new functions instead call `List()` (which itself does `RLock`/`RUnlock`, registry.go:47-48) and then `Get(name)` per loop iteration (another `RLock`/`RUnlock` each, registry.go:35-36) — N+1 separate lock acquisitions instead of one held span, and (per the existing helpers' rationale) no longer a single consistent snapshot of the registry across the whole enumeration.
+
+**Cost**: a second locking idiom for the same kind of operation in the same file/package, so a future registry change (e.g., an actual delete/unregister path) has two different consistency guarantees to reason about instead of one.
+
+**Existing pattern to reuse**: `cmd/entire/cli/agent/registry.go:208-215` (`AllProtectedDirs`'s copy-under-lock header) — `CallerSessionEnvVars` and `CallerSessionCandidates` should copy `[]Factory` under one `RLock` the same way, then call `AsCallerSessionIdentifier` on the instantiated agents outside the lock, instead of composing `List()` + per-name `Get()`.
+
+## Finding 4: three near-identical `clearCallerSessionEnv` test helpers — verified: `testutil` can safely import `agent`, but not for all three
+
+- `cmd/entire/cli/agent/caller_session_test.go` (`clearCallerSessionEnv`, package `agent`)
+- `cmd/entire/cli/strategy/caller_session_test.go:1378-1383` (`clearCallerSessionEnv`, package `strategy`)
+- `cmd/entire/cli/session_current_test.go:709-714` (`clearCallerSessionEnv`, package `cli` — already correctly reused by `hooks_git_cmd_test.go` and `sessions_test.go` in the same package, so no further dup *within* `cli`)
+- plus two inline `Unsetenv` loops: `cmd/entire/cli/integration_test/setup_test.go:581-587` and `e2e/tests/main_test.go:1723-1725`
+
+All five iterate `agent.CallerSessionEnvVars()` and unset each. **Verified by grep** that no production (non-`_test.go`) package currently imports `cmd/entire/cli/testutil` except `integration_test`, and that `agent`'s own production code does not import `testutil` (only one `_test.go` file does, and it's `package agent_test`, not `package agent`). So `testutil` importing `agent` in production code creates no cycle for `strategy`, `cli`, `integration_test`, or `e2e/tests`.
+
+**But it does break for `agent`'s own internal test.** `cmd/entire/cli/agent/caller_session_test.go` is `package agent` (an internal test, not `agent_test`). I confirmed empirically (built a minimal two-package repro) that Go's toolchain rejects exactly this shape with `import cycle not allowed in test`: an internal test file of package P importing package Q, where Q imports P (production). If `testutil` imports `agent`, `agent`'s own `package agent` test file could no longer import `testutil` to reach a shared `testutil.ClearCallerSessionEnv`.
+
+**Cost**: three copies of the same 5-line loop, one of which is structurally required to stay separate.
+
+**Existing helper to extract to / call**: add `testutil.ClearCallerSessionEnv(t *testing.T)` to `cmd/entire/cli/testutil/testutil.go` (which would newly import `agent.CallerSessionEnvVars()`), and have `strategy/caller_session_test.go:1378-1383` and `session_current_test.go:709-714` call it instead of redefining it — both packages already import `testutil` elsewhere in their test suites, so this is a net reduction. The `agent`-package copy must stay as a local unexported helper (already minimal: it's just `for _, name := range CallerSessionEnvVars()`, unqualified, since it's in-package). The two `TestMain`-context `Unsetenv` loops (`integration_test/setup_test.go`, `e2e/tests/main_test.go`) could similarly call a `testutil` helper, but they need `os.Unsetenv`/error-handling shape rather than `t.Setenv`, so at most a secondary, lower-value consolidation (e.g. `testutil.UnsetCallerSessionEnvVars() []error`) — flagging it, not insisting on it.
+
+## Finding 5: `sessionResolutionLabel` — no finding
+
+Read `sessionWorktreeLabel` (`sessions.go:302-310`) and `sessionPhaseLabel` (`sessions.go:313-322`), the only other label helpers in the same file/area. Both are small switch/if-chains mapping a *different* domain enum (`WorktreeID`/`WorktreePath`, `SessionState.Phase`) to a display string; neither overlaps `sessionResolutionLabel`'s cases or logic. Searched all `func.*Label(` definitions under `cmd/entire/cli/` — none operate on `strategy.SessionResolution` or share switch arms with it. This is ordinary Go idiom (one switch per enum type), not a case of an existing helper being re-implemented. Per the review rules, dropping this — no named existing alternative exists.</result>
+<usage><subagent_tokens>173326</subagent_tokens><tool_uses>17</tool_uses><duration_ms>299826</duration_ms></usage>
 </task-notification>
 
 ---
 
 <task-notification>
-<task-id>a41cc34d30c82af99</task-id>
-<tool-use-id>REDACTED</tool-use-id>
-<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-green-meadow-d9ab/f6847120-2db3-4501-ab09-281451876d12/tasks/a41cc34d30c82af99.output</output-file>
+<task-id>a88107262c87e822d</task-id>
+<tool-use-id>toolu_01TxxE8qP1CMbQyhNXzwoGoq</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-green-meadow-d9ab/f6847120-2db3-4501-ab09-281451876d12/tasks/a88107262c87e822d.output</output-file>
 <status>completed</status>
-<summary>Agent "Altitude review of sentinel diff" finished</summary>
+<summary>Agent "Simplification review of caller-session diff" finished</summary>
 <note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
-<result>## ALTITUDE review — `interactive.go` agent-sentinel diff
+<result>## Simplification review — `strategy.ResolveCallerSession` and callers
 
-**Verdict: the altitude is right.** This is a case of "deliberately narrow, well-documented, and I can show why the more general alternatives don't actually work here" rather than a symptom patch. Findings below are the verification behind that call, not a list of problems.
+Read the full diff plus `agent/caller_session.go`, `strategy/caller_session.go`, `session_current.go`, both new test files, and `strategy/session_state.go`/`session_identity.go`/`paths/entiredir.go` for calibration. Findings below, organized by your six angles.
 
-### 1. Hardcoded env-var allowlist vs. the three general alternatives
+### 1. `resolveCallerFromEnv` — simpler formulation exists
 
-- **Process ancestry (`proclive`)**: doesn't fit this problem's shape. `proclive.Ancestry.Depth` (`cmd/entire/cli/proclive/proclive.go:257-270`) only matches a *specific, previously-recorded* `Identity` (PID + start-time + host + boot) against the current chain — it has nothing to check against for a cold `entire` invocation from a shell tool that never registered an identity. The only ancestry mechanism that works from process names alone is `transientNames` (`proclive.go:90-101`), and its own doc comment is the argument against reusing that shape here: "interpreter runtimes are deliberately absent — for several agents the runtime IS the long-lived agent." The same ambiguity would hit TTY detection even harder: matching on an ancestor process name (e.g. "cursor") can't distinguish the shell-tool's non-interactive spawn from a human's terminal opened *inside* Cursor's IDE, which is also a descendant of the same vendor process. The env var is deliberately scoped narrower than ancestry — the commit message (`fe7edeb21`) confirms it was verified empirically ("Cursor's shell tool sets `CURSOR_AGENT=1` in the child env") rather than inferred, which is exactly the property ancestry-by-name can't guarantee. `proclive` is also unsupported on Windows by its own doc comment, so it can't be the primary mechanism regardless.
-- **Inverting the default**: the function already ends in that shape at its last step — the `/dev/tty` probe plus raw-mode check requires positive proof of an interactive terminal (`interactive.go:55-63`). Moving that inversion earlier, ahead of the CI and agent checks, would be a materially larger behavioral change (risk of false negatives suppressing real human prompts) than this diff's scope, and isn't what this diff claims to do.
-- **Asking each agent (`DetectPresence`)**: verified this is the wrong capability, not just an unused one. `agent.Agent.DetectPresence` (`cmd/entire/cli/agent/agent.go:39-40`) answers "is this agent configured in the repository" via static filesystem checks — `cursor.DetectPresence` stats `.cursor/` (`cmd/entire/cli/agent/cursor/cursor.go:59-71`), `opencode.DetectPresence` stats `.opencode/`/`opencode.json` (`cmd/entire/cli/agent/opencode/opencode.go:43-56`). Neither says anything about the *current process's* runtime context, and no other method on the `Agent` interface does either (confirmed by reading the full interface in `agent.go:24-60`). Reusing it would require inventing a new capability, not wiring up an existing one.
+**File:** `cmd/entire/cli/strategy/caller_session.go:145-195`
 
-### 2. Does the list belong in `interactive` or in the per-agent packages?
+The loop carries three loop-scoped variables (`best`, `bestState`, `bestDepth`) and buries the "untracked kept only if nothing tracked exists yet" rule as a special case inside the main ranking loop (`if !tracked { if !best.Found() { best = resolved }; continue }`), then reuses the same `best` for the tracked path via `!best.Tracked || isNearerCaller(...)`. The invariant "tracked always beats untracked" is true only because of how `!best.Tracked` happens to evaluate on the very first tracked candidate — it's implicit, not structural.
 
-**Centralizing it in `interactive` is structurally forced, not a compromise.** `cmd/entire/cli/agent/external/discovery.go:18` imports `cli/interactive`. If `interactive` in turn imported `agent` (or an agent subpackage) to let each vendor own its own sentinel name, that would be a direct import cycle: `agent → interactive → agent`. The package doc comment at the top of `interactive.go:1-4` ("without inducing an import cycle (strategy cannot import cli)") already states this constraint for the sibling case; this diff's placement is the same constraint applied to `agent`. There's no available seam that lets the per-agent packages own their own sentinel string without breaking the build.
+**Cost:** a reader has to trace how the untracked branch's early-continue interacts with the tracked branch's `!best.Tracked` check to convince themselves ties are impossible; the two concerns (rank among tracked; fall back to untracked) are interleaved rather than sequential.
 
-### 3. Guard test for list-in-sync-with-list
+**Simpler form** — split into two passes, since `resolveCallerFromEnv` only ever needs the answer to "is there a tracked one" before it can even consider an untracked one:
 
-**No guard test is warranted, and the diff's refactor is the better fix.** I grepped the whole tree for `"CURSOR_AGENT"`, `"OPENCODE"`, `"GEMINI_CLI"`, `"COPILOT_CLI"`, `"PI_CODING_AGENT"` outside `interactive/` — zero hits. There is no second, independently-maintained list of these vendor env-var names anywhere else in the codebase (in particular, `DetectPresence` never references them — see above), so there is nothing left for `agentSubprocessEnvVars` to drift against. Before this diff, the same five-name set *was* duplicated by hand across `isAgentSubprocessEnv`, the positive test table, and the negative test's clearing calls (visible in the diff's removed lines) — that's exactly the "list in one place must stay in sync with a list somewhere else" shape this repo's guard tests exist for (`TestEntireDirCheckExemptions`, `TestRootBasesAreTrusted`, `TestGitStatusCallSitesPassNoOptionalLocks`). This diff collapsed the duplicates into one slice that the detection function and both test helpers now read directly (`interactive.go:87-93`, `interactive_test.go` `clearAgentSubprocessEnv`), which eliminates the drift risk instead of merely testing for it. That's a stronger fix than adding a guard test would have been.
+```go
+func resolveCallerFromEnv(ctx context.Context, states []*SessionState) (ResolvedSession, bool) {
+	candidates := agent.CallerSessionCandidates()
+	if len(candidates) == 0 {
+		return ResolvedSession{}, false
+	}
+	byID := indexByID(states)
+	ancestry, haveAncestry := proclive.CurrentAncestry()
 
-### 4. Does `CLAUDE.md` describe this at the right level?
+	// Pass 1: nearest tracked candidate, if any.
+	var best ResolvedSession
+	var bestState *SessionState
+	bestDepth := -1
+	for _, c := range candidates {
+		state, tracked := byID[c.SessionID]
+		if !tracked {
+			continue
+		}
+		depth := -1
+		if haveAncestry &amp;&amp; state.Owner != nil {
+			depth = ancestry.Depth(*state.Owner)
+		}
+		if !best.Found() || isNearerCaller(depth, bestDepth, state, bestState) {
+			best = ResolvedSession{SessionID: c.SessionID, Resolution: ResolutionCallerEnv, AgentType: c.AgentType, Tracked: true}
+			bestState, bestDepth = state, depth
+		}
+	}
+	// Pass 2: nothing tracked — the first published claim is still a real
+	// diagnosis (Tracked==false), so report it rather than nothing.
+	if !best.Found() {
+		first := candidates[0]
+		best = ResolvedSession{SessionID: first.SessionID, Resolution: ResolutionCallerEnv, AgentType: first.AgentType}
+	}
+	// ...debug log, return best, true
+}
+```
 
-Yes. The updated section (`CLAUDE.md`, "Spawning subprocesses in tests (TTY detection)", step 3) names `interactive.agentSubprocessEnvVars` as "the single source of truth" and gives the current names only as an illustrative enumeration, which is the same idiom the rest of this file already uses elsewhere (name the invariant and the enforcing code, list current specifics for orientation). No test in this repo parses `CLAUDE.md` against code to keep any such enumeration honest (checked — other files only reference `CLAUDE.md` in comments/error strings as a pointer, never parse it), so leaving this list as prose here is consistent with existing practice, not a new gap this diff introduces.
+I verified this preserves every documented behavior (tracked beats untracked unconditionally by construction; nearest-depth/recency tie-break unchanged; same first-untracked-wins fallback; same log fields, since `bestDepth` stays `-1` in the fallback either way). I'd ship this version — it makes "tracked always wins" a fact about control flow rather than about how a boolean happens to be seeded.
 
-No findings to file — the altitude is correct at every one of the four checkpoints, and I could verify the "forbidden" and "no duplicate" claims directly rather than assume them.</result>
-<usage><subagent_tokens>133703</subagent_tokens><tool_uses>22</tool_uses><duration_ms>171966</duration_ms></usage>
+### 2. `isNearerCaller`'s four branches
+
+**File:** `cmd/entire/cli/strategy/caller_session.go:201-212`
+
+The first and third branches (`depth&gt;=0 &amp;&amp; bestDepth&lt;0 → true`, `depth&lt;0 &amp;&amp; bestDepth&gt;=0 → false`) are the two halves of one condition — "exactly one side resolved" — each spelled out with its own explicit-but-symmetric depth check.
+
+**Cost:** minor; a reader has to notice the symmetry rather than see it stated.
+
+**Simpler form** (4 branches → 3, same behavior):
+
+```go
+func isNearerCaller(depth, bestDepth int, state, bestState *SessionState) bool {
+	if (depth &gt;= 0) != (bestDepth &gt;= 0) {
+		return depth &gt;= 0
+	}
+	if depth &gt;= 0 {
+		return depth &lt; bestDepth
+	}
+	return interactedAfter(state, bestState)
+}
+```
+
+Low-priority — the existing version is explicit and matches this repo's preference for spelled-out branches (e.g. `findSessionByCommitAncestry`'s single-line `||`/`&amp;&amp;` chain is denser, not sparser). I'd only make this change opportunistically, not as a standalone cleanup.
+
+### 3. `ResolvedSession` fields — no finding
+
+`Tracked` is **not** redundant with `Resolution`: it's always `true` for `ResolutionAncestry`/`Worktree`/`OtherWorktree` (those come straight from tracked `ListSessionStates` results) but can be either value on `ResolutionCallerEnv`, which is exactly the case that needs distinguishing (an agent naming a session Entire never recorded). `AgentType` is likewise orthogonal — set only pre-load, on the one tier where the environment names an agent before any state lookup. `ResolutionNone` as the empty-string zero value is doing real work: it's what makes `Resolution string `json:"resolution,omitempty"`` correctly omit the field for `session info &lt;id&gt;`/`session list` (which pass `strategy.ResolutionNone` explicitly in `sessions.go`), and it reads better than a bare `""` at those call sites and in tests. Nothing to simplify here.
+
+### 4. `session_current.go` — the no-session branch and `reportUntrackedCallerSession` share a shape
+
+**File:** `cmd/entire/cli/session_current.go:51-64` (no-session branch) and `:100-118` (`reportUntrackedCallerSession`)
+
+Both do: build one-or-two message lines → if machine-readable, `SilenceUsage`, write lines to stderr, return `NewSilentError(...)`; else write lines to stdout, return `nil`.
+
+**Cost:** the branching shape (silence/stream-target/error-vs-nil) is duplicated verbatim across ~30 lines instead of parameterized once; a future third "can't emit a session envelope" case would duplicate it a third time.
+
+**Simpler form** — one small helper both call sites feed lines and a sentinel error into:
+
+```go
+func reportSessionUnavailable(cmd *cobra.Command, machineReadable bool, sentinel error, lines ...string) error {
+	w := cmd.OutOrStdout()
+	if machineReadable {
+		cmd.SilenceUsage = true
+		w = cmd.ErrOrStderr()
+	}
+	for _, line := range lines {
+		fmt.Fprintln(w, line)
+	}
+	if machineReadable {
+		return NewSilentError(sentinel)
+	}
+	return nil
+}
+```
+
+The no-session branch becomes a one-line call with a literal message; `reportUntrackedCallerSession` keeps its own doc comment (the diagnosis rationale is genuinely worth keeping) but its body shrinks to building the two message strings and calling the helper.
+
+### 5. Test redundancy
+
+**Finding — one test can go:** `cmd/entire/cli/strategy/caller_session_test.go:84-96` (`TestResolveCallerSession_PrefersTheCallerOverThisWorktreesSession`) adds nothing over `:59-80` (`TestResolveCallerSession_PrefersTheCallerOverAnotherWorktreesSession`). `ResolveCallerSession` returns from `resolveCallerFromEnv` immediately on success (`caller_session.go:112-114`), before tiers 3/4 are even computed — so whether the decoy session happens to sit in the current worktree or a foreign one is invisible to the code under test; both tests exercise the exact same short-circuit. The "AnotherWorktreesSession" variant is the one to keep — its comment ties it directly to the reported bug shape. Drop `PrefersTheCallerOverThisWorktreesSession`.
+
+**Not redundant:** `TestResolveCallerSession_MatchesOwnerByProcessAncestry` (tier 2 vs. tier 4) and `TestResolveCallerSession_EnvOutranksAncestry` (tier 1 vs. tier 2) test different tier orderings and should both stay.
+
+**Minor, related finding:** `cmd/entire/cli/agent/caller_session_test.go:65-69`:
+```go
+if !slices.IsSorted(got) {
+	// Sorted by agent name, and the names happen to sort together; the
+	// contract callers rely on is only that the result is stable.
+	t.Logf("CallerSessionEnvVars() = %v (not lexically sorted; stable order is what matters)", got)
+}
+```
+This never fails the test — it's a no-op `t.Logf` gated on a condition nobody asserts against, inside `TestCallerSessionEnvVars_ListsEveryPublishingAgent`. Cost: a reader has to work out that it does nothing before dismissing it. Simpler form: delete the block; the function's actual assertion is just the `slices.Contains` loop that follows it.
+
+### 6. Dead code from the refactor
+
+**Real finding:** `strategy.FindMostRecentSession` (`cmd/entire/cli/strategy/session_state.go:176-193`) is dead in production code. Before this diff it had three callers — `hooks_git_cmd.go`'s `withHookSession`, `session_current.go`, and `session_tokens.go` — and this diff migrated all three to `ResolveCallerSession`. A repo-wide grep confirms zero remaining non-test callers; it survives only via its own test (`TestFindMostRecentSession_FiltersByWorktree` in `session_state_test.go`) and a one-line mention in `FindMostRecentSessionInCurrentWorktree`'s doc comment. Its body is also now literally duplicated: it's exactly tiers 3+4 of `ResolveCallerSession` (`mostRecentSessionID(sessionStatesForCurrentWorktree(...))` falling back to `mostRecentSessionID(states)`), just without the tier tagging. Since it's exported, no linter flags this automatically. Cost: two parallel implementations of "worktree-scoped most-recent, falling back to any-worktree" logic sitting in the same file, one of them unreachable. Simpler form: delete `FindMostRecentSession` and its dedicated test; `FindMostRecentSessionInCurrentWorktree` (still used by `session_tokens.go --current`) stays as-is, with its doc comment's "Unlike `FindMostRecentSession`" contrast dropped.
+
+**Minor:** `CallerSessionCandidate.AgentName` (`cmd/entire/cli/agent/caller_session.go:84`, populated in `CallerSessionCandidates()`) is written on every candidate but read nowhere outside its own package's test (`caller_session_test.go:103-104`) — `resolveCallerFromEnv` only reads `.SessionID` and `.AgentType`. Not incorrect, just a field carried through the type with no production consumer; worth confirming it's meant for future use before keeping it, otherwise it's one less thing to explain.
+
+### Summary
+
+Strongest, most actionable items: the dead `FindMostRecentSession` function (#6), the redundant worktree-preference test (#5), and the duplicated report-and-exit shape in `session_current.go` (#4). The `resolveCallerFromEnv` two-pass rewrite (#1) is a genuine readability win if you want to take it. `isNearerCaller` (#2) and the unused `AgentName` field (#6b) are low-priority. Question 3 turned up no issue — the `ResolvedSession` fields all carry distinct information.</result>
+<usage><subagent_tokens>184999</subagent_tokens><tool_uses>18</tool_uses><duration_ms>346503</duration_ms></usage>
 </task-notification>
 
 ---
 
-ok, PR is up, what's next
+<task-notification>
+<task-id>abd4ef6a9bfa4fcd2</task-id>
+<tool-use-id>toolu_01QRz1mkJ8oVVfcG7qDQv3mz</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-green-meadow-d9ab/f6847120-2db3-4501-ab09-281451876d12/tasks/abd4ef6a9bfa4fcd2.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review of caller-session diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Confirmed: `session_adopt.go` has zero references to `ResolveCallerSession` or `IsCaller` — it never imports the new resolver at all. Now I have everything needed to write the review.
 
----
+## ALTITUDE review: `strategy.ResolveCallerSession` (commit `4de2b6838`)
 
-I feel session current could just also behave differently when inside a session and the env vars are available?
+### 1. Tier 4 (`other-worktree`) — report-don't-remove is defensible, but it's only half the fix
 
----
+`cmd/entire/cli/strategy/caller_session.go:39-44` (const), `:118-123` (`ResolveCallerSession`)
 
-yes, build it.
+The diff's choice — keep tier 4, gate action on `IsCaller()`, label the tier, warn on stderr — is coherent *as a labeling strategy*, and I don't think deleting the tier outright is obviously better: the commit message's claim that "what has been happening in this repo" is a real, separate question a human can legitimately want is true, and `entire session current`'s own doc comment history shows that was the command's original intent. TTY-gating (alternative b) is weaker than it looks: this repo's own TTY-detection is documented (`interactive.CanPromptInteractively`) as a five-tier, easily-defeated heuristic, and gating tier 4 on it would silently change `--json`'s behavior based on terminal attachment — `--json` output is inherently meant for non-interactive consumption, so TTY-gating would essentially always suppress tier 4 there while doing nothing to stop a human's own non-interactive script from losing the "what's happening here" answer they wanted.
+
+An explicit `--any-worktree` flag (alternative c), however, is a genuinely stronger design the diff doesn't discuss: it would make the *default* invocation of `session current`/`tokens` — the one an agent runs unprompted — return nothing rather than a foreign session's ID, and would require a positive, visible opt-in to get the guess at all. That's a structural guarantee ("you can't get this by accident") instead of an interpretive one ("you got it, but we told you not to trust it"). The cost is a UX regression for the human "what's going on here" case (an extra flag to discover) and it doesn't cover an agent that decides to pass the flag anyway — but it directly closes the exact incident shape described (an agent reads `session current`'s default output and acts on it) at the source, rather than relying on every downstream consumer to check `IsCaller()`.
+
+Whether "report tier 4 + gate on `IsCaller()`" is *actually* the right depth therefore hinges entirely on every action-taking consumer honoring `IsCaller()` — see finding 2, where the one consumer the incident report names (`session adopt`) does not.
+
+**On `FindMostRecentSession`'s "third caller":** I searched the whole repository (`grep -rn "FindMostRecentSession\b"`) and could not find a third production caller — before this diff there were exactly three (`hooks_git_cmd.go`, `session_current.go`, `session_tokens.go`'s non-`--current` branch), and the diff converted all three to `ResolveCallerSession`. `strategy.FindMostRecentSession` (`cmd/entire/cli/strategy/session_state.go:180`) now has zero production callers — only its own tests (`session_state_test.go`) and a stale comment in `cmd/entire/cli/integration_test/hook_bench_test.go:46` ("`listAllSessionStates() is called twice: once in FindMostRecentSession (logging init)`" — that logging-init call, `withHookSession`, no longer goes through this function at all).
+
+That's the real altitude gap here, distinct from the premise as stated: `session_state.go` wasn't touched by this diff (it's absent from the 19-file changeset), so the function that embodies the exact hazard this PR spent its whole description diagnosing is left fully exported, undeprecated, and with a doc comment ("Falls back to unfiltered search if the worktree path can't be determined") that reads as an unremarkable implementation detail rather than the load-bearing danger `ResolveCallerSession`'s own doc comment now explains at length. Nothing stops a future call site — `doctor.go`, `status.go`, an MCP tool — from calling `strategy.FindMostRecentSession` directly and silently reintroducing the incident. **Deeper fix:** either fold `FindMostRecentSession`'s body into `ResolveCallerSession`'s tiers 3/4 (as internal helpers) and delete the exported function, or leave it but add a doc comment pointing at `ResolveCallerSession` and explaining why a caller-identification use case must not call this directly. Cost: low — it's a leaf function with three now-inert production callers already migrated; the only work is updating its doc comment (or deleting it and inlining, touching the one test file that exercises it directly).
+
+### 2. `session adopt` is where the diff's own incident description says the harm happens, and it is completely unguarded
+
+`cmd/entire/cli/session_adopt.go:68-123` (`runAdopt`), `:312-362` (`selectAdoptSourceSession`), `:364-375` (`sessionBelongsToSourceWorktree`)
+
+`session_adopt.go` imports neither `ResolveCallerSession` nor `IsCaller` — confirmed by grep, zero hits. Its own trust model is narrower than "most recent in the store" (it requires an explicit `--from &lt;worktree&gt;`, and its auto-selection is scoped to sessions *in that worktree*, filtered to a 12h-recent, adoptable window), but it has **no mechanism at all** to check that the session it's about to mutate is the *calling* agent's own — `sessionBelongsToSourceWorktree` only checks internal self-consistency (does this ID belong to the named worktree), never "is this mine." Concretely: if an agent reads `entire session current --json` in a worktree with no sessions of its own, it gets back a real, `other-worktree`-tier session ID plus that session's `worktree_path` in the same JSON envelope. Nothing stops it from then running `entire session adopt &lt;id&gt; --from &lt;that worktree_path&gt;` — the two values are mutually consistent (they really do belong together), so `selectAdoptSourceSession`'s explicit-ID path loads and accepts it, and the adopt proceeds exactly as the incident describes, mutating a third party's live session and resetting its checkpoint bookkeeping. The label and stderr warning on `session current` reduce the odds a careful reader misinterprets the tier, but they are advisory text in a stream the acting command never reads.
+
+Worse, the hazard doesn't even need `session current`: `entire session adopt --from &lt;any-worktree-path&gt;` with no positional ID, where that worktree happens to have exactly one recent adoptable session (a common case — that's literally what made the old `FindMostRecentSession` fallback return a plausible-looking answer), auto-adopts it with zero caller verification, independent of anything this diff touched.
+
+Given `IsCaller()` now exists as exactly the primitive `session adopt` would need (e.g., refuse or require `--force`/confirmation when the resolved candidate for an implicit adopt is not `IsCaller()`-true, or at minimum warn before mutating when the session was reached via `session current`'s weak tier), shipping the resolver without wiring it into the one command whose damage the incident report is about is a real gap, not a cosmetic one. I'd still ship the resolver now — it's independently correct (fixes hook log attribution, `session tokens`, `session current`'s display truthfulness) and the adopt guard is a genuinely separate, larger design question (what does "mine" mean for a `--from` pointing at a different machine, where ancestry can't apply, versus a same-machine sibling worktree, where it can) that shouldn't block this. But the commit message and CLAUDE.md addition should not read as though the hijack scenario is closed — "the tier still exists... `IsCaller()` is the gate for anything that *acts*" (CLAUDE.md:744-745) currently describes a gate that guards nothing, since its one real actor is unwired. I'd flag this explicitly in the PR rather than let the follow-up be implicit.
+
+### 3. Two ancestry-matching implementations — should be one shared primitive, and the fix is cheap
+
+`cmd/entire/cli/strategy/caller_session.go:225-253` (`sessionIDByOwnerAncestry`) vs. `cmd/entire/cli/strategy/session_identity.go:84-112` (`findSessionByCommitAncestry`)
+
+Both live in the same package, both take `(ctx, states []*SessionState)`, both snapshot `proclive.CurrentAncestry()` once, both scan for the state whose `Owner` is the nearest ancestor with `depth &lt; bestDepth`, and both break ties with the same `interactedAfter` (already shared). The scan loops are near-verbatim duplicates of each other, differing only in: (a) `findSessionByCommitAncestry` additionally requires `state.WorktreePath != ""`, `sessionIDByOwnerAncestry` does not; (b) return type (`*SessionState` vs `SessionID string`); (c) log component (`"checkpoint"` vs `"session"`). This is exactly the kind of two-copies-of-one-algorithm case this codebase's own conventions warn about elsewhere (e.g. `types.AddTokenUsage` is called out as "the single token-summing primitive — do not hand-roll another; a field-by-field copy is how the nested total came to be dropped in the first place").
+
+This is not the over-generalization risk the task raises — it wouldn't require a protocol change or a new abstraction layer, just extracting the existing ~15-line scan into one shared function parameterized by an extra filter predicate and returning `*SessionState` (callers that want just the ID take `.SessionID`), e.g. `nearestSessionByOwner(ctx context.Context, states []*SessionState, extra func(*SessionState) bool, logComponent string) *SessionState`. Cost: touching two call sites, ~20 lines removed, and deciding — explicitly, in code, not by two people independently choosing — whether the `WorktreePath != ""` requirement belongs in both or is a real semantic difference between "who authored this commit" and "who is running this process" (worth settling regardless, since right now it's silent and undocumented why caller-resolution omits a filter that commit-linking keeps). I'd call this a legitimate, low-cost altitude fix left on the table rather than a must-fix; the duplication is real but small enough that it's a fair judgment call to defer.
+
+### 4. Env-var tier seam (`agent` declares, `strategy` reads) is the right altitude — reading fresh beats persisting
+
+`cmd/entire/cli/agent/caller_session.go:127-136` (interface), `cmd/entire/cli/strategy/caller_session.go:145-195` (`resolveCallerFromEnv`)
+
+This matches the established pattern elsewhere in the codebase (`agent.TranscriptSanitizer`, `agent.SessionEndBudgeter`): per-agent capability declared in `agent`, consumed by business logic in `strategy` that needs session state the `agent` package doesn't have (avoiding the same kind of import-cycle the `settings` package exists to break). I don't think a `HookInput`-style protocol change or persisting the ID onto `SessionState` at hook time is a deeper fix here, and the reason is different from the `ReadTranscript(path)` case CLAUDE.md discusses: that case needs persistence because the *reader* (`os.ReadFile(sessionRef)`) is a different process than the one that resolved the path, so containment has to be re-derived from data that outlived the original resolution. Tier 1 has the opposite shape — the process asking "which session am I" is, by construction, the same process (or a descendant) that has the env var in its own environment right now. Persisting the ID onto `SessionState` at turn start wouldn't help a *different, later* process identify itself as the caller (it isn't the caller), so it would serve a different purpose (recording provenance for diagnostics) than tier 1 actually needs. Tier 2 (`ancestry`) already does the "persist once, compare many times" thing correctly, via `SessionState.Owner` captured by `captureSessionOwner` — which is precisely why tier 2, not tier 1, is the one that needs and has a stored reference point. I'd call this the "altitude is right" case the task rules invite: the seam mirrors an existing, working pattern, and the alternative doesn't solve a problem tier 1 actually has.
+
+### 5. Test-harness isolation follows half of the documented two-layer pattern — and the missing half may not transfer cleanly here
+
+`cmd/entire/cli/integration_test/setup_test.go:78-84`, `e2e/tests/main_test.go:56-59`, plus three near-identical `clearCallerSessionEnv(t)` helpers (`cmd/entire/cli/session_current_test.go:26`, `cmd/entire/cli/agent/caller_session_test.go:85`, `cmd/entire/cli/strategy/caller_session_test.go:18`)
+
+CLAUDE.md's "Config/Cache/Keyring Isolation in Tests" section documents two layers for this exact class of problem (a developer's real agent environment leaking into `go test`): an in-process safety net baked into the resolver itself (`userdirs`/`tokenstore` detect `testing.Testing()` and fall back automatically, "shared across tests in one process" with no per-test opt-in needed) *and* explicit TestMain-level env plumbing for spawned binaries, which `testing.Testing()` can't see. This diff replicates only the second layer — correctly, and via the same registry-derived, can't-rot mechanism the rest of the section prizes — but adds nothing resembling the first: `agent.callerSessionIDFromEnv` (`cmd/entire/cli/agent/caller_session.go:169-175`) calls `os.Getenv` unconditionally, with no `testing.Testing()` awareness, unlike `userdirs.Config()` or `interactive.CanPromptInteractively()` (which explicitly special-case it, per `cmd/entire/cli/interactive/interactive.go:40`). The result is that isolation for in-process unit tests is entirely opt-in, hand-copied into three files, and depends on every future test that exercises `ResolveCallerSession`/`CallerSessionCandidates` remembering to call it.
+
+That said, I don't think a straight port of the `userdirs` pattern is free here the way it was there, which is worth being honest about: `userdirs` can gate its *fallback* on `testing.Testing()` because the override (`$ENTIRE_CONFIG_DIR`) and the fallback (a resolved default directory) are two different code paths — the override still wins under test. Caller-session env vars have no such second channel: the "deliberate test override" (`t.Setenv("CODEX_SESSION_ID", ...)`) and the "leaked from the real shell" case are the *same* `os.Getenv` call, so a blanket `testing.Testing()` gate would also blind every positive-case test (`TestCallerSessionCandidates_ReadsThePublishedID` and friends) unless a second signal were invented to distinguish them — real added complexity, not a drop-in. The blast radius is also smaller than the config/cache case CLAUDE.md was written for: a leaked var here fails a test assertion locally; it doesn't write into the developer's real `~/.config/entire`. Given that, the chosen approach — TestMain isolation plus opt-in per-test clearing — is a reasonable place to stop, though it is a symptom fix relative to the documented ideal, and the honest cost of the "deeper" version should be named rather than assumed away. Separately, and much more minor: the three `clearCallerSessionEnv` copies could collapse to one if there were a shared test-helper location all three packages can import without a cycle (`testutil` currently imports neither `agent` nor `strategy`, and isn't imported by either in production code) — not worth doing on its own, but worth folding in if a shared test-helper package is ever introduced for other reasons.
+
+### 6. CLAUDE.md section — right level for this file's own conventions, one rot-prone spot worth a pointer
+
+`CLAUDE.md:737-806`
+
+The section explains the *mechanism and why* (four tiers, why tier 4 stays, why tier 1 is per-agent-declarative, the untracked-vs-not-found distinction, the nested-claims case) rather than just restating code — consistent with this file's dominant style everywhere else (extensive "why," "do not simplify," "established empirically" framing). The one place I'd flag as more rot-prone than the rest of the section: the five agent → env-var pairs (CLAUDE.md:753-758) are now stated in three places — here, in each agent's `CallerSessionEnvVar()` doc comment, and in `callerSessionEnvVarByAgent` in `cmd/entire/cli/agent/caller_session_test.go:238-244`. Unlike most of this file's other enumerated facts (counts, percentages, measured latencies), a wrong env-var name here doesn't error loudly — it just silently degrades to a weaker tier, and only `TestCallerSessionEnvVar_UnpublishedAgentsStayUnpublished` catches a *newly capable* agent going unlisted, not an *existing* one whose vendor renamed the variable. That's a real, if narrow, gap between "documented" and "enforced." This is consistent with a cost this file already accepts elsewhere (e.g., the "eighteen files call `settings.Load` directly" count, which will drift as files are added), so I wouldn't call it a deviation from house style — but given the silent-degradation failure mode is worse than most of this file's other rot risks, a one-line pointer from the CLAUDE.md table to `callerSessionEnvVarByAgent` as "the enforced copy" would be cheap and would tell a future editor which source to trust if they ever diverge.</result>
+<usage><subagent_tokens>197832</subagent_tokens><tool_uses>28</tool_uses><duration_ms>461472</duration_ms></usage>
+</task-notification>

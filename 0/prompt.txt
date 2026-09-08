@@ -1,0 +1,75 @@
+## 1. The settings gate leaves `Task` open, which is most of the review threat
+​
+`ReviewConfig.Prompt` is gated; `ReviewProfileConfig.Task` is not. Both come from the same committed `.entire/settings.json`, and both land verbatim in the same prompt, adjacent — `review/prompt.go:42-52`:
+​
+```go
+if trimmed := ...cfg.Task...; trimmed != "" {
+    sections = append(sections, "Task: "+trimmed)      // ungated
+    ...
+}
+if trimmed := ...cfg.AlwaysPrompt...; trimmed != "" {
+    sections = append(sections, trimmed)               // gated by this PR
+}
+```
+​
+`profileTask` (`review/profile.go:59-62`) returns `cfg.Task` verbatim when set. So for `entire review`, a PR that writes its instructions into `task` instead of `prompt` gets the identical result — plus no rejection notice, because nothing was rejected. `review_default_profile` is ungated too, so a PR can also choose *which* profile runs. The commit message flags Task as "flagged rather than decided", but `docs/security-and-privacy.md` gives reasons for skills and model and none for task, which reads as an oversight rather than a decision.
+​
+Either gate `Task` (provenance is already computed per profile — it's one more `decide()` call) or say in the doc why the primary instruction channel is exempt when the field appended after it isn't.
+​
+Two things I checked that are *not* holes, worth recording so they don't get re-litigated:
+- **`Skills` is genuinely safe**: `VerifyConfiguredSkillsInstalled` (`review/picker.go:1140-1174`) rejects any string that isn't a curated builtin or a discovered skill name, so free text there fails the run before the agent starts. The doc's "skills resolve to locally installed content" is backed by a real mechanism.
+- **`investigate` has no equivalent gap**: `AlwaysPrompt` is `InvestigateConfig`'s only free-text field, so that half of the gate is complete.
+​
+## 2. `explain`'s "one sanitization point" doesn't cover the default output path
+​
+`formatTranscriptBytes` is the `--verbose`/`--full` path only. The default body isn't sanitized: `renderExplainBody` (`explain.go:2046-2049`) returns `md` **unmodified** when `shouldUseColor(w)` is false — piped output, `NO_COLOR`, any non-TTY — and the same raw-`md` fallback exists inline at `explain.go:2098-2099`. That `md` is built from the stored AI summary, or from `buildNoSummaryMarkdown(extractIntent(...), meta.FilesTouched, hint)`: agent-authored free text out of checkpoint metadata, which is the same trust class as the transcript content the commit does sanitize, and it's what most `explain` invocations print.
+​
+Worth also confirming glamour drops raw ESC from text nodes on the colored path rather than passing it into its own output.
+​
+## 3. The fetch-ownership blast radius is wider than "fork clone", and one doc line now says the opposite
+​
+`checkpointRemoteIsInherited` treats an undeterminable owner as inherited (`util.go:484-491`), so this isn't only forks: **any repo whose origin is a non-forge URL** — `file://`, a bare path, a host `gitremote.ParseURL` can't extract an owner from — now loses checkpoint reads with a committed `checkpoint_remote`. The PR's own integration test is the proof: `setupGitRefsCheckpointRemoteRepo` had to start writing a `settings.local.json`. Self-hosted/on-prem users hit this, and the PR body only names the fork case.
+​
+Relatedly, `util.go:456-458` still reads:
+​
+> An identity whose owner cannot be determined … counts as inherited: … and falling back **preserves the previous behavior for those repos**.
+​
+That was true while only `PushURL` used the predicate. For fetches it's now the reverse.
+​
+Also: the rejection is `logging.Warn` only, so reads silently return nothing and neither `status` nor `doctor` says why. Of the three rejection paths in this PR this is the one users will experience as "my checkpoints vanished", and it's the only one that didn't get a stderr notice. `entire status` already prints the checkpoint sync destination and its source — that's the natural place.
+​
+## 4. `copilotcli`: the "narrowest policy the CLI supports" claim is off
+​
+Verified on 1.0.83: all four flags exist, and `copilot help permissions` confirms *"Denial rules always take precedence over allow rules, even --allow-all-tools"* — so the deny approach is sound and a clear improvement on `--allow-all-tools`. But the same help text says the deny/allow flags *"control approval prompts and do not expose tools that were filtered out by `--available-tools`/`--excluded-tools`"*. Availability is a separate, stricter layer this PR doesn't touch, so read tools stay available and unprompted and untrusted transcript content can still steer file reads whose contents land in the generated summary. If the goal is really "nothing in the input may be able to drive tool execution", `--available-tools` is the control that does it. The claudecode path carries the same read residual, so this is a comment-accuracy fix plus an optional tightening, not a Copilot-specific regression.
+​
+Separate risk: "a text-only prompt completes without any approval flag" is validated only by the opt-in `ENTIRE_COPILOT_SMOKE=1` test that CI never runs. If that's wrong on some version or auth config, Copilot summaries degrade silently.
+​
+## 5. `redact`: solid — and measurably free
+​
+I benchmarked both commits on a 2000-line transcript with 3 secrets per line (M4 Max, `-count=3`):
+​
+|              | base `7e2f57fc6` | PR      |
+| ------------ | ---------------- | ------- |
+| secret-heavy | ~136 ms          | ~131 ms |
+| no secrets   | ~89 ms           | ~86 ms  |
+​
+The verification re-parse is noise next to the regex layers, and the copy-on-write walk appears to pay for itself. Given redaction is a documented hot spot, that's worth stating in the PR body — otherwise a reader assumes a per-line re-parse costs something.
+​
+Two small things:
+​
+- **The "fails the redaction rather than certifying" contract has one call site where it doesn't.** `checkpoint/ephemeral.go:449-464` (subagent transcript) hard-fails only on `redact.ErrScannerDegraded`; any other `JSONLBytes` error is treated as "not valid JSONL" and downgraded to `redact.Bytes`. `reencodeRedacted` returns plain `fmt.Errorf`, so it takes the downgrade branch. This looks dormant in practice — the content already parsed once, and `Encode` over a map/`[]any`/string/`json.Number` tree can't realistically fail — but if the contract is meant to hold, that branch should key on a sentinel rather than on "any error means malformed JSONL".
+- `redactJSONLLines`'s capacity comment ("Redaction only ever shrinks or preserves length") is now stale: `reencodeRedacted` can grow a line, since Go escapes U+2028/U+2029 unconditionally. It's only a `Grow` hint, so nothing breaks.
+
+---
+
+<task-notification>
+<task-id>b1s803bs3</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/tmp/claude-1000/-home-coder-git-entireio-cli-review/a7c68862-145e-498e-bf9d-fd4184c5eddf/tasks/b1s803bs3.output</output-file>
+<status>completed</status>
+<summary>Background command "Wait for integration and canary results" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+go ahead

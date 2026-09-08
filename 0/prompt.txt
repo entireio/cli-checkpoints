@@ -1,0 +1,86 @@
+1. redact: verify JSONL redaction lands, re-encode any line it misses
+
+Hardening statement: redaction output is certified (RedactedBytes), but the certification is currently asserted, not verified. This change backs it with a per-line post-condition and a structural fallback, so the byte-preserving fast path stays byte-preserving and every other line is redacted by construction.
+
+Where: redact/redact.go — applyJSONReplacements (:904), redactJSONLLines (:807), redactSingleJSONValue (:654).
+
+Steps:
+
+1. Refactor the leaf walk to two consumers. collectJSONLReplacements (:991) currently returns (original, redacted) pairs. Extract the walk so it can either collect pairs (fast path, unchanged) or return a redacted copy of the decoded tree, applying the same shouldSkipJSONLField / shouldSkipJSONLObject / credential-context rules. One walk, two outputs, so the skip rules cannot drift apart.
+2. Add the post-condition. After applyJSONReplacements returns, and only for lines that had replacements: decode the spliced result and walk its string leaves. If any leaf still equals a replacement's original (honoring the pair's key scoping), the splice did not land. Comparing decoded values against the recorded originals avoids any assumption that the redactor is idempotent.
+3. Fall back structurally on a miss. Re-encode the line from the redacted tree (encoder with SetEscapeHTML(false), reattach the line's surrounding whitespace). Formatting fidelity is deliberately sacrificed only for lines the splice could not rewrite. If the marshal itself fails, return an error — JSONLBytes then refuses to certify rather than shipping the line, which is the direction the RedactedBytes contract requires.
+4. Apply the same treatment to redactSingleJSONValue, which shares applyJSONReplacements for whole-document content.
+5. Tests. The two cases I confirmed on main become regression tests with flipped assertions: a leaf containing raw U+2028 (Go's encoder escapes it even with HTML escaping off, so the search key never matched), and a line using \/. Add: \uXXXX-escaped ASCII, non-ASCII written ensure_ascii-style, a duplicated leaf value, a keyed replacement, and a fast-path test asserting byte-identical output for a line with no encoding variance. My throwaway repro (redact/report_item3_verify_test.go in the scratchpad worktree) can seed these.
+
+Suggested commit message: redact: verify each JSONL splice landed and re-encode lines it cannot rewrite — body: "applyJSONReplacements splices by matching the re-encoded leaf against the raw line. JSON admits more than one encoding of the same string, so a producer's encoding choice could leave a leaf outside the splice's reach with no signal. Redaction now re-checks every spliced line against the collected originals and falls back to a structural re-encode of that line; a line that cannot be rewritten fails the redaction rather than certifying."
+
+---
+2. settings: extend the local-provenance gate to agent instruction fields
+
+Hardening statement: the loader already honors exec-bearing settings (openai_privacy_filter.command, external_agents) only from a local file positively verified as the developer's own. Fields that carry verbatim instructions into agents spawned with permission checks disabled belong behind the same gate: investigate.always_prompt and every ReviewConfig.Prompt.
+
+Where: cmd/entire/cli/settings/ — new agent_prompt_trust.go modeled on opf_command_trust.go; call site in loadMergedSettings (settings.go:706); schema fields at settings.go:139 (Review map[string]ReviewConfig), :215, :434 (Agents/Judge), :506 (Investigate.AlwaysPrompt).
+
+Steps:
+
+1. Add enforceAgentPromptTrust(ctx, s, localSettingsPath, localData). For each gated field that is non-empty after merge: keep it only if the local file explicitly sets that key (rawHasKey(raw, "investigate", "always_prompt"); for the review maps, walk rawObject per agent key to the prompt member) and classifyLocalSettingsDeep(ctx, localSettingsPath) == localOwn. Otherwise reset to "" and record the rejected value plus reason, exactly like opf.rejectedCommand. localUnverifiable fails closed here for the same reason it does for the OPF command: these strings get the last word in a prompt that is the stated control for bypassPermissions / --dangerously-bypass-approvals-and-sandbox spawns (agent/claudecode/spawner.go:25).
+2. Cover every ReviewConfig.Prompt reachable in the schema — the top-level review map, the nested Agents map, and Judge. A test that walks the settings schema for ReviewConfig occurrences (like the existing TestAllHookConfigRelPaths_Covers... pattern) keeps a future field from bypassing the gate.
+3. Surface the downgrade. Add an accessor mirroring ExternalAgentsRejection(); have investigate and review print a one-line stderr notice naming the dropped field and the file it came from, so a user whose configured preamble stops applying learns why. This mirrors the note already printed when settings fail to reload on --continue (investigate/cmd.go:577).
+4. Optional follow-up for shared team preambles: an interactive confirmation that displays the exact project-layer text before honoring it (the shape of confirmUntrustedIssueSeed at investigate/cmd.go:731, with an explicit allow flag). Non-interactive runs keep the drop. Ship the gate first; add this only if teams ask.
+5. Judgment call to document in the PR: Skills and Model stay ungated — skills resolve to locally installed content and model is a routing hint — but say so explicitly so the boundary is a decision, not an omission.
+6. Tests: mirror the opf_command_trust_test.go matrix — project-set ignored, untracked-local honored, staged/committed local ignored, unverifiable repo keeps the layer but drops the field, and the same set for a review.<agent>.prompt.
+
+Suggested commit message: settings: honor agent instruction fields only from the developer's own local layer — body: "investigate.always_prompt and review prompts are appended verbatim to prompts for agents that run with approvals disabled, so they get the same provenance requirement as the OPF command and external_agents: present in .entire/settings.local.json and that file verified untracked. Rejection downgrades the field and is surfaced on stderr rather than failing the load."
+
+---
+3. checkpoint/remote: apply the ownership check to fetch URL resolution
+
+Hardening statement: PushURL only routes to a configured checkpoint_remote after checkpointRemoteIsInherited confirms the setting is ours rather than one that arrived with the clone. FetchURL performs the same routing decision and should apply the same confirmation, so both directions of checkpoint traffic follow one ownership rule.
+
+Where: cmd/entire/cli/checkpoint/remote/util.go — fetchURLAuthoritative (:63), checkpointRemoteIsInherited (:405), the doc comment at :184 that documents the asymmetry.
+
+Steps:
+
+1. In fetchURLAuthoritative, after config := s.GetCheckpointRemote() resolves non-nil, run the inheritance check before deriving the checkpoint URL. The push side passes (config, originURL, pushRemoteURLs); the fetch side's identity set is origin plus, when supplied, the LeadReadRemote URL — reuse the existing function with that set rather than writing a second predicate, so the two directions cannot drift.
+2. On "inherited", fall through to the no-config path (lead read remote, then origin) and logFallback with the inheritance reason, keeping the existing authoritative=false semantics for the fallback URL so FetchCheckpointRef's absence classification is unaffected.
+3. The existing escape hatch already documented at :403 carries over unchanged: a checkpoint repo that is genuinely yours under a different owner is declared in settings.local.json.
+4. Cost check: the inherited probe reads remotes and settings; fetch resolution runs inside hooks. If profiling shows it matters, memoize per process the way versionedPaths does (settings/opf_command_trust.go:219) — the answer cannot change within one hook process.
+5. Update the docs that describe the asymmetry: the doc comment block at :184 and the README section that justifies the guard on write-side privacy.
+6. Tests: the fork-clone topology from checkpointRemoteIsInherited's own doc comment, exercised through FetchURL — committed checkpoint_remote with origin owned by another account resolves to origin, owned topology still resolves to the checkpoint repo, local-layer config still honored.
+
+Suggested commit message: checkpoint/remote: require checkpoint_remote ownership for fetches, matching pushes — body: "PushURL confirms a configured checkpoint_remote is ours before routing writes to it; FetchURL now applies the same check before routing reads, so an inherited setting cannot select the repository that local checkpoint refs are populated from."
+
+---
+4. copilotcli: run text generation with the least tool capability the CLI permits
+
+Hardening statement: the Claude text-generation sibling loads no settings precisely so nothing in the input can drive tool execution (agent/claudecode/generate.go:20-24). The Copilot path should state and enforce the same contract instead of --allow-all-tools.
+
+Where: cmd/entire/cli/agent/copilotcli/generate.go:17.
+
+Steps:
+
+1. Verify against the pinned Copilot CLI version what the narrowest non-interactive mode is: first try no approval flag at all (text-only prompts may complete without any tool call); if the CLI requires one, prefer an explicit deny for the shell/write/edit tool classes (--deny-tool) over a blanket allow. Keep --disable-builtin-mcps, the os.TempDir() working directory, and StripGitEnv.
+2. Pin the resulting argv in a unit test the way your versioncheck commit pins the auto-updater's command to literals, so a future flag change is a reviewed decision.
+3. Add a smoke test that summary generation still completes, since the failure mode of over-restricting is a broken summarizer rather than anything subtle.
+4. Port the isolation-contract doc comment from claudecode/generate.go so the reasoning lives at the flag.
+
+Suggested commit message: copilotcli: pin text generation to a minimal tool surface — body: "Summary generation is a text-in text-out call. The subprocess now runs with the narrowest tool policy the CLI supports, matching the isolation contract the Claude generator already documents, and the argv is pinned by test."
+
+---
+5. explain: sanitize transcript rendering at the terminal boundary
+
+Hardening statement: checkpoint listings already pass user-influenced text through sanitizeForTerminal before printing. explain --verbose/--full renders transcript content to the same terminal and should go through the same filter.
+
+Where: cmd/entire/cli/checkpoint_list.go:150 (existing filter), cmd/entire/cli/explain.go:2151 (appendTranscriptSection), cmd/entire/cli/summarize/summarize.go:567 (FormatCondensedTranscript).
+
+Steps:
+
+1. Promote sanitizeForTerminal to a shared home (tuiutil, next to SanitizeDisplayText) and point checkpoint_list.go at it — one implementation, per the exported-SymlinkedEntryError precedent of not letting two producers describe one condition differently.
+2. Apply it in explain's rendering of entry.Content, ToolName, and ToolDetail — at the display boundary, not inside FormatCondensedTranscript, since that formatter also builds LLM prompt input where mutation is unwanted.
+3. Test: a transcript entry carrying ESC/CSI/OSC sequences renders with them stripped, tabs and newlines preserved.
+
+Suggested commit message: explain: route transcript rendering through the shared terminal sanitizer — body: "checkpoint list already sanitizes prompt text before printing; explain's verbose transcript view now uses the same shared filter, so all terminal rendering of session content passes one sanitization point."
+
+---
+
+go ahead and commit/sign

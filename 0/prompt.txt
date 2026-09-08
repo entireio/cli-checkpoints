@@ -1,0 +1,146 @@
+/simplify
+
+---
+
+<task-notification>
+<task-id>affee9ad3923bd3ff</task-id>
+<tool-use-id>toolu_01WBnQd1rWHjUHhbhAdkHBM6</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-green-meadow-d9ab/f6847120-2db3-4501-ab09-281451876d12/tasks/affee9ad3923bd3ff.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review of sentinel diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>No pre-existing helper being duplicated there — `clearAgentSubprocessEnv` is genuinely new in this diff, not a re-implementation of something already in the file.
+
+I've verified all three angles directly against the code (not speculation). Summary of what I checked and found:
+
+**Finding: none.**
+
+Details of verification:
+
+1. **Canonical env-var registry in `agent/`**: grepped every per-agent package (`geminicli`, `copilotcli`, `cursor`, `opencode`, `pi`) for `Getenv`/env-const declarations. None declares `GEMINI_CLI`, `COPILOT_CLI`, `CURSOR_AGENT`, or `OPENCODE` as subprocess-detection sentinels — those packages' env vars serve different purposes (test overrides like `ENTIRE_TEST_CURSOR_PROJECT_DIR`, home-dir overrides like `PI_CODING_AGENT_DIR` in `cmd/entire/cli/agent/pi/pi.go:31`, nesting markers like `ENTIRE_PI_NESTED` in `cmd/entire/cli/agent/pi/hooks.go:47`). `PI_CODING_AGENT` (no `_DIR` suffix) does not exist anywhere else in the codebase as a constant. So there is no existing sentinel registry this diff bypasses.
+
+   Also confirmed the import-cycle claim in the diff's own comments: `cmd/entire/cli/agent/external/discovery.go` already imports `cmd/entire/cli/interactive`, and `cmd/entire/cli/strategy` imports `cmd/entire/cli/agent`. If `interactive` imported `agent` to source these sentinels, that would close a cycle (`agent/external` → `interactive` → `agent`). So sourcing the list from `agent` is not legal, and the package-doc comment in `interactive.go:1-3` ("without inducing an import cycle") is accurate — the duplication here is structurally required, not an oversight.
+
+2. **"Any of these env vars is set" helper**: grepped `cmd/entire/cli/execx/*.go` and the whole repo for `AnyEnv`/`EnvSet`/`EnvPresent`/`LookupAny`-shaped helpers. None exists. `execx` only has path-scanning and spawn helpers (`pathscan.go`, `spawn_detached.go`, `execx_unix.go`), nothing for env-var presence checks.
+
+3. **Test env-clearing helper**: `cmd/entire/cli/testutil/testutil.go` and `cmd/entire/cli/testutil/gitenv/gitenv.go` only provide git-config isolation (`IsolateGitConfigEnv`, `gitenv.Isolated`/`IsolateProcess`), which target git-specific env vars (`GIT_*`, `HOME`, etc.) for a different purpose. No generic "clear a set of named env vars" helper exists there or elsewhere in the repo (`grep -rln "func clear.*Env|func Clear.*Env|func unset.*Env"` matched only the new `interactive_test.go` itself). `clearAgentSubprocessEnv` is new, not a duplicate of an existing helper.
+
+No reuse findings to report.</result>
+<usage><subagent_tokens>109023</subagent_tokens><tool_uses>10</tool_uses><duration_ms>51921</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a29c45c74887db7ae</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-green-meadow-d9ab/f6847120-2db3-4501-ab09-281451876d12/tasks/a29c45c74887db7ae.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review of sentinel diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I read the diff and the full `interactive.go` file, then traced every call site of `CanPromptInteractively` (76 hits) to establish how hot this path actually is.
+
+**Path established:** `isAgentSubprocessEnv` is reached from `CanPromptInteractively` on essentially every non-test invocation (it sits after the cheap `EnvTestTTY`/`testing.Testing()` checks, before which nothing short-circuits it in production). The two call sites inside git-hook code are:
+- `strategy/manual_commit_hooks.go:405` (`tryAgentCommitFastPath`) and `:485`, both inside `PrepareCommitMsg`, which fires once per `git commit` (agent or human) — not once per agent turn/tool call.
+- `hooks_git_cmd.go:90,110` and `strategy/checkpoint_policy.go:59,69,79,107`, all gated behind error/degraded-policy branches (checkpoint policy unreadable/unsupported), so they don't fire on the ordinary hook path at all.
+
+So the hottest realistic frequency is "a small constant number of calls per `git commit`," not per keystroke/tool-call.
+
+**Findings against the four angles:**
+
+1. **Loop vs `||` chain cost** — no efficiency finding. Each `os.Getenv` is a linear scan of Go's cached environ slice (tens of entries, string compares), on the order of 100ns–1µs; 5 lookups plus the `GIT_TERMINAL_PROMPT` check is a few microseconds at most, once or twice per `git commit`. This repo's own documented hook-performance work (CLAUDE.md's "Hook performance" section: redaction at 99.7% of blob-write cost, hook p50 floor ~3s dominated by `process_sessions`/`write_temporary_checkpoint`, git subprocesses in milliseconds) puts every other cost in the same hook 3-6 orders of magnitude above this. Not measurable against the rest of `PrepareCommitMsg`, which also opens the repo, reads session state, and computes checkpoint IDs. The added sentinels (`CURSOR_AGENT`, `OPENCODE`) are a functional change (2 more vendors to detect), not a loop-vs-chain artifact — same conclusion applies to them.
+
+2. **Slice allocation** — no finding. `agentSubprocessEnvVars` is a package-level `var`, so its backing array is built once at program init, not per call to `isAgentSubprocessEnv`. This is not a per-call allocation, and is at least as cheap as the previous hard-coded chain.
+
+3. **Ordering** — no finding. The alphabetical order (`COPILOT_CLI, CURSOR_AGENT, GEMINI_CLI, OPENCODE, PI_CODING_AGENT`) versus a "most-likely-first" order would change iteration count by at most a few loop steps over 5 entries, each a sub-microsecond `os.Getenv`. Same magnitude argument as (1) — not measurable at this call frequency. (Note: I did not flag the pre-existing double call to `CanPromptInteractively()` within one `PrepareCommitMsg` invocation — `tryAgentCommitFastPath` at line 405 and the switch at line 485 — because that duplication predates this diff and the diff doesn't touch either call site; it's out of scope for "cost the diff introduces.")
+
+4. **Long-lived closures/captured scope** — no finding. `clearAgentSubprocessEnv(t *testing.T)` is a plain helper taking `t` as a parameter, not a closure capturing it; it's invoked from within short-lived `t.Run` subtests and nothing outlives the test.
+
+**No efficiency findings.** The diff replaces a 4-branch `||` chain with a loop over a 5-element package-level slice, on a path that fires at most a handful of times per `git commit` (confirmed via the 76 `CanPromptInteractively` call sites; the only non-error-path hits are inside `PrepareCommitMsg`). The added `os.Getenv` calls are sub-microsecond and dwarfed by every other documented cost in these same hooks (redaction, git subprocesses). This is a 5-element env scan on a cold-relative-to-hook-total path — exactly the case where "no efficiency finding" is the right answer rather than a manufactured one.</result>
+<usage><subagent_tokens>112295</subagent_tokens><tool_uses>10</tool_uses><duration_ms>98042</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ab93ca09f173747c5</task-id>
+<tool-use-id>toolu_01PU675CwxC5CDYio6QHttqe</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-green-meadow-d9ab/f6847120-2db3-4501-ab09-281451876d12/tasks/ab93ca09f173747c5.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review of sentinel diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Simplification Review — `isAgentSubprocessEnv` sentinel refactor
+
+I read the diff and the full current `interactive.go` / `interactive_test.go`, and cross-checked comment density against `cmd/entire/cli/paths/entiredir.go` to calibrate house style (which runs dense/explanatory by design, including deliberate cross-referencing between adjacent doc comments).
+
+### Finding (minor, debatable)
+
+- **file**: `cmd/entire/cli/interactive/interactive.go`
+- **line**: 76 vs. 103
+- **summary**: The "presence check" semantics of `agentSubprocessEnvVars` are stated once in the slice's own doc comment ("Presence alone is the signal…", line 76) and restated in `isAgentSubprocessEnv`'s doc comment eight lines later ("…where the others are presence checks.", line 103).
+- **cost**: Low — six words, adjacent comments, not actually confusing. A reader scanning either symbol independently still gets a correct, self-contained explanation.
+- **simpler form**: The function comment's closing clause could drop to `"GIT_TERMINAL_PROMPT stays outside the list because only the exact value "0" counts — the user may legitimately set it to "1"."` and rely on the slice comment (already directly above) to have established that the others are presence checks.
+- **counter-argument**: This mirrors a pattern the codebase already uses on purpose — `entiredir.go`'s `ErrEntireDirUnsupportedEntry` comment explicitly restates and contrasts against `ErrEntireDirNotDirectory` ("which is the same shape... but not the same sentence") specifically to make each sentinel's comment self-contained. The clause here is doing the same contrastive work (why GIT_TERMINAL_PROMPT is excluded), not blind restatement. I'd call this a stylistic judgment call, not a real complexity cost — flagging it because the task asked me to check for it, not because it materially hurts readability.
+
+### Everything else: no simplification findings
+
+1. **Slice + loop vs. the old `||` chain** — justified, not ceremony. Pre-diff the list was hand-spelled in three code locations (the `||` chain, the test's `cases` table, and a hand-written `t.Setenv(..., "")` clear-list in `TestIsAgentSubprocessEnv_GitTerminalPromptOnIsNotAgent`), which is exactly the kind of drift this repo's conventions call out repeatedly (e.g. the settings/metadata-dir sections in CLAUDE.md). The refactor is the minimum shape that fixes it: one `[]string`, one `range` loop in the function, and the tests iterate the same slice instead of re-copying it. No generics, no map, no reflection — appropriately plain.
+
+2. **Test structure** (`TestIsAgentSubprocessEnv`, `_AnyNonEmptyValueCounts`, `_GitTerminalPromptOnIsNotAgent`) — three tests earn their keep as three distinct axes: (a) enumerate-the-slice + the GIT_TERMINAL_PROMPT positive case, (b) presence-not-equality semantics across varied values ("1"/"true"/"0"/"no") on one representative var, (c) the GIT_TERMINAL_PROMPT negative case. None subsumes another — (b) in particular is the one test guarding against a future accidental `== "1"` instead of `!= ""`, which the enumerate loop (fixed at `"1"`) wouldn't catch. This also matches the file's existing convention of several small, narrowly-scoped `Test*` functions per behavior (see the four `TestCanPromptInteractively_*` tests already in the file, untouched by this diff).
+
+3. **Doc comments generally** — appropriately dense for this file's style; only the one marginal overlap above.
+
+4. **Dead code / leftovers** — none found. The old `||` chain and the old hand-written clear-list are fully removed, nothing orphaned.
+
+5. **`clearAgentSubprocessEnv` also clearing `GIT_TERMINAL_PROMPT`** — right shape, not an awkward seam. Since exactly one sentinel (`GIT_TERMINAL_PROMPT`) is deliberately excluded from `agentSubprocessEnvVars`, hardcoding its single extra `t.Setenv(..., "")` line after the loop is simpler than inventing a second slice or a generalized "all sentinels including exact-value ones" abstraction for a set of one. The naming (`clearAgentSubprocessEnv`, mirroring `isAgentSubprocessEnv`, not `clearAgentSubprocessEnvVars`) already signals it clears everything the function checks, not just the slice.
+
+**Files reviewed**: `/Users/soph/.herdr/worktrees/cli/worktree-green-meadow-d9ab/cmd/entire/cli/interactive/interactive.go`, `/Users/soph/.herdr/worktrees/cli/worktree-green-meadow-d9ab/cmd/entire/cli/interactive/interactive_test.go`, `/Users/soph/.herdr/worktrees/cli/worktree-green-meadow-d9ab/cmd/entire/cli/paths/entiredir.go` (style calibration only).</result>
+<usage><subagent_tokens>115997</subagent_tokens><tool_uses>4</tool_uses><duration_ms>164338</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a41cc34d30c82af99</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-green-meadow-d9ab/f6847120-2db3-4501-ab09-281451876d12/tasks/a41cc34d30c82af99.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review of sentinel diff" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## ALTITUDE review — `interactive.go` agent-sentinel diff
+
+**Verdict: the altitude is right.** This is a case of "deliberately narrow, well-documented, and I can show why the more general alternatives don't actually work here" rather than a symptom patch. Findings below are the verification behind that call, not a list of problems.
+
+### 1. Hardcoded env-var allowlist vs. the three general alternatives
+
+- **Process ancestry (`proclive`)**: doesn't fit this problem's shape. `proclive.Ancestry.Depth` (`cmd/entire/cli/proclive/proclive.go:257-270`) only matches a *specific, previously-recorded* `Identity` (PID + start-time + host + boot) against the current chain — it has nothing to check against for a cold `entire` invocation from a shell tool that never registered an identity. The only ancestry mechanism that works from process names alone is `transientNames` (`proclive.go:90-101`), and its own doc comment is the argument against reusing that shape here: "interpreter runtimes are deliberately absent — for several agents the runtime IS the long-lived agent." The same ambiguity would hit TTY detection even harder: matching on an ancestor process name (e.g. "cursor") can't distinguish the shell-tool's non-interactive spawn from a human's terminal opened *inside* Cursor's IDE, which is also a descendant of the same vendor process. The env var is deliberately scoped narrower than ancestry — the commit message (`fe7edeb21`) confirms it was verified empirically ("Cursor's shell tool sets `CURSOR_AGENT=1` in the child env") rather than inferred, which is exactly the property ancestry-by-name can't guarantee. `proclive` is also unsupported on Windows by its own doc comment, so it can't be the primary mechanism regardless.
+- **Inverting the default**: the function already ends in that shape at its last step — the `/dev/tty` probe plus raw-mode check requires positive proof of an interactive terminal (`interactive.go:55-63`). Moving that inversion earlier, ahead of the CI and agent checks, would be a materially larger behavioral change (risk of false negatives suppressing real human prompts) than this diff's scope, and isn't what this diff claims to do.
+- **Asking each agent (`DetectPresence`)**: verified this is the wrong capability, not just an unused one. `agent.Agent.DetectPresence` (`cmd/entire/cli/agent/agent.go:39-40`) answers "is this agent configured in the repository" via static filesystem checks — `cursor.DetectPresence` stats `.cursor/` (`cmd/entire/cli/agent/cursor/cursor.go:59-71`), `opencode.DetectPresence` stats `.opencode/`/`opencode.json` (`cmd/entire/cli/agent/opencode/opencode.go:43-56`). Neither says anything about the *current process's* runtime context, and no other method on the `Agent` interface does either (confirmed by reading the full interface in `agent.go:24-60`). Reusing it would require inventing a new capability, not wiring up an existing one.
+
+### 2. Does the list belong in `interactive` or in the per-agent packages?
+
+**Centralizing it in `interactive` is structurally forced, not a compromise.** `cmd/entire/cli/agent/external/discovery.go:18` imports `cli/interactive`. If `interactive` in turn imported `agent` (or an agent subpackage) to let each vendor own its own sentinel name, that would be a direct import cycle: `agent → interactive → agent`. The package doc comment at the top of `interactive.go:1-4` ("without inducing an import cycle (strategy cannot import cli)") already states this constraint for the sibling case; this diff's placement is the same constraint applied to `agent`. There's no available seam that lets the per-agent packages own their own sentinel string without breaking the build.
+
+### 3. Guard test for list-in-sync-with-list
+
+**No guard test is warranted, and the diff's refactor is the better fix.** I grepped the whole tree for `"CURSOR_AGENT"`, `"OPENCODE"`, `"GEMINI_CLI"`, `"COPILOT_CLI"`, `"PI_CODING_AGENT"` outside `interactive/` — zero hits. There is no second, independently-maintained list of these vendor env-var names anywhere else in the codebase (in particular, `DetectPresence` never references them — see above), so there is nothing left for `agentSubprocessEnvVars` to drift against. Before this diff, the same five-name set *was* duplicated by hand across `isAgentSubprocessEnv`, the positive test table, and the negative test's clearing calls (visible in the diff's removed lines) — that's exactly the "list in one place must stay in sync with a list somewhere else" shape this repo's guard tests exist for (`TestEntireDirCheckExemptions`, `TestRootBasesAreTrusted`, `TestGitStatusCallSitesPassNoOptionalLocks`). This diff collapsed the duplicates into one slice that the detection function and both test helpers now read directly (`interactive.go:87-93`, `interactive_test.go` `clearAgentSubprocessEnv`), which eliminates the drift risk instead of merely testing for it. That's a stronger fix than adding a guard test would have been.
+
+### 4. Does `CLAUDE.md` describe this at the right level?
+
+Yes. The updated section (`CLAUDE.md`, "Spawning subprocesses in tests (TTY detection)", step 3) names `interactive.agentSubprocessEnvVars` as "the single source of truth" and gives the current names only as an illustrative enumeration, which is the same idiom the rest of this file already uses elsewhere (name the invariant and the enforcing code, list current specifics for orientation). No test in this repo parses `CLAUDE.md` against code to keep any such enumeration honest (checked — other files only reference `CLAUDE.md` in comments/error strings as a pointer, never parse it), so leaving this list as prose here is consistent with existing practice, not a new gap this diff introduces.
+
+No findings to file — the altitude is correct at every one of the four checkpoints, and I could verify the "forbidden" and "no duplicate" claims directly rather than assume them.</result>
+<usage><subagent_tokens>133703</subagent_tokens><tool_uses>22</tool_uses><duration_ms>171966</duration_ms></usage>
+</task-notification>
+
+---
+
+ok, PR is up, what's next
+
+---
+
+I feel session current could just also behave differently when inside a session and the env vars are available?
+
+---
+
+yes, build it.

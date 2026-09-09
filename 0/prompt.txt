@@ -312,3 +312,43 @@ in this PR
    session state and process ancestry, so ownership can change between calls. A false→true transition causes a legitimate session to
    be refused or prompted with an empty reason. It also duplicates source-store and process-tree scans on every refusal. Capture
    (owned, reason) once and use that result.
+
+---
+
+- [P2] A matching inherited environment claim bypasses nearer source-store owners — cmd/entire/cli/session_adopt.go:186
+   Cross-repository source ranking only runs after ResolveCallerSession fails to identify a caller. If an outer Claude session
+   publishes its ID and launches an inner Gemini/OpenCode session, the inner agent inherits the outer ID. With both states in the
+   source repository and the command running in the target repository, the target-only resolver reports the outer ID as caller-env;
+   the matching-ID branch immediately authorizes adoption without examining the nearer inner owner in the source store. Resolve caller
+   identity against the combined target/source candidate set rather than using source states only as a fallback.
+
+---
+
+I would choose:
+
+ │ Resolve against the combined target/source candidate set using the existing shared resolver semantics, including the depth-0
+ │ exemption.
+
+ Under that model, the two failing tests are based on incomplete evidence:
+
+ - OwnerAncestryDoesNotOverrideAPositiveMismatch is no longer a positive mismatch. It was only positive because the first resolution
+   omitted source state Y.
+ - AmbiguousCallerIsNotRescuedByAnyAncestor is similarly no longer globally ambiguous. Once Y is known at depth 0, the existing policy
+   says no unknown claim can be nearer.
+
+ Keeping those assertions while combining candidates would preserve artifacts of the old two-stage implementation and force
+ adopt-specific divergence from IsCaller().
+
+ I would replace them with tests for the actual combined semantics:
+
+ 1. Outer inherited env X + nearer source owner Y → Y wins.
+ 2. Env X + source Y at depth 0 → Y wins, explicitly pinning the exemption.
+ 3. Env X unplaceable + source Y deeper than depth 0 → ambiguous and adoption refuses.
+ 4. A genuinely identified different winner in the combined set → selected session refuses.
+ 5. Equal-depth candidates → recency breaks the tie.
+
+ The remaining depth-0 equal-owner uncertainty is already an acknowledged limitation of the shared resolver. If mutation needs a
+ stricter standard, that should become an explicit shared concept such as IsSafeToMutate, not implicit adopt-specific ordering.
+
+ So my recommendation is: ship the combined implementation, retain the shared resolver policy, and revise the two tests whose premises
+ changed. The simplification is a good signal that this is the correct boundary.

@@ -1,0 +1,122 @@
+can you look at comments
+
+---
+
+also does the trail have findings?
+
+---
+
+Reviewed all 5 commits. `mise run lint` is clean, `gitrepo` tests pass, and the autocrlf test is a genuine RED→GREEN (I ran the new tests against `main`'s `content_overlap.go` — `..._AutocrlfNormalizedWorkingTree` fails there). Two `strategy` failures exist (`TestSymlinkedHooksDirError_*`, macOS `/var` vs `/private/var`) but they're in untouched `hooks_test.go` and pre-existing.
+
+The core change is right: `workingTreeMatchesBlob` compares raw disk bytes to a blob hash, so any clean filter — autocrlf, git-lfs, `ident`, a custom `filter.*.clean` — makes a clean file look permanently dirty and carry it forward forever. Delegating to git is the correct fix, and batching to one subprocess (fc12e7fad) beats the earlier per-file `--quiet --exit-code` design.
+
+## 1. `--no-optional-locks` does not stop `git diff` from rewriting the index
+
+This is the one I'd fix before merging. Measured on git 2.50.1 (Apple Git-155), same repo, same shape, stat-stale index:
+
+| invocation                                                 | `.git/index`  |
+| ---------------------------------------------------------- | ------------- |
+| `git status --porcelain`                                   | REWRITTEN     |
+| `git --no-optional-locks status --porcelain`               | UNCHANGED     |
+| `git diff --name-only HEAD -- <paths>`                     | REWRITTEN     |
+| `git --no-optional-locks diff --name-only HEAD -- <paths>` | **REWRITTEN** |
+| `GIT_OPTIONAL_LOCKS=0 git diff ...` (env form)             | **REWRITTEN** |
+| `git diff-index --name-only HEAD -- <paths>`               | UNCHANGED     |
+
+`builtin/commit.c` gates its refresh on `use_optional_locks()`; `builtin/diff.c`'s `refresh_index_quietly()` doesn't. So `worktree_diff.go:33` carries the flag but still takes `.git/index.lock` and renames a new index over `.git/index` — the exact producer CLAUDE.md's "`git status` Is a Write" section documents (#2111: the `index.lock` collision with the user's own `git add`, and the virtiofs empty-tree commit), from the post-commit hook, asynchronous to the human's terminal.
+
+It's not always-on: a fresh index → UNCHANGED. But the rewrite needs stat-stale entries, and this code only runs when there are candidates — committed content ≠ shadow content with a still-dirty worktree. That *is* the stat-stale case.
+
+`git diff-index` avoids the write but reports stat-dirty-yet-content-identical files as changed. In this code that direction is conservative (an extra carry-forward, never a lost one), so it may be an acceptable trade — but it's a real behavior change, so it's your call. What shouldn't ship is the current state, where the flag reads as if it handles this and nothing says otherwise.
+
+Related: `TestGitStatusCallSitesPassNoOptionalLocks` greps `"status"` only. This is the codebase's first worktree-comparing `git diff` — `experts_cmd.go:591` and `manual_commit_hooks.go:2840` are `--cached`, `review/scope.go:222` is `base...HEAD`, none touch the index. Whatever you decide, the guard should learn about `git diff <rev>` so the next call site doesn't rediscover this.
+
+## 2. The fallback silently reinstates the bug, at Debug level
+
+`content_overlap.go:527` — on timeout or any git failure the code drops to `workingTreeMatchesBlob`, which is filter-unaware by construction. In an lfs/autocrlf repo that's straight back to phantom carry-forward, and the only trace is a Debug line. `logging.Warn` matches how `StatusWalkBudget` breaches are surfaced.
+
+Related: the 5s budget is an inline literal in the strategy layer. The convention here is a named budget beside the primitive (`gitrepo.StatusWalkBudget`); it belongs next to `ChangedWorktreeFiles`.
+
+## 3. `ChangedWorktreeFiles` is never executed by a test
+
+Only the pure `chunkLiteralPathspecs` helper is unit-tested. The multi-chunk merge inside `ChangedWorktreeFiles` is unreachable from any test — the strategy tests pass one path, and `gitDiffPathspecBudget` is a `const`, so nothing can force a second chunk. Making it a package `var` (or a parameter) would let one small `gitrepo` test cover the merge and the `:(literal)` claim in the doc comment. I did verify that claim by hand against real git — `:(literal)star*.txt` and `:(literal)sub/:(glob)weird.txt` both match exactly one file — so the comment is accurate, just unpinned.
+
+## Smaller
+
+- `worktree_diff.go:41` — `cmd.Output()` parks git's stderr in `ExitError.Stderr`, but `%w` renders only `exit status 128`. The Debug line in §2 will name no cause. `errors.As` + append `ee.Stderr`, or set `cmd.Stderr` to a buffer.
+- `TestFilesWithRemainingAgentChanges_ComparesWorktreeToCommitNotIndex` passes on `main` too — it's a design pin against someone "simplifying" to a bare `git diff`, not a regression test. Worth saying so in its comment.
+- `docs/architecture/checkpoint-scenarios.md:215-220` lists three carry-forward rules and never mentions the working-tree check at all. That gap predates this branch, but the branch changes that step from "raw blob hash" to "filter-aware", which is what CLAUDE.md means by keeping the docs current on strategy behavior.
+- `testutil.InitRepo` already sets `core.autocrlf = true` in every test repo, so the explicit `config core.autocrlf true` at `content_overlap_test.go:428` is redundant. I'd keep it — it makes the test self-sufficient — but not everyone will read it that way.
+
+## Checked and fine
+
+`EnvWithoutRepoOverrides` is correctly applied (hook + `-C`, so `GIT_DIR`/`GIT_INDEX_FILE` would otherwise redirect it). `headTree` at `manual_commit_hooks.go:993` is `commit.Tree()`, so `headCommit.Hash` and `commitTree` can't disagree. The `keep []bool` rework preserves `filesTouched` ordering; `FilesTouched` is `omitempty`, so nil→empty slice is invisible in the state file and nothing nil-checks it. An unmatched pathspec exits 0 rather than erroring, and `git diff <commit>` correctly ignores a divergent index when the worktree matches the commit — both verified against real git.
+
+---
+
+Re-reviewed at `ae39859f1`. The `git diff` approach is gone entirely, replaced by `git hash-object` — that's the right call, and it's a better answer than either option I named: it applies clean filters, never touches the index, and gives an exact hash so degradation can be per-file instead of all-or-nothing.
+
+Verified fixed: `TestHashWorktreeFilesDoesNotRewriteStatStaleIndex` passes and I re-confirmed the mechanism by hand. Warn level, named `WorktreeContentHashBudget`, stderr in the error, real tests for the primitive, docs and CLAUDE.md updated, design-pin comment — all there. I also checked two things I'd have flagged otherwise and they're fine: custom clean filters really are applied (`filter.upper.clean` on a real repo hashes to the uppercased content, so the doc comment's claim holds beyond autocrlf), and `==` on `plumbing.Hash` is safe — go-git v6 declares `SHA1 ObjectFormat = iota`, so the zero `format` *is* SHA1 and `FromHex` sets SHA256 explicitly. It's stricter than `.Equal()`, which ignores the format field entirely, and stricter fails toward carry-forward.
+
+Lint 0 issues; `gitrepo` passes; `strategy` has the same two pre-existing `TestSymlinkedHooksDirError_*` macOS `/var` failures in untouched `hooks_test.go`. The autocrlf test is still RED against `main`'s implementation.
+
+## 1. The new guard is inert against the code it was written to prevent
+
+I restored `f799fedc9`'s `worktree_diff.go` verbatim into the tree and ran `TestGitWorktreeDiffCallSitesDoNotRefreshTheIndex`. It **passes**.
+
+`containsAnyMarker(rest)` requires a git-invocation marker on the same line as `"diff"`. gofmt puts a long argv on its own lines, so the file splits into:
+
+```go
+baseArgs := []string{
+    "--no-optional-locks", "-C", worktreeRoot,
+    "diff", "--name-only", "-z", ...   // ← "diff", no marker  → skipped
+}
+cmd := exec.CommandContext(ctx, "git", args...)  // ← marker, no "diff" → never grepped
+```
+
+`git grep` does see the line (`--untracked` is on) — it's the marker requirement that drops it. The single-line form is caught; I confirmed that too with a throwaway `exec.CommandContext(ctx, "git", "diff", "--name-only", "HEAD")`, which fails the guard correctly.
+
+The status guard's documented limitation doesn't transfer, and that's the part worth internalizing. There, the flag and the word `"status"` both live on the argv line, so wrapping separates the *flag* from the word — a false positive, loud, safe. Here the marker lives on the `exec.Command` line and `"diff"` on the argv line, so wrapping separates the *marker* — a false negative, silent. Same structure, opposite failure direction.
+
+Options: drop the marker requirement and match `"diff"` alone (noisier but sound), scan the enclosing statement rather than the line, or — matching existing precedent in this repo — an explicit `file:reason` allowlist like `entireDirCheckExemptions`, where anything unlisted fails.
+
+Related and smaller: `strings.Contains(rest, `+"...HEAD"`)` matches one expression's exact gofmt spelling (`review/scope.go:222`). Rewriting it as `fmt.Sprintf("%s...HEAD", baseRef)`, or adding spaces around the `+`, fires the guard falsely. Loud direction, so not urgent.
+
+## 2. Symlinks now always read as dirty
+
+`git hash-object` follows the link and hashes the target's *content*; git stores a symlink blob as the target *path string*. Measured:
+
+```
+hash-object link.txt        → 9230cd37…   (content of real.txt)
+git rev-parse HEAD:link.txt → c9c61fe1…   (hash of the string "real.txt")
+```
+
+So a symlink candidate can never compare clean — permanent carry-forward, the same phantom-loop class this branch exists to remove, for a narrow trigger. Not a regression against `main` (the raw-byte fallback also always said dirty), but it *is* one against the intermediate `git diff` version, which handled symlinks correctly. `commitTree.File(path)` already carries `Mode`, so skipping candidates with `filemode.Symlink` before the hash call is a couple of lines.
+
+## 3. Smaller
+
+- The Warn text says "using filter-unaware raw hashes for failed files", but for a missing or unreadable file the fallback isn't a raw-hash comparison at all — `ReadFileNoFollow` fails and the file is treated as dirty. Worth matching the wording to both outcomes.
+- If `git` is off `$PATH`, the batch fails with a non-`ExitError`, `ctx.Err()` is nil, and the per-file retry spawns once per path; `errors.Join` then puts every one of those errors into a single Warn line. Bailing out of the retry when the batch error isn't an `ExitError` bounds it — the retry exists for "one bad file in a good batch", which is precisely the `ExitError` case.
+- `--stdin-paths` would delete `chunkPaths`, its test, the 8 KiB budget and the Windows argv comment. I checked that it applies filters identically (`--stdin` implies `--no-filters`; `--stdin-paths` does not). You'd still need the per-file retry — git dies at the first bad path either way (verified: rc=128, partial stdout, stderr names the file). Purely optional.
+
+One thing worth keeping: discarding the partial stdout on failure and retrying is the right call, and the `len(fields) != len(paths)` check is what makes it safe rather than merely cautious — git really does emit hashes for the files it processed before dying.
+
+---
+
+One new thing: IsRegular() excludes Windows cloud placeholders
+
+requiresConfinedWorktreeHash gates on info.Mode().IsRegular(). That's the right shape — IsRegular is m&ModeType == 0, a whole-field check, not the single-bit trap CLAUDE.md warns about — but fs.ModeIrregular is part of ModeType (confirmed: ModeType&ModeIrregular != 0 is true, ModeIrregular.IsRegular() is false), and CLAUDE.md:639-658 records that Windows lands OneDrive Files On-Demand placeholders in exactly that bit, with a non-surrogate reparse tag so a placeholder file carries ModeIrregular alone.
+
+If that holds, a repo inside a synced folder on Windows sends no candidate to hash-object — every one falls to the filter-unaware raw-byte path. Git for Windows defaults core.autocrlf=true, so the phantom carry-forward this branch exists to remove would persist for precisely the population most exposed to it, silently, with no warning (the file never reaches git, so nothing errors).
+
+The repo already has the answer to this and it's two lines: .entire's entry scan masks the bit rather than matching it — mode.Type() &^ fs.ModeIrregular must equal 0 or ModeDir. The same masking here (info.Mode().Type() &^ fs.ModeIrregular != 0 → confined) keeps symlinks, FIFOs and directories out while letting a placeholder through.
+
+I can't test this — I'm on darwin, and the claim rests on CLAUDE.md's own documented Windows finding rather than on a measurement I made. Worth a look before merge given the population it affects.
+
+Minor: the guard now fires on any "diff" string literal
+
+Dropping the marker requirement is what fixed the wrapped-argv miss, and the comment says so — but it also means any non-git "diff" in cmd//internal/ fails the build. I confirmed with var outputModes = map[string]int{"diff": 1, "json": 2}, which produced "worktree-comparing git diff can rewrite the index even with --no-optional-locks" pointing at a map literal.
+
+Loud and one line to fix, so the tradeoff is defensible; the message just doesn't admit the possibility. Adding "…or add an allowlist entry if this line is not a git invocation" would save the next person a minute. Related: the allowlist is keyed by path with a single fragment, so a file holding both a benign "diff" literal and a real git call can only exempt one of them.
+
+Everything else I checked on this pass came back clean — filemode.Symlink on commitFile.Mode, the commit-Symlink-but-regular-on-disk and commit-Regular-but-symlink-on-disk crossings (both conservative), chunkPaths(nil) spawning nothing when every candidate is confined, and the t.Setenv/t.Parallel interaction in the new test.

@@ -51,3 +51,52 @@ Only the pure `chunkLiteralPathspecs` helper is unit-tested. The multi-chunk mer
 ## Checked and fine
 
 `EnvWithoutRepoOverrides` is correctly applied (hook + `-C`, so `GIT_DIR`/`GIT_INDEX_FILE` would otherwise redirect it). `headTree` at `manual_commit_hooks.go:993` is `commit.Tree()`, so `headCommit.Hash` and `commitTree` can't disagree. The `keep []bool` rework preserves `filesTouched` ordering; `FilesTouched` is `omitempty`, so nil→empty slice is invisible in the state file and nothing nil-checks it. An unmatched pathspec exits 0 rather than erroring, and `git diff <commit>` correctly ignores a divergent index when the worktree matches the commit — both verified against real git.
+
+---
+
+Re-reviewed at `ae39859f1`. The `git diff` approach is gone entirely, replaced by `git hash-object` — that's the right call, and it's a better answer than either option I named: it applies clean filters, never touches the index, and gives an exact hash so degradation can be per-file instead of all-or-nothing.
+
+Verified fixed: `TestHashWorktreeFilesDoesNotRewriteStatStaleIndex` passes and I re-confirmed the mechanism by hand. Warn level, named `WorktreeContentHashBudget`, stderr in the error, real tests for the primitive, docs and CLAUDE.md updated, design-pin comment — all there. I also checked two things I'd have flagged otherwise and they're fine: custom clean filters really are applied (`filter.upper.clean` on a real repo hashes to the uppercased content, so the doc comment's claim holds beyond autocrlf), and `==` on `plumbing.Hash` is safe — go-git v6 declares `SHA1 ObjectFormat = iota`, so the zero `format` *is* SHA1 and `FromHex` sets SHA256 explicitly. It's stricter than `.Equal()`, which ignores the format field entirely, and stricter fails toward carry-forward.
+
+Lint 0 issues; `gitrepo` passes; `strategy` has the same two pre-existing `TestSymlinkedHooksDirError_*` macOS `/var` failures in untouched `hooks_test.go`. The autocrlf test is still RED against `main`'s implementation.
+
+## 1. The new guard is inert against the code it was written to prevent
+
+I restored `f799fedc9`'s `worktree_diff.go` verbatim into the tree and ran `TestGitWorktreeDiffCallSitesDoNotRefreshTheIndex`. It **passes**.
+
+`containsAnyMarker(rest)` requires a git-invocation marker on the same line as `"diff"`. gofmt puts a long argv on its own lines, so the file splits into:
+
+```go
+baseArgs := []string{
+    "--no-optional-locks", "-C", worktreeRoot,
+    "diff", "--name-only", "-z", ...   // ← "diff", no marker  → skipped
+}
+cmd := exec.CommandContext(ctx, "git", args...)  // ← marker, no "diff" → never grepped
+```
+
+`git grep` does see the line (`--untracked` is on) — it's the marker requirement that drops it. The single-line form is caught; I confirmed that too with a throwaway `exec.CommandContext(ctx, "git", "diff", "--name-only", "HEAD")`, which fails the guard correctly.
+
+The status guard's documented limitation doesn't transfer, and that's the part worth internalizing. There, the flag and the word `"status"` both live on the argv line, so wrapping separates the *flag* from the word — a false positive, loud, safe. Here the marker lives on the `exec.Command` line and `"diff"` on the argv line, so wrapping separates the *marker* — a false negative, silent. Same structure, opposite failure direction.
+
+Options: drop the marker requirement and match `"diff"` alone (noisier but sound), scan the enclosing statement rather than the line, or — matching existing precedent in this repo — an explicit `file:reason` allowlist like `entireDirCheckExemptions`, where anything unlisted fails.
+
+Related and smaller: `strings.Contains(rest, `+"...HEAD"`)` matches one expression's exact gofmt spelling (`review/scope.go:222`). Rewriting it as `fmt.Sprintf("%s...HEAD", baseRef)`, or adding spaces around the `+`, fires the guard falsely. Loud direction, so not urgent.
+
+## 2. Symlinks now always read as dirty
+
+`git hash-object` follows the link and hashes the target's *content*; git stores a symlink blob as the target *path string*. Measured:
+
+```
+hash-object link.txt        → 9230cd37…   (content of real.txt)
+git rev-parse HEAD:link.txt → c9c61fe1…   (hash of the string "real.txt")
+```
+
+So a symlink candidate can never compare clean — permanent carry-forward, the same phantom-loop class this branch exists to remove, for a narrow trigger. Not a regression against `main` (the raw-byte fallback also always said dirty), but it *is* one against the intermediate `git diff` version, which handled symlinks correctly. `commitTree.File(path)` already carries `Mode`, so skipping candidates with `filemode.Symlink` before the hash call is a couple of lines.
+
+## 3. Smaller
+
+- The Warn text says "using filter-unaware raw hashes for failed files", but for a missing or unreadable file the fallback isn't a raw-hash comparison at all — `ReadFileNoFollow` fails and the file is treated as dirty. Worth matching the wording to both outcomes.
+- If `git` is off `$PATH`, the batch fails with a non-`ExitError`, `ctx.Err()` is nil, and the per-file retry spawns once per path; `errors.Join` then puts every one of those errors into a single Warn line. Bailing out of the retry when the batch error isn't an `ExitError` bounds it — the retry exists for "one bad file in a good batch", which is precisely the `ExitError` case.
+- `--stdin-paths` would delete `chunkPaths`, its test, the 8 KiB budget and the Windows argv comment. I checked that it applies filters identically (`--stdin` implies `--no-filters`; `--stdin-paths` does not). You'd still need the per-file retry — git dies at the first bad path either way (verified: rc=128, partial stdout, stderr names the file). Purely optional.
+
+One thing worth keeping: discarding the partial stdout on failure and retrying is the right call, and the `len(fields) != len(paths)` check is what makes it safe rather than merely cautious — git really does emit hashes for the files it processed before dying.

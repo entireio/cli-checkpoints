@@ -1,0 +1,77 @@
+1. The one line that makes it correct is untested
+
+I deleted the three-line loop that copies pre-threshold keys into the new map, and the entire redact suite still passes.
+
+With it deleted, here's what actually happens — a 25-key object whose early k0 is duplicated at the end, shadowing a secret:
+
+hasDuplicateJSONKeys missed a duplicate of a pre-migration key
+shadowed secret shipped in certified output:
+  {"k0":"REDACTED","k1":"filler 1",...
+
+That is exactly the hole the duplicate-key scan was added to close, silently reopened, with green tests. Pi's real code passes this — the implementation is right, it just has no guard.
+
+Why the new test misses it: TestHasDuplicateJSONKeys_WideObject duplicates key_19, the 20th key, which is already in the map by then — so it only exercises map-vs-map. Every pre-existing duplicate-key test has 2 keys and never crosses the threshold. Nothing covers a duplicate whose first occurrence was in the pre-migration slice. I have the test written and can drop it in.
+
+2. The branch is based on a head that no longer exists
+
+#2321 merged as 628169784, but its second parent is 7d947a313 — the branch got one more update before merge, so the e73fac296 pi built on isn't in main. The branch is currently 6 commits ahead of main and behind it on unrelated work (a large userdirs/tokenstore change landed since).
+
+The content is identical, though: two-dot origin/main..b6a54ee3c shows only pi's own lines in redact (+15 test, 36± redact.go, +39 bench). So git rebase --onto origin/main e73fac296 replays just b6a54ee3c and drops the five #2321 commits as already-applied. Clean, but it has to happen before a PR.
+
+Minor
+
+- The benchmark uses "key_N":null values. That isolates the scan cleanly (29 MB/s vs 11 MB/s with string values) but under-measures a realistic wide object, where the regex layers run per leaf. Fine as a regression pin — worth a comment saying that's deliberate so nobody "fixes" it later.
+- 50 000 keys — the case that showed 9.5× — isn't in the table. 8 000 catches a regression fine, so this is optional.
+- const duplicateKeySliceThreshold = 16 is declared inside the case '{': block while the doc comment above the function refers to it by name; function scope would be easier to find.
+
+---
+
+Round 2 is nearly there. The security gap is genuinely closed — but the rewrite dropped the assertion that covered the *other* direction, and I can prove it.
+
+## Fixed
+
+- **Migration carry-over is now guarded.** `REDACTED` is the right test. Verified by mutation: delete the carry-over loop and it fails with the `sk-ant-api03-…` secret visible in the assertion output. That was the load-bearing gap.
+- **Rebased onto main** — single commit `1e2386a52`, tree clean, `mise run lint` 0 issues, benchmark flat (21 / 26 / 30 MB/s across 200 / 2 000 / 8 000).
+- Const moved to function scope; benchmark comment now explains the `null`-values choice.
+
+## New: the no-false-positive direction lost its only unit coverage
+
+The rewrite **replaced** `TestHasDuplicateJSONKeys_WideObject` rather than adding alongside it, and that test carried an assertion the new one doesn't:
+
+```go
+assert.False(t, hasDuplicateJSONKeys(unique))   // 20 unique keys — gone
+```
+
+Proof it now matters — I planted a mutant that reports a false duplicate on every object with more than 16 keys:
+
+```go
+if len(seenSlice) == duplicateKeySliceThreshold {
+    return true // MUTANT
+```
+
+**The entire `redact` suite passes.** If that ever regressed, every wide line (>16 keys) would silently take the structural rebuild instead of the byte-preserving splice — Go's encoder sorts map keys, so every wide line in every stored transcript gets reordered and its whitespace collapsed, plus the redactor re-runs over every leaf — and nothing would fail.
+
+The assertion that catches it does exist, it's just in the wrong place. Pi's benchmark has `got != input` → "redaction changed secret-free input", and I confirmed it fires on the mutant at all three widths:
+
+```
+--- FAIL: BenchmarkJSONLContent_WideObject/Keys200
+    redact_bench_test.go:57: redaction changed secret-free input
+--- FAIL: .../Keys2000
+--- FAIL: .../Keys8000
+```
+
+Benchmarks don't run in CI, so that's not a guard. The two directions are complementary, not alternatives — restore the `assert.False` line, or promote the byte-preservation check into a unit test.
+
+## Still not addressed
+
+The commit message is unchanged — one line, no body:
+
+```
+perf(redact): bound duplicate-key scan cost
+
+Entire-Checkpoint: 01M22XNF00CSQYWNZ0TX8J1SAF
+```
+
+No measurements, no rationale for the threshold of 16, and specifically not the note about deliberately leaving the unconditional scan alone. That last one was the point: it's what stops someone re-deriving the 6% question later. Every commit in #2321 carries a full why; this one carries none.
+
+Two small things left — one `assert.False` line and a commit body. Want me to just do both and amend, or send it back to pi one more time?

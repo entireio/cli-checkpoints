@@ -1,0 +1,53 @@
+can you look at comments
+
+---
+
+also does the trail have findings?
+
+---
+
+Reviewed all 5 commits. `mise run lint` is clean, `gitrepo` tests pass, and the autocrlf test is a genuine RED→GREEN (I ran the new tests against `main`'s `content_overlap.go` — `..._AutocrlfNormalizedWorkingTree` fails there). Two `strategy` failures exist (`TestSymlinkedHooksDirError_*`, macOS `/var` vs `/private/var`) but they're in untouched `hooks_test.go` and pre-existing.
+
+The core change is right: `workingTreeMatchesBlob` compares raw disk bytes to a blob hash, so any clean filter — autocrlf, git-lfs, `ident`, a custom `filter.*.clean` — makes a clean file look permanently dirty and carry it forward forever. Delegating to git is the correct fix, and batching to one subprocess (fc12e7fad) beats the earlier per-file `--quiet --exit-code` design.
+
+## 1. `--no-optional-locks` does not stop `git diff` from rewriting the index
+
+This is the one I'd fix before merging. Measured on git 2.50.1 (Apple Git-155), same repo, same shape, stat-stale index:
+
+| invocation                                                 | `.git/index`  |
+| ---------------------------------------------------------- | ------------- |
+| `git status --porcelain`                                   | REWRITTEN     |
+| `git --no-optional-locks status --porcelain`               | UNCHANGED     |
+| `git diff --name-only HEAD -- <paths>`                     | REWRITTEN     |
+| `git --no-optional-locks diff --name-only HEAD -- <paths>` | **REWRITTEN** |
+| `GIT_OPTIONAL_LOCKS=0 git diff ...` (env form)             | **REWRITTEN** |
+| `git diff-index --name-only HEAD -- <paths>`               | UNCHANGED     |
+
+`builtin/commit.c` gates its refresh on `use_optional_locks()`; `builtin/diff.c`'s `refresh_index_quietly()` doesn't. So `worktree_diff.go:33` carries the flag but still takes `.git/index.lock` and renames a new index over `.git/index` — the exact producer CLAUDE.md's "`git status` Is a Write" section documents (#2111: the `index.lock` collision with the user's own `git add`, and the virtiofs empty-tree commit), from the post-commit hook, asynchronous to the human's terminal.
+
+It's not always-on: a fresh index → UNCHANGED. But the rewrite needs stat-stale entries, and this code only runs when there are candidates — committed content ≠ shadow content with a still-dirty worktree. That *is* the stat-stale case.
+
+`git diff-index` avoids the write but reports stat-dirty-yet-content-identical files as changed. In this code that direction is conservative (an extra carry-forward, never a lost one), so it may be an acceptable trade — but it's a real behavior change, so it's your call. What shouldn't ship is the current state, where the flag reads as if it handles this and nothing says otherwise.
+
+Related: `TestGitStatusCallSitesPassNoOptionalLocks` greps `"status"` only. This is the codebase's first worktree-comparing `git diff` — `experts_cmd.go:591` and `manual_commit_hooks.go:2840` are `--cached`, `review/scope.go:222` is `base...HEAD`, none touch the index. Whatever you decide, the guard should learn about `git diff <rev>` so the next call site doesn't rediscover this.
+
+## 2. The fallback silently reinstates the bug, at Debug level
+
+`content_overlap.go:527` — on timeout or any git failure the code drops to `workingTreeMatchesBlob`, which is filter-unaware by construction. In an lfs/autocrlf repo that's straight back to phantom carry-forward, and the only trace is a Debug line. `logging.Warn` matches how `StatusWalkBudget` breaches are surfaced.
+
+Related: the 5s budget is an inline literal in the strategy layer. The convention here is a named budget beside the primitive (`gitrepo.StatusWalkBudget`); it belongs next to `ChangedWorktreeFiles`.
+
+## 3. `ChangedWorktreeFiles` is never executed by a test
+
+Only the pure `chunkLiteralPathspecs` helper is unit-tested. The multi-chunk merge inside `ChangedWorktreeFiles` is unreachable from any test — the strategy tests pass one path, and `gitDiffPathspecBudget` is a `const`, so nothing can force a second chunk. Making it a package `var` (or a parameter) would let one small `gitrepo` test cover the merge and the `:(literal)` claim in the doc comment. I did verify that claim by hand against real git — `:(literal)star*.txt` and `:(literal)sub/:(glob)weird.txt` both match exactly one file — so the comment is accurate, just unpinned.
+
+## Smaller
+
+- `worktree_diff.go:41` — `cmd.Output()` parks git's stderr in `ExitError.Stderr`, but `%w` renders only `exit status 128`. The Debug line in §2 will name no cause. `errors.As` + append `ee.Stderr`, or set `cmd.Stderr` to a buffer.
+- `TestFilesWithRemainingAgentChanges_ComparesWorktreeToCommitNotIndex` passes on `main` too — it's a design pin against someone "simplifying" to a bare `git diff`, not a regression test. Worth saying so in its comment.
+- `docs/architecture/checkpoint-scenarios.md:215-220` lists three carry-forward rules and never mentions the working-tree check at all. That gap predates this branch, but the branch changes that step from "raw blob hash" to "filter-aware", which is what CLAUDE.md means by keeping the docs current on strategy behavior.
+- `testutil.InitRepo` already sets `core.autocrlf = true` in every test repo, so the explicit `config core.autocrlf true` at `content_overlap_test.go:428` is redundant. I'd keep it — it makes the test self-sufficient — but not everyone will read it that way.
+
+## Checked and fine
+
+`EnvWithoutRepoOverrides` is correctly applied (hook + `-C`, so `GIT_DIR`/`GIT_INDEX_FILE` would otherwise redirect it). `headTree` at `manual_commit_hooks.go:993` is `commit.Tree()`, so `headCommit.Hash` and `commitTree` can't disagree. The `keep []bool` rework preserves `filesTouched` ordering; `FilesTouched` is `omitempty`, so nil→empty slice is invisible in the state file and nothing nil-checks it. An unmatched pathspec exits 0 rather than erroring, and `git diff <commit>` correctly ignores a divergent index when the worktree matches the commit — both verified against real git.

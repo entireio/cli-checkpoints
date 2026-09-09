@@ -1,0 +1,59 @@
+## A. `doctor bundle` is the third fallback site, and it's the egress one
+​
+`doctor_bundle.go:314-320` still falls through unconditionally:
+​
+```go
+out, err := redact.JSONLContent(string(contents))
+if err == nil {
+    return []byte(out)
+}
+// Fall through to plain redaction if the JSON redactor refuses (malformed input, etc.)
+return redact.Bytes(contents)
+```
+​
+Same shape as the two you just fixed, no `errors.Is` for either sentinel — and this one builds a bundle the user ships to Entire.
+​
+I verified the consequence rather than assuming it. Given a line whose secret is spelled with `\uXXXX` escapes (legal JSON, never emitted by Go's encoder — precisely the case the verification exists for):
+​
+- `redact.JSONLContent` → `{"msg":"key REDACTED end"}`. Caught, and visibly re-encoded, so the new path is doing its job on the real case.
+- `redact.Bytes` on the same bytes → survives verbatim as `\u0067\u0068\u0070\u005f\u0030\u0031...`, which is `REDACTED`, recoverable by any JSON reader.
+​
+So the downgrade doesn't just under-scan on this input, it ships the secret. Both `reencodeRedacted` error paths still look unreachable in practice (the content already parsed once to get there; `Encode` over a map/`[]any`/string/`json.Number` tree can't realistically fail), so it's dormant exactly like the other two were — but if the contract is worth enforcing at two write sites it's worth enforcing at the one that leaves the machine. Same one-line `errors.Is` pair.
+​
+## B. The emoji half of `SanitizeTerminalText` doesn't belong on markdown bodies
+​
+The ZWJ / variation-selector / skin-tone stripping exists because those runes "confuse width calculations" — true of the fixed-width `checkpoint list` cell it was written for. `renderExplainBody` now applies it to every `explain` body, which is the default output most users see. Measured on the new code:
+​
+```
+in : "Refactored by 👨‍👩‍👧 the 👍🏽 team ⚠️ done"
+out: "Refactored by 👨👩👧 the 👍 team ⚠ done"
+```
+​
+A family becomes three separate people and ⚠️ loses its presentation selector, in AI-authored summary prose where nothing is being width-aligned. The ANSI/OSC stripping is what belongs at this boundary; the width hack is collateral from a different problem. Worth splitting the two: escape/non-printable stripping everywhere, emoji normalization only where a fixed-width cell is actually being filled.
+​
+## C. `status`'s inherited verdict uses the push identity set
+​
+`InheritedCheckpointRemote(ctx, elected.Name)` votes with origin + every push URL of the elected remote — `PushURL`'s set. The fetch path votes with origin + `LeadReadRemote`. In the "cloned the base, added my fork" topology that the push-side doc calls out as the whole reason for requiring both identities (origin matches the checkpoint owner, the push remote doesn't), `status` prints "checkpoint_remote … is not in use" while a fetch with no lead candidate resolves origin-only and *does* use it.
+​
+`computeCheckpointSyncInfo` already labels two approximations of exactly this class as "Accepted divergence" (`status.go:341-344`, `357-358`). This is a third and it's unlabeled — given the commit's own framing that the two directions "cannot drift" because they share a predicate, sharing the predicate but not the identity set is worth a sentence.
+​
+## Minor
+​
+- `keepWorkerPresent` isn't applied to `profile.Judge`, so a committed judge whose only field is a prompt reads as `IsZero()` after the gate and falls into the auto-select branch at `review/cmd.go:748`. A judge's identity *is* its `Agent` field (no map key), so a prompt-only judge had no agent to run and was already degenerate — I don't think it needs a fix, but a sentence in the comment would stop a future reader treating the asymmetry as an oversight.
+- `InheritedCheckpointRemote` does its own `settings.Load(ctx)` even though `computeCheckpointSyncInfo` already holds `s` and re-checks `GetCheckpointRemote() != nil` before calling it. Harmless, just a redundant load on a path documented as local-only.
+
+---
+
+Use codex to review all the changes in this branch.
+
+---
+
+tackle the six
+
+---
+
+yep
+
+---
+
+retry

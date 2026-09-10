@@ -1,0 +1,803 @@
+can you review this plan, less "/Users/peytonmontei/Documents/Documents - Peyton’s MacBook Pro/entire/devenv/entireio/cli/.worktrees/origin/docs/superpowers/plans/2026-09-10-checkpoint-health-split.md"
+
+and this pr https://entire.io/gh/entireio/cli/trails/1284/fix-make-checkpoint-status-reflect-hook-health that we're splitting please
+
+---
+
+the issue with the pr 2337 is that it was too large initially and covered too much in one pr when the issue has multiple issues that needs to be addressed different ways and for reviewing, 6k lines too much. and breaking down where one is 4k also doesn;t help. initially with this plan made it seem like we can do each one off of main since 2337 is off of main, your response suggests otherwise so think about it this way then
+
+---
+
+6 seems like a lot
+
+---
+
+this is not for 2337 it's do https://github.com/entireio/cli/pull/2343
+
+---
+
+did you re-read the plan i sent you ? like it shouldn't have made sense with teh 2337 then
+
+---
+
+did you re-read the plan i sent you ? like it shouldn't have made sense with teh 2337 then and maybe you hsould re-read the issue
+
+---
+
+yeah but seems loike there is a bigger issue with the hooks then that's why we ahd this plan
+
+---
+
+i said not 6
+
+---
+
+are the other closes: other issues? or what are you taloking about now im confused i just meant hook issue and now you're confusing me
+
+---
+
+hate both
+
+---
+
+that what is the point of 2343 then
+
+---
+
+4k insertions seems like a lot here /simplify
+
+---
+
+<task-notification>
+<task-id>a4c5d8e0770c01158</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-Documents---Peyton-s-MacBook-Pro-entire-devenv-entireio-cli--worktrees-origin/85f5bebd-f8cf-4a76-973f-970a5af82ccc/tasks/a4c5d8e0770c01158.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review of PR 2343" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have what I need. Writing the altitude review.
+
+## ALTITUDE REVIEW — PR #2343 (`fix: make checkpoint status reflect hook health`, +6807/−500, 41 files)
+
+Baseline verified at `0138471ae`; PR head read at `/private/tmp/pr2343-review`. Production (non-test) additions are ~3,114 lines; tests ~3,638; docs 55.
+
+---
+
+### Framing finding: the PR says `Fixes #2264` and delivers #1349 + #2263 + a slice of #1965
+
+`#2264`'s reporter scoped it explicitly: *"`status.go` calls `strategy.CheckGitHookState(ctx)` … Read-only; the fix stays in doctor."* That is ~15 lines. What shipped under that header is a lefthook-native install/uninstall subsystem (~1,500 production lines), a per-session warning-claim protocol (~470), and an unrelated session-listing rewrite (~180). Everything below is measured against that.
+
+---
+
+### 1. Mechanism for #1349: owned `lefthook-local` artifacts — **CORRECTLY SCOPED** (with a caveat)
+
+**Change:** `lefthook_{integration,detection,artifacts,transaction,yaml}.go` write `lefthook-local.yml` + `.lefthook-local/&lt;hook&gt;/entire.sh` + a `.git/info/exclude` block, all ownership-marked.
+
+**I verified the cheap alternatives before crediting this.** Option (4) self-repair is **not** a cheaper alternative — *it already exists and ships today*. Baseline `strategy.EnsureSetup` (`common.go:96`):
+
+```go
+if !IsGitHookInstalled(ctx) {
+    if _, err := ReinstallGitHooks(ctx); err != nil { ... }
+}
+```
+
+…and `EnsureSetup` runs at every TurnStart. So a lefthook reclaim is already repaired on the next agent turn. The residual gap is exactly what the reporter guessed: a push/commit between a lefthook re-sync and the next Entire invocation. That gap is **real and uncoverable by self-repair** — there is no file left to hook.
+
+The mechanism is also the *right* seam rather than an arbitrary one, for a reason the PR never states but which justifies it: lefthook resolves `lefthook.yml` + `lefthook-local.yml` **at run time, not install time**. So the moment Entire's artifacts exist, an *already-installed* lefthook launcher dispatches to them — no `lefthook install`, no user action, no refresh needed. And `source_dir_local` is a clone-local, gitignorable namespace, so Entire never edits shared config. Husky/Rush/pre-commit have no equivalent (their hook bodies are committed and shared), which is why generalizing here would be worse, not better.
+
+**Verdict: keep the mechanism.** The caveat is packaging, not depth: this is a #1349/#2263 fix and belongs in its own PR. Cost attributable to it: ~1,515 production + ~1,521 test ≈ **3,036 lines** riding on a `Fixes #2264`.
+
+---
+
+### 2. Two-phase transaction layer — **TOO DEEP** (~600 lines)
+
+**Change:** `lefthook_transaction.go` `stagedLefthookFile` with `stage → deactivate → publish → finishDeactivation → rollbackStagedLefthookFiles` (380 lines), plus `snapshotHookIntegration`/`restoreHookIntegrationSnapshots` in `hook_integration_transaction.go` (84 lines) which buffers **17 files** (`lefthook-local.yml`, `info/exclude`, and per-hook script + hook + backup) into memory before every install.
+
+**Depth vs problem:** this is ACID semantics over 7 small idempotent file writes. The pre-existing native installer (`InstallGitHook`) writes 5 hook files non-transactionally and has done so for the project's whole life; no issue in the set reports a torn install. Worse, the two layers are redundant: an inner per-file stage/rollback *inside* an outer whole-tree snapshot/restore, so a mid-publish failure unwinds twice.
+
+The odd `deactivate()` step (create temp, close, remove, rename config aside, publish scripts, delete the aside) exists to make the config invisible while scripts are being written — a window measured in microseconds, in a file only read when a git hook fires.
+
+**Right altitude:** the operations are already idempotent and content-compared (`errLefthookFileUnchanged`). Write scripts first, config last — config-last *is* the commit point, because the config is what makes lefthook dispatch. A failed run leaves orphan scripts that the next run overwrites. `EnsureGitHookIntegration` is called on every turn start, so "retry heals it" is a guarantee, not a hope.
+
+**Savings: ~350 production + ~250 test = ~600.**
+
+---
+
+### 3. Two bridges at once + body-shape matching — **TOO DEEP** (~350 lines)
+
+**Change:** native hooks are installed *and* lefthook artifacts are installed, then reconciled by `inspectActiveHookDelivery` (22 lines) and `restoreProvenLefthookBridges` (45 lines), which needs `looksLikeLefthookHook` + `knownLefthookV2Body` + `knownDirectEntireLefthookBody` (110 lines) to tell the two apart.
+
+This is a hedge, not a root-cause fix, and the runtime-resolution fact from §1 is why. Read `EnsureGitHookIntegration` in order (`hook_integration_transaction.go:113-215`):
+
+1. install lefthook artifacts;
+2. if `!activeCurrent`, **also** install native wrappers over lefthook's launcher;
+3. then `restoreProvenLefthookBridges` renames `&lt;hook&gt;.pre-entire` **back over** the wrapper just written, if the backup looks like a lefthook launcher.
+
+Step 3 undoes step 2. The PR writes a state and then reconciles it, when the decision was available beforehand: *if the file at `&lt;hook&gt;` is a lefthook launcher and the lefthook artifacts are current, don't wrap it at all.* Decide ownership per hook before writing. The native bridge is then needed only in the genuinely different case — lefthook config present but `lefthook install` never run — and it is the plain existing installer.
+
+**The 90-line matcher is the sharpest instance of over-depth.** `knownLefthookV2Body` embeds a **byte-exact copy of lefthook's generated wrapper tail**, including every package-manager probe branch (`mise`, `devbox`, `uv`, `swift package`, `mint run csjones/lefthook-plugin`, `bundle exec`, `yarn`, `pnpm`, `go tool`…). Any template tweak in a lefthook point release makes this return `false`, which makes `inspectActiveHookDelivery` return `false`, which makes `CheckGitHookIntegration` report `lefthook_active_hooks_outdated` **and makes `EnsureGitHookIntegration` write native wrappers over lefthook's hooks** — i.e. it re-creates #1349's fight from the other side, on a lefthook upgrade. Byte-exactness buys nothing here: the file is already trusted to execute as a git hook, and whether Entire is actually wired is proven separately by `inspectLefthookArtifacts`. The predicate only needs to establish *lefthook is the dispatcher*, which is `strings.Contains(content, "call_lefthook run \""+hook+"\"")` — about 8 lines.
+
+**Savings: ~200 production + ~150 test = ~350.**
+
+---
+
+### 4. `knownDirectEntireLefthookBody` matches only this PR's own test fixtures — **remove regardless** (~5 lines, but it invalidates the durability evidence)
+
+```go
+func knownDirectEntireLefthookBody(body, hook string) bool {
+	const integrationLauncher = "  shift\n  hook=\"$1\"\n  shift\n  exec \"$PWD/.lefthook-local/$hook/entire.sh\" \"$@\"\n"
+	e2eLauncher := "  shift 2\n  sh \".lefthook-local/" + hook + "/entire.sh\" \"$@\"\n"
+	return body == integrationLauncher || body == e2eLauncher
+}
+```
+
+Both strings are byte-identical to fixtures written by tests in this PR: `installSimulatedLefthookHooks` (`cmd/entire/cli/integration_test/lefthook_integration_test.go:120-148`) and `simulatedLefthookLauncher` (`e2e/tests/lefthook_durable_test.go:88-110`). **Real lefthook never emits either.** Production code was extended to recognize test doubles so the tests would pass.
+
+The consequence for the review: **no test in this PR exercises a real lefthook binary.** The e2e test's own comment says so ("without requiring a separately installed Lefthook binary"), and the PR's Verification section lists that e2e as evidence of durability. The 90-line `knownLefthookV2Body` — the only branch a real lefthook would hit — is covered solely by a hand-transcribed fixture (`realLefthookWrapper`, `hook_integration_test.go:776`). Cheapest correct move: adopt the substring predicate from §3, which matches real lefthook *and* both fixtures, and delete this function.
+
+---
+
+### 5. `hookManagerIntegrationKind` — **premature generality that isn't a seam** (~15 lines)
+
+Three values (`none`, `hook-directory`, `lefthook`), one of which (`hook-directory`, Husky) only selects which *advice paragraph* prints. There is no `hookBackend` interface; `checkGitHookIntegrationInDir` and `EnsureGitHookIntegration` are `if lefthook { ...110 lines... }` inline branches. So it pays for the concept of a general manager backend while giving #1250 nothing: adding Rush or Husky means a third inline branch or a refactor.
+
+**This is not the CLAUDE.md special-case smell** — lefthook-only is correct, for the `source_dir_local` reason in §1, and I would reject a general seam here as *deeper* than the problem (there is no second manager with a clone-local config to build it against). But the enum should be `Name == lefthookManagerName` or a `bool`, deleting a type that promises an abstraction the code doesn't have. **Savings: ~15.**
+
+---
+
+### 6. Five-state `GitHookIntegrationHealth` for #2264 — **right depth here, wrong depth for the issue** (~200 lines if #2264 shipped alone)
+
+`hook_integration.go` (242 lines) replaces the 3-state `CheckGitHookState` with `{Mode, State, Manager, ReasonCode, Reason}` over 5 states. Auditing what each field earns:
+
+| Addition | Value independent of the lefthook work? |
+|---|---|
+| `Error` state (`inspectGitHookStateInHooksDir`) | **Yes** — baseline collapsed *every* read failure into `Absent`, so a permissions error read as "not installed". Genuinely new, ~20 lines. |
+| `Degraded` state | No — exists only because §3 keeps two bridges alive. |
+| `Mode` / `Manager` | No — lefthook copy only. |
+| `ReasonCode` | Marginal; a stable JSON discriminator is reasonable, but nothing consumes it except the fingerprint in §7. |
+
+So #2264 alone is `CheckGitHookState` + the `Error` distinction + a status line ≈ **35 lines**. Also: `legacyGitHookState` (`hooks.go:438`) is **production-dead** — referenced only by its own test. Delete: 13 lines + test.
+
+**Verdict for this PR: keep** (the lefthook work needs Mode/Manager). Flag only that ~200 of those lines are #1349's cost booked to #2264, and delete the dead adapter.
+
+---
+
+### 7. Per-session warning-claim protocol — **TOO DEEP** (~810 lines)
+
+**Change:** `strategy/session_state.go` +240 (`StoreHookHealthWarningHint`, `ClaimHookHealthWarning`, `RollbackHookHealthWarningClaim`, `LoadHookHealthWarningHint`, `TransferHookHealthWarningHint`, `RecordHookHealthRecovery`, `validHookHealthWarningFingerprint`) and `lifecycle.go` +210, plus `agent.StandaloneHookResponseWriter` and `mergeTurnStartHookResponse`. Tests: +268 / +166.
+
+That is ~900 lines to print one sentence at most once per session.
+
+The machinery exists because the PR chose **stdout** as the channel, and stdout at TurnStart is already owned by the native context-injection payload (Claude Code and Codex require exactly one JSON value). Everything cascades from that one decision:
+
+- `mergeTurnStartHookResponse` must splice `systemMessage` into someone else's JSON;
+- Gemini can't carry both, so it needs a new agent capability (`StandaloneHookResponseWriter`) **and the PR rolls back `ContextInjectionDecided` to sacrifice context injection for that turn** — a warning is now allowed to displace model-facing context;
+- because stdout writes can fail after the suppression marker is set, there must be a claim/rollback pair, with `RollbackHookHealthWarningClaim` opening its own `context.WithoutCancel` + 2s budget + `WithSessionLockWait` override;
+- because SessionState doesn't exist at SessionStart but the banner also emits the warning, there must be an out-of-band `&lt;session&gt;.hook-health` hint file plus `TransferHookHealthWarningHint` at TurnStart to fold it in;
+- because a fingerprint must be able to re-fire, there must be `RecordHookHealthRecovery` with write-ahead ordering.
+
+**#1965 — the issue that actually asks for this class of warning — specifies the cheap altitude, and it's already implemented in this repo:**
+
+&gt; *"a nice property of the git-hook route: hook stderr goes to whatever process ran `git commit`, which is the agent itself, so the warning lands in the agent's transcript"* … *"rate-limited the way `warnStaleEndedSessions` already does it (sentinel file mtime in the session-state dir, fail-open)"*
+
+stderr has no single-value constraint (Entire already prints `[entire] Warning: …` from hooks, including in this very PR at `removeNativeGitHooksSafe`), needs no merge, no new agent capability, no injection sacrifice, no claim/rollback, and no SessionStart→TurnStart hint transfer, because a sentinel mtime isn't session-scoped. **Right altitude: stderr + `warnStaleEndedSessions`-style sentinel ≈ 40 lines.**
+
+Secondary altitude issue in the same area: the warning is emitted from **two** sites (SessionStart banner *and* TurnStart), and the hint-transfer protocol exists to stop them double-printing. One site would do. `doctor` and `status` also both report it, and #1965 is not referenced anywhere in the PR.
+
+**Savings: ~430 production + ~380 test = ~810.**
+
+---
+
+### 8. `EnsureSetup` lost its "already installed?" guard — **TOO DEEP for the hot path** (~15 lines to fix, large runtime win)
+
+Baseline: `if !IsGitHookInstalled(ctx) { ReinstallGitHooks(ctx) }` — five file reads, then usually stop.
+
+Head: `EnsureGitHookIntegration(ctx, …)` **unconditionally**, on every TurnStart. Per turn that is now: `detectHookManagersForIntegration` (~35 `Lstat`s across the lefthook/hk config matrix), `checkNativeHookRepair` (5 reads), `snapshotHookIntegration` (**17 file reads buffered into memory**), `validateLefthookMainConfig` (YAML parse), install, then `CheckGitHookIntegration` for verification (another full detect + read + parse pass), then `restoreProvenLefthookBridges` (another pass) — and `repairLifecycleHookHealth` in `lifecycle.go` calls `CheckGitHookIntegration` **a second time** immediately after, for the warning. Roughly 100+ syscalls and 3 YAML parses where there were 5 reads.
+
+This is the hot path CLAUDE.md treats as budget-critical (`StatusWalkBudget`, `gitrepo.Status` single-walk rule, the whole no-memoization discussion). Writes are content-compared so they no-op, but reads and snapshots are not.
+
+**Right altitude:** early-out — call `CheckGitHookIntegration` once, return if `Current`, and hand the same result to the warning path instead of re-deriving it. Restores the baseline's cheap-path property and removes the duplicate check.
+
+---
+
+### 9. Session-listing rewrite in `status.go` — **OUT OF SCOPE, and it drops documented behavior** (~480 lines)
+
+None of #1349/#2263/#2264/#1250/#2237/#1965 asks for any of this:
+
+- `worktreeGroup` removed; sessions are now a flat list sorted by `LastActiveAt`.
+- `store.List` → new `store.ListReadOnly` (`session/state.go` +26), so status no longer deletes stale records.
+- **`finalizeExitedSessions` is no longer called from `status.go` at all.** I confirmed by grep at PR head: the only remaining call sites are `doctor.go:201` and `session_sweep.go:100`. CLAUDE.md states: *"`finalizeExitedSessions` sweeps those inside `entire status` (text and `--json`)"*. The PR rewrites the docs to declare status a read-only observer rather than flagging the behavior change — a documented capability removed as a side effect of a hook-health PR.
+- `--json` `active_sessions` changes from **one entry per agent** (with `"active" wins over idle"` dedupe and sticky `capture_degraded`) to **one entry per session**, plus five new fields. That is a breaking change to a documented machine-readable contract, in a PR whose stated scope is hook health.
+- `writeActiveSessions` is retained with the comment *"retains the direct rendering seam used by focused tests"* — a production-dead function kept alive for tests.
+
+**Right altitude:** revert to the baseline grouping/dedupe/sweep; add the `git_hooks` + `checkpoint_sync_state` + `checkpoint_storage_backend` fields only. If the flat read-only listing is wanted, it is its own PR against its own issue, with the sweep removal argued explicitly.
+
+**Savings: ~180 production + ~300 test = ~480.**
+
+---
+
+### 10. `pre-push "$1" "$2"` ABI change with no consumer — **TOO DEEP** (~12 lines)
+
+`buildHookSpecs` now emits `pre-push "$1" "$2"` and `hooks_git_cmd.go` widens to `RangeArgs(1, 2)` — then documents that the second arg is deliberately ignored:
+
+```go
+// Git's hook ABI also supplies args[1], the URL for this invocation.
+// Routing intentionally stays remote-name based: …
+```
+
+Changing the generated hook body forced a backward-compatibility shim in `hook_repair.go`:
+
+```go
+if hook == prePush &amp;&amp; currentNativeHookContent(strings.Replace(content, `pre-push "$1"`, `pre-push "$1" "$2"`, 1), hook) {
+```
+
+An ABI widening plus a migration matcher, for an argument nothing reads. Either wire a consumer or drop both. (#2263's `$@` observation is about lefthook **scripts** receiving args — which they do, unchanged, because the script passes `"$@"` through.)
+
+---
+
+### 11. `CheckAndWarnHookManagers` wasn't taught about the integration it now has — **TOO SHALLOW** (net negative lines)
+
+`setup.go` calls `EnsureGitHookIntegration` and then, on the next line, `strategy.CheckAndWarnHookManagers`, which for lefthook now prints:
+
+&gt; `Warning: Lefthook detected (lefthook.yml)` … *"may overwrite hooks installed by Entire when it installs or refreshes hooks. If Lefthook reinstalls hooks, run `entire enable` to restore Entire's hooks."*
+
+Immediately after Entire installed the durable artifacts that make that statement false. #2263's complaint was precisely *"a manual step, after the fact, with no signal for when it is needed"* — and the PR leaves that text in place while removing its cause. Gate the warning on `CheckGitHookIntegration` returning `Lefthook/Current` (or replace it with a one-line confirmation). Removes lines.
+
+---
+
+### 12. Dead production code carried in (~21 lines)
+
+- `legacyGitHookState` (`hooks.go:438`) — referenced only by its own test.
+- `installLefthookFiles(ctx, absolutePath)` (`lefthook_transaction.go:18`) — test-only wrapper around `installLefthookFilesAt`, carrying a leftover task marker: `//nolint:unparam // Task 3 wires the settings-selected true path.` Production calls the `At` variant. Either wire the settings path or have the tests call `…At` directly.
+
+---
+
+### 13. Deleted general-manager regression coverage
+
+`TestHookOverwrite_MidTurnWipe_NextPromptRecovers` (issue #784: **Husky** overwrites hooks mid-turn → next prompt recovers → backups chain correctly) is **replaced** by `TestHookOverwrite_LefthookRefreshKeepsCurrentCommitCovered`. The general "any manager clobbers, self-repair recovers, `.pre-entire` chain intact" assertion is gone, and with it the only integration-level guard on the mechanism #2237 is about. Keep both — the Husky case is the one the new code path does *not* cover.
+
+---
+
+## (a) Total estimated line reduction from altitude corrections
+
+| Finding | Prod | Test | Total |
+|---|---|---|---|
+| §2 transaction layer collapsed to write-order | 350 | 250 | 600 |
+| §7 warning claim protocol → stderr + sentinel | 430 | 380 | 810 |
+| §9 session-listing rewrite reverted | 180 | 300 | 480 |
+| §3 two-bridge reconciliation + byte-exact matcher | 200 | 150 | 350 |
+| §12 dead code, §5 enum, §10 ABI shim, §11 warning gate | ~55 | ~30 | ~85 |
+| **Total (all functionality retained)** | **~1,215** | **~1,110** | **≈ 2,325** |
+
+Landing at roughly **4,480 lines**, with §13's deleted test restored.
+
+Separately: if the lefthook subsystem is split into its own PR against #1349/#2263 (as its scope warrants), **~3,036 lines** leave this PR, and what remains for `Fixes #2264` is ~250 lines — status snapshot, the `Error`-state distinction, and the doctor rewiring.
+
+## (b) Verdict on proportionality
+
+~4,700 lines is not proportionate, but the diagnosis is packaging and implementation depth rather than a wrong mechanism. The core choice — become a lefthook-local citizen via `source_dir_local` — is the correct altitude for #1349, and I want to be explicit about why, because the issue's own cheaper options do not survive inspection: option (4) self-repair **already ships** in baseline `EnsureSetup`, so the PR's real increment over today is the narrow window between a lefthook re-sync and the next Entire invocation, and lefthook's run-time config resolution means artifacts alone close that window with no user action and no `lefthook install`. Nothing cheaper does that. What is out of altitude is everything stacked on top: ACID two-phase transactions over seven idempotent small files in a codebase whose native installer has never been transactional; two delivery bridges installed and then reconciled, when per-hook ownership was knowable before the first write; ~90 lines of byte-exact third-party template matching that will invert into #1349-in-reverse on the next lefthook release and whose only tested-real branch is a hand-transcribed fixture; a ~900-line claim/hint/transfer/rollback protocol to print one sentence, chosen over the stderr channel that the requesting issue (#1965, uncited) names and that this repo already uses; and an unrelated session-listing rewrite that silently retires the `finalizeExitedSessions` sweep CLAUDE.md documents and breaks the `--json` `active_sessions` shape. Each of those is one level below the problem it solves, and the pattern — a per-turn hot path that went from five file reads to ~100 syscalls and three YAML parses — is the same over-depth expressed as runtime cost. Split into three PRs (status truth ~250 lines; lefthook integration ~2,000 after §2/§3; hook-health warning ~60), each is defensible on its own terms and reviewable against its own issue.</result>
+<usage><subagent_tokens>198213</subagent_tokens><tool_uses>33</tool_uses><duration_ms>440127</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a4a7e9fcfc290c5aa</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-Documents---Peyton-s-MacBook-Pro-entire-devenv-entireio-cli--worktrees-origin/85f5bebd-f8cf-4a76-973f-970a5af82ccc/tasks/a4a7e9fcfc290c5aa.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review of PR 2343" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result># PR #2343 — REUSE review
+
+Verified against the PR-head tree at `/private/tmp/pr2343-review` and the merge base. Every helper named below was read in place before being recommended. Ranked by estimated lines saved.
+
+---
+
+## 1. The inner staged transaction is fully redundant with the outer snapshot/restore — ~145 lines
+
+**File:** `/private/tmp/pr2343-review/cmd/entire/cli/strategy/lefthook_transaction.go:149-368`
+
+`EnsureGitHookIntegration` (`hook_integration_transaction.go:131`) calls `snapshotHookIntegration` **before** `installLefthookFilesAt`, and its `fail()` closure runs `restoreHookIntegrationSnapshots` on *every* error path — including the one from `installLefthookFilesAt` (line 175-180). `snapshotHookIntegration` (line 633-643) captures bytes+mode for exactly the files the installer writes: `lefthook-local.yml`, `info/exclude`, and `.lefthook-local/&lt;hook&gt;/entire.sh`. So `stagedLefthookFile`'s `original`/`originalMode` capture and `rollbackStagedLefthookFiles` restore the same bytes the outer layer is about to restore anyway.
+
+**Duplicated cost:** `stageLefthookArtifacts` (34), `publishLefthookTransaction` (23), `stagedLefthookFile` + `stageLefthookFile` (65), `publish` (8), `rollbackStagedLefthookFiles` (43), `cleanupStagedLefthookFiles` (9) — 182 lines of a second staging/backup/rollback engine, plus the `beforePublish func(string) error` fault seam threaded through two files.
+
+**Existing helpers to use instead:**
+- `strategy.writeHookFile(root *os.Root, name, content string) (bool, error)` — `hooks.go:800-820`. This *already* does exactly what `stageLefthookFile` + `publish` do: read existing, compare content, compare the exec bit, atomic-rename write, return whether it wrote. It only needs a `mode os.FileMode` parameter (it hardcodes `0o755`) to serve the `0o644` config and exclude files too.
+- `jsonutil.WriteFileAtomicIn(root, name, data, perm)` — `jsonutil/write.go:85`, already used by this PR in `removeOwnedLefthookArtifacts` and `restoreHookIntegrationSnapshots`.
+- Rollback: `snapshotHookIntegration` / `restoreHookIntegrationSnapshots`, already in the PR.
+
+Keep `prepareLefthookDirectories`/`cleanupLefthookDirs` (snapshots deliberately skip directories) and `deactivate`/`finishDeactivation` (that is a distinct liveness property — not having Lefthook read a config pointing at half-written scripts). Everything else collapses to one `for _, artifact := range artifacts { writeHookFile(...) }` loop.
+
+**Lines saved: ~145**
+
+---
+
+## 2. `hook_integration_test.go` re-inlines the package's own repo-setup helper 24 times — ~110 lines
+
+**File:** `/private/tmp/pr2343-review/cmd/entire/cli/strategy/hook_integration_test.go` (24 sites; also `lefthook_integration_test.go` ×3, `hook_repair_test.go` ×1)
+
+Every test opens with the same 6-9 line preamble (lines 186-193, 249-261, 391-397, 412-418, 438-452, 473-487, 512-518, 535-542, 571-582, 628-634, 677-688, 717-730, …):
+
+```go
+repoDir := t.TempDir()
+testutil.InitRepo(t, repoDir)
+clearGlobalHooksPath(t, repoDir)
+if err := os.WriteFile(filepath.Join(repoDir, "lefthook.yml"), nil, 0o644); err != nil {
+    t.Fatal(err)
+}
+t.Chdir(repoDir)
+```
+
+**Existing helper:** `newLefthookTestRepo(t)` at `lefthook_integration_security_test.go:322` — same package, does precisely this (`t.TempDir` → `testutil.InitRepo` → write `lefthook.yml` → `t.Chdir` → `paths.ClearWorktreeRootCache`), and is used 6 times in the file that defines it and **zero** times in the 943-line file that needs it most. It needs one small generalization: return `hooksDir` too and take the main-config body (some sites write `pre_commit: {}`, some write nil), and add `clearGlobalHooksPath`. `initHooksTestRepo` (`hooks_test.go:31`) is the pre-existing native-only sibling — the two should become one helper with a config argument rather than three variants.
+
+**Lines saved: ~110**
+
+---
+
+## 3. Eight copies of the same `yaml.Node` mapping scan across the three new YAML files — ~60 lines
+
+**Files:** `lefthook_yaml.go:53-63, 78-87, 112-125`, `lefthook_artifacts.go:158-165, 167-174, 143-151`, `lefthook_detection.go:156-167`
+
+There is no pre-existing YAML node helper in the repo — I checked every `yaml` importer (`plugin_manifest.go`, `redact/packs.go`, `e2e/vogon/main.go`, `tools/complexity/dupl/main.go`); all use plain struct unmarshalling. So this is **duplication between the three new files**, exactly as suspected:
+
+- `mappingValue` (`lefthook_artifacts.go:158`, 8 lines), `mappingKey` (`:167`, 8 lines) and `mappingValueCount` (`lefthook_detection.go:156`, 12 lines) are three projections of one scan. `mappingValueCount` already returns the value; `mappingKey` exists only because `hasOwnedLefthookConfigEntries:110` needs the key node alongside it.
+- Four more copies of the identical `for i := 0; i+1 &lt; len(parent.Content); i += 2` loop are inlined: `ensureMappingValue`, `setOwnedLefthookSourceDir`, `setOwnedLefthookScript`, and the inner loop of `findLefthookScriptEntry`.
+
+**Fix:** one primitive — `mappingEntry(parent *yaml.Node, key string) (keyNode, valueNode *yaml.Node, found, duplicate bool)` — subsumes all three functions and all four inline loops. `findLefthookScriptEntry`'s 30 lines become ~16; `setOwnedLefthookScript`'s 28 become ~16.
+
+**Lines saved: ~60**
+
+---
+
+## 4. The Lefthook wrapper template is hardcoded in 5 places across 4 packages — ~45 lines
+
+**Files:**
+- `strategy/hook_integration_transaction.go:287-311` (production matcher `looksLikeLefthookHook`)
+- `strategy/hook_integration_test.go:768-775` (`noOpLefthookWrapper`) and `:777-783` (`realLefthookWrapper`)
+- `cli/status_test.go:2992-2998` (`statusLefthookWrapper`)
+- `integration_test/lefthook_integration_test.go:121-149` (`installSimulatedLefthookHooks`)
+- `e2e/tests/lefthook_durable_test.go:91-109` (`simulatedLefthookLauncher`)
+
+`statusLefthookWrapper` and `realLefthookWrapper` are **byte-identical functions in different packages**. The other three differ only in the `call_lefthook()` body. All five are hand-crafted to satisfy the production matcher's accepted prefixes/suffixes, so changing the accepted template means editing six places and there is no compile-time link between them.
+
+**Fix:** export one builder from `strategy` next to `looksLikeLefthookHook` — `strategy.LefthookWrapper(hook, body string) string` — with named bodies for the v2, no-op, and direct-dispatch variants. Precedent for exporting a hook-shape helper for cross-package tests already exists: `strategy.ManagedGitHookNames()` (`hooks.go:43`) is exported and used from `integration_test`.
+
+**Lines saved: ~45** (plus removal of a cross-package drift hazard)
+
+---
+
+## 5. `openEffectiveHooksRoot` is a third hooks-directory root opener — ~45 lines
+
+**File:** `hook_integration_transaction.go:32-111` (`effectiveHooksRoot` type, `name()`, `openEffectiveHooksRoot`, `validateEffectiveHooksRoot` — 66 lines total)
+
+`hooks.go` already has two sanctioned openers with long doc comments explaining exactly when each applies: `hooksRootForInstall` (`hooks.go:181-195` — lstat, refuse a symlink at the hooks dir, `osroot.Shared(abs)`) and `hooksRootForRemoval` (`hooks.go:216-222` — `EvalSymlinks` then `osroot.Shared`). `openEffectiveHooksRoot` re-derives the hooks dir a third way: anchor on `repoRoot`, else `commonDir`, else the filesystem volume root, and carry a `prefix` so every read must go through `hooks.name(hook)` — 12 call sites in this one file.
+
+Since `getHooksDirInPath` returns an absolute path and `hooksRootForInstall` already refuses a symlinked hooks directory (which is what `TestRemoveGitHookIntegration_RejectsSymlinkedEffectiveHooksDirectory` asserts), `hooksRootForInstall(hooksDir)` gives a root anchored *at* the hooks dir — the `prefix`/`name()` indirection disappears entirely and all 12 call sites read `readOptionalRegular(root, hook)`.
+
+The one property the new code adds is rejecting a symlink in a *parent* component above the hooks dir. Note that the install path — which actually writes hooks — is content with `hooksRootForInstall`, so this applies a stricter standard to reading than to writing. If that property is wanted, `osroot.NoSymlinkedParent(root, name)` (`osroot/osroot.go:487`) is the existing predicate for it. Composes with finding 6.
+
+**Lines saved: ~45**
+
+---
+
+## 6. `removeNativeGitHooksSafe` reimplements `RemoveGitHook` — ~35 lines
+
+**File:** `hook_integration_transaction.go:429-474` (46 lines)
+
+Same algorithm as `RemoveGitHook` (`hooks.go:822-893`), hook for hook: remove if it carries our marker, restore the `.pre-entire` backup, warn-and-skip when the active hook was modified since install. It also open-codes the marker test as `strings.Contains(string(active), entireHookMarker)`.
+
+**Existing helpers:**
+- `strategy.RemoveGitHook(ctx)` — `hooks.go:822`. Extract its body as `removeNativeGitHooksIn(root *os.Root, strict bool) (int, error)` and have both call it. (The only real behavioural delta: `RemoveGitHook` warns and continues on an unclassifiable hook, the new one errors — a `strict` flag.)
+- `classifyExistingHook(root, name) (hookClassification, error)` — `hooks.go:358`, with `hookOurs`/`hookForeign`/`hookAbsent`. This is the sanctioned marker test and it correctly classifies a symlinked hook as foreign, which the inline `strings.Contains` does not.
+- `hookFileExists(root, name)` — `hooks.go:389`.
+
+**Lines saved: ~35**
+
+---
+
+## 7. Read paths do Node surgery where struct unmarshalling would do — ~40 lines
+
+**File:** `lefthook_detection.go:88-140` (`validateLefthookMainConfig`), `:169-181` (`lefthookScalarSetting`), `lefthook_artifacts.go:89-100` (`inspectOwnedLefthookSourceDir`)
+
+`validateLefthookMainConfig` needs four facts — absence of `extends`, absence of `remotes`, `source_dir`, `source_dir_local` — and no comments. It reaches them through `parseYAMLMapping` + four `mappingValueCount` calls + `lefthookScalarSetting`. A struct does it directly:
+
+```go
+var cfg struct {
+    Extends        *[]string `yaml:"extends"`
+    Remotes        *[]any    `yaml:"remotes"`
+    SourceDir      *string   `yaml:"source_dir"`
+    SourceDirLocal *string   `yaml:"source_dir_local"`
+}
+```
+
+More importantly, **I verified yaml.v3 already detects duplicate keys on struct and map unmarshal but not on Node unmarshal** (test run in-tree: `line 2: mapping key "source_dir" already defined at line 1` for struct and `map[string]any`; `err=&lt;nil&gt;` with 4 content entries for `yaml.Node`). The eight hand-rolled `duplicate` branches and their `"duplicate %s setting"` errors are re-implementing a library feature that Node traversal simply opted out of. For the write paths that legitimately need comments, one extra `yaml.Unmarshal(data, &amp;map[string]any{})` inside `parseYAMLMapping` (4 lines) buys the whole-document unique-key guarantee, after which `mappingValueCount` loses its `duplicate` return and `findLefthookScriptEntry` drops from four return values to three.
+
+Deletes `lefthookScalarSetting` (13) and ~8 duplicate branches; shrinks `validateLefthookMainConfig` by ~18.
+
+**Lines saved: ~40** (net of the 4-line addition)
+
+---
+
+## 8. `TransferHookHealthWarningHint` and `RecordHookHealthRecovery` are the same function — ~40 lines
+
+**File:** `strategy/session_state.go:509-584`
+
+Both: acquire the session gate → obtain a fingerprint → `LoadSessionState` → set `state.LastHookHealthWarning` → `SaveSessionState` → `openSessionStateRootForRead` → `osroot.RemoveNoSymlinks(root, sessionID+hookHealthHintSuffix)`. `RecordHookHealthRecovery` differs only by writing the hint first and by validating the fingerprint. Merge into one `promoteHookHealthHint(ctx, sessionID, fingerprint string, writeFirst bool) error`.
+
+Separately, the file already carries two hint pairs with the same file-in-session-state-root shape — `StoreModelHint`/`LoadModelHint` (`:296`, `:318`) and `StoreAgentTypeHint`/`LoadAgentTypeHint` (`:607`, `:673`) — and the new code hand-rolls a third (`writeHookHealthWarningHint`, and the root/read plumbing inside `LoadHookHealthWarningHint`). A `writeSessionHint(ctx, sessionID, suffix, data)` / `readSessionHint(ctx, sessionID, suffix)` pair over the existing `openSessionStateRoot` / `openSessionStateRootForRead` would serve all three.
+
+**Lines saved: ~40**
+
+---
+
+## 9. `legacyGitHookState` is dead and re-derives a mapping that already exists — ~34 lines
+
+**File:** `strategy/hooks.go:438-449` (12 lines) + `hook_integration_test.go:370-388` (~22 lines)
+
+The only non-test reference is the definition itself (verified by grep across the tree). `CheckGitHookState`/`gitHookStateInHooksDir` (`hooks.go:421`, `:479`) already produce a `GitHookState` natively for the legacy callers the doc comment names, so nothing needs the health→state translation. Delete both the function and `TestCheckGitHookStateCompatibilityMapping`, which tests only itself.
+
+**Lines saved: ~34**
+
+---
+
+## 10. `verifyGitHookIntegrationRemoved` and `AnyGitHookIntegrationInstalled` are inverses of one walk — ~30 lines
+
+**File:** `hook_integration_transaction.go:479-504` (26 lines) and `:506-545` (40 lines)
+
+Both walk the identical three artifact classes in the same order: `lefthook-local.yml` via `hasOwnedLefthookConfigEntries`, `lefthookScriptPath(hook)` via `lefthookScriptOwned`, and the native hook marker. One returns bool, the other returns an error naming the first survivor. Fix: one `ownedArtifactsRemaining(ctx, repoRoot) ([]string, error)`; `AnyGitHookIntegrationInstalled` is `len(...) &gt; 0 || AnyGitHookInstalled(ctx)`, and `verify` is `if len(...) &gt; 0 { return fmt.Errorf(...) }`.
+
+**Lines saved: ~30**
+
+---
+
+## 11. `configuredRemoteNamesForStatus` reimplements a cached strategy helper — ~18 lines
+
+**File:** `cli/status.go:484-501`
+
+**Existing helper:** `strategy.configuredRemotesInConfigOrder(ctx)` — `strategy/checkpoint_sync_remote.go:218`. It is memoized per invocation (`cachedRemotesInConfigOrder`) and returns remotes in `.git/config` section order, deliberately, because "`git remote` output is alphabetical and unsuitable". The new function iterates go-git's `repo.Remotes()` in map order and loses both the ordering guarantee and the cache. Export a thin `strategy.ConfiguredRemoteNames(ctx)` wrapper and delete this one.
+
+**Lines saved: ~18**
+
+---
+
+## 12. `inspectActiveHookDelivery` duplicates the per-hook native walk — ~15 lines
+
+**File:** `hook_integration_transaction.go:223-243`
+
+The loop body — read the hook, check `Mode().Perm()&amp;0o111`, check `currentNativeHookContent(content, hook)` — is `inspectGitHookStateInHooksDir`'s loop (`hooks.go:491-534`) with `|| looksLikeLefthookHook(data, hook)` added as an accepted shape. Parameterizing the existing inspector with an extra accepted-content predicate keeps one walk.
+
+**Lines saved: ~15**
+
+---
+
+## 13. Repeated 5-attribute health logging block — ~12 lines
+
+**File:** `cli/lifecycle.go` — the same `slog.String("mode"/"state"/"manager"/"reason_code")` block appears at three sites in `repairLifecycleHookHealth` and again in `handleLifecycleSessionStart`. Extract `hookHealthLogAttrs(health) []any`.
+
+**Lines saved: ~12**
+
+---
+
+## 14. `runCLIAt` duplicates `TestEnv.RunCLIWithError` — ~9 lines
+
+**File:** `integration_test/lefthook_integration_test.go:219-227`. Identical to `(*TestEnv).RunCLIWithError` (`testenv.go:169-181`) except `cmd.Dir`. Add `RunCLIInDir(dir string, args ...string)` to `TestEnv` and have `RunCLIWithError` delegate to it with `env.RepoDir`.
+
+**Lines saved: ~9**
+
+---
+
+## 15. `containsString` duplicates `slices.Contains` — ~7 lines
+
+**File:** `lefthook_detection.go:228-235`, used at `:198` and `:200`. `slices.Contains` is stdlib and already used across this repo (`plugin_group.go:229`, `repo_mirror.go:698`, `status_test.go:1883`, …).
+
+**Lines saved: ~7**
+
+---
+
+## Total
+
+**~645 lines** removable from reuse alone — roughly 10% of the PR's +6,807, split about **~455 in production code** and **~190 in tests**.
+
+Two notes on composition and on what I did *not* find:
+
+- Findings 1, 5 and 6 compose: adopting `hooksRootForInstall` (5) makes `removeNativeGitHooksSafe` textually `RemoveGitHook` (6), and dropping the inner staging engine (1) removes the `beforePublish` seam that currently forces `installLefthookFilesAt` to be public to the coordinator. Done together they are closer to ~240 than the ~225 the individual estimates sum to.
+- **The PR does not violate the repo's reuse conventions where it matters most.** It correctly routes every filesystem operation through `osroot`/`worktreedir`/`gitdir`/`jsonutil` rather than hand-rolling path safety, it uses the `settings` package, it does not open a repository outside `gitrepo`, and `status.go` is a net *de-duplication* (+366/-226): it deletes the second session-collection loop in `runStatusJSON` in favour of one shared `buildStatusSnapshot`. `doctor.go` and `common.go` are clean migrations to the new API, not new copies. `integration_test/hook_overwrite_test.go` (-88) is likewise a consolidation.</result>
+<usage><subagent_tokens>232730</subagent_tokens><tool_uses>50</tool_uses><duration_ms>514030</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ab5c94468726dd714</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-Documents---Peyton-s-MacBook-Pro-entire-devenv-entireio-cli--worktrees-origin/85f5bebd-f8cf-4a76-973f-970a5af82ccc/tasks/ab5c94468726dd714.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review of PR 2343" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Cleaned up. Here are the findings.
+
+## Measurement method
+
+I instrumented the PR-head tree with throwaway Go tests (now deleted): a PATH-shimmed `git` that logs every invocation, plus wall-clock timing loops. Repo: warm local APFS temp repo, 1 commit, macOS. **Every number below is measured, not estimated.** A real worktree (large tree, iCloud-synced per your notes) will be strictly worse.
+
+| Path | Measured | git spawns |
+|---|---|---|
+| **baseline** `IsGitHookInstalled` (old EnsureSetup gate, hooks current) | **0.15 ms** | 0 (cached) |
+| new `CheckGitHookIntegration` — native/current | **21.9 ms** | 3 (2 net) |
+| new `EnsureGitHookIntegration` — native, steady state | **62.7 ms** | 8 |
+| new `CheckGitHookIntegration` — lefthook/current | **40.9 ms** | 3 |
+| new `EnsureGitHookIntegration` — lefthook, steady state | **139 ms** | 13 |
+| `getHooksDirInPath` | 9.99 ms | 1 |
+| `GetHooksDir` (the cached twin) | 0.0036 ms | 0 |
+| `snapshotHookIntegration` | 30.9 ms | 3 |
+| `checkNativeHookRepairInDir` | 10.7 ms | 1 |
+| `inspectNativeHookIntegration` | 10.1 ms | 1 |
+| `InstallGitHook` (idempotent no-op) | 0.23 ms | 0 |
+| `detectHookManagersForIntegration` (37 lstats) | 0.049 ms | 0 |
+| `RecordHookHealthRecovery` | 0.32 ms | 0 |
+
+**Per agent turn**, `handleLifecycleTurnStart` now runs Ensure + a second full Check: **~85 ms native / ~180 ms lefthook, against a 0.15 ms baseline — a ~560× regression on the hook hot path.** Plus one more Check (22–41 ms) at SessionStart.
+
+---
+
+## F1 — Top impact: `getHooksDirInPath` and `CommonDirForWorktree` are uncached, so one Ensure forks `git` 8–13 times
+
+`strategy/hooks.go:133` (`getHooksDirInPath`), `gitdir/gitdir.go:163` (`CommonDirForWorktree`), consumed by `hook_integration_transaction.go:46` (`openEffectiveHooksRoot`) and `hook_repair.go:35`.
+
+Verified spawn log for one native `EnsureGitHookIntegration` with everything already current:
+```
+rev-parse --show-toplevel        (WorktreeRoot — cached after this)
+rev-parse --git-path hooks       ×5
+rev-parse --git-common-dir       ×2
+```
+Lefthook: **13 spawns** (`--git-path hooks` ×6, `--git-common-dir` ×7). `openEffectiveHooksRoot` alone costs 2 spawns and is called 4× per lefthook Ensure.
+
+Waste: ~10 ms fork+exec+`rev-parse` each, for two answers that cannot change inside a hook process. `GetHooksDir` right next door already memoizes this exact call (`hooksDirCache`, hooks.go:60-105) and measures **2750× faster** (3.6 µs). The new code deliberately routed around the cached variant to take an explicit `repoRoot`.
+
+Fix: key the existing cache by `repoRoot` (or add a `sync.Map[repoRoot]string` in each) and have `getHooksDirInPath`/`CommonDirForWorktree` serve from it. **Saving: ~70 ms/turn native, ~120 ms/turn lefthook** — the single biggest win, and it needs no restructuring.
+
+## F2 — `EnsureSetup` lost its "already installed" gate, so every turn runs the whole install transaction
+
+`strategy/common.go:114-119`. Before: `if !IsGitHookInstalled(ctx) { ReinstallGitHooks(ctx) }` — 0.15 ms and zero writes in the steady state. Now: unconditional `EnsureGitHookIntegration`, which always runs detect → native repair check → **full snapshot** → `InstallGitHook` → full `CheckGitHookIntegration`. 62.7 ms native / 139 ms lefthook, on every turn, in a repo where nothing is wrong.
+
+The comment says "the coordinator is idempotent" — it is, in outcome, but not in cost.
+
+Fix: `health := CheckGitHookIntegration(ctx); if health.State == Current { return }` before the transaction. That is also the health value the caller wants (see F3), so the check is not extra work. **Saving: ~62 ms/turn native, ~139 ms/turn lefthook** on the overwhelmingly common healthy path, and it eliminates the snapshot (F4) for free.
+
+## F3 — Two full inspections per turn: Ensure's internal verification plus lifecycle's own check
+
+`hook_integration_transaction.go:168` / `:216` and `lifecycle.go` `repairLifecycleHookHealth` (`ops.repair` then `ops.check`).
+
+Correction to the review brief: lines 149/168/216 are **mutually exclusive branches** — exactly one runs per Ensure, so there is no triple-inspection inside Ensure. The real duplication is across the boundary: `repairLifecycleHookHealth` calls `EnsureSetup` (whose last act is a full `CheckGitHookIntegration`) and then immediately calls `CheckGitHookIntegration` again itself. Two complete inspections, back to back, with nothing between them that can change the answer.
+
+Fix: have `EnsureGitHookIntegration` return `(int, GitHookIntegrationHealth, error)` — it already computed it for verification — and let lifecycle consume that. **Saving: 21.9 ms/turn native, 40.9 ms/turn lefthook.**
+
+## F4 — `snapshotHookIntegration` runs unconditionally before anything is known to need writing
+
+`hook_integration_transaction.go:131` and `:597-660`. 30.9 ms measured. Per call: 1 `--git-common-dir` + `openEffectiveHooksRoot`'s 2 more spawns, 17 `LstatNoSymlinks`, and a **full read of every file that exists** (5 native hooks, up to 5 `.pre-entire` backups, `info/exclude`, `lefthook-local.yml`). All of it is rollback insurance for writes that, in the steady state, never happen (`writeHookFile` is content-idempotent, `stageLefthookFile` returns `errLefthookFileUnchanged`).
+
+On the closure question: the `fail` closure at `:135` retains those file bytes for the whole Ensure. Bounded (hooks are ~1 KB; `info/exclude` a few KB), so not a memory finding — the problem is capturing the snapshot at all.
+
+Fix: take the snapshot lazily on first staged mutation, or skip it entirely behind F2's gate. **Saving: ~31 ms/turn.**
+
+## F5 — `restoreProvenLefthookBridges` re-resolves everything `inspectActiveHookDelivery` just resolved
+
+`hook_integration_transaction.go:245-256`, called at `:210` directly after `:199`. It re-calls `paths.WorktreeRoot`, then `openEffectiveHooksRoot` (**2 more git spawns**), then re-reads all 5 hooks plus their 5 backups — immediately after `inspectActiveHookDelivery` opened the same root and read the same 5 hooks. Fix: pass `repoRoot` and the `effectiveHooksRoot` down as parameters (the type already exists). **Saving: ~20 ms/turn in lefthook repos.**
+
+## F6 — `installLefthookFilesAt` re-does the caller's detect/select/validate
+
+`lefthook_transaction.go:31-44` repeats `detectHookManagersForIntegration` + `selectLefthookIntegrationManager` + `validateLefthookMainConfig` that `EnsureGitHookIntegration:120-143` performed moments earlier — including a second read and yaml.v3 parse of the main config. Fix: take `manager hookManager` as a parameter. Saving is small (~0.1 ms + one parse) but it is the same argument as F5 and free to fix.
+
+## F7 — The same 5 hook files are read 5–9 times per Ensure
+
+Counted call sites over one native Ensure: `checkNativeHookRepairInDir` (5 reads) → `snapshotHookIntegration` (5) → `InstallGitHook`'s own `checkNativeHookRepair` (5, hooks.go:738, new in this PR) + `classifyExistingHook` (5) + `writeHookFile` (5) → final Check's `checkNativeHookRepairInDir` (5) + `inspectNativeHookIntegration` (5) — then lifecycle's second Check repeats the last two (10). ~45 `ReadFileNoFollow` calls, each ~6 syscalls (Lstat, Open, Lstat, Stat, Read, Close), for 5 small files whose contents cannot change mid-call.
+
+Individually cheap (`InstallGitHook` total is 0.23 ms), so this is a low-priority item on fast storage — but it is the term that scales badly on the slow-FS cases in #1642/#2091. Fix: read the hooks directory once into a `map[string][]byte` and thread it through the inspectors.
+
+## F8 — `entire status` now pays 22–41 ms of hook inspection unconditionally, including when Entire is disabled
+
+`status.go:382` (`buildStatusSnapshot`). Baseline `status.go` did **no** git-hook inspection at all (verified against `0138471a`). `buildStatusSnapshot` is called from both `runStatus` and `runStatusDetailed` before any `s.Enabled` guard, so `entire status` in an unrelated git repo now forks `git rev-parse` twice. Fix: gate on `s.Enabled` (the health line is only rendered for enabled repos anyway) or fold it into the memoization of F1.
+
+## F9 — Per-turn session-state churn with no "unchanged" early-out
+
+`lifecycle.go` `repairLifecycleHookHealth` calls `strategy.RecordHookHealthRecovery` on **every healthy turn** (the common case). `strategy/session_state.go` `RecordHookHealthRecovery` then unconditionally does: flock acquire → `openSessionStateRoot` (MkdirAll + OpenChild) → atomic write of the hint file → `LoadSessionState` → `SaveSessionState` (atomic write) → `openSessionStateRootForRead` → unlink. Measured **320 µs**, four root opens and two atomic writes, when `state.LastHookHealthWarning` already equals the fingerprint and the correct action is "do nothing".
+
+Fix: read `state.LastHookHealthWarning` first; return early when equal — no lock, no writes. Separately, `TransferHookHealthWarningHint` (`lifecycle.go` turn start, 147 µs) takes the session flock *before* checking whether a hint file exists; the ENOENT probe is cheap and lock-free, so invert the order. **Saving: ~0.45 ms/turn and two flock acquisitions** — small next to F1/F2, but it is pure waste on the same contended lock as the rest of turn start.
+
+## F10 — No budget on any of the new turn-start work
+
+CLAUDE.md requires agent-hook capture paths to be wall-clock bounded (`StatusWalkBudget`, `ErrStatusBudgetExceeded`, the `SessionEndBudgeter` precedent). `repairLifecycleHookHealth` inherits `logCtx` with no deadline, and the 8–13 `git rev-parse` spawns have no cap beyond `exec.CommandContext`. At 10 ms/spawn on warm APFS this is 85–180 ms; on the iCloud-evicted tree in your notes (30–40 s stalls) it can consume the whole flat 30 s hook timeout from #2115 before capture even starts. Once F1 lands the exposure drops to 1–2 spawns, which is probably the right fix — but a `context.WithTimeout` around the repair, failing open to the previous health, matches the documented pattern.
+
+## Minor / cosmetic
+
+- **`currentNativeHookContent`** (`hooks.go:536-560`): calls `buildHookSpecs(cmdPrefix)` *inside* the per-line loop, constructing all 5 hook specs (multi-line string concatenation each) to read one. Called 5× per inspection, ~45×/turn → ~225 spec constructions. µs-level; hoist the `buildHookSpecs` call above the loop or index by name.
+- **`legacyGitHookState`** (`hooks.go:438`): dead code — defined, no non-test callers.
+- **`entire enable`** runs the full Ensure 2–3× per invocation (`setup.go:1363` then `EnsureSetup` at `:1407`, plus `:345` when global flags changed) ≈ 125–190 ms. One-shot command, low priority, but the F3 threading fixes it too.
+
+## Answers to the specific questions
+
+- **#4 repo opens:** clean. No `git.PlainOpen`/`git.Open` introduced anywhere in the new files; everything routes through `worktreedir`/`gitdir`/`osroot`, and `worktreedir.OpenAt` → `osroot.Shared` is process-memoized. No `gitrepo.Status` call added. The expensive git reads here are subprocesses, not go-git.
+- **#5 closures:** `beforePublish` captures nothing of size. `fail` retains the snapshot bytes (F4) — bounded and not a real problem; the snapshot itself is.
+- **#6 non-lefthook short-circuit:** yes, it short-circuits correctly. A repo with no lefthook config never reaches yaml.v3, and the 37-name detection scan is only **49 µs** measured (the `.config/` names fail fast at the parent-root open). Do not "optimize" the detection scan — the non-lefthook penalty is entirely the git subprocesses in F1/F2.
+
+**Recommended order:** F1 (memoize the two git resolvers) → F2 (restore the already-current gate, which subsumes F4) → F3 (thread health out of Ensure). Those three take the turn-start addition from ~85 ms to roughly ~10–15 ms native, without touching any of the correctness machinery.</result>
+<usage><subagent_tokens>189682</subagent_tokens><tool_uses>41</tool_uses><duration_ms>495499</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>af6d66127ccfdf0f7</task-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-Documents---Peyton-s-MacBook-Pro-entire-devenv-entireio-cli--worktrees-origin/85f5bebd-f8cf-4a76-973f-970a5af82ccc/tasks/af6d66127ccfdf0f7.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review of PR 2343" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result># PR #2343 — Simplification review
+
+Reviewed the full diff plus whole files at PR head. Findings are ranked by estimated lines saved. Every proposal preserves edited-hook protection, rollback-on-failure, symlink safety, and ownership checks.
+
+---
+
+## Production code
+
+### 1. `strategy/lefthook_transaction.go:149–368` — the hand-rolled two-phase commit re-implements `jsonutil.WriteFileAtomicIn` — **~185 lines**
+
+`stagedLefthookFile` + `stageLefthookFile` + `deactivate` + `finishDeactivation` + `publish` + `rollbackStagedLefthookFiles` + `cleanupStagedLefthookFiles` + `publishLefthookTransaction` + `stageLefthookArtifacts` = 212 lines to write 7 small files.
+
+Two independent reasons it is more machinery than the job needs:
+
+- **`jsonutil.WriteFileAtomicIn` (write.go:85) already is `stageLefthookFile`+`publish`**: `OpenParentNoSymlinks` → `CreateTempIn` → write → `Chmod` → rename, with deferred temp cleanup. The staged type adds only per-file rollback bookkeeping.
+- **The rollback bookkeeping is redundant with the outer snapshot layer.** `installLefthookFilesAt` runs only from `EnsureGitHookIntegration` (`hook_integration_transaction.go:175`), which has already snapshotted all 17 relevant paths at :131 and restores every one on any failure via `fail(...)`. So there are two nested rollback mechanisms for the same files; the inner one never gets to do anything the outer one wouldn't.
+- **`deactivate`/`finishDeactivation` buys nothing.** Its purpose is "lefthook must not see a config referencing scripts mid-write". Write order gives that for free: scripts first (each an atomic rename), config last. A concurrent hook run then sees either the old script or the new one — both valid — and never a config pointing at a missing file.
+
+**Simpler form:** a `[]lefthookWrite{root, name, data, mode, counted}` built in order (scripts → `info/exclude` → config last), each applied with `jsonutil.WriteFileAtomicIn`, keeping the existing unchanged-content skip for the `written` count. ~30 lines replacing 212, plus ~15 lines of plumbing dropped from `installLefthookFilesAt:85–105`.
+
+### 2. `strategy/session_state.go:347–587` + `lifecycle.go` — the warning claim protocol has two stores where one does the job — **~125 lines**
+
+8 new exported functions / 241 lines to show a dedup'd one-line warning. The cost is the **dual store**: a `&lt;session&gt;.hook-health` hint file *and* `SessionState.LastHookHealthWarning`, which forces `TransferHookHealthWarningHint` (30 lines), a hint-then-state branch in every one of `ClaimHookHealthWarning` / `RollbackHookHealthWarningClaim` / `RecordHookHealthRecovery`, a write-ahead ordering comment, and the `hookHealthWarningRetryFingerprint = ["","","","retry"]` sentinel that exists *only* because durable state may already hold the fingerprint being rolled back.
+
+The hint file works before SessionState exists and after it exists, is per-session, gated by the same `acquireSessionGate`, and is the only store any of these functions actually needs.
+
+**Simpler form:** single store = the hint file.
+- `StoreHookHealthWarningHint` and `RecordHookHealthRecovery` become the same function (write fingerprint under gate) — merge them.
+- `ClaimHookHealthWarning` becomes read-hint / compare / write (~20 lines, no state branch).
+- `RollbackHookHealthWarningClaim` becomes "delete the hint if it still equals ours" — 3 lines instead of the sentinel + dual-store dance (keep the bounded cleanup context, that part is justified).
+- `TransferHookHealthWarningHint` and the `LastHookHealthWarning` field disappear entirely, along with the lifecycle call at `lifecycle.go:832`.
+- `lifecycleHookHealthFingerprint` (`lifecycle.go:148`): `json.Marshal([4]string{...})` for a dedup key → `strings.Join(..., "\x00")`, which removes the error branch *and* the reason `validHookHealthWarningFingerprint` must parse JSON and count 4 fields.
+
+Guarantee preserved: exactly one warning per fingerprint change, atomically elected under the gate, retried if stdout failed.
+
+### 3. `strategy/hook_integration_transaction.go:285–396` — 85 of the 112 lines are a whitelist of lefthook's *own* generated body — **~87 lines**
+
+`looksLikeLefthookHook` already establishes everything the two callers need in its first 25 lines: the `LEFTHOOK_VERBOSE` / `LEFTHOOK=0` / `call_lefthook()` preamble plus the `call_lefthook run "&lt;hook&gt;" "$@"` suffix. No hand-written hook has that shape, so the structural match *is* the "this file is lefthook's generated wrapper for hook X, not a user file" proof — the same role an ownership marker plays elsewhere.
+
+`knownLefthookV2Body` (78 lines) then exact-matches the *body* — lefthook's installed-binary branch, the whole `node_modules` / `go tool` / `bundle` / `yarn` / `pnpm` / `mint` / `uv` / `mise` / `devbox` probe chain. That body is the part lefthook regenerates and varies by lefthook version and install method, so pinning it means the next lefthook release makes the check silently return `false` — falling back to native, or refusing to restore a valid bridge — with no error and no test that would notice.
+
+`knownDirectEntireLefthookBody` (5 lines) is worse in kind than in size: its `e2eLauncher` string is byte-matched against a fixture written by `e2e/tests/lefthook_durable_test.go:104–105`. Production code carrying a test's shell fixture.
+
+**Simpler form:** keep the prefix/suffix structural match, delete both body whitelists. If per-version paranoia is still wanted, bound it with a cheap invariant (body under N lines and containing no `hooks git` invocation) rather than a version-pinned transcript. Callers and the three existing `looksLikeLefthookHook` tests are unaffected.
+
+### 4. Eight near-identical `yaml.Node` mapping traversals across three files — **~60 lines**
+
+Every one is `for i := 0; i+1 &lt; len(parent.Content); i += 2 { if parent.Content[i].Value == key … }`:
+
+| function | file:line |
+|---|---|
+| `mappingValueCount` | `lefthook_detection.go:156` |
+| `ensureMappingValue` | `lefthook_yaml.go:53` |
+| `setOwnedLefthookSourceDir` | `lefthook_yaml.go:79` |
+| `setOwnedLefthookScript` | `lefthook_yaml.go:112` |
+| `removeOwnedMappingEntry` | `lefthook_yaml.go:200` |
+| `findLefthookScriptEntry` (inner) | `lefthook_artifacts.go:143` |
+| `mappingValue` | `lefthook_artifacts.go:158` |
+| `mappingKey` | `lefthook_artifacts.go:167` |
+
+`mappingValue` and `mappingKey` are pure duplicates of `mappingValueCount` differing only in which half of the pair they return — and `hasOwnedLefthookConfigEntries:107–111` calls `mappingValueCount` and then `mappingKey` for *the same key* back to back, which is the tell.
+
+**Simpler form:** one primitive `mappingIndex(parent *yaml.Node, key string) (int, error)` (index of the key node, `-1` for absent, error on duplicate). `mappingValue`/`mappingKey` are deleted (call sites use `Content[i]`/`Content[i+1]`); the other six shrink to ~8–18 lines each. 150 lines → ~90.
+
+Answering the brief's question directly: **plain struct unmarshalling cannot replace this.** Ownership is carried in YAML *comments* (`lefthookNodeOwned` reads Head/Line/Foot comments), which only `yaml.Node` exposes, and the write path must preserve unrelated user content. Node-level work is required; the eight copies of the traversal are not. Related: `findLefthookScriptEntry`'s `(*yaml.Node, bool, bool, error)` signature (value, owned, found, err) is better as `(*lefthookScriptEntry, error)` with `nil` meaning absent — removes a boolean at 3 call sites.
+
+### 5. `strategy/hook_integration.go` — 13 `GitHookIntegrationHealth` literals collapse to 3 constructors + an early return — **~45 lines**
+
+Confirmed count: 13 struct literals in 242 lines. The reason-code branching does collapse:
+
+- **Three sites are the same "degraded if native still works, else error" shape**: `hook_manager_ambiguous` / `hook_manager_ambiguous_no_native` (:83–96), `unsupportedLefthookLayoutHealth` (:198–215), `lefthook_native_bridge` / `lefthook_artifacts_outdated` (:150–166). Each does `inspectNativeHookIntegration` → `if nativeErr == nil &amp;&amp; nativeState == GitHooksCurrent` → Degraded literal, else the other literal. → one `degradedIfNativeWorks(ctx, repoRoot, mode, manager, degradedCode, degradedReason, fallback)`; `unsupportedLefthookLayoutHealth` disappears as a function.
+- **Three error constructors are one**: `lefthookInspectionError`, `nativeHookInspectionError`, and the inline `hook_manager_detection_error` literal (:70–76) differ only in mode/manager/code → `inspectionError(mode, manager, code, err)`.
+- **Nesting**: `if selected { …58 lines… }` at :110–167 wraps 37 lines indented three levels or more, with the native path unindented below it. Flip to `if !selected { return nativeIntegrationHealth(ctx, repoRoot) }` and move the trailing `switch nativeState` (:174–195) into that helper — the whole `default`-plus-`GitHooksAbsent` unreachable-state literal at :195 goes with it.
+
+### 6. `strategy/lefthook_detection.go:33–86` duplicates the manager table in `hook_managers.go:33–60` — **~25 lines**
+
+`detectHookManagersForIntegration` re-lists Husky / pre-commit / Overcommit / hk (with the `hk` loop unrolled into four hand-written entries at :43–45) plus the same `append(append([]string{}, lefthookMainConfigNames...), lefthookLocalConfigNames...)` join. The two detectors differ only in dedup policy and lstat strictness, not in *what* they look for — so the table drifting is a live hazard.
+
+**Simpler form:** one `hookManagerChecks()` returning the shared table; `detectHookManagers` and `detectHookManagersForIntegration` both consume it. Also the two `&amp;hookManagerDetectionError{manager: hookManager{Name: lefthookManagerName, ConfigPath: name, OverwritesHooks: true, IntegrationKind: …}, err: …}` literals at :73 and :76 are identical except for the wrapped error → one `lefthookDetectionError(name string, err error)`.
+
+### 7. `strategy/hook_integration_transaction.go:479–545` — `AnyGitHookIntegrationInstalled` and `verifyGitHookIntegrationRemoved` are the same walk twice — **~22 lines**
+
+Both walk (a) `lefthook-local.yml` → `hasOwnedLefthookConfigEntries`, (b) each `lefthookScriptPath(hook)` → `lefthookScriptOwned`, differing only in returning `bool` vs `error` (verify additionally checks native markers). 66 lines.
+
+**Simpler form:** one `ownedLefthookArtifactPresent(root *os.Root) (string, error)` returning the first owned artifact's name (empty = none). `Any…` is `name != "" || AnyGitHookInstalled(ctx)`; verify is `if name != "" { return fmt.Errorf("owned artifact %s remains", name) }` plus its native loop.
+
+### 8. `strategy/lefthook_transaction.go:107–147` — `cleanupLefthookDirs(root, created)` pasted into 5 error branches — **~20 lines**
+
+Six `switch`/`if` arms each repeat the cleanup call before returning, and the `Lstat` → classify → `MkdirAllNoSymlink` sequence for the worktree dirs is then written out a second time verbatim for `info` (:130–145).
+
+**Simpler form:** `func ensureRealDir(root *os.Root, dir string) (created bool, err error)` holding the lstat/classify/mkdir logic, called in a loop for the lefthook dirs and once for `info`; wrap the whole function in named returns with a single `defer func(){ if err != nil { cleanupLefthookDirs(root, created) } }()`.
+
+### 9. `strategy/lefthook_transaction.go:31–44` — `installLefthookFilesAt` re-runs the detection its only caller just ran — **~17 lines**
+
+`EnsureGitHookIntegration:120–157` does `detectHookManagersForIntegration` → `selectLefthookIntegrationManager` → `validateLefthookMainConfig`, then calls `installLefthookFilesAt`, which does all three again (parsing the YAML config a third time, plus a fresh 5-hook lstat sweep of `source_dir`).
+
+**Simpler form:** pass the already-selected `manager` in. Same for `restoreProvenLefthookBridges` (:245), which re-derives `repoRoot` via `paths.WorktreeRoot` and `cmdPrefix` via `hookCmdPrefix` when the caller has both — 8 lines and one redundant failure mode. Related: `checkNativeHookRepairInDir` runs at `hook_integration_transaction.go:128` and `InstallGitHook` now calls `checkNativeHookRepair` again at `hooks.go:738` — the second is redundant on the Ensure path (keep it, since `InstallGitHook` has other callers, but drop the one at :128).
+
+### 10. `strategy/hook_integration_transaction.go:45–111` — `openEffectiveHooksRoot` duplicates its own anchoring logic — **~15 lines**
+
+The anchors slice is declared with `path` only and then has `.root` back-filled by two separate error-checked assignments (:54–68); the `Rel` + `IsLocal` + `validateEffectiveHooksRoot` sequence is then written once inside the loop (:78–81) and again for the filesystem-root fallback (:92–96).
+
+**Simpler form:** build the anchor list after opening each root, append the volume root as a third entry, and keep one `Rel`/`IsLocal`/`validate` block inside the single loop. One `validateEffectiveHooksRoot` call site instead of two.
+
+### 11. `strategy/hooks.go:438–449` — `legacyGitHookState` is dead in production — **12 lines (+22 test)**
+
+Defined, never called outside `hook_integration_test.go:384`. The test exists only to cover the unused function.
+
+### 12. `strategy/hook_integration_transaction.go` — inverted `readOptionalRegular` idiom ×6 — **~15 lines**
+
+`if data, _, err := readOptionalRegular(...); err == nil &amp;&amp; data != nil { … } else if err != nil { return fmt.Errorf(...) }` appears at :511, :523, :536, :553, :599 and in `AnyGitHookIntegrationInstalled`. `readOptionalRegular` already returns `(nil, nil, nil)` for a missing file, so the natural shape is `data, _, err := …; if err != nil { return … }; if data == nil { continue }` — 3 lines instead of 6, and it reads forward.
+
+### 13. `lifecycle.go:679–734` — `emitPreparedTurnStartOutput` has four exit shapes with duplicated writes — **~15 lines**
+
+Two `os.Stdout.Write` sites and two `writer.WriteHookResponse` sites, gated by a `len(payload) &gt; 0 &amp;&amp; warning != ""` block that returns from inside itself. Restructure to one decision then one write: `if len(payload) == 0 { warnOnly() }`; `if standalone &amp;&amp; warning != "" { … }`; else `payload = mergeIfWarning(payload, warning)` and a single `os.Stdout.Write`. Also `emitTurnStartOutput` (:674) is a 3-line wrapper used once — inline it, or if the split exists for tests, say so in the comment rather than "callers can roll back a claim".
+
+### 14. `status.go:404–418` — `checkpointSyncState`'s `switch` has both an exhaustive case list and a `default` — **8 lines**
+
+`Outdated|Absent|Error → blocked` and `default → blocked` are the same answer. `if syncErr != "" { return blocked }; if hookState == Current { return ready }; if hookState == Degraded { return degraded }; return blocked` — 4 lines.
+
+### 15. `strategy/lefthook_detection.go:228–235` — `containsString` reimplements `slices.Contains` — **8 lines**
+
+Go 1.26; `slices.Contains` is already used elsewhere in the tree.
+
+### 16. `status.go:712–715` — `writeActiveSessions` is a production wrapper kept for tests
+
+Its own comment says so ("retains the direct rendering seam used by focused tests"), and 10+ `status_test.go` sites call it. Not worth deleting (that would churn the tests), but the honest form is a `_test.go`-local shim or renaming it `renderStatusSessions` and having production use it too — right now production calls `writeActiveSessionsSnapshot` and only tests call the wrapper. Noting rather than costing lines.
+
+*Out of scope but worth a look before merge:* `collectStatusSessions` (`status.go:392`) switched to `store.ListReadOnly` and dropped the `finalizeExitedSessions` sweep that both the text and `--json` paths previously ran (`status.go:-560`, `-960`). That's a behaviour removal, not a simplification — flagging only because it rides inside a refactor that otherwise reads as pure cleanup.
+
+**Production subtotal: ~660 lines** (of ~2,800 new production lines).
+
+---
+
+## Tests
+
+Delegated a full pass over the 1,765 new test lines. Top items:
+
+| Finding | Lines |
+|---|---|
+| `strategy/hook_integration_test.go` — 24 copies of the `TempDir`/`InitRepo`/`clearGlobalHooksPath`/`WriteFile(lefthook.yml)`/`Chdir` preamble → one `newHookRepo(t, opts…)` | 85 |
+| `hook_integration_test.go:796–918` — 4 symlink-rejection tests with identical bodies → 1 table, 5 cases | 70 |
+| before/after read+stat snapshots hand-rolled in 3 files → `testutil.SnapshotFiles` / `RequireFilesUnchanged` | 50 |
+| `hook_integration_test.go` — 7 read-and-compare blocks → the in-package `assertFileBytes` | 40 |
+| `hook_integration_test.go:16–184` — two tables over `CheckGitHookIntegration` → one | 40 |
+| `hook_integration_test.go` — 3 "degenerate hook is not current" tests → 1 table | 35 |
+| the lefthook wrapper shell fixture written 4× (`realLefthookWrapper`, `statusLefthookWrapper` byte-identical, `installSimulatedLefthookHooks`, `simulatedLefthookLauncher`) → `testutil.LefthookWrapper(hook, body)` | 35 |
+| `status_test.go` ↔ `integration_test/status_health_test.go` — 3 unit/integration pairs re-asserting the same text; keep both levels, make the integration copies JSON-contract-only + share fixture builders | 35 |
+| `lifecycle_test.go:487–750` — 6× health literal, 4× ops literal → 2 helpers | 30 |
+| `hook_integration_test.go:437–509` — restore/don't-restore pair → 1 table | 28 |
+| `lefthook_integration_test.go:138–288` — reuse `newLefthookTestRepo`, collapse 2 `Rejects…` tests | 28 |
+| concurrent-single-winner scaffolding written twice (`session_state_test.go:132`, `lifecycle_test.go:674`) → `testutil.RaceCount` | 25 |
+| smaller: `session_state_test.go` preamble (12), `integration_test` raw `exec` where `testutil.RunGit`/`RunCLIIn` exist (10), `hook_repair_test.go`'s `hookRepairRepo` as a 5th repo builder (8), 2 sites bypassing `installStatusGitHooks` (4) | 34 |
+
+**The sharpest point is intra-PR:** this PR *adds* `newLefthookTestRepo`, `assertFileBytes`, `snapshotTestFiles` (`lefthook_integration_security_test.go:322/335/351`) and `installStatusGitHooks` (`status_test.go:2307`) — and then its own sibling files **in the same package** hand-roll all four. `hook_integration_test.go:97–111` even defines the repo builder a third time as a test-local closure. Also `integration_test/hook_repair_test.go:29–37` re-implements the hook-with-stdout runner that `integration_test/hooks.go:513` already provides, and `e2e/tests/lefthook_durable_test.go:49` hard-codes the hook-name list that `strategy.ManagedGitHookNames()` exports.
+
+**Test subtotal: ~535 lines** with no coverage loss (+30 optional).
+
+---
+
+## Total
+
+**~1,195 lines** — ~660 production, ~535 test — out of +6,807. The two structural conclusions behind the largest items:
+
+1. **There are two rollback mechanisms nested inside each other.** The snapshot/restore layer (74 lines, covers a superset: native hooks and their backups too) is the one that actually fires; `lefthook_transaction.go`'s 212-line staging state machine is a second, narrower one that never gets to act, re-implementing `jsonutil.WriteFileAtomicIn` in the process. Keep the snapshot layer, delete the staging machine, order the writes.
+2. **The warning-dedup subsystem stores the same fingerprint in two places.** Every awkward piece — the transfer step, the write-ahead ordering, the `["","","","retry"]` sentinel, three functions' dual branches — exists to reconcile the hint file with `SessionState.LastHookHealthWarning`. Drop the field; the hint file already satisfies both the pre-state and post-state cases under the same gate.</result>
+<usage><subagent_tokens>194355</subagent_tokens><tool_uses>35</tool_uses><duration_ms>566112</duration_ms></usage>
+</task-notification>

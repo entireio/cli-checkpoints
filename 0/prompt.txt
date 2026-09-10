@@ -1,0 +1,139 @@
+ok, I do have a session called windows which has this branch pulled and droid installed. Test it there
+
+---
+
+<cross-session-message from="bridge:session_01CpC34jRMEhTpsikHyAoGYC" from-name="windows" from-mode="prompting">
+Fix VERIFIED on real Windows. Step 1 passed exactly as you predicted; Step 2 impossible (both API keys unset); found one regression the fix left behind — 3 pre-existing droid unit tests now fail on Windows.
+
+STEP 0 — ENVIRONMENT
+droid 0.215.1 (so the version installed here is your %ComSpec% /d /s /c + windowsVerbatimArguments case)
+go1.26.6 windows/arm64 — note ARM64
+mise installed (scoop shim)
+git log -1: ec586d9e5 factoryai-droid: install the cmd.exe hook wrappers on Windows
+FACTORY_API_KEY: unset. ANTHROPIC_API_KEY: unset.
+
+Also relevant to your gating argument: `sh` IS on PATH here (Git Bash, scoop). So this box is exactly the host you designed HookHostIsWindows for — UseWindowsProductionHooks' `sh -c 'exit 0'` probe would have succeeded and kept the broken sh wrapper. Your choice not to gate on the probe is empirically justified on this machine.
+
+STEP 1 — ALL AS PREDICTED
+Built the branch, put it first on PATH (needed: three other entire.exe shadow it here, tools2 wins by machine PATH). Version string confirms ec586d9e5. Scratch repo + one empty commit + `entire enable --agent factoryai-droid` → "Installed 8 hooks".
+
+.factory/settings.json: all 8 entries are cmd.exe forms, zero `sh -c '`. The fix took. Seven are `cmd.exe /d /s /c "where.exe entire >nul 2>nul & if errorlevel 1 (ver>nul) else (entire hooks ... )"`; the Stop entry is the bare (unprefixed) cmd form with the plain-text warning, as expected from its different wrapper shape.
+
+(a) sh -c wrapper at a cmd command line, cwd=scratch repo:
+    exit code 0, stderr "The system cannot find the path specified." (cmd trying to redirect to a file named /dev/null), and NO .entire\logs DIRECTORY CREATED AT ALL. entire never executed. That is the CI signature reproduced precisely — including the silent exit 0, which is why droid never reported anything wrong.
+
+(b) native cmd.exe wrapper, same cwd:
+    reached entire. Bare, it exits 1 with "failed to parse hook event: empty hook input" — i.e. it got all the way into hook dispatch and only lacked the stdin payload the real agent supplies. Fed a plausible payload ({"session_id":...,"transcript_path":...}) it exits 0, prints the context injection, and logs:
+      "msg":"session-start","component":"lifecycle","agent":"factoryai-droid","event":"SessionStart","session_id":"win-verify-b"
+    So (a) → nothing, (b) → a real session-start. Exactly your expectation.
+
+EXTRA CHECK YOUR PLAN DIDN'T COVER — DOUBLE WRAPPING
+Your Step 1(b) tests the stored string as a top-level command line, but droid hands that string to a shell, so the stored `cmd.exe /d /s /c "..."` gets nested inside droid's own `%ComSpec% /d /s /c`. I tested that, because if nesting broke, Step 1 would have looked fine and the e2e would still fail.
+
+I could not test this through a .bat (the batch parser plus a `<` redirection on the same line produced a spurious `"" was unexpected at this time.` — disregard that if I'd reported it; it was my harness, not your code). I wrote a small Go spawner that sets SysProcAttr.CmdLine directly, reading the command line from a file so no shell requotes it — a byte-exact model of node's windowsVerbatimArguments. Both plausible compositions WORK, session-start logged for each:
+  cmd.exe /d /s /c cmd.exe /d /s /c "where.exe entire >nul ..."   (0.215.1, args joined bare)  → exit 0, logged
+  cmd.exe /d /s /c "cmd.exe /d /s /c "where.exe entire >nul ..."" (0.178.0, node shell: wraps) → exit 0, logged
+cmd's /s "strip first and last quote" rule handles the nesting in both directions. So the fix is robust across the composition change between 0.178.0 and 0.215.1.
+
+STEP 2 — CANNOT RUN
+Both FACTORY_API_KEY and ANTHROPIC_API_KEY are unset in this session's environment, so `mise run test:e2e --agent factoryai-droid TestMultiSessionSequential` cannot make its calls. I did not attempt it and did not go looking for credentials elsewhere — that's the user's to supply. Everything above is free/no-API.
+
+THE ONE PROBLEM — A REGRESSION YOUR COMMIT INTRODUCED
+Running the full package suite on Windows, three PRE-EXISTING droid tests now fail on real assertions because they hardcode the OS-unaware wrapper while the implementation now installs cmd forms:
+  TestInstallHooks_FreshInstall                  (8 assertions, all "X was not found", each quoting the sh -c command)
+  TestInstallHooks_PreservesUserHooksOnSameType  (subtest PostToolUse; hooks_test.go:346/356/357/367)
+  TestInstallHooks_ReplacesLegacyLocalDevHook    (hooks_test.go:112 "could not find the installed command ... to seed the legacy hook")
+They call agentpkg.WrapProductionSilentHookCommand / WrapProductionPlainTextWarningHookCommand — the unconditional sh variants.
+
+I verified this is genuinely yours and not the platform: I checked out main in a worktree and ran the same tests on this same box. On main every TestInstallHooks_* failure is "TempDir RemoveAll cleanup: ... being used by another process" with ZERO assertion failures. On your branch those three have real assertion failures. (For the avoidance of doubt: all the other FAILs I saw across ./cmd/entire/cli/agent/... — including the whole pi package and a pi absolute-path test — are pre-existing Windows harness artifacts, unrelated to you.)
+
+Severity is moderate, not release-blocking, because CI will NOT catch it: ci.yml's windows-latest job runs `go test ./cmd/entire/cli/... -run '(Windows|MSYS)'`, and none of those three names match. Your two new tests DO match, and I confirmed the exact CI filter is green on both packages:
+  go test ./cmd/entire/cli/agent ./cmd/entire/cli/agent/factoryaidroid -run '(Windows|MSYS)' -count=1  → ok, ok
+So CI stays green, your new tests do run on the Windows runner as your commit message intends, but anyone running the full suite on Windows (your user, on this box) sees 3 red droid tests.
+
+Fix shape, using what you already added: those three assertions want the ForOS selectors keyed on the host, e.g. WrapProductionSilentHookCommandForOS(cmd, agentpkg.HookHostIsWindows()) and WrapProductionPlainTextWarningHookCommandForOS(cmd, agentpkg.WarningFormatSingleLine, agentpkg.HookHostIsWindows()) — or better, pin both shapes deterministically with SetWindowsHookProbeForTesting(goos, probe) so the tests stop depending on the runtime OS at all. No droid test currently uses either the ForOS variants or that seam. ReplacesLegacyLocalDevHook needs the same treatment at its seeding step, which looks up the installed command before rewriting it.
+
+For your triage question — "fix did not work" vs "second Windows defect behind the first": on the free evidence, the hook-delivery defect is fixed. The wrapper reaches entire and produces a real lifecycle event under both of droid's shell compositions. I have not exercised commit→checkpoint end-to-end (that needs the paid test or a synthetic droid transcript), so I can't rule out a further defect downstream of hook delivery; I can rule out the hook-delivery cause you diagnosed.
+
+Nothing committed, nothing pushed, repo clean, temp worktree removed. All artifacts are in my scratchpad. Tell me if you want the synthetic full-lifecycle run (session-start → user-prompt-submit → stop → commit, with a fabricated droid transcript) — that would close the checkpoint question without spending API budget, and I can do it on request.
+</cross-session-message>
+
+---
+
+<cross-session-message from="bridge:session_01CpC34jRMEhTpsikHyAoGYC" from-name="windows" from-mode="prompting">
+Synthetic lifecycle: CHECKPOINT APPEARS — outcome 1, hook delivery was the only defect. But your test fix is NOT on this box, so I could not re-verify the regression; please send the diff.
+
+RE-RUN OF THE DROID PACKAGE — BLOCKED, NEED THE DIFF
+I fetched origin. origin/fix-droid-ai-windows-test is still ec586d9e5, my worktree is clean at ec586d9e5, and `grep droidHookCommand\|droidStopHookCommand cmd/entire/cli/agent/factoryaidroid/hooks_test.go` finds nothing. Your signing is wedged, so nothing arrived. For the record, at HEAD your exact command still gives:
+  go test ./cmd/entire/cli/agent/factoryaidroid ./cmd/entire/cli/agent -count=1  → 13 assertion failures at hooks_test.go:NN
+That is the unfixed baseline, not a verdict on your fix.
+
+Yes, send me the diff — it is test-only and confined to hooks_test.go, so paste it and I will apply it in a throwaway git worktree (NOT my user's working tree, which stays clean) and report the assertion count. I agree with your reasoning for keying to the host rather than pinning the seam: pinning would have made those three assert a shape that is never installed on Windows, which is worse than what they did before. And keeping the two routing tests naming the wrapper outright is right — routing them through the selector under test would make them tautological.
+
+SYNTHETIC LIFECYCLE — OUTCOME 1, CHECKPOINT APPEARS
+Ran it twice. Fresh scratch repo, `git init`, initial commit, `entire enable --agent factoryai-droid`, hooks fired in order with fabricated payloads, real `git commit`.
+
+Fidelity choices, so you can judge the weight of the result:
+- Hooks fired through the commands entire actually wrote into .factory/settings.json, read back verbatim via ConvertFrom-Json (quotes intact) and prefixed with `cmd.exe /d /s /c` — i.e. droid 0.215.1's real double-wrapped composition, spawned with my byte-exact CmdLine spawner. Run 1 accidentally lost the outer quotes in my extraction; run 2 is the faithful one and both landed a checkpoint.
+- Transcript in droid's own envelope shape from transcript.go — {"type":"message","id":...,"message":{"role":...,"content":[...],"usage":{...}}} — plus a leading {"type":"session_start"} line to exercise the non-message skip path. Payload fields from types.go: sessionInfoRaw, userPromptSubmitRaw (prompt+model), stopRaw.
+- Transcript placed at ~/.factory/sessions/<project>/<sid>.jsonl via the real ENTIRE_TEST_DROID_PROJECT_DIR seam, matching ResolveSessionFile.
+- Transcript grew mid-turn (2 lines at session-start, 4 by stop), as droid's would.
+
+Run 2 result — HEAD 6a84520 carries `Entire-Checkpoint: 01M238D0PXJAKPCAK74KS2DQBR`, and explain shows:
+  session synthetic-lifecycle-2 · tokens 6.3k
+  Intent: "Add a greeting file and a version file"
+  Files (2): greeting.txt, version.txt
+  Transcript: [User] ... [Tool] Create: greeting.txt / [Tool] Write: version.txt / [Assistant] Added both files.
+`entire session list` after session-end: "ended · tokens 6.3k · checkpoint 01M238D0PXJAKPCAK74KS2DQBR".
+
+So every stage downstream of hook delivery works on Windows: session creation, prompt attribution as Intent, model capture, token accounting (6.3k matches the usage blocks including cache reads), ExtractModifiedFiles pulling both file paths out of the tool_use blocks, condensation on commit, trailer, and finalize on session-end.
+
+The log contrast with your CI artifact is the cleanest evidence:
+  entire.log here: session-start, turn-start, turn-end, session-end (component=lifecycle) AND "prepare-commit-msg: trailer added"
+  CI artifact:     git hooks only, AND "prepare-commit-msg: no active sessions"
+Same message, opposite value, and the four lifecycle events that were entirely absent are now present.
+
+HOW MUCH THIS DOES AND DOESN'T PROVE
+It proves entire's side end-to-end on a real Windows ARM64 host: given hook payloads and a transcript of the shapes the droid package parses, a commit produces a correct checkpoint. It does not prove real droid emits exactly those bytes — my payloads are faithful to types.go and transcript.go, not to a captured droid session, so a field real droid sends differently would not show up here. I did not exercise PreToolUse/PostToolUse[Task], so the subagent path is untested. I'd call the "second defect downstream" hypothesis unsupported rather than excluded; combined with the non-Windows e2e passing and hook delivery being the only OS-divergent step, I think outcome 1 is the right read, but the paid test is still what closes it.
+
+Nothing committed, nothing pushed, my user's tree clean. Send the hooks_test.go diff whenever your user unwedges signing — or paste it and I will worktree-apply it now.
+</cross-session-message>
+
+---
+
+<cross-session-message from="bridge:session_01CpC34jRMEhTpsikHyAoGYC" from-name="windows" from-mode="prompting">
+Patch verified on real Windows: 13 assertion failures → 0, CI filter still green. One correction to my earlier method, and one thing you should know before you push.
+
+APPLYING IT
+Diff arrived intact — tabs survived transit (57 leading-tab lines), `git apply --check` silent, applied clean in a throwaway worktree at ec586d9e5. `go vet ./cmd/entire/cli/agent/factoryaidroid` clean.
+
+RESULT — your exact command
+  go test ./cmd/entire/cli/agent/factoryaidroid ./cmd/entire/cli/agent -count=1
+  assertion failures: 0   (was 13 at the same commit unpatched)
+I categorised every failure-detail line in the run rather than eyeballing it: all 35 are `TempDix RemoveAll cleanup: ... being used by another process` — sorry, `TempDir` — and zero are assertions. 32 top-level `--- FAIL`, all from that cleanup. Re-ran twice more: 0 assertions, 35 cleanup, both times. Stable.
+
+CI filter, patched worktree:
+  go test ./cmd/entire/cli/agent/factoryaidroid ./cmd/entire/cli/agent -count=1 -run '(Windows|MSYS)'
+  ok  factoryaidroid  0.263s
+  ok  agent           0.539s
+
+A CORRECTION TO HOW I ESTABLISHED THE REGRESSION
+My original "it's yours, not the platform" claim leaned on comparing your branch against local `main` on this box. That comparison was weaker than I presented it: local main here is **335 commits behind origin/main**, and your branch is 333 commits ahead of it. So branch-vs-main conflated your commit with ~332 others. Concretely, when I diffed the failing-test sets, twelve tests fail on the branch but not on main — TestOpenHookConfig_Vouched*, TestHookConfigFile_RemoveDir*, TestInstallHooks_*DenyRule — and those trace to other commits in that range (0c35f7606 "key the vouched-symlink policy by a canonical worktree path" accounts for the vouched ones), not to you. Three fail on main but not the branch. So the 23-vs-35 cleanup counts are not comparable and I won't offer them as evidence.
+
+The conclusion is unchanged and now rests on something better: a same-commit before/after. At ec586d9e5 unpatched, 13 assertion failures; at ec586d9e5 with only your test-only patch, 0. Nothing else varies. That is cleaner than the main comparison ever was, and it also independently confirms the failures were your test/impl mismatch rather than anything in those 332 commits. The mechanism was never in doubt either — the assertions quoted the `sh -c` form against a cmd install.
+
+BEFORE YOU PUSH
+Your branch is 3 commits BEHIND origin/main (271beb11e) and 1 ahead. So it needs a rebase or merge before it lands, and whoever reviews should not use this box's local `main` as a baseline for anything — it is 335 behind. Worth checking whether the three commits you're behind touch hook_command.go or the droid package; I didn't look, since that's your side and unpushed.
+
+On the helpers themselves: the doc comment is right about why, and the "tests that assert WHICH form is chosen do not use this" note is the part that stops someone later routing the two Windows tests through the same selector and quietly making them tautological. Good.
+
+Everything cleaned up: both throwaway worktrees removed, `git worktree list` shows only my user's checkout, tree unmodified, nothing committed, nothing pushed. Still no paid e2e — keys remain unset and that stays your user's call.
+</cross-session-message>
+
+---
+
+what was broken ?
+
+---
+
+great, now main has a nightly e2e run that excludes droid becuase it was failing, can you pull latest main changes here and validate your fix by enabling droid test on that workflow ?

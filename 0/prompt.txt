@@ -1,0 +1,199 @@
+/simplify
+
+---
+
+<task-notification>
+<task-id>ab874082972b24ce0</task-id>
+<tool-use-id>toolu_01ACjrbGerhbZstbMU36omq3</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-green-forest-f25b/277870d8-d0d4-4ee2-bc38-c1cb50432614/tasks/ab874082972b24ce0.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Read the diff and both files, plus the neighbouring `checkHookDrift` / `checkRetiredDenyRule` for comment calibration and `agent/registry.go` for `List()`'s contract.
+
+## Findings
+
+**1. `cmd/entire/cli/explain_summary_provider.go:295-310` — `summaryCapableProviderNames` re-derives a loop that already exists twice.**
+It is `listEnabledSummaryProviders` (same file, 225-247) minus the `isSummaryProviderAvailable` filter and with a different return type: same `listRegisteredAgents()` walk, same `getSummaryAgent` + `continue` on error, same `AsTextGenerator` + `continue`. `checkSummaryProvider` (doctor.go:1375-1382) then spells the same two-step lookup a third time. Cost: three copies of "resolve a name to an agent and ask whether it can generate text" to keep in step; a change to the capability predicate (e.g. an agent that reports capability but refuses at runtime) has to be found in three places.
+Simpler form: one helper next to `isSummaryProviderAvailable` —
+```go
+func summaryCapableAgent(name types.AgentName) (agent.Agent, bool) {
+	ag, err := getSummaryAgent(name)
+	if err != nil {
+		return nil, false
+	}
+	_, ok := agent.AsTextGenerator(ag)
+	return ag, ok
+}
+```
+Both loop bodies collapse to `if _, ok := summaryCapableAgent(name); !ok { continue }`. (Note doctor's use must stay two guards, because unregistered → silent and incapable → report; it can still use the helper for the second half.)
+
+**2. `explain_summary_provider.go:333-337`, `doctor.go:1389-1391`, `explain_summary_provider_test.go:1360-1371` — the empty-capable-set defence is dead, in two places, and one test exists only to reach it.**
+The comment at 329-332 concedes it "is not a shape the shipped CLI has"; `cli` links every built-in agent, so `summaryCapableProviderNames()` is never empty in production. doctor's `if capable := …; len(capable) &gt; 0` is worse — its false branch is unreachable in tests too, because `runCheckSummaryProvider` always stubs `codex` as capable. Cost: two branches nothing can execute, a test whose only subject is the branch written to satisfy it, and 4 comment lines + 3 test comment lines explaining the arrangement (~25 lines total for a state that cannot occur).
+Simpler form: single-return `unsupportedSummaryProviderError`, unconditional `Fix:` line in doctor, delete `TestUnsupportedSummaryProviderError_DegradesWithNoCapableProviders` and the closing comment paragraph. If you would rather keep the guard, the paragraph should shrink to one clause ("empty only with a stubbed registry") — the current four lines are the part that costs.
+
+**3. `explain_summary_provider.go:308` — `sort.Strings(names)` is redundant, and it is the sole reason for the new `sort` import.**
+`listRegisteredAgents` is `agent.List`, which ends in `slices.Sort(names)` (`cmd/entire/cli/agent/registry.go:54`); the loop appends in that order, so the result is already sorted. Cost: an import and a claim ("Sorted for a stable message.", line 289) that reads as if order were unhandled upstream. Simpler form: drop the call, the import, and that sentence. The guard test's `slices.Equal` against a sorted `want` passes either way.
+
+**4. `explain_summary_provider_test.go:1389-1394` — the opencode/factoryai-droid loop asserts nothing the line above it hasn't.**
+`slices.Equal(got, want)` at 1383 already fixes the set exactly; if it holds, neither name can be present. Cost: 6 lines and a second failure message for one condition, so a future edit to `want` has to be mirrored here to stay meaningful. Simpler form: delete the loop; if the intent is documentary, one comment line on `want` ("opencode and factoryai-droid are deliberately absent") carries it.
+
+**5. `explain_summary_provider_test.go:1353-1357` — `strings.Count(got, "opencode") != 1` duplicates coverage and is brittle.**
+That the filter excludes non-capable agents is pinned directly by `REDACTED`; here it is asserted indirectly through an occurrence count over prose, which any future wording that legitimately names the value twice ("agent %q … ; %q cannot …") would fail. Cost: a test that fails on message edits rather than on behaviour change. Simpler form: assert the suggestion segment instead — `strings.Contains(got, "supported agents: codex, gemini")` — which pins both the list and the exclusion in one line and lets the 1345 assertion cover the subject.
+
+**6. `doctor.go:1332-1360` — three of the five comment paragraphs are trimmable; one duplicates the comment added in the other file.**
+- 1352-1356 (the `$PATH` bullet, 5 lines) discusses a condition the function never inspects — there is no PATH code in `checkSummaryProvider` at all. That is the "argues with a position nobody holds" shape.
+- 1332-1336 states "a value no `entire` command will write (both writers are capability-gated)", and line 1392 prints the same fact to the user. One of the two is enough; the printed line is the one users need.
+- 1358-1360 ("Reports without fixing", 3 lines): the local norm for a read-only check in this file is one clause — `checkHookDrift` says "Read-only; the fix is `entire enable --force`." `checkRetiredDenyRule`'s long ownership paragraph earns its length because it is the one check that *writes*; this one doesn't.
+- 1335-1336 ("every agent name is a legal `enable --agent` value / this field reads from the same registry") is the same sentence as `explain_summary_provider.go:315-317`. Cost: two copies of one mechanism drift apart. Simpler form: keep it in `unsupportedSummaryProviderError` (where the reader is deciding what to print) and have doctor's comment say "see `unsupportedSummaryProviderError` for how the value gets here".
+
+The load-bearing halves — 1338-1342 (why the check exists at all) and 1346-1351 (why unregistered is silent, which line 1378 points at) — should stay.
+
+**7. `explain_summary_provider.go:330` and `explain_summary_provider_test.go:1360` — both comments describe a string the code does not emit.**
+They say the degraded branch avoids `"one of: "` / a dangling `"one of"`; the format string at 338 says `supported agents: `. Cost: a reader greps for "one of" and finds nothing, then has to reconstruct which branch is meant. Simplest fix follows from finding 2 (both comments go); otherwise quote the real prefix.
+
+**8. `cmd/entire/cli/doctor_summary_provider_test.go:117` — `loadErr` is used by 1 of 5 call sites, and buys one guard inside the helper.**
+Four callers pass `nil` (two implicitly, via the zero-valued table field) so that one row can exercise a branch whose only observable is silence — the same assertion its three siblings make. Cost: a parameter and an `if loadErr != nil` branch in a helper whose name is about the *configured provider*, plus a table column that is empty in three of four rows. Simpler form: `runCheckSummaryProvider(t, configured string)`, and let the settings-load case override `loadSummarySettings` itself in a four-line standalone test — or drop that row entirely, since the branch it covers only logs. Also `cmd.SetErr(&amp;bytes.Buffer{})` at :139 is unnecessary: nothing in `checkSummaryProvider` writes to `ErrOrStderr`.
+
+## Checked and clean
+
+`stubSummaryRegistry` is **not** over-parameterised: three callers pass three distinct shapes (`{codex,opencode}`/codex, `{codex,gemini,opencode}`/codex+gemini, `{opencode}`/none), so both the `all` list and the variadic `capable` are earned. It is arguably under-used — roughly fifteen pre-existing tests in the same file hand-roll the same two seam overrides — but that is pre-existing, not something the diff adds.
+
+`checkSummaryProvider`'s control flow is already the flat form: four sequential guards, no nesting, and the unregistered/incapable guards cannot be merged without turning a silent case into a wrong diagnosis. No finding there.</result>
+<usage><subagent_tokens>137777</subagent_tokens><tool_uses>13</tool_uses><duration_ms>215538</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a02973d55da11cbe3</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-green-forest-f25b/277870d8-d0d4-4ee2-bc38-c1cb50432614/tasks/a02973d55da11cbe3.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Findings, strongest first.
+
+**1. `doctor_summary_provider_test.go:36-40` — re-implements `newTestCmd`**
+The new `runCheckSummaryProvider` hand-builds `&amp;cobra.Command{}` + `SetContext(context.Background())` + `SetOut`/`SetErr` buffers. That is verbatim `newTestCmd(t) (*cobra.Command, *bytes.Buffer)` at `cmd/entire/cli/doctor_test.go:37`, same package (`cli`), already used at ~20 call sites in `doctor_test.go` (631, 663, 685, 718, …). Cost: a second spelling of doctor's test-command fixture, and the new one discards the stderr buffer (`SetErr(&amp;bytes.Buffer{})`), so a check that later writes to stderr can't be asserted on here. Replace lines 36-40 with `cmd, out := newTestCmd(t)` and return `out.String()`.
+
+**2. `explain_summary_provider.go:295-309` — second copy of the registry walk in `listEnabledSummaryProviders` (:225-247)**
+The two bodies differ by exactly one predicate and the accumulator type:
+
+```
+registered := listRegisteredAgents()          // both
+ag, err := getSummaryAgent(name); err→continue // both
+agent.AsTextGenerator(ag); !ok→continue        // both
+isSummaryProviderAvailable(name, ag)           // only in listEnabledSummaryProviders
+```
+
+Cost: a third registry walk and a third copy of the capability probe in one file; an agent-lookup or capability change now has to be made in two loops that must stay in step. Concrete fix: parameterize the existing one — `summaryCapableAgents(requireInstalled bool) []checkpointSummaryProvider` — with `listEnabledSummaryProviders` = `summaryCapableAgents(true)` and `summaryCapableProviderNames` mapping `.Name` over `summaryCapableAgents(false)`. `isSummaryProviderAvailable` (`:249`) is already the isolated differing predicate, so the split is a one-line `if requireInstalled`.
+
+**3. `explain_summary_provider.go:308` — `sort.Strings` duplicates a guarantee the registry already gives**
+`listRegisteredAgents` is `agent.List` (`:28`), whose doc says "in sorted order" and which sorts at `cmd/entire/cli/agent/registry.go:54` (`slices.Sort(names)`). Filtering preserves order, so the sort is a no-op on every production path and the only reason it can't be dropped is a stubbed seam that returns unsorted names — which no test in the diff does. Dropping it also removes the new `sort` import. (Answering the convention question: `sort.Strings` is fine — it's the dominant spelling in this package, `runner_apply.go:270`, `api_cmd.go:439`, `remote_topology.go:82`; `slices.Sort` is used in `agent/` and `clean.go:504`. No finding there.)
+
+**4. `doctor.go:1375-1382` — fourth copy of the "resolve name → is it a text generator" probe**
+`getSummaryAgent(name)` + `agent.AsTextGenerator(ag)` already appears three times next door (`explain_summary_provider.go:348`, `:378`, `:393`) and as `agentSupportsTextGeneration` in `review/profile.go:458` (unexported, so not callable from `cli`). The diff is already willing to depend on that file's seams (`loadSummarySettings`, `getSummaryAgent`), so the cheap fix is one predicate there — e.g. `summaryProviderCapability(provider string) (registered, capable bool)` — called by doctor and by the three error sites. Concrete cost beyond the duplication: doctor.go gains a new `agent/types` import (diff line 9) solely for the `types.AgentName(...)` conversion, which a string-taking helper would keep on the other side of the call.
+
+**5. Optional — `explain_summary_provider.go:114` is the hardcoded list the new helper exists to replace**
+"install claude, codex, gemini, pi, cursor, or copilot" is the same six agents `summaryCapableProviderNames()` now derives, hand-maintained 180 lines above it, and the diff's own `REDACTED` adds a "update this list and README together" burden while leaving this one un-derived. Caveat that keeps this from being a straight substitution: line 114 spells *binary* names (`claude`, `copilot`) where the helper returns *agent* names (`claude-code`, `copilot-cli`), so wiring it up changes that message's wording. Worth doing or worth a comment saying why not.
+
+Checked and found nothing (so you don't re-look): doctor has no shared section/heading formatter — `checkLogSink:1228`, `checkHookDrift:1249` and `checkRetiredDenyRule:1295` each hand-roll `"&lt;Heading&gt;: STATE"` plus indented lines, so the new block matches the convention; there is no "load settings, stay silent" helper — all nine `LoadEntireSettings` call sites handle their own error, and reusing the `loadSummarySettings` seam is the right existing hook; and `stubSummaryRegistry` has no pre-existing equivalent — `stubSummaryProviderForTest` (`explain_test.go:1143`) and `stubUnavailableSummaryProvider` (`runner_setup_test.go:326`) each stub one fixed scenario and neither touches `listRegisteredAgents`, so it's new consolidation over the ~46 inline stub assignments in `explain_summary_provider_test.go`, not a duplicate. The one loose end: `runCheckSummaryProvider`'s `loadSummarySettings` stub is a third variation of that same block; folding a settings argument into `stubSummaryRegistry` would cover it, but no existing helper does.</result>
+<usage><subagent_tokens>142852</subagent_tokens><tool_uses>24</tool_uses><duration_ms>242491</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>adcccf5dce9d3c7e1</task-id>
+<tool-use-id>toolu_013P7ChGtKmLDSFzrZrVKuaK</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-green-forest-f25b/277870d8-d0d4-4ee2-bc38-c1cb50432614/tasks/adcccf5dce9d3c7e1.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>No real efficiency problems in this diff. Every checked hypothesis came out negative; details below so the negatives are auditable.
+
+## Findings
+
+**None actionable.** One low-severity note, reported only because it was asked about explicitly:
+
+`cmd/entire/cli/doctor.go:1363` — `checkSummaryProvider` performs a second in-process `settings.Load`. Doctor's own `PreRunE` already calls `strategy.EnsureRedactionConfigured` → `settings.Load` (`cmd/entire/cli/strategy/common.go:453`), so this is a genuine repeat read. Marginal cost is small because the expensive parts are memoized process-wide by the time it runs: `paths.WorktreeRoot` caches per-cwd (`paths/paths.go:87-104`) so no second `git rev-parse`, and the tracked-ness probe caches in `versionedPaths` (`settings/opf_command_trust.go:206`) so no second go-git index read. What remains is `RequireEntireDir` (one `Lstat` + one-level `ReadDir`, measured at ~8µs in CLAUDE.md) plus two small `ReadFile`s and a JSON unmarshal — sub-millisecond, once per interactive `entire doctor` run that already spawns `ListSessionStates`, `openRepository`, and remote resolution. The cheaper alternative (thread one `*EntireSettings` through `runSessionsFix`) is a refactor of doctor's entire check list and would remove the `loadSummarySettings` seam the new test stubs. Not worth acting on.
+
+## Checked and clear
+
+- **`summaryCapableProviderNames()` registry loop** (`explain_summary_provider.go:295-309`): `agent.Get` (`agent/registry.go:34`) is an RLock + map lookup + `factory()`. Every built-in factory is a bare `&amp;T{}` (verified all eight: cursor, claudecode, copilotcli, codex, factoryaidroid, geminicli, opencode, pi), and the external factory returns a pre-built `wrappedAgent` closure (`agent/external/discovery.go:263`) whose `DeclaredCapabilities()` reads a cached field. `AsTextGenerator` is two type assertions. So the loop is ~10 map lookups + ~10 tiny allocations, no I/O, no syscalls, no `exec`. Low microseconds.
+- **It deliberately omits the expensive step.** The near-identical `listEnabledSummaryProviders` (line 225) also calls `isSummaryProviderAvailable`, which is the `exec.LookPath` per agent. The new function skips it. That is the right call for cost as well as for semantics.
+- **`unsupportedSummaryProviderError` is not on a hot path.** All three call sites (lines 350, 379, 394) are reachable only from explicit user commands: `entire explain --generate` (`explain.go:813` → `1058`), `entire dispatch` / `entire runner setup` (`runner_setup.go:233`, `dispatch.go:25`), and `entire configure --summarize-provider` (`setup.go:773` → `234`). No lifecycle/hook handler reaches any of them, and none is called in a loop — `listEnabledSummaryProviders` is the only loop over the registry and it does not build errors. One invocation per failed command, on the way to returning that error.
+- **`entire doctor` has one entry point** (`doctor.go:102` → `runSessionsFix`); nothing automated invokes it.
+- **No double work worth naming in doctor.** `getSummaryAgent(name)` at 1376 is repeated inside `summaryCapableProviderNames()` at 1389, but 1389 is only reached on the fault branch (every healthy case returns at 1369/1374/1378), and the repeat is one map lookup plus one struct allocation.
+- **`make([]string, 0, len(registered))`** over-allocates ~10 slots for ~6 results (~64 bytes) and avoids a growth reallocation. Correct trade.
+- **`sort.Strings(names)` (line 308) is dead work in the shipped binary** — `agent.List` already returns sorted names (`registry.go:44-55`) and the loop preserves order. It is ≤6 strings, so the cost is unmeasurable, and it does defend the documented "sorted" contract against the `listRegisteredAgents` seam, which `stubSummaryRegistry` fills with an unsorted slice. Not worth removing; if it's touched, `slices.Sort` would drop the new `sort` import in favour of the `slices` this package already uses.</result>
+<usage><subagent_tokens>144729</subagent_tokens><tool_uses>29</tool_uses><duration_ms>296084</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a97377073e64898b9</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-green-forest-f25b/277870d8-d0d4-4ee2-bc38-c1cb50432614/tasks/a97377073e64898b9.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Altitude findings
+
+### 1. `cmd/entire/cli/settings/settings.go:282` (`SummaryGenerationSettings.Validate`) — the "settings can't import agent" premise is false; loader-level rejection is possible, but not through `Validate()`
+
+**The stated blocker does not exist.** `cmd/entire/cli/settings/symlinked_agent_dirs_trust.go:9` already imports `cmd/entire/cli/agent`. CLAUDE.md's rule is that `settings` cannot import **`cli`**, not `agent`.
+
+**The real blocker is registry derivation, not the cycle.** Registration is `init()`-based (`agent/cursor/cursor.go:26`, one per impl package), and `go list -deps` shows `agent/claudecode`, `agent/codex`, `agent/geminicli`, `agent/pi` and `agent/external` all transitively import `cli/settings` — so `settings` can never pull the impls in. A `Validate()` that called `agent.Get` would see an empty registry in any binary that did not import the impls, and "unregistered" is the fail-open branch, so the check would silently stop firing depending on the caller's import graph. That is verbatim the failure CLAUDE.md documents for `agent.vouchableDirs` and for why `agent.CallerSessionEnvVars()` is static.
+
+**And the documented seam for exactly that already exists**: a pinned static list in `agent` plus an enforced guard test in the `cli` package (where every built-in is registered). This diff *wrote that pinned list* — `explain_summary_provider_test.go:404`'s `want := []string{"claude-code", "codex", "copilot-cli", "cursor", "gemini", "pi"}` with a drift-in-both-directions guard — but put it on the test side of the seam, where the loader cannot reach it. Only known-incapable **built-ins** need to be rejectable (an external plugin is unregistered at load time either way, and the reported condition is exactly `opencode`/`factoryai-droid`), so a pinned list is sufficient — no discovery, no exec.
+
+Deeper change: `agent.SummaryCapableAgentNames()` — static, in `cmd/entire/cli/agent/capabilities.go`, mirroring `agent.callerSessionEnvVars`; keep the diff's test as its `TestSummaryCapableProviderNames_MatchesTheRegistry`-style guard.
+
+**But `Validate()` is the wrong consumer of it.** Its only expression is a hard failure: `settings.go:786` turns it into `return nil, fmt.Errorf("merged settings invalid: %w", err)`. `summary_generation.provider` lives in a *committed* `.entire/settings.json`, so one bad hand-edit would fail every `settings.Load` — every hook, `status`, and `doctor`'s own PreRunE — over a misconfigured on-demand feature. That is precisely the case CLAUDE.md rules out for the local-layer gate ("It never errors — one committed file must not brick `status`/`doctor`").
+
+So the genuinely deeper vehicle is the **rejection channel**, not validation: drop the field in a `settings.enforce…`-style step, record `EntireSettings.SummaryProviderRejection()` beside `LocalLayerRejection`/`ExternalAgentsRejection`/`SymlinkedAgentDirsRejection`, and let `status.go` print it at `status.go:145`'s site. That also *fixes* the three commands (the resolver falls through to auto-select) rather than only explaining them. Whether silently substituting a provider is acceptable is a product call — flag it rather than decide it.
+
+**Verdict:** the fix is one level too shallow, and the level below it is reachable with the documented pattern. It is *two* levels down (hard `Validate()` rejection) that is genuinely wrong.
+
+### 2. `cmd/entire/cli/explain_summary_provider.go:348` — one of the three "fixed" error sites is unreachable; the other two are the same gate written twice
+
+`buildCheckpointSummaryProviderWithEffectiveModel`'s `!ok` branch cannot be reached by any caller: line 81 sits behind `validateSummaryProvider`, line 99 behind `ensureSummaryProviderPresent`, and line 197 (`autoSelectSummaryProvider`) takes candidates from `listEnabledSummaryProviders`, which already filters on `AsTextGenerator` (line 233). No test reaches it either. So it is a backstop, not a surface — changing its text is harmless but it is not one of the three commands.
+
+The two reachable gates, `ensureSummaryProviderPresent` (373) and `validateSummaryProvider` (387), are the identical three checks — get → capability → PATH — differing only in wording and an unused `ctx`. The diff makes them share the capability *message* while leaving them two functions.
+
+Deeper change: one `resolveUsableSummaryProvider(ctx context.Context, name types.AgentName) (agent.Agent, error)` in `explain_summary_provider.go`, with `ensureSummaryProviderPresent`/`validateSummaryProvider` collapsing into it (or one calling the other), and the backstop at 348 left as a bare internal error.
+
+### 3. `cmd/entire/cli/doctor.go:1376-1380` — the doctor check re-derives the capability predicate a fourth time instead of asking the resolver
+
+`getSummaryAgent` + `agent.AsTextGenerator` inline is now the 7th non-test `AsTextGenerator` site in this feature and the second copy of "is the configured provider usable". It can drift from what the resolver actually refuses — `AsTextGenerator` consults `CapabilityDeclarer` (`agent/capabilities.go:153`) and `agent/model_lister.go:31` already documents one capability helper that deliberately does not, so divergence here is not hypothetical.
+
+Deeper change: export a single `summaryProviderFault(ctx) (message string, faulty bool)` from `explain_summary_provider.go` (next to the gate in finding 2) and have `checkSummaryProvider` render it. Doctor's deliberate exclusion of the PATH condition becomes a parameter, not a second implementation.
+
+### 4. `cmd/entire/cli/explain_summary_provider.go:114` — the new derived list left its hand-spelled sibling in place, one function above
+
+`summaryCapableProviderNames()` (295) exists so "an agent that gains `GenerateText` needs no second edit here and one that loses it cannot leave a stale name in a user-facing error." Line 114 is that exact stale-prone list, unchanged: `"install claude, codex, gemini, pi, cursor, or copilot"` — reachable whenever nothing is installed, and already missing `copilot-cli`'s real spelling. README:612/618 is a third copy.
+
+Deeper change: derive line 114's list from `summaryCapableProviderNames()` too (binary vs agent name is the only wrinkle, and `isSummaryCLIAvailable` already owns that mapping), so the helper is the single source rather than a fourth spelling.
+
+### 5. Status vs doctor: doctor is defensible at this depth, and the status home only exists at the deeper one
+
+`status.go` never mentions summary generation, and the rejections it does report (145, 153, 184) are *trust downgrades* — "your setting was dropped". This condition is honored-and-fatal, so it is not a rejection in that channel's sense today and would not fit beside them. It becomes one only if finding 1 is taken, at which point the `status` line comes free. No finding against the doctor placement; note only that the check lands in `runSessionsFix` (`doctor.go:175`), so it is absent from `doctor trace`/`logs`/`bundle`, which is consistent with its neighbours.
+
+### 6. Minor, but it sets the check's scope: `cmd/entire/cli/doctor.go:1341-1347`
+
+The reason given for not reporting an *unregistered* provider is that it "would mean running discovery, which execs every candidate binary". The named variant (`external.DiscoverAndRegisterNamedAlways`, used by `discoverSummaryProviderIfMissing`) execs exactly one binary — the sweep is the other function. The decision is still right; the accurate statement is "doctor must not exec any plugin to write a diagnostic", which the same comment already makes one line later. Worth correcting because it is the argument holding the check's boundary in place.</result>
+<usage><subagent_tokens>147810</subagent_tokens><tool_uses>30</tool_uses><duration_ms>390725</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>b95yrg7a3</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-green-forest-f25b/277870d8-d0d4-4ee2-bc38-c1cb50432614/tasks/b95yrg7a3.output</output-file>
+<status>completed</status>
+<summary>Background command "Lint and run the full cli suite after the cleanup" completed (exit code 0)</summary>
+</task-notification>

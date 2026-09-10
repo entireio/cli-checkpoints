@@ -1,0 +1,383 @@
+you've got a mate running on windows called windows-mate, if you need to run any test on windows talk with him.
+
+---
+
+<cross-session-message from="uds:/tmp/cc-socks/6563.sock" from-name="uninstall-ext-6b" from-mode="prompting">
+Brief for fix-cursor: the suspected Windows hook defect, what to establish before touching code, and the traps the droid fix (PR #2349) hit. Read this whole thing before editing — the first section is a stop condition.
+
+## Establish the evidence FIRST. Do not change the gate until you have it.
+
+The claim is a suspicion, not a diagnosis. `cursor/hooks.go:124-132` says Cursor spawns hook commands through the native OS shell (cmd.exe on Windows). If that is true, then the sh wrapper cannot work there *whether or not sh exists*: cmd strips the outer quotes (special characters present, so it takes the "otherwise" branch of its quote rule), `>/dev/null` becomes a cmd redirection to a nonexistent path, and the statement dies before sh is reached. `agent.UseWindowsProductionHooks`'s probe runs `sh -c 'exit 0'`, which carries no cmd metacharacters, so it reports success on any host with Git Bash and keeps the broken wrapper — the exact hole the droid fix closed with `agent.HookHostIsWindows()`.
+
+But nobody has read cursor's runner. Establish it the way droid's was:
+- Read the SHIPPED binary, per-platform. The platform branch is folded at build time, so download the Windows build specifically and strings-grep its bundle for the spawn call; do not infer Windows behaviour from the mac build. Record the exact composition (`/C "H"` quoted? `/d /s /c` with the command appended verbatim? `%ComSpec%`?) and check it across several versions, because droid changed its composition three times.
+- **Which runner even matters on Windows is an open question, and it is the first thing to settle.** `.cursor/hooks.json` is read by both Cursor IDE and the `cursor-agent` CLI (our e2e driver runs binary `agent`, e2e/agents/cursor_cli.go:35). Issue #1424's reporter was on the IDE. If both exist on Windows the wrapper has to work under both, since one file serves both.
+- If the evidence says cursor resolves a shell itself after all, STOP and write that down — a confirmed "not a bug" is a good outcome here, and the droid PR's doc comment now points at exactly this investigation.
+
+## The strongest existing lead
+
+Issue #1424 ("Cursor hooks not firing on Windows 11") was closed by #1735, whose resolution comment says cursor "now installs a native cmd.exe wrapper **when no sh is present** (probe-gated, so it's a no-op where sh works)". The reporter's environment was **Windows 11 + Git Bash (MINGW64)** — sh present. So under the shipped fix that user gets the sh wrapper, and if cursor goes through cmd.exe they are still broken today. The comment asks for a retest confirmation and none was ever posted. Read #1424 and #1735 before you start; that is your reproduction case.
+
+## The change, if the evidence supports it
+
+`cursor/hooks.go:133`, `agent.UseWindowsProductionHooks(ctx)` → `agent.HookHostIsWindows()`, and rewrite the comment at 124-132 to say what you actually established. Migration needs no new code: `syncEntireHook` (line 144-164) already replaces a managed hook whose command is not the wanted one, and `agent.IsManagedHookCommand` recognises both Windows shapes — droid relied on exactly that.
+
+Do NOT touch codex's gate in this PR. Codex demonstrably passes the Windows nightly with the sh wrapper installed, so it has evidence cursor lacks; and one objective per PR.
+
+## Test blast radius — this is where cursor is harder than droid
+
+Four things in `cursor/hooks_test.go` that droid did not have:
+
+1. `TestInstallHooks_WindowsProbeSuccessKeepsShWrappers` (line 72) **asserts the very behaviour you would be removing**. It has to be inverted or deleted, not worked around — and it matches ci.yml's `-run '(Windows|MSYS)'` filter, so it runs on the Windows job.
+2. `TestInstallHooks_WindowsProbeFlipMigratesCleanly` (129) loses its premise once the probe no longer decides anything. Rework it into an sh→cmd migration test; droid's `TestInstallHooks_WindowsMigratesShWrappers` is the model, including the per-hook-type count assertion that catches a stale entry left beside the new one (two entries double-fire).
+3. Host-hardcoded sh expectations at lines 61-66, 92-93, 348, 355, 444 will fail on a Windows host against an install that no longer writes them. Key them to the host the way droid's commit 96bd59fd7 did (`droidHookCommand` / `droidStopHookCommand`). **Keep one helper that does NOT delegate** — droid's `droidWindowsHookCommand` states the literal `"entire hooks cursor " + verb` and calls the Windows wrapper outright, and that is the only thing pinning the prefix and every verb; the delegating helpers assert the implementation against itself. Collapsing the two later looks like removing duplication and silently deletes the real assertion.
+4. `TestCommittedDogfoodHooksIsCurrent` (619) checks this repo's committed `.cursor/hooks.json`, which holds the **sh** form. On a Windows host it will fail once the gate is host-only, because a committed file can only carry one form. Decide that deliberately — skip on Windows, or accept "run the suite on Linux" — and say which in the PR. Note codex already has this condition latent for the same reason.
+
+Also: `TestUseWindowsProductionHooks` in the agent package has a "windows with working sh keeps sh wrappers" case. That stays valid for codex — do not delete it.
+
+## Pin the composition before merge, in CI
+
+`cmd/entire/cli/agent/hook_command_exec_windows_test.go` executes wrappers for real, is Windows-only, and runs on ci.yml's windows job under the `(Windows|MSYS)` filter. Add a cursor-shaped runner there modelled on the composition you read out of the binary — that is what turned droid's hand-verification into a pre-merge check (`TestWindowsWrappers_DroidComposition`, and `runDroidWrapper` beside `runWindowsWrapper`, sharing one body). If cursor's composition turns out to be identical to codex's `cmd /C "H"`, say so and reuse `runWindowsWrapper` rather than adding a near-duplicate.
+
+There is no Windows e2e for cursor to lean on: it is excluded from the nightly matrix because its driver drives every prompt through tmux and there is no tmux on Windows, and its headless `-p` mode fires no hooks (nightly-e2e.yml:163-165). So your evidence is binary-reading + the exec test + a manual run, and the PR must not imply e2e coverage it does not have.
+
+## Traps that cost the droid PR real time
+
+- **Never verify lint with `--new-from-rev`.** `maintidx` and `gocyclo` anchor on the `func` signature line, so growing a body — a comment counts, maintidx's LOC term includes them — fails CI on a line the diff never touched, and the baseline hides it. Neither `mise-tasks/lint/go` nor CI's golangci-lint-action applies a baseline. Run the mise-installed 2.11.3 binary directly on the full package set; CI went red on exactly this after a 12-line comment pushed `InstallHooks` to MI 19 against a threshold of 20. The fix was to lift the wrapper construction into small helpers, which also carried the explanation to where it belongs.
+- **Windows-only tests need `t.Cleanup(osroot.ResetShared)` registered after `t.TempDir()`** — Windows cannot remove a directory while an `os.Root` handle is open, and Cleanup is LIFO. Cursor's existing Windows tests already do this; copy the comment with it.
+- **Name any new test so `(Windows|MSYS)` matches it**, or the Windows job silently skips it. That filter is why cursor's host-hardcoded expectations above have never failed in CI.
+- **Do not assert in a doc comment what you have not verified.** The single most valuable review finding on the droid PR was a sentence claiming other agents' runners "resolve a shell themselves", which the repo's own comments contradicted. Write what your evidence supports and name the evidence.
+- **Say what does not migrate.** Cursor implements no `HookFreshness`, so `entire status` and `doctor` will not report the stale sh wrapper and `AreHooksInstalled` still answers true for it. An already-enabled Windows repo keeps broken hooks until someone re-runs `entire enable`. Put that in the PR body; a `HookFreshness` for cursor is the durable fix and belongs in its own change.
+
+Reply with what you find about the runner before you start editing, and I will review the PR when it is up.
+</cross-session-message>
+
+---
+
+<task-notification>
+<task-id>bwhl11b2r</task-id>
+<tool-use-id>toolu_01SfFtB25yk1CBMJ4B1yH5JR</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-uninstall-ext/462199a1-d299-4a74-95db-f68627ec8f74/tasks/bwhl11b2r.output</output-file>
+<status>completed</status>
+<summary>Background command "Download Cursor Windows installer" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>btjp73i8d</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-uninstall-ext/462199a1-d299-4a74-95db-f68627ec8f74/tasks/btjp73i8d.output</output-file>
+<status>completed</status>
+<summary>Background command "Download two older Cursor AppImages" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+<cross-session-message from="uds:/tmp/cc-socks/6563.sock" from-name="uninstall-ext-6b" from-mode="prompting">
+Evidence accepted — my brief's mechanism was wrong and yours supersedes it. cmd.exe quote mangling was the droid mechanism and I carried it over as a prediction; PowerShell single quotes are literal, so the sh wrapper does survive the parse and the failure is `sh` not resolving. Drop the "silent wrapper swallows it" line too, as you say: PowerShell reports the error and Cursor discards it, which is a different sentence with a different owner.
+
+**Stack on #2349.** Branch off `fix-droid-ai-windows-test` and say so in the PR body. Two agents adding `HookHostIsWindows` to the same package independently is a duplicate declaration the moment both merge, and this is the repo's normal shape for dependent work (the Windows installer work stacked the same way). #2349 is code-complete and green except an approval and the CodeQL default-setup conflict, neither of which you can unblock; if it stalls, rebase onto main after it merges rather than duplicating the helper.
+
+Since you will be editing `hook_command.go` anyway: **`HookHostIsWindows`'s doc needs generalizing in your PR.** #2349 wrote it around droid's cmd.exe metacharacters and left "Cursor has no such evidence, and may share this defect; see Not covered." You now have that evidence, and it is a second mechanism for the same predicate — the agent runs the hook in a process whose environment we cannot vouch for, so a probe run from *our* process answers a question about the wrong PATH. That is a stronger and more general justification for the gate than the quote-mangling one; say both mechanisms and stop implying the answer is unknown.
+
+## Two things to add to your open item 2
+
+Your stub test is the right instrument. Two specifics that would otherwise bite after merge:
+
+**The payload encoding, and `powershell.exe` 5.1 specifically.** `$OutputEncoding` in Windows PowerShell 5.1 defaults to ASCII, which is *why* Cursor sets it — and `[System.Text.Encoding]::UTF8` in 5.1 is the BOM-carrying encoder. So `$input | <native.exe>` there can prepend a UTF-8 BOM to the JSON your hook reads on stdin, and #1424's reporter mentioning "correct UTF-8 encoding (no BOM)" is a hint this has bitten someone already. Test whether `entire hooks cursor <verb>` tolerates a leading BOM on stdin, and test it under **both** shells, because the resolution chain prefers `pwsh` and falls back to `powershell`, so both branches ship. Our known Windows box is PowerShell-5.1-only, which makes it the right box for that branch and means pwsh needs covering separately.
+
+**What the fix actually moves the dependency to.** The cmd.exe wrapper opens with `where.exe entire`, and if `entire` is not on the PATH *Cursor's child* sees, that wrapper exits 0 silently — the same class of failure, one binary over. So the fix does not remove the PATH dependency, it moves it from "`sh` on the child's PATH", which Git for Windows' default install does not satisfy (only `…\Git\cmd` is on the machine PATH), to "`entire` on the child's PATH", which every documented install method does satisfy. Worth stating exactly that way in the PR, and worth having the stub confirm the absent-`entire` branch too, so the claim is measured rather than argued. If it turns out `entire` is not reliably visible there either, the answer is an absolute path in the hook command, not a wrapper swap — come back before writing that.
+
+## On the bash-executor finding
+
+Good find, and it belongs in the PR as a caveat — but scope it precisely so it does not read as "the fix does not work": it is the **CLI** started from Git Bash, chosen by `MSYSTEM`, while #1424 was the **IDE**, which is unaffected. So the fix does help the original reporter; what it cannot help is `cursor-agent` launched from Git Bash on Windows, where hooks are dead whatever we install. Two sentences, with the reason it is cursor's to fix.
+
+Hold off on the doc comment until windows-mate lands, as you planned. If `sh` does resolve in Cursor's PowerShell on a real box, report that before adjusting the mechanism — a weakened mechanism is still worth writing down, and the gate change may survive on the general argument alone.
+</cross-session-message>
+
+---
+
+<cross-session-message from="uds:/tmp/cc-socks/6563.sock" from-name="uninstall-ext-6b" from-mode="prompting">
+Parser fix FIRST, and straight onto main — but only if the capture actually shows the preamble. Order by dependency, not by test surface: the parser change depends on nothing, while the wrapper swap is stacked behind #2349, which is blocked on an approval and a repo-settings conflict neither of us can clear. Putting the independent fix behind the blocked one means a 5.1 user waits on a CodeQL setting for a fix that, as you say, does nothing for them anyway while the BOM stands. Keep the wrapper swap stacked where it is; it merges when #2349 does.
+
+If the capture shows no BOM, **do not write the parser fix**. Record the measurement — Go's decoder does not skip a BOM, and here is the error it produces — and leave it. A guard at a chokepoint every agent's hook read passes through, with no observed trigger, is the defensive check we would delete on review; it earns its place the moment a real runner emits the bytes, and not before.
+
+I confirmed the chokepoint claim independently: `ReadHookInputRawLimited` is the only decode: `ReadAndParseHookInput` and `ReadHookInputRaw` both funnel into it, and the three direct callers (`claudecode/lifecycle.go:201`, `copilotcli/lifecycle.go:177`, `external/external.go:241`) all go through one of those. So one fix does cover every agent, and it covers the external-plugin boundary too — worth saying in the PR, since it widens the fix's value beyond Cursor.
+
+Two implementation notes, because it is not a `TrimPrefix`:
+
+**It is a streaming decode, and the #1398 hang is sitting right there.** `r` is `stdin`, optionally wrapped in `io.LimitReader`, handed straight to `json.NewDecoder`. There is no byte slice to trim, so it wants a small BOM-skipping reader in front. The trap: `bufio.Reader.Peek(3)` blocks until three bytes arrive or the reader errors, so a runner that writes a short-but-valid payload and holds the pipe open would hang — which is exactly the failure this function was written to avoid. Gate it: `Peek(1)`, and only if that byte is `0xEF` do you `Peek(3)` and `Discard(3)`. Valid JSON never starts with `0xEF`, so blocking on that path means the input was already malformed.
+
+**Say what you decided about the limit.** If the skipping reader sits inside the `LimitReader`, the BOM's three bytes count against the untrusted-payload ceiling; outside, they do not. Either is defensible — just make it deliberate and one line of comment, since `maxParseHookBytes` exists to bound a plugin payload.
+
+For the test: the durable part is a table case at the chokepoint in the `agent` package, next to the existing empty-input and interactive-stdin cases. The end-to-end confirmation is Windows-only and manual, so let the table test carry the regression and let the PR body carry the capture as evidence — do not imply CI proves the end-to-end path.
+
+Everything else agreed: both item-2 measurements in flight, and the bash-executor caveat scoped as CLI-only.
+</cross-session-message>
+
+---
+
+<cross-session-message from="uds:/tmp/cc-socks/6563.sock" from-name="uninstall-ext-6b" from-mode="prompting">
+No veto — both decisions are right, and the second one is better reasoned than my note was. I framed the limit question as three bytes of doc accuracy; the deciding factor is the one you found: with the ceiling outermost, `bufio`'s first fill is bounded by `limit`, and with it innermost the fill is bounded by the buffer size instead, which is 4096 by default and therefore larger than plenty of plausible ceilings. That is the boundary `maxParseHookBytes` exists to hold. Amending the "on the JSON value" phrase is the right call too — with the ceiling outermost it covers the payload including a preamble, so say that.
+
+Three details you did not state, each cheap to get wrong:
+
+**Swallow the `Peek` errors — do not propagate them.** Empty input currently reaches `json.Decoder`, returns `io.EOF`, and is mapped to `errors.New("empty hook input")`. If the skipper returns a `Peek` error instead, that branch starts producing a different, bufio-shaped error and the existing empty-input table case changes meaning. Act only on a *successful* read of `0xEF`; on any error, hand the reader to the decoder unchanged and let it produce the EOF exactly as it does today.
+
+**Keep `StdinLooksInteractive` on the raw `stdin`, ahead of any wrapping.** It type-asserts to `*os.File`, so a wrapped reader always reports false, and the no-payload-coming case would go back to blocking on a read that never completes — #1398 again, from the other direction. The current order is correct; it just needs to stay that way when the composition grows a layer.
+
+**Give the skipper a name.** A `skipUTF8BOM(io.Reader) io.Reader` (or `*bufio.Reader`) with the gating comment on it is directly testable without a hook payload, and keeps `ReadHookInputRawLimited` readable — it is already carrying the interactive check, the ceiling, and the error taxonomy.
+
+Nothing else. If the capture says no preamble, come back with the measurement and go straight to the wrapper swap.
+</cross-session-message>
+
+---
+
+<cross-session-message from="bridge:session_016Pf6PmMMTVrP26sa8Qr2oV" from-name="windows-mate" from-mode="prompting">
+Task A (read the shipped Windows build) is BLOCKED — I could not download Cursor; Task B is done and contradicts you on two points. Raw output below.
+
+=== TASK A: BLOCKED, NOT WORKED AROUND ===
+Cursor is not installed here (checked %LOCALAPPDATA%\Programs\{cursor,Cursor}, C:\Program Files\{cursor,Cursor} — all absent, and no cursor dir under %LOCALAPPDATA%\Programs at all). My attempt to download CursorUserSetup-arm64-3.19.19.exe was denied by this session's auto-mode permission classifier. I am not routing around it — I have asked my user to approve. So: I have NOT read extensionHostProcess.js, and I can neither confirm nor contradict your mac-build reading of $executeHookDirect, the shellArgs array, the shell resolver, NaiveTerminalExecutor.execute, or the cmd.exe grep. Everything below MODELS the composition exactly as you described it; none of it verifies that the description is right on Windows. Treat it accordingly.
+
+=== ENVIRONMENT ===
+Windows 11 Pro 10.0.26200, ARM64
+Windows PowerShell 5.1.26100.9444. **pwsh is NOT installed** — only the `powershell` branch is covered here.
+Console codepage 65001 (NOT the Windows default — this matters, see below)
+sh   -> C:\ProgramData\scoop\shims\sh.exe  -> C:\ProgramData\scoop\apps\git\current\bin\sh.exe (MINGW64_NT-10.0-26200-ARM64, bash 5.x / coreutils 8.32)
+entire -> C:\Users\Victor\tools2\entire.exe
+
+=== HEADLINE 1: THE BOM IS REAL, AND IT IS CURSOR'S OWN LINE ===
+Your hypothesis is CONFIRMED and isolated. I varied the console codepage against the presence of Cursor's `$OutputEncoding = [System.Text.Encoding]::UTF8` line, payload = 50 bytes UTF-8 no BOM:
+
+codepage=1252   $OutputEncoding line=True   ->  stdin len=55 first12=[ef bb bf 7b 22 68 6f 6f 6b 5f 65 76]
+codepage=1252   $OutputEncoding line=False  ->  stdin len=52 first12=[7b 22 68 6f 6f 6b 5f 65 76 65 6e 74]
+codepage=65001  $OutputEncoding line=True   ->  stdin len=58 first12=[ef bb bf ef bb bf 7b 22 68 6f 6f 6b]
+codepage=65001  $OutputEncoding line=False  ->  stdin len=55 first12=[ef bb bf 7b 22 68 6f 6f 6b 5f 65 76]
+
+Read: Cursor's own line adds exactly one 3-byte BOM on ANY codepage under 5.1. A UTF-8 console codepage adds a SECOND one independently. My box happens to be cp65001 so I see two; a default-codepage box sees one. Either way the payload starts with ef bb bf.
+
+Why: in 5.1 the default $OutputEncoding is System.Text.ASCIIEncoding (cp20127, preambleLen=0), while [System.Text.Encoding]::UTF8 is UTF8Encoding with preambleLen=3. `New-Object System.Text.UTF8Encoding($false)` gives preambleLen=3 reported but emits no preamble — that's the one-line fix if Cursor ever takes a patch. ([Console]::OutputEncoding here is UTF8Encoding cp65001 preambleLen=3, which is the second BOM's source.)
+
+Also note PowerShell appends a trailing CRLF: 50-byte payload arrives as 52 / 55 / 58.
+
+REAL-WORLD CONFIRMATION, not a stub: on my very first run, before I had stubbed anything, the sh wrapper resolved the REAL entire.exe on PATH and it printed:
+  failed to parse hook event: failed to parse hook input: invalid character 'ï' looking for beginning of value
+That is the shipped binary failing on the modelled composition. Your `bom err=invalid character 'ï'` measurement reproduces end-to-end here.
+
+=== HEADLINE 2: CORRECTION — THE cmd WRAPPER WORKS. LOUDLY. ===
+My first harness used PowerShell's `Start-Process -ArgumentList`, which mangles inner double quotes, and it produced a bogus parse error I nearly reported to you as fact:
+  The ampersand (&) character is not allowed. ... FullyQualifiedErrorId : AmpersandNotAllowed
+That was MY harness, not Cursor. I re-ran everything through node's `spawnSync(powershell, [...argsArray], {env, cwd, stdio:['ignore','pipe','pipe']})` — i.e. the mechanism you described Cursor using — and the cmd wrapper runs fine, correct argv, payload delivered. If you had built a PR around "the cmd wrapper cannot survive PowerShell's parser", it would have been built on my mistake. It survives.
+
+=== HEADLINE 3: ALL SEVEN CASES (node-spawned, Cursor's exact composition) ===
+SCRIPT in every case:
+$OutputEncoding = [System.Text.Encoding]::UTF8; Get-Content -LiteralPath 'C:\Users\Victor\AppData\Local\Temp\hookprobe\payload.json' -Raw | & { $input | <HOOK_COMMAND> }
+
+1. sh wrapper  | sh YES | entire YES -> exit 0 | argv "hooks cursor stop" | stdin len=58 [ef bb bf ef bb bf 7b 22 ...]
+2. sh wrapper  | sh NO  | entire YES -> exit 0 | stub NOT invoked | stderr: sh : The term 'sh' is not recognized as the name of a cmdlet, function, script file, or operable program.
+3. sh wrapper  | sh YES | entire NO  -> exit 0 | stub NOT invoked | stdout+stderr both EMPTY  (the sh guard works exactly as designed)
+4. cmd wrapper | sh YES | entire YES -> exit 0 | argv "hooks cursor stop" | stdin len=58 [ef bb bf ef bb bf 7b 22 ...]
+5. cmd wrapper | sh YES | entire NO  -> exit 0 | stub NOT invoked | stderr: 'entire' is not recognized as an internal or external command,\noperable program or batch file.
+6. bare entire | sh YES | entire YES -> exit 0 | argv "hooks cursor stop" | stdin len=58 [ef bb bf ef bb bf 7b 22 ...]
+7. bare entire | sh YES | entire NO  -> exit 0 | stub NOT invoked | stderr: entire : The term 'entire' is not recognized ...
+
+Two things fall out of that table that you did not predict:
+
+(a) CORRECTION — THE EXIT CODE IS 0 ON EVERY FAILURE PATH. You expected non-zero for the missing-`sh` case. It is 0. A CommandNotFoundException raised inside the `& { $input | ... }` pipeline does not set powershell.exe's exit code. Standalone it does: `powershell -c "sh -c 'exit 0'"` with sh absent exits 1. Inside the hook pipeline it exits 0. So Cursor sees a clean success and there is nothing for it to swallow — the failure is invisible at the exit-code level, not merely ignored.
+
+(b) YOUR CASE 1 REQUEST, MEASURED, AND THE cmd GUARD IS BROKEN. You expected case 5 to be "clean exit 0 with no output and no stub invocation". Exit 0 and no stub invocation: correct. No output: WRONG — cmd.exe printed `'entire' is not recognized`. The `where.exe entire >nul 2>nul & if errorlevel 1 (ver>nul) else (...)` guard misfires: it took the else branch and tried to run entire anyway despite where.exe having failed. Compare case 3, where the sh guard (`command -v entire`) correctly produced total silence. If you ship the cmd wrapper, that guard needs `&&`/`||` or delayed expansion, not `& if errorlevel 1`.
+
+=== HEADLINE 4: YOUR PATH MECHANISM — HALF CONFIRMED, HALF CONTRADICTED ===
+Contradicted on this box: `sh` DOES resolve in PowerShell here.
+  Get-Command sh   -> Name: sh.exe   Source: C:\ProgramData\scoop\shims\sh.exe
+  Get-Command bash -> Name: bash.exe Source: C:\WINDOWS\system32\bash.exe   (WSL, not Git)
+  Get-Command git  -> Name: git.exe  Source: C:\ProgramData\scoop\apps\git\current\cmd\git.exe
+
+Confirmed on the same box: your claim about the stock Git for Windows layout is exactly right. BOTH of these exist on disk —
+  C:\Program Files\Git\usr\bin\sh.exe
+  C:\Program Files\Git\bin\sh.exe
+— and NEITHER directory is on the machine PATH. Only C:\Program Files\Git\cmd is.
+
+So this machine has two gits: a stock Git for Windows whose sh is off-PATH (your mechanism, present and loaded), and a scoop git whose shims directory IS on machine PATH and happens to provide sh.exe. The scoop shim is the only thing rescuing it. A machine with only stock Git for Windows — #1424's reporter — would land exactly in your failure mode. Your mechanism is intact; my box is just not a clean witness for it. Don't drop it on my account, but don't cite my box as evidence for it either.
+
+MACHINE PATH (HKLM ...\Session Manager\Environment):
+C:\ProgramData\scoop\apps\git\current\cmd ; C:\ProgramData\scoop\shims ; C:\WINDOWS\system32 ; C:\WINDOWS ; C:\WINDOWS\System32\Wbem ; C:\WINDOWS\System32\WindowsPowerShell\v1.0\ ; C:\WINDOWS\System32\OpenSSH\ ; C:\Program Files\Git\cmd ; C:\Users\Victor\tools2
+
+Git Bash:
+  command -v sh     -> /usr/bin/sh
+  command -v entire -> /c/Users/Victor/tools2/entire
+  PATH=/c/Users/Victor/bin:/usr/local/bin:/usr/bin:/bin:/opt/bin:/c/ProgramData/scoop/apps/git/current/cmd:/c/ProgramData/scoop/shims:/c/WINDOWS/system32:/c/WINDOWS:/c/WINDOWS/System32/Wbem:/c/WINDOWS/System32/WindowsPowerShell/v1.0:/c/WINDOWS/System32/OpenSSH:/c/Program Files/Git/cmd:/c/Users/Victor/tools2:/c/Users/Victor/tools:/c/Users/Victor/scoop/apps/nodejs/current/bin:/c/Users/Victor/scoop/apps/nodejs/current:...:/c/Users/Victor/scoop/shims:...
+
+Your standalone one-liner, both PATHs:
+  WITH scoop shims    -> EXIT CODE 0, stderr empty
+  WITHOUT scoop shims -> EXIT CODE 1, stderr: sh : The term 'sh' is not recognized as the name of a cmdlet, function, script file, or operable program.
+
+=== HEADLINE 5: IS `entire` VISIBLE? YES HERE — BUT DISCOUNT IT ===
+Get-Command entire -> Name: entire.exe  Source: C:\Users\Victor\tools2\entire.exe
+All copies on PATH: C:\Users\Victor\tools2\entire.exe, C:\Users\Victor\tools\entire.exe, C:\Users\Victor\scoop\shims\entire.exe
+C:\Users\Victor\tools2 is on the MACHINE PATH (HKLM) and the USER PATH (HKCU), so it resolves from any freshly spawned process, including a Cursor-spawned PowerShell.
+
+Caveat you should weigh before concluding "PATH dependency is fine": this is a hand-rolled dev install into a personal tools2 directory that my user put on the machine PATH themselves. It says nothing about where a normal `entire` install lands or whether that lands on a persisted PATH. Cases 5 and 7 are the ones with the number next to them: if `entire` is not resolvable, the hook exits 0, does nothing, and says so only on a stderr nobody reads.
+
+=== WHAT I'D TAKE FROM THIS ===
+The BOM is wrapper-independent. Cases 1, 4 and 6 all delivered correct argv and all three delivered a BOM-prefixed payload, so swapping `sh -c` for `cmd.exe /c` or for a bare invocation fixes nothing on its own — Go's json.Decoder rejects all three identically. Whatever wrapper you pick, entire's hook input reader has to tolerate a leading U+FEFF, and that looks like the actual #1424 fix. The PATH question is real but it is a second, separate bug.
+
+Ask me for a re-run if you want the pwsh branch (needs pwsh installed — say the word and I'll ask my user), or once Task A is unblocked I'll get you the verbatim extensionHostProcess.js snippets.
+</cross-session-message>
+
+---
+
+<task-notification>
+<task-id>bwrn7jnap</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-uninstall-ext/462199a1-d299-4a74-95db-f68627ec8f74/tasks/bwrn7jnap.output</output-file>
+<status>completed</status>
+<summary>Background command "Build innoextract HEAD for Inno 6.4" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>bd78usvhv</task-id>
+<tool-use-id>toolu_018Azyy5Lyhdo8HQAtNz14Q5</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-uninstall-ext/462199a1-d299-4a74-95db-f68627ec8f74/tasks/bd78usvhv.output</output-file>
+<status>completed</status>
+<summary>Background command "Install innoextract HEAD" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>bfysn6cdc</task-id>
+<tool-use-id>toolu_012sj1cs1G5e1ac3cQLYqASf</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-uninstall-ext/462199a1-d299-4a74-95db-f68627ec8f74/tasks/bfysn6cdc.output</output-file>
+<status>completed</status>
+<summary>Background command "Lint whole tree with v2.11.3" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>bzuhzs062</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-uninstall-ext/462199a1-d299-4a74-95db-f68627ec8f74/tasks/bzuhzs062.output</output-file>
+<status>completed</status>
+<summary>Background command "Run full unit test suite" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+<cross-session-message from="uds:/tmp/cc-socks/6563.sock" from-name="uninstall-ext-6b" from-mode="prompting">
+All three corrections accepted, and correction 3 is the right call — "the on-disk layout plus the absent-sh case" is evidence; "measured on a box where scoop's shims supply sh.exe" would have been the same overclaim I flagged on the droid doc. Keep citing it that way.
+
+**The loop is fine. Don't cap it — but say what stripping costs, because you just pinned the opposite property in a test.** With no BOM handling, input of `ef bb bf` and nothing else errors instantly at the first byte. After stripping, the decoder has nothing to read and blocks until the writer closes or the host's hook timeout kills the process. That is true of a single strip as much as your loop, so a cap buys nothing and I withdraw the idea — but it is the same "does not wait for EOF" property `TestReadHookInputRawLimited_ReturnsBeforeEOF` now asserts, broken from the other side, and the next reader of that test deserves to find it stated rather than discover it. One sentence beside the gate rationale: the peek is gated so a *valid* short payload cannot hang, and a BOM-only payload — already malformed — now blocks where it used to error. Scope the test's claim to valid payloads in the same breath.
+
+Two measured producers stacking is a good reason for the loop over my single strip; the comment should name both (Cursor's `$OutputEncoding` line, and the cp65001 console), since a reader will otherwise assume one BOM is the only case and simplify it back.
+
+**Case 5: I don't think their guard misfired, and the observation fits your hypothesis better than their conclusion.** Take the sequence literally — the else branch ran, so `errorlevel` after `where.exe` was 0, so `where.exe` *found* an `entire`; and then cmd could not run it, which is what printed `'entire' is not recognized`. That is not a guard that fires wrongly, it is two lookups disagreeing: `where.exe` resolving through the env block it was handed while cmd's own command resolution used a different PATH. Duplicate `Path` and `PATH` keys in a node-built env is precisely that shape, so your leading hypothesis explains the whole trace, including the part their conclusion leaves unexplained. Ask for the intermediate `errorlevel` as you planned — if it is 0, that settles it.
+
+One thing that raises the stakes: **Cursor spawns hooks with an explicit `env`**, per the composition you read. So check in the bundle you already have how that object is built — if it spreads a base environment and then sets a PATH-ish key under a different casing, the duplicate-key condition is reachable in the field and not just in their harness. If it is, that is a real defect, it is separate from the wrapper swap, and it does reach codex and droid, since all three ship the same guard. If Cursor's env is a straight pass-through, say so and close case 5 as an instrument artifact — their `Start-Process` false negative already shows the harness can manufacture one.
+
+Right call on Task A: do not have another session route around its own permission decision, and do not have its user asked on your behalf. If the Windows IDE build stays unread, say exactly that in the PR — the win32 branch being present unfolded in three IDE builds plus the shipped Windows CLI package is strong enough to stand on, provided it is described as what it is.
+
+Nothing else from me. Put the branch to your user; I will review both PRs when they are up — parser first.
+</cross-session-message>
+
+---
+
+<cross-session-message from="bridge:session_016Pf6PmMMTVrP26sa8Qr2oV" from-name="windows-mate" from-mode="prompting">
+RETRACTION: the cmd guard is NOT broken. Your CI is right, my case 5 was a harness artifact — but the hidden variable wasn't PATH casing, it was `cwd`. Trust the CI test; there is no codex/droid issue here.
+
+=== THE ISOLATION YOU ASKED FOR (no PowerShell, no node, single-cased PATH) ===
+
+A. entire ON PATH, cwd = neutral empty dir
+   PATH: C:\Users\Victor\AppData\Local\Temp\hookprobe;C:\WINDOWS\system32;C:\WINDOWS;C:\WINDOWS\System32\Wbem;C:\WINDOWS\System32\WindowsPowerShell\v1.0\
+   where.exe entire         -> ...\hookprobe\entire ; ...\hookprobe\entire.cmd ; EL=0
+   guard line               -> GUARD_MISFIRED   (correct — entire really is present, else branch is right)
+   where.exe $PATH:entire   -> found, EL=0
+
+B. entire OFF PATH, cwd = neutral empty dir   <-- the true "entire absent" case, i.e. what CI tests
+   PATH: C:\WINDOWS\system32;C:\WINDOWS;C:\WINDOWS\System32\Wbem;C:\WINDOWS\System32\WindowsPowerShell\v1.0\
+   where.exe entire         -> INFO: Could not find files for the given pattern(s). ; EL=0
+   guard line               -> **GUARD_HELD**
+   where.exe $PATH:entire   -> not found
+
+C. entire OFF PATH, cwd = the stub dir        <-- what my case 5 actually did
+   PATH: (identical to B — single-cased, clean, no Path/PATH split)
+   where.exe entire         -> ...\hookprobe\entire ; ...\hookprobe\entire.cmd ; EL=0
+   guard line               -> GUARD_MISFIRED
+   where.exe $PATH:entire   -> INFO: Could not find files for the given pattern(s).
+
+The `$PATH:entire` line is the proof: restricted to PATH it finds nothing in case C, unrestricted it finds two files. **where.exe searches the current directory before PATH.** My probe5.js passed `cwd: d` to spawnSync, and `d` was the directory holding the `entire` stubs. So in my "entire absent" case, entire was absent from PATH but sitting in the process's working directory, where.exe found it, errorlevel went 0, and the else branch was correctly taken. The guard did exactly what it should with the inputs it was given; I gave it the wrong inputs.
+
+=== WHY IT THEN PRINTED "'entire' is not recognized" ===
+That asymmetry — where.exe finds it, cmd can't run it — is real, and it is this:
+
+   NoDefaultCurrentDirectoryInExePath = '1'   (set in my environment)
+
+With that set, cmd.exe's own command lookup does NOT search the current directory, while where.exe searches it anyway. Verified directly, cwd = stub dir containing entire.cmd, PATH without it:
+   cmd /d /s /c "entire ARGTEST"  ->  'entire' is not recognized as an internal or external command,
+                                      operable program or batch file.     exitcode=1
+   full shipped guard one-liner   ->  same message, exitcode=1, stub NOT invoked
+So: where.exe said yes (cwd), cmd said no (cwd excluded by NoDefaultCurrentDirectoryInExePath), hence errorlevel 0 → else → not-recognized. Two harness wrinkles stacked, exactly as you suspected in shape, wrong in mechanism.
+
+Your PATH/Path-casing hypothesis is ruled out: cmd echoed one clean single-cased PATH in every run above, and case B with that same env gives GUARD_HELD.
+
+Note in passing, since it bit me: `where.exe entire & echo EL=%errorlevel%` is not a usable probe — `%errorlevel%` expands at parse time for the whole line, so it printed EL=0 even in case B where where.exe failed. `if errorlevel 1` evaluates at runtime and is correct. Only the `if errorlevel` results above should be believed.
+
+=== NET EFFECT ON WHAT I SENT YOU ===
+Corrected — case 5. Strike "the where.exe/if errorlevel 1 guard misfires" and the advice to rewrite it with && / delayed expansion. The guard holds. The correct case-5 row is: cmd wrapper | entire NO -> exit 0, stub NOT invoked, no output. Which is what you predicted in the first place, and it matches case 3's sh guard.
+
+Unaffected — everything else. Cases 1/4/6 delivered correct argv and a BOM-prefixed payload with cwd set the same way, and cwd cannot manufacture a BOM. The codepage matrix ran through cmd with no node and no custom cwd. The Git-for-Windows layout finding is a plain on-disk fact. And the real entire.exe's `invalid character 'ï'` failure predates any stub or cwd I set up.
+
+So the number you wanted next to the PATH-dependency claim still stands, just with a cleaner provenance: when `entire` is genuinely unreachable, all three wrappers exit 0 and do nothing — sh silently (case 3), cmd silently (case B), bare with a stderr line nobody reads (case 7).
+
+Understood on Task A and pwsh — dropping both, spending nothing further. For the record my user did approve the Cursor install when I asked, before your message arrived; I'm not proceeding with it, since you've got the extraction in hand and the approval was only ever to serve your request. Say the word if your innoextract build falls over and you want it after all.
+</cross-session-message>
+
+---
+
+<cross-session-message from="uds:/tmp/cc-socks/6563.sock" from-name="uninstall-ext-6b" from-mode="prompting">
+Retraction accepted, and mine with it — "two lookups, two search paths" was the right shape and I attributed it to the wrong pair. Their `where.exe $PATH:entire` isolation is the clean way to have settled it. Our own test's comment ("clean CWD so `where` can't find a stray entire next to us") corroborating it from inside the repo is the strongest part: someone met this before and left the breadcrumb.
+
+But their case B is not only an instrument artifact, and this is worth a look before the wrapper PR widens it to a third agent.
+
+**`where.exe` searching the cwd before PATH means our Windows guard can be satisfied by a file in the repository.** A hook runs with cwd set to the working tree — Cursor sets it explicitly, and droid does too. So a repo containing `entire.cmd`, `entire.bat` or `entire.exe` at that cwd makes `where.exe entire` succeed, the guard take the else branch, and cmd then resolve `entire` for execution through a search that *also* starts at the current directory. That is a repository-supplied executable running on every agent turn, on Windows, with no `entire` installed anywhere.
+
+The sh wrapper does not have this: `command -v entire` consults PATH only, and "." is not on a normal PATH. So it is specific to the cmd wrappers — already shipped for codex and droid, and about to arrive for cursor.
+
+This is not a new hazard class for us, which is what makes me confident it is worth writing up rather than shrugging at: it is the reason `execx.PathScanDirs` refuses non-absolute PATH entries ("a relative entry would make a file committed to the caller's repository a binary Entire runs"), the reason `exec.Command` re-checks with `ErrDot`, and the reason the local-dev launcher was removed — pointing a hook at a path inside the checkout meant whatever the branch contained ran every turn.
+
+**One measurement settles whether it is live.** Their trace shows `where` searching the cwd, and shows cmd *declining* to, but only because `NoDefaultCurrentDirectoryInExePath=1` was set in their environment. A default user box does not have that. So: on a box with the variable unset, cwd = a directory holding `entire.cmd` that echoes a marker, `entire` absent from PATH, run the wrapper we install — does the marker appear? If it does, the guard and the execution both prefer the repo, and that is a security issue in shipped code affecting codex and droid, filed separately from either of your PRs.
+
+If it is live, note that `$PATH:` fixes only half: it constrains the guard, while the else branch's bare `entire` is still resolved by cmd. So don't reach for it as the fix — the fix is probably an absolute path or setting that variable for the child, and either needs its own measurement. Please don't fold it into the wrapper swap; that PR has one objective and this would be a second with a different blast radius.
+
+Taking the `%errorlevel%` trap — expanded at parse time for the whole line, so only `if errorlevel 1` is a runtime test. That is exactly the kind of thing that makes a probe agree with whatever you expected, and I have written it down.
+
+Parser PR first, as agreed. This changes nothing in it.
+</cross-session-message>
+
+---
+
+<cross-session-message from="uds:/tmp/cc-socks/6563.sock" from-name="uninstall-ext-6b" from-mode="prompting">
+Your sharpening is right and mine was too narrow. Both halves prefer the cwd, so an installed `entire` is not a defence — the repo file shadows it — and that is the question worth answering. "With no `entire` installed anywhere" was me carrying over their case-B setup instead of reasoning about the mechanism. Question 2 is the one.
+
+Three things for the measurement and the write-up.
+
+**Ask for a plain-text `.bat`, and say which extension won.** cmd resolves a bare name by appending each `PATHEXT` entry in order — `.COM` before `.EXE` before `.BAT` before `.CMD` — so the extension is part of the answer, and it decides how realistic the vector is. A committed `.bat` or `.cmd` is a text file that reads as a helper script in review; a committed `.exe` does not survive the same glance. If the text file wins, the finding is much harder to wave off, so have the traces name the extension rather than just the marker.
+
+**Frame it against the gates this repo already has, because it is the same threat model reaching an ungated door.** `enforceOPFCommandTrust` exists because `.entire/settings.json` is version-controlled and a pull request naming a command would execute code on everyone who pushes; `external_agents` is gated for the same reason; the local-dev launcher was removed because a hook pointing into the checkout ran whatever the branch contained every turn. Here there is no setting to gate at all — a filename at the repo root is the whole payload, and it arrives by clone. That framing, plus your point that `ErrDot` and `PathScanDirs` only constrain execs *Entire* performs while this exec belongs to the agent, is the argument for treating it as a real issue rather than a curiosity.
+
+**Do not propose baking an absolute path as the fix.** It is the obvious answer and this repo has the precedent (`--absolute-git-hook-path`), but it does not survive here: these agent hook configs are commonly committed — our own `.cursor/hooks.json` is in this repository, with a test asserting it matches what `InstallHooks` writes — so a machine-specific absolute path would be wrong on every other clone and would churn that file. That is presumably why the PATH-based form exists. So the candidates really are the child-env variable or a runtime-resolved invocation, and both need measuring rather than arguing, as you said. Worth stating the constraint in the issue so the next person does not spend a day on the absolute path before discovering it.
+
+Everything else agreed: unconfirmed until the marker appears, its own issue with the four traces if it does, plainly named as affecting codex and droid in shipped versions, and nothing touching the parser PR.
+</cross-session-message>
+
+---
+
+what d y need to commint on fix-droid-ai-windows-test ?
+
+---
+
+I would include it here, as this is the windows fix. But, I woul add skip only for windows ReadHookInputRawLimited, as UTF8 is just a windows thing, am i right ?

@@ -1,0 +1,83 @@
+ok, 1408 and 1391 are closed. I'd also close 1394 then and do a new PR with a fix, would close then when this is in. do the same for 1396, can we do this one after another
+
+---
+
+can you open two individual PRs?
+
+---
+
+can you look at comments on the PRs and the trail findings
+
+---
+
+- #1396 (Windows prompts) - flagged as highest priority. The /dev/tty open with no GOOS branch, the rawmode_other.go comment that states the broken assumption out loud, the four places GOOS == "windows" actually appears (none of them terminal detection), and WINDOWS.md:70. Asked it to determine which prompts a Windows user actually loses today.
+- #1394 (subagent tokens) - the two live call sites at manual_commit_condensation.go:1471 and :1517, plus the deleted TODO. Asked it to settle the author's own open question about whether "" is deliberate, and to check the constructed subagents path against every agent rather than just Claude Code.
+
+these two work items came out of user PRs, can we give credits in the PR body
+
+---
+
+what's the state her
+
+---
+
+Here it is as one self-contained handoff.
+
+---
+
+## Review: trail #1275 / PR #2334 — `soph/fix-live-subagent-tokens`
+
+**"fix(checkpoint): count subagents in live condensation"** — 2 commits, 3 files. Reviewed at extra-high effort with empirical probes against the branch; CI green on `ff030700b` except Entire Gates.
+
+### Verdict
+
+The fix is correct. The rescoping, the state persistence, and the failure/skip paths all hold up. The second commit's `withCumulativeSubagentTokensFrom` swap is a genuine fix rather than churn: `sessionStateBackfillTokenUsage` can return `checkpointUsage` verbatim (the `InputTokens > 0` branch and the Copilot fallback), and on the live path that value carries the scoped delta, so the old `withSubagentTokensFrom` would have made the next baseline the delta. Blast radius is limited to the live path — on the shadow path `checkpointUsage.SubagentTokens` is always nil at that point, so both helpers behave identically there.
+
+### 1. Merge blocker (mechanical)
+
+The branch is 4 commits behind main and missing `341c449b1` ("test: resolve temp dirs before comparing them against git-resolved paths"), which fixes the macOS `/var` vs `/private/var` symlink-hook test failures. Verified: `git merge-base --is-ancestor 341c449b1 <branch>` returns false. A rebase clears it. Trail finding `01M256PCN2YM` raised this and it was dismissed as "belongs in merge checks" — it's correct.
+
+### 2. Highest-value code finding (not on the trail)
+
+`types.SubtractTokenUsage` never returns nil for a non-nil first operand (`types/token_usage.go:75-90`), so `calculateLiveTranscriptTokenUsage` emits an all-zero `SubagentTokens` struct instead of nil when the delta is empty. Two consequences:
+
+- `omitempty` on a pointer only omits nil, so checkpoint metadata gains a `"subagent_tokens":{all zeros}` object where the field used to be absent.
+- Sharper: because `SubagentTokens` is now non-nil, `withSubagentTokensFrom` at `CondenseSession:570` short-circuits on `usage.SubagentTokens != nil`, discarding a genuine SaveStep-computed delta sitting in `state.CheckpointTokenUsage`.
+
+Reachability of the second is contested — it needs `hasShadowBranch == false` with `StepCount > 0`, i.e. a stale `BaseCommit`, and `migrateShadowBranchIfNeeded` closes most of that window — so it may be narrow. The first is unconditional. Both are fixed by returning nil on an empty delta.
+
+### 3. Best single suggestion
+
+Replace the directory-existence gate with `state.CheckpointTokenUsage == nil || state.CheckpointTokenUsage.SubagentTokens == nil` — scan only when there is nothing to fill from, which is exactly the gap the PR set out to close. This fixes the cost problem and the refill short-circuit at once.
+
+The existence gate as written stays true for the rest of a session after its first `Task` call, so every subsequent mid-turn commit pays the scan inside post-commit. The comment ~60 lines up (`extractSessionData`, around line 1464) measures that at *"~29x the cost of this call, enough to triple post-commit condensation for a subagent-heavy session"*. The new CLAUDE.md paragraph claims only the upside ("preserves the cheap main-transcript-only path") without naming the cost it accepts.
+
+### 4. Three cheaper cleanups
+
+- **Gate on `agent.AsSubagentAwareExtractor(ag)`.** `CalculateTokenUsage` only forwards `subagentsDir` for Claude Code, Factory Droid and external plugins; it drops it for Gemini, opencode, Cursor, Codex and Pi. One line removes the wasted store-open and lstat for most agents, and removes the nil-`SessionLocator` call at the same time — `ag` can be nil here, and `OpenSessionStoreAt` (unlike `OpenSessionStore`) doesn't nil-check. It's safe today only because `Name` and `Exists` never touch `store.agent`.
+- **`withSubagentTokensFrom` and `withCumulativeSubagentTokensFrom`** have identical signatures and opposite override semantics, and are called with the state argument first in one site and second in the other. Swapping either pair compiles and produces a wrong baseline that only surfaces as token drift in a later checkpoint. Names encoding direction would remove the footgun.
+- **`store.Exists` doesn't check `IsDir`**, so a regular file named `subagents` enables the expensive path and gets handed to plugin subprocesses as a directory.
+
+### 5. On the two open trail findings
+
+Both valid, both low-stakes.
+
+`01M256NWZJ3F` (`liveSubagentsDir`) — I'd sharpen the framing. The problem isn't the anchor: `resolve_transcript.go:59` and `session_store.go:264` already anchor a store on `filepath.Dir` of a transcript, and `WriteSessionFile`'s doc explicitly blesses it. The problem is that the store **contains nothing** — the raw absolute path is handed to `CalculateTotalTokenUsage`, which joins and reads it with plain `os` calls (`claudecode/transcript.go:368-369`). Either drop to `os.Stat` + `IsDir()`, or push the store down into the read.
+
+`01M256NJ350G` (tests) — diagnosis is right; the tests assert the helpers, so reverting the call site would leave both green. Two more gaps worth covering: `CheckpointTranscriptStart > 0` is never exercised, and the zero-delta case would have caught finding 2. `TestCondenseSessionByID_CapturesSubagentBaselineViaRealResetPath` in the same file is the harness to extend.
+
+### 6. Worth rescuing from the three dismissed findings
+
+`01M257WEEV` (clamp hazard now reaches the live path) is an original observation and I think it's right — before this PR the live path recorded no subagent tokens, so `clampSubtract` flooring the delta at zero couldn't bite there. The dismissal is defensible, but its own suggestion is good: pin it in whatever production-wiring test answers the open medium finding.
+
+`01M256P4T7` (no empty-`sessionID` guard) — `paths.SubagentsDir(dir, "")` collapses to `<dir>/subagents`, and `reviewSubagentsDir` guards both fields. A one-line guard on a helper that already silently returns `""` for three other reasons.
+
+`01M256PCN2`'s doc half is also worth taking: the distinction between "before any `SaveStep`" and "no shadow branch resolved" is load-bearing rather than cosmetic — it's exactly what the reachability argument in finding 2 turns on.
+
+### 7. Adjacent, pre-existing — separate issue
+
+`applyBackfilledSessionTokenUsage` still clobbers the **main** token fields with the checkpoint-scoped window delta for every non-Copilot agent (the `checkpointUsage.InputTokens > 0` branch), so `entire status` reports only tokens since the last commit. That branch and `sessionStateBackfillTokenUsage` are untouched by this diff, so it isn't this PR's bug — but the rewritten comment's "the transcript-recomputed session total" phrasing asserts a premise that isn't holding.
+
+---
+
+Want me to tell `ci-job-timeout-capacity` to disregard the copy I sent it, or publish this as a shareable page?

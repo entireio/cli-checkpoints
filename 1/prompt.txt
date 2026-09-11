@@ -1,0 +1,258 @@
+Can you look at this issue: checkpoint_push_remote naming a missing remote → doctor says "Checkpoints sync to a single elected remote" for a repo that syncs nowhere)
+
+---
+
+<task-notification>
+<task-id>ble12nrsj</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-brave-forest-f558/95176793-6169-4c16-baf0-3587e48ad0cc/tasks/ble12nrsj.output</output-file>
+<status>completed</status>
+<summary>Background command "Run the full pre-commit gate on the final tree" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>a4c230e4b22bdc749</task-id>
+<tool-use-id>toolu_01EYDrjp8vBJM4uv1ci8Wx8K</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-brave-forest-f558/95176793-6169-4c16-baf0-3587e48ad0cc/tasks/a4c230e4b22bdc749.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I've read the full diff, the post-diff source, the resolver, and all call sites. Here's the simplification review.
+
+## Findings
+
+**1. `cmd/entire/cli/remote_topology.go:109-113` — an `if` wrapping an assignment that is already correct on the nil path.**
+`ResolveCheckpointSyncRemote` returns a nil error on success and `t.electionErr` is already nil, so the guard changes nothing.
+Simpler: `_, t.electionErr = strategy.ResolveCheckpointSyncRemote(ctx)` (the two-line comment above it still applies and can stay).
+
+**2. `remote_topology.go:196` and `:208` — the same predicate computed twice inside one function (three walks per report, counting `syncDisabled` at `:172`).**
+Both branches are reachable, but under `syncDisabled()` they are *provably the same condition*: `unpinnedNames() ⊆ destinations`, so `len(names) &gt; 0 ⟹ len(destinations) &gt; 0`; and `syncDisabled` is only true when `len(destinations) == 0 || len(names) &gt; 0`, so `len(destinations) &gt; 0 ⟹ len(names) &gt; 0`. The second check re-derives what the first already decided, and each call allocates a fresh slice.
+Simpler: bind `names := t.unpinnedNames()` once at the top of `describeSyncDisabled` and use it in both places.
+
+**3. `remote_topology.go:202-216` — the two `Fix:` branches are the same two clauses reordered.**
+Branch A: "point … at one of them, or remove the setting to let Entire elect one." Branch B: "remove …, or point it at a remote once this repo has one." Collapsing them deletes the `if/else`, the three-line `// "them" refers to the list above…` comment that exists only to explain the branch, and the second `unpinnedNames()` walk from finding 2.
+Simpler:
+
+```go
+if misconfigured == nil {
+    return
+}
+fmt.Fprintln(w, "  Fix: remove strategy_options.checkpoint_push_remote to let Entire elect one,")
+fmt.Fprintln(w, "  or point it at a remote this repo actually has.")
+fmt.Fprintln(w, "  A remote name is a per-clone fact: …")
+```
+
+Only loss is the deixis ("one of them"), which is also what forces the explanatory comment.
+
+**4. `remote_topology.go:168-173` — the remoteless case drives three separate constructs and no test exercises it.**
+`len(t.destinations) == 0` is the only reason `describeSyncDisabled` needs its `if len(names) &gt; 0` guard (`:196`) *and* the else-`Fix` branch (`:211`). Neither disjunct of `syncDisabled` is dead — both are reachable (`isConfiguredRemote` fails for any name in a repo with no remotes, and an unreadable settings file errors regardless) — but all four unit tests build a topology with at least one destination, so the entire remoteless path is unexercised. Either take finding 3 (which erases two of the three constructs) or add a `remoteTopology{electionErr: …}` case with no destinations.
+
+**5. `doctor.go:174-177`, `remote_topology_test.go:13-16`, `integration_test/checkpoint_sync_remote_test.go:539` — doctor's two header strings are spelled three times, and the test's copy defeats its own stated purpose.**
+The test comment says the var exists "so the tests assert on the text a user actually sees", but it is a copy — change doctor.go's header and the test stays green against the old string. `enable` already does this right with a package-level var.
+Simpler: move doctor's literal next to `enableCheckpointNoteHeaders` as `doctorCheckpointNoteHeaders` (both in `remote_topology.go`, so the two callers' phrasings sit side by side), have `doctor.go` and `remote_topology_test.go` reference it, and delete `doctorHeaders`.
+
+**6. `remote_topology.go:59-65` — the bug anecdote is told four times, near-verbatim.**
+"told a repo whose election had failed closed that checkpoints 'sync to a single elected remote' and to run `entire status` to see which one" appears in the `electionErr` field comment, `CLAUDE.md` (diff line 10), the integration-test comment (`checkpoint_sync_remote_test.go:533-537`), and the unit-test doc (`remote_topology_test.go:25-29`). One canonical home (the field comment is the right one — it is what justifies the field's existence) plus test names that already say it (`FailedElectionReplacesTheDestinationClaim`) covers it; the two test comments can shrink to one line each.
+
+**7. `remote_topology.go:178-180` — the errors.As remedy rule is stated three times.**
+`CheckpointPushRemoteNotConfiguredError`'s doc ("a caller that cannot tell them apart must offer neither — the same rule the .entire directory errors follow"), `describeSyncDisabled`'s doc, and `TestCheckpointNote_UnrecognizedElectionErrorGetsNoRemedy`'s doc all argue the same point. Low severity; the type doc is the canonical home, and the other two can cite rather than restate.
+
+## Answers to the specific questions
+
+- **`describeSyncDisabled` as one shape:** yes — findings 2 + 3 turn it into header → cause (`errors.As`/else) → one `names` block → one unconditional remedy, with no nested conditionals and one `unpinnedNames()` call.
+- **Is the second `unpinnedNames()` branch reachable?** Both arms are reachable, but the test is redundant with the first one (finding 2). It is not dead code; it is re-derived state.
+- **`syncDisabled()`'s condition:** neither disjunct is dead. It reads fine as written (`!(has remotes &amp;&amp; all pinned)`); the issue isn't its expression but that its `len(destinations) == 0` half is the sole source of the downstream branching in finding 3 and is untested (finding 4).
+- **`checkpointNoteHeaders` struct:** justified, keep it. Two adjacent `string` parameters would be silently swappable and both callers would read as two bare literals at the call site; the named fields are worth the six lines. The struct's own doc comment could lose a clause, but that's cosmetic.
+- **The 5 unit tests:** none is redundant — they hit five distinct branches (disabled-over-ambiguous, disabled-when-unambiguous, unmatched-error-no-remedy, pinned exemption, ambiguity still works). The *integration* addition is the overlapping one: its four assertions are a subset of `TestCheckpointNote_FailedElectionReplacesTheDestinationClaim`'s, at integration cost. The only thing it proves that the unit test cannot is the wiring (doctor really calls this, and a real misconfigured repo really produces the error), so `Checkpoint sync: DISABLED` present plus `single elected remote` absent is enough there; the `checkpoint_push_remote` / `"gone"` assertions re-pin text the unit test owns.
+
+Nothing in the diff is dead code, and the new typed error in `strategy` is the minimum shape needed (one field, one `Error()`).</result>
+<usage><subagent_tokens>132329</subagent_tokens><tool_uses>6</tool_uses><duration_ms>169125</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a71ba3213b2a786b5</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-brave-forest-f558/95176793-6169-4c16-baf0-3587e48ad0cc/tasks/a71ba3213b2a786b5.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Findings
+
+**1. `cmd/entire/cli/doctor.go:174-177` + `cmd/entire/cli/remote_topology_test.go:13-16` — doctor's two header strings exist in two places; the change already built the sharing mechanism and used it only for enable.**
+
+The change introduces `enableCheckpointNoteHeaders` as a package-level var (`setup.go:1436`) precisely so enable's two call sites share one value — but doctor keeps an inline `checkpointNoteHeaders{...}` literal, and the new test then hand-copies those same two strings into its own `doctorHeaders` var. Cost: the test's own comment claims it uses "the headers `entire doctor` passes … so the tests assert on the text a user actually sees", and that is not true of a copy — rename `"Checkpoint sync: DISABLED"` in `doctor.go` and all five tests in the new file stay green while doctor's output changed. Fix: hoist a `doctorCheckpointNoteHeaders` var (next to `enableCheckpointNoteHeaders`, or in `remote_topology.go` beside the struct) and reference it from `doctor.go:174` and `remote_topology_test.go:21`. The third copy, in `integration_test/checkpoint_sync_remote_test.go:48`, is in a different package and can't share without exporting — leave it.
+
+**2. `cmd/entire/cli/remote_topology.go:172, 196, 208` — `unpinnedNames()` is recomputed three times per disabled render, twice within one function.**
+
+`describeCheckpointDestination` → `syncDisabled()` (line 172) → `describeSyncDisabled` (lines 196 and 208). Lines 196 (`if names := t.unpinnedNames(); len(names) &gt; 0`) and 208 (`if len(t.unpinnedNames()) &gt; 0`) are the *identical* predicate re-evaluated with nothing mutating in between, each allocating a fresh slice. Hoist `names := t.unpinnedNames()` to the top of `describeSyncDisabled` and use it at both. Beyond the allocation, the hoist earns its keep in legibility: the comment at 206-207 exists only to explain in prose that line 208's condition is the same one that produced the list at 197 ("'them' refers to the list above"), which a shared variable states structurally. Same shape on the ambiguous path — `unpinnedNames()` runs at 172 via `syncDisabled()` and again at 261 — so computing it once in `describeCheckpointDestination` and passing it down would cover both paths; that one is optional, the in-function duplicate is not.
+
+**3. Minor — `cmd/entire/cli/remote_topology_test.go:18`: `describe` is an unqualified, generic package-level name in a 172-file shared test package (`cli`).**
+
+It's unique today (`go vet` passes) and there's no existing helper it duplicates — no `remote_topology_test.go` existed before, so nothing to reuse. But `describe` is the kind of name the next test file also wants; `describeTopology` costs nothing and keeps it collision-free.
+
+## Checked and genuinely not duplication
+
+- **`status.go:356 computeCheckpointSyncInfo` / `:433 writeCheckpointSyncLines`** do report the same fail-closed condition, but there is nothing here to share. Status does not re-implement the detection — it calls the same `strategy.ResolveCheckpointSyncRemote` and prints the resolver's message verbatim (`info.Err = err.Error()`), which is exactly what the new error type's doc comment promises. The renderings are genuinely different artifacts (one styled `strings.Builder` line vs. a multi-line `io.Writer` diagnosis with remedy), and they never run in one process: `doctor.go`'s `runSessionsFix` does not render the status block, and neither does `printEnabledStatus`. Folding `Err string` into a typed field to share the `errors.As` would only move the duplication.
+- **The typed error follows the existing strategy convention exactly** — pointer receiver, `XxxError` struct, `errors.As` — same as `V1DivergedError` / `BootstrapTooLargeError` / `V1RefMovedError` (`manual_commit_opf_rewrite.go:43-73`). No pre-existing sentinel or classifier covered this: `checkpoint_read_remotes.go:16` names both fail-closed causes in a comment but does not distinguish them in code, and nothing string-matched the old message (only a doc comment at `git_remote_cache.go:209` quotes it).
+- **`describeSyncDisabled`'s shape** (`&lt;thing&gt;: VERDICT` heading, `  %v`, `Fix:` lines, per-cause branch with no remedy in the default) matches `writeEntireDirDiagnosis` (`entiredir_guard.go:169`) and doctor's other headings (`doctor.go:892, 1411`) — which all inline their headings too. There is no shared heading/verdict helper to call.
+- **No list-formatting helper exists** to replace `strings.Join(names, ", ")`; that is what line 261 of the same file already does.
+- **No settings-key constant** for `checkpoint_push_remote` exists to replace the literals at lines 186/209/212 — `settings.go:2019` spells it literally as well.
+- **The added `ResolveCheckpointSyncRemote` call is not an extra git shell-out** worth avoiding by feeding it the remotes `pushURLsByRemote` already collected: `main.go:37` installs `strategy.WithGitRemoteCache` on the root context, so the election's `.git/config` reads are memoized for the whole command.</result>
+<usage><subagent_tokens>152994</subagent_tokens><tool_uses>24</tool_uses><duration_ms>202724</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a86340eac86892c16</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-brave-forest-f558/95176793-6169-4c16-baf0-3587e48ad0cc/tasks/a86340eac86892c16.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Verdict
+
+The fix is one level too shallow, and the file's own history proves it: `remote_topology.go` is 5 weeks old and this is the **third** rewrite of the same paragraph for the same reason. `a3136178c` wrote it, `6fe608f93` rewrote it ("stop the destination note contradicting the election"), and this rewrites the failure half. `6fe608f93`'s message even names the right answer and declines to take it: *"It now states the election and points at `entire status`, which already reports the elected destination and the unpushed count, rather than restating precedence rules that would go stale again."* Pointing at status instead of using it is exactly what produced the bug under review. The current change repeats the choice.
+
+That said, several individual decisions inside the change are right (the typed error especially), and the `enable` call site is defensible. Findings below, ordered by depth.
+
+---
+
+### 1. `cmd/entire/cli/remote_topology.go:111` — the resolver is asked, then its answer is thrown away
+
+`if _, err := strategy.ResolveCheckpointSyncRemote(ctx); err != nil` keeps only the error. The success branch at **lines 261–267** still narrates the election from static text ("Checkpoints sync to a single elected remote — not to whichever one you push to… Run `entire status` to see the elected destination") while `inspectRemoteTopology` has the elected name and `Source` in hand and discards both.
+
+So the root cause — *this note asserts what the election decided instead of asking it* — is fixed for the error arm only. The success arm is still a hand-maintained restatement of a five-tier precedence rule, and still sends the user to a second command to learn an answer doctor already computed one function earlier.
+
+**Instead:** bind the whole `CheckpointSyncRemote` into `remoteTopology`, not just `err`, and print it: `Checkpoints sync to "origin" (set by checkpoint_push_remote).` A sentence that names the resolver's own output cannot go stale when a tier is added or `observed` is renamed; a sentence describing the rules can, and has, twice.
+
+### 2. `remote_topology.go:56–66` vs `status.go:330–353` — a second reporter of a condition that already has a single-source-of-truth type, **in the same Go package**
+
+`checkpointSyncInfo` exists, by its own doc comment, as *"the single shared computation behind both the text and JSON checkpoint-sync sections… so the two outputs cannot drift"*, and its `Err` field (`status.go:342`, set at `status.go:366`) is precisely the fail-closed message this change re-derives. Both files are `package cli`; `computeCheckpointSyncInfo(ctx, s)` needs nothing but settings. **The coupling cost of "doctor renders status's computation" is a `settings.Load` call** — there is no package boundary, no import, no cycle.
+
+Weighed seriously, the objection I'd expect (status is a hot path; merging fan-out detection into it adds `git remote -v` + N `PushURL` probes to every `entire status`) argues for merging in *one* direction only: doctor/enable consume `checkpointSyncInfo`, `remoteTopology` stays the doctor-side fan-out input. That costs status nothing and removes the second reporter.
+
+**Instead:** make `checkpointSyncInfo` the one checkpoint-destination verdict, give it the fan-out/other-remote fields, and add a third renderer for the note. Then `status --json`, `status` text, doctor and enable cannot disagree by construction — which is the property the type was created for and which this change quietly breaks.
+
+### 3. `remote_topology.go:157–173` (`syncDisabled`) vs `status.go:362–366` — the pinned exemption is the pre-push gate's policy, re-derived in a renderer, and it now disagrees with the other renderer
+
+Three spellings of one rule are now live:
+
+| site | predicate |
+|---|---|
+| pre-push gate (`manual_commit_push.go:99`) | `!ps.hasCheckpointURL()` — after a dialing `resolvePushSettings` |
+| `status.go:381` | `PushURL(ctx, elected.Name)` — needs an elected remote |
+| `remote_topology.go:99` + `168` | `PushURL(ctx, name)` per remote — needs none |
+
+On the same repo (dedicated `checkpoint_remote` + broken `checkpoint_push_remote`), `entire status` prints `! Checkpoints NOT syncing: …` and `entire doctor` prints **nothing**. status.go:362–365 documents its side as an *"Accepted divergence"* from the gate because *"there is no elected remote left to probe PushURL against here"* — and the new code demonstrates that premise was wrong; probing per-remote needs no election. So the change found the better answer and then left it in one command's presentation layer while the other keeps shipping the acknowledged-wrong one.
+
+Two commands disagreeing about "is my session history syncing" is not acceptable divergence — a user who runs both cannot tell which is true.
+
+**Instead:** extract the local half of the gate's exemption once — `remote.DedicatedCheckpointPushCovers(ctx, remoteName) bool`, which is just `GetCheckpointRemote() != nil &amp;&amp; PushURL(name).enabled` — and have the gate, `computeCheckpointSyncInfo` and the note all call it. That retires status's accepted divergence rather than institutionalising a second, opposite one.
+
+### 4. `strategy/manual_commit_push.go:99–105` + `checkpoint_sync_remote.go:153`, `:186` — the silence the user actually experiences is at **push time**, and it is untouched
+
+`checkpointSyncAllowedForRemote` logs the fail-closed error at `Warn` into `.entire/logs` (`:153`), and `hintGatedCheckpointSync` returns early on `err != nil` (`:186`, with the comment noting the gate "logs a warning" — to a file). So at the exact moment a `git push` silently drops every checkpoint, the user sees nothing on stderr. This change adds the report to two commands the user must think to run, neither of which they will run *because* the failure is silent.
+
+Crucially, the conditionality that makes the ordinary gated-sync hint hard (habitual destination vs. one-off `git push heroku`, `checkpoint_sync_remote.go:189–204`) **does not apply here**: a `checkpoint_push_remote` naming a non-existent remote is wrong for every push target, so the advice is unconditionally correct. This is the cheapest and highest-yield report of the three, and it is the one not written.
+
+**Instead:** in `hintGatedCheckpointSync`, split the `err != nil` early return — `errors.As` the new `CheckpointPushRemoteNotConfiguredError` and print it to the `stderrWriter` the file already holds.
+
+### 5. `remote_topology.go:285–292` + `setup.go:1434–1441` — `checkpointNoteHeaders` shares the body and parameterises only the register
+
+The struct exists because `enable` wants "Note: checkpoint sync is currently disabled in this repo." and doctor wants "Checkpoint sync: DISABLED" — but everything after the header (`Affected remotes:`, `Fix:`, the `settings.local.json` paragraph) is doctor's voice, printed verbatim under enable's note heading. A two-string struct passed through two functions is the smallest possible way of saying *these are two reports*.
+
+This one is a judgment call and the current form is defensible — it's not a strategy pattern, it's two strings. But it's the seam that grows a third field the first time a caller wants different body wording, and it only exists because the data isn't shared (finding #2).
+
+**Instead:** share the verdict, not the prose. `enable` prints one line; doctor prints the diagnosis block. `checkpointNoteHeaders` then has nothing to do.
+
+### 6. `doctor.go:172–177` — it *is* a doctor check; it just doesn't say so
+
+Everything adjacent (`checkGitHookSymlinks`, `checkEntireDirSymlinks:710`, `checkLogSink:1227`, `checkRetiredDenyRule:1294`) is `func check*(cmd *cobra.Command)` printing `"&lt;Subject&gt;: &lt;STATE&gt;"` + indented remedy. The new output is character-for-character that shape — `Checkpoint sync: DISABLED`, indented cause, `Fix:` — but is reached through a shared helper with its headings inlined at the call site.
+
+The `ambiguous` half genuinely isn't a check (nothing is broken; it's advisory, and shared with `enable` on purpose). The `disabled` half is: it's a misconfiguration with a remedy, i.e. the same class as every `check*` above it. Note also that doctor's `Long` enumerates "Checks performed: 1–5" and this verdict is in none of them — tolerable for a note, less so for a DISABLED finding.
+
+**Instead:** `checkCheckpointSyncDestination(cmd)` beside the others, calling the shared verdict from #2, with its headings as its own constants. `enable` keeps its one-liner. That also deletes the reason `checkpointNoteHeaders` exists.
+
+### 7. `setup.go:1428`, `:1449` — `enable` acquired the new verdict by inheritance, not by decision
+
+The diff adds no call site; it changes an argument, and the disabled report rides along into two flows (`runEnableInteractive`, and `printEnabledStatus`, itself reached from `setup.go:1235` and `:1495`). That's not scope creep in the usual sense — it's the opposite risk: a new verdict appeared in another command's output without anyone choosing it, which is the same failure mode as promoting a command into `agent-help`'s listing by accident.
+
+It happens to be the right outcome. A committed `checkpoint_push_remote` naming a remote this clone lacks is *specifically* a clone-time condition — the change's own remedy text says so ("a committed one disables checkpoint sync in every clone that lacks that name") — and `enable` is when a fresh clone first runs. **Keep it**, but print enable's one-liner rather than doctor's diagnosis block (#5), and say in the PR that it was chosen rather than inherited.
+
+### 8. `strategy/checkpoint_sync_remote.go:43–64` — the typed error is at the right altitude (positive), but it now has two phrasings
+
+Turning the fail-closed case from a `fmt.Errorf` into `CheckpointPushRemoteNotConfiguredError` moves the failure mode from a string into the resolver's type surface, and gating the remedy on `errors.As` with no `else` branch follows the `.entire`-directory rule exactly (a remedy only for a matched cause; an unmatched error gets none). That is the one part of the change that generalises rather than branches.
+
+The wart is a consequence of #2, not independent: the condition now has two sentences — the error's own message, printed verbatim by `status` (`status.go:435`), and `remote_topology.go:186–188`'s re-phrasing from the struct field. One renderer would leave one sentence.
+
+---
+
+## Summary
+
+Not a symptom patch in the trivial sense — the typed error and consulting the resolver are both real improvements — but it stops one level short in three ways that compound: it asks the election only about failure (#1), builds a second reporter beside a type that exists to prevent exactly that (#2), and re-derives the pre-push gate's exemption policy in a renderer where it now contradicts the other renderer (#3). The simplest more-general change is a single checkpoint-destination verdict in `package cli`, computed once, rendered by status text, status JSON, doctor and enable — plus one `errors.As` in `hintGatedCheckpointSync` so the user hears about it at the moment their push drops the data (#4).</result>
+<usage><subagent_tokens>165446</subagent_tokens><tool_uses>28</tool_uses><duration_ms>274195</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ad3efcd7806a2dfcd</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-brave-forest-f558/95176793-6169-4c16-baf0-3587e48ad0cc/tasks/ad3efcd7806a2dfcd.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Verified empirically with a `git` shim that logs every subprocess plus an out-of-repo benchmark module against the actual resolver. Summary first, then the list.
+
+## Verdict: the added resolver call is free in practice — 0 extra subprocesses
+
+Measured with a PATH shim that logs every `git` exec, running the binary built from this worktree:
+
+| run | total git spawns | evidence the new call spawned nothing |
+| --- | --- | --- |
+| `entire doctor`, 2 remotes + broken `checkpoint_push_remote` | 8 | `git remote get-url gone` appears **once** (from the earlier election in `checkDisconnectedMetadata` → `CheckpointReadRemotes`); the new call was served from the memo |
+| `entire doctor`, ordinary 1-remote repo | 7 | `git config --local --get-regexp ^remote\..*\.url$` appears **once** |
+| `entire enable` (already-enabled, 2 remotes) | 11 | `remote get-url gone` once, logged *before* the note |
+
+Why: `main.go:37` installs `strategy.WithGitRemoteCache` on the root context, so `isConfiguredRemote` and `configuredRemotesInConfigOrder` are memoized per repo per process (`cmd/entire/cli/strategy/git_remote_cache.go`), and both call sites already resolve the election earlier in the same command. `settings.Load` is **not** cached, so the call does cost one extra settings load.
+
+Benchmarks (Apple M4 Max, warm page cache, `go test -bench -benchtime=3000x` against the real packages):
+
+- `settings.Load`: **101 µs** (no `settings.local.json`) / **176 µs** (with one — the go-git tracked probe).
+- `ResolveCheckpointSyncRemote` with the git-remote cache installed: **225 µs** / **324 µs**.
+- `ResolveCheckpointSyncRemote` with **no** cache installed: **24.2 ms** (the git spawns; `/usr/bin/git` on macOS is the Xcode stub, ~12 ms each).
+
+So the added call costs ~0.2–0.3 ms inside a function that already spawns 3 git processes (~30–70 ms on macOS) for a 2-remote repo. That is ~0.5% of `inspectRemoteTopology`'s own cost.
+
+## Findings
+
+1. **`cmd/entire/cli/remote_topology.go:109-113` — the new `ResolveCheckpointSyncRemote` call: no finding.** 0 extra subprocesses in both measured call sites; +1 uncached `settings.Load` (~0.1–0.2 ms). Worst case, if this is the first election in the process (a doctor run where `checkDisconnectedMetadata` short-circuits at `PrimaryFetchableFromRemote`), it is +1–2 git spawns ≈ 12–24 ms, one-shot on a user-invoked command. Not worth optimizing.
+
+2. **`cmd/entire/cli/remote_topology.go:196` and `:208` — `unpinnedNames()` is called three times per disabled-sync print** (`syncDisabled():172`, then `:196`, then `:208`), each allocating a fresh `[]string`. The ambiguous path calls it twice (`:172`, `:261`). Sub-microsecond, so this is a tidiness nit, not a cost. Cheaper: hoist `names := t.unpinnedNames()` to the top of `describeSyncDisabled` and use `len(names)` at `:208` instead of re-deriving it — the block-scoped `names` at `:196` is exactly the value `:208` recomputes.
+
+3. **`cmd/entire/cli/remote_topology.go:99-101` — pre-existing, not introduced by this diff, but it dominates the function.** `remote.PushURL` is called once per remote and each call shells out (`GetRemoteURL(ctx, "origin")` → `git remote get-url origin`, observed 2–3 times per run) *and* does its own `settings.Load` (`checkpoint/remote/util.go:267,271`). Plus `settings.LoadCheckpointsConfig` at `:105` re-reads the same two JSON files with a separate loader. Net: for a 2-remote repo the function does 3 git spawns and 3 settings-file loads before the diff, 4 after. If anyone wants to speed this function up, the per-remote `get-url origin` is the target, not the new resolver call.
+
+4. **No hot path.** All three callers of `printCheckpointDestinationNote` are user-invoked: `doctor.go:174` (the `doctor` RunE), `setup.go:1428` (`runEnableInteractive`), `setup.go:1449` (`printEnabledStatus`). Nothing in `strategy/hooks.go` or any lifecycle handler reaches `inspectRemoteTopology`. Also worth knowing for cost accounting: the non-interactive single-agent enable path (`setup.go:2119`, the `--agent &lt;name&gt;` first-run flow) never calls the note at all — confirmed by the shim run, where `git remote -v` was absent entirely.
+
+5. **`inspectRemoteTopology` does duplicate one lookup conceptually** — it has the full remote-name list in hand at `:91-95` from `git remote -v`, and the resolver re-derives it via `git config --get-regexp` / `git remote get-url`. The memo makes that free at runtime, and reusing the local list would mean re-implementing the election's precedence outside the resolver, which is the exact bug the diff's own comment argues against. Leave it.</result>
+<usage><subagent_tokens>181044</subagent_tokens><tool_uses>45</tool_uses><duration_ms>425287</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>bod0d0n1p</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-brave-forest-f558/95176793-6169-4c16-baf0-3587e48ad0cc/tasks/bod0d0n1p.output</output-file>
+<status>completed</status>
+<summary>Background command "Full pre-commit gate after simplification" completed (exit code 0)</summary>
+</task-notification>

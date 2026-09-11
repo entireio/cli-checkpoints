@@ -1,0 +1,160 @@
+<task-notification>
+<task-id>blj4rd5dt</task-id>
+<tool-use-id>toolu_014yTn6tptBkfEu4BuGzQQPA</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-lucky-cloud-7c4c/9cd7778b-84df-4e7c-8f39-10f6e4facd35/tasks/blj4rd5dt.output</output-file>
+<status>completed</status>
+<summary>Background command "Wait for auth-go CI to finish" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+got this feedback:
+
+# OAuth redirect TLS protection
+
+Specification for Soph · 8 September 2026 · Proposed follow-up to [auth-go PR #25](https://github.com/entireio/auth-go/pull/25)
+
+Reviewed revision: `ea5c91b5492bd15295bbbf94ceea1e39ccf0b7fd`.
+
+## Goal
+
+Prevent every OAuth HTTP client in this library from following an HTTPS-to-HTTP redirect. Preserve the existing host restriction for credential-bearing requests and the device-authorization flow's regional HTTPS routing.
+
+The simplest viable change is one shared internal redirect check for TLS downgrades and the redirect limit. Both existing client policies use it. This needs no public API change, new dependency, or configurable security opt-out.
+
+## Security finding
+
+**High severity: the new host restriction still permits credentials to cross a plaintext connection.** This is a remaining gap in the protection added by PR #25; the downgrade behavior already existed before the PR.
+
+[`RejectCrossHostRedirect`](https://github.com/entireio/auth-go/blob/ea5c91b5492bd15295bbbf94ceea1e39ccf0b7fd/internal/oauthhttp/httpclient.go#L80) compares `req.URL.Host` with the first request's host. The scheme is excluded, so this redirect passes:
+
+```text
+https://issuer.example/oauth/token
+  → http://issuer.example/oauth/token
+```
+
+Both URLs have the same `URL.Host`. Their implicit destination ports also change from 443 to 80, despite the literal host comparison succeeding.
+
+For 307 and 308 responses, Go preserves a replayable request body. This library constructs its form requests with replayable bodies, so a token endpoint or proxy that redirects to HTTP can expose `subject_token`, `refresh_token`, an authorization code and PKCE verifier, or `device_code` to a network observer. Initial URL validation and `AllowInsecureHTTP=false` do not validate subsequent redirects. [Go's HTTP client documentation](https://pkg.go.dev/net/http#Client.Do) describes method/body replay and permissive scheme changes.
+
+The [`HTTPClientFollowingCrossHostRedirects`](https://github.com/entireio/auth-go/blob/ea5c91b5492bd15295bbbf94ceea1e39ccf0b7fd/internal/oauthhttp/httpclient.go#L57) exception has the same TLS gap because it sets `CheckRedirect` to nil. A public device-authorization request body does not make plaintext transport safe: its response contains a redeemable `device_code`. An observer who obtains that code can attempt redemption after the user authorizes the device request.
+
+The precondition is an HTTPS endpoint returning a downgrade redirect, for example through an open redirect or proxy misconfiguration. This finding does not assume an attacker can modify an otherwise correctly protected HTTPS response.
+
+## Required behavior
+
+1. **Keep TLS once a redirect chain reaches HTTPS.** Before following each redirect, compare the destination scheme with the immediately preceding request. After an HTTPS request, require an HTTPS destination. Checking only the initial request is insufficient for an HTTP→HTTPS→HTTP chain.
+2. **Apply the check to both constructors.** The ordinary client and the device-authorization client must both enforce TLS protection. Regional routing exempts device authorization from the host restriction only.
+3. **Preserve the existing redirect limit.** Both policies refuse when `len(via) >= 10`, matching the existing Go client behavior.
+4. **Preserve existing compatible flows.** Retain the ordinary client's case-insensitive host comparison against `via[0]`, including explicit port restrictions. Keep supported HTTP→HTTPS upgrades, local HTTP development, and regional HTTPS device authorization working.
+5. **Refuse before sending the next request.** Surface an error through the flow's existing error handling and return no token set or device-code response. The new policy's own error message must not include credentials, request bodies, or full URLs containing sensitive components. Sanitizing the existing `net/http` URL-error wrapper is outside this change.
+
+Initial HTTP requests remain subject to the library's existing `AllowInsecureHTTP` and loopback checks. Enabling that option does not permit a later downgrade after HTTPS has been reached.
+
+### Compatibility and security matrix
+
+The following assumes the initial URL has passed existing validation. All rows except the final limit test are below the redirect cap.
+
+| Redirect | Ordinary OAuth client | Device-authorization client |
+| --- | --- | --- |
+| HTTPS→HTTPS, same host and explicit port | Follow | Follow |
+| HTTPS→HTTPS, different host | Refuse | Follow |
+| HTTPS→HTTPS, changed explicit port | Refuse | Follow, preserving regional routing behavior |
+| HTTPS→HTTP, same host | Refuse | Refuse |
+| HTTPS→HTTP, different host | Refuse | Refuse |
+| HTTP→HTTPS, unchanged literal host and port | Follow | Follow |
+| Loopback HTTP→HTTP, same host, with existing HTTP opt-in | Follow | Follow |
+| HTTP→HTTPS→HTTP, otherwise allowed hosts | Refuse the final hop | Refuse the final hop |
+| Attempt to follow with ten requests already in `via` | Refuse | Refuse |
+
+## Implementation shape
+
+Keep the implementation in `internal/oauthhttp/httpclient.go`:
+
+1. Extract an unexported helper with the existing `CheckRedirect` signature. It checks the redirect limit, returns successfully for an empty history, and otherwise rejects a transition from HTTPS to a non-HTTPS destination using `via[len(via)-1]`.
+2. Have `RejectCrossHostRedirect` invoke that helper before its existing comparison with `via[0].URL.Host`.
+3. Assign the same helper as the device-authorization client's `CheckRedirect` policy instead of setting the policy to nil.
+
+Keep the current constructors, transports, request timeouts, and call sites. The helper's name is an implementation choice; its behavior is the contract. No policy factory, per-client state, credential-field inspection, or new public option is needed.
+
+### Files affected
+
+| File | Responsibility |
+| --- | --- |
+| `internal/oauthhttp/httpclient.go` | Shared mandatory checks and both policy assignments |
+| `internal/oauthhttp/httpclient_test.go` | Policy matrix, redirect chains, limit, and constructor behavior |
+| `sts/redirect_test.go` | Credential-bearing POST downgrade regression |
+| `deviceflow/regional_test.go` | Device-start and token-poll downgrade regressions; regional-routing compatibility |
+| `README.md` and `CHANGELOG.md` | Accurate security guarantees and release note |
+
+## Acceptance tests
+
+Write the regressions first and confirm they fail on the reviewed revision for the expected reason.
+
+1. **Both constructor policies:** exercise the matrix above. Replace the existing assertion that the device-authorization policy must be nil with assertions that it allows regional HTTPS redirects and rejects downgrades. Preserve hostname case handling and the redirect-limit boundary.
+2. **STS POST, 307 and 308:** begin with a valid HTTPS endpoint and `AllowInsecureHTTP=false`; redirect to HTTP with the same literal `URL.Host`. Assert that the HTTP destination receives no request, `Exchange` returns an error, and no token set is returned. This fixture must not change the explicit port in the URL: otherwise the existing host check could make the test pass without testing TLS protection.
+3. **Device token poll, 307 and 308:** apply the same checks to `PollDeviceAuth`. Assert that the redirected destination receives no request and no token set is returned.
+4. **Device authorization, 307 and 308:** redirect `StartDeviceAuth` from HTTPS to HTTP. Assert that the destination receives no request and no `DeviceCode` is returned. Keep a successful cross-host HTTPS regional-routing test, including correct `ResponseOrigin`, plus the existing public-form-key test.
+5. **Upgrade followed by downgrade:** exercise a permitted HTTP→HTTPS hop followed by HTTP. Assert rejection of the final hop in both policies. This prevents an implementation that only checks the first request's scheme from passing.
+
+Use only synthetic credentials and isolated test fixtures. A recording `RoundTripper` can verify the actual `http.Client` redirect decisions without external traffic. For a real network fixture, route logical default ports to local test listeners while preserving the request URLs and verifying the test TLS certificate. A direct policy assertion alone is insufficient for the flow-level tests.
+
+## Documentation corrections
+
+Describe device authorization as exempt from the host restriction while still subject to TLS protection and the redirect limit. Explain that its response carries a secret even though the library-built request body is public.
+
+Correct the claim that Go strips Basic authentication on every host change. Go can forward sensitive headers to subdomains; furthermore, the current `deviceflow.Client` has no `ClientSecret` field and its `postForm` does not explicitly set Basic authentication. The exception's rationale must describe the implemented API. [Go's header-forwarding rules](https://pkg.go.dev/net/http#Client) document the distinction.
+
+Update the existing Unreleased security entry rather than adding a conflicting guarantee. Retain the requirement for callers to validate `DeviceCode.ResponseOrigin` before assigning it to `TokenBaseURL`.
+
+## Verification and delivery
+
+This is one corrective slice for PR #25: it ships independently because both client policies, their regression coverage, and their security documentation form a complete fix. Target approximately 150–250 additional changed lines across the six implementation/test/documentation files above; measure the actual PR diff before pushing and remain below the repository's 800-line hard ceiling. Allow approximately 30–45 minutes for implementation and verification, excluding external review turnaround.
+
+After the failing-test confirmation and implementation, run the focused suite, then the repository's full formatting, lint, vulnerability, and race-test checks:
+
+```sh
+go test ./internal/oauthhttp ./sts ./deviceflow
+mise run check
+git diff --check
+git diff --numstat origin/main...HEAD
+```
+
+Completion requires every new regression to pass, all existing checks to pass, and review of both constructor assignments to confirm that regional routing cannot disable TLS protection.
+
+### Evidence already collected
+
+At the reviewed revision, the full `go test -race ./...` suite passed, formatting checks were clean, `golangci-lint` reported zero issues, and `govulncheck` found no vulnerabilities. The full test run required access to the existing tests' cache lock directory.
+
+A temporary policy-level check against both actual constructors failed as follows:
+
+```text
+credential request: HTTPS to HTTP redirect accepted; want refusal before sending request
+device authorization: HTTPS to HTTP has no redirect guard; net/http default permits this hop
+```
+
+This confirms the policy gap. A complete network reproduction was not run during the review; the flow-level regressions specified above remain implementation work. Review intent came from the PR description and commit message because checkpoint context was unavailable.
+
+## Scope boundary
+
+This specification addresses TLS downgrades. The broader policy governing which HTTPS regional hosts device authorization may trust remains a separate design decision, as already acknowledged in PR #25. This fix must not be presented as resolving that trust question or as making every cross-host device redirect safe.
+
+This document is a proposal for Soph to implement. No implementation changes or GitHub review comments accompany it.
+
+---
+
+<task-notification>
+<task-id>b2o3hdiz8</task-id>
+<tool-use-id>toolu_01B2JS1SbsZs1SkVjQKmYV6Y</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph--herdr-worktrees-cli-worktree-lucky-cloud-7c4c/9cd7778b-84df-4e7c-8f39-10f6e4facd35/tasks/b2o3hdiz8.output</output-file>
+<status>completed</status>
+<summary>Background command "Wait for auth-go CI on the new commit" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+ok, reply and update the body
+
+---
+
+ok #25 is merged

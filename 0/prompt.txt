@@ -1,0 +1,112 @@
+1
+
+---
+
+did you run a reviewer on it?
+
+---
+
+okay run reviewer
+
+---
+
+<task-notification>
+<task-id>a439ce6a2ab77488e</task-id>
+<tool-use-id>toolu_018sggJ7mqhvK8EQCqswp7sm</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-Documents---Peyton-s-MacBook-Pro-entire-devenv-entireio-cli--worktrees-tokens/0321cdd8-aa32-4c13-869b-38d8625ce4f4/tasks/a439ce6a2ab77488e.output</output-file>
+<status>completed</status>
+<summary>Agent "Review the PR 3 attribution plan" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Plan Review — PR 3
+
+**Status:** Issues Found
+
+---
+
+### Rendering-half claims verified
+
+I read the base branch's `checkpoint_tokens.go`, `explain.go`, `api/checkpoint/*`, `token_cost.go`, `registry.go`, `session_tokens.go`, the `#2269` diff, and `tokens-report`'s `tokenreport/` package; spot-built the probe worktree.
+
+| # | Claim | Verdict |
+|---|---|---|
+| 1 | `ReadSessionContent` reachable from `checkpoint tokens` | **Partly.** Reachable from `loadCheckpointTokensReport` — `lookup.store` is `checkpoint.PersistentStore` (`explain.go:90-94`), which embeds `SessionReader` (`api/checkpoint/interfaces.go:19-33`). **Not** reachable where the plan puts the call. See Issue A. |
+| 2 | `token_transcript_start` present and populated | **Yes.** `Metadata.TokenTranscriptStart` at `api/checkpoint/metadata.go:443`; written via `persistent.go:730` / `fsstore.go:332` from `state.TokenTranscriptStart` (`manual_commit_condensation.go:770`). Contract also matches: `AttributeTokens(transcript, startLine, subagentsDir)` takes a **startLine**, in the same unit as `CalculateTokenUsage(ctx, ag, data.Transcript, state.TokenTranscriptStart, "")` (`manual_commit_condensation.go:1546`) — you pass the offset, you don't slice bytes. |
+| 3 | `exactPercents` reusable | **Yes.** `token_cost.go:278` — `exactPercents(counts []int) []int`, variable length, largest-remainder, index-stable. Two caveats in Issue F. |
+| 4 | `~+250` rendering estimate | **Not credible.** See Budget. |
+| 5 | Harness at `sessions_test.go:1955` | **Yes, and it can supply a transcript.** `TestCheckpointTokensCmd_TextOutputWithRealCheckpointShape` starts at 1954; `runExplainAutoTestRepo` (`explain_test.go:379`) does `t.Chdir` — the no-`t.Parallel()` caution is correct; the write already passes `Transcript: redact.AlreadyRedacted(...)`, and `WriteOptions` carries `TokenTranscriptStart`, so the window is settable. Task 3 Step 1 is actionable. |
+| 6 | `agent.AsTokenAttributor` / agent lookup | **Yes.** `GetByAgentType(types.AgentType) (Agent, error)` at `registry.go:193`; `Metadata.Agent` is `types.AgentType`; registry populated in the `cli` package via the blank import at `config.go:22`. |
+
+Harvest spot-check: probe worktree exists, 16 files, `git diff --numstat e09a82674` → **+2275 / −6**, `go build ./...` clean.
+
+---
+
+### Claims that are WRONG
+
+1. **"Of the 2,275, 1,364 are test lines."** Actual: **1,117** (tests + testdata). Non-test implementation is **1,158**. Off by 247, and it matters — see Budget.
+
+2. **"Keep the `checkpoint_tokens.go` edit to a single call"** / Decision 2's "invoked from one line in `writeCheckpointTokensText`.** `writeCheckpointTokensText(w io.Writer, report checkpointTokensReport)` has no `ctx` and no store. It cannot read a transcript. The read must happen in `loadCheckpointTokensReport`, so the file needs **three** edits: a field on `checkpointTokensReport` (`checkpoint_tokens.go:18-38`), a call in `loadCheckpointTokensReport`, and the render call. Still small, but the plan's central design constraint is stated falsely.
+
+3. **Task 2 Step 3, "subagents via `SubagentRecord`" — dead code as written.** `types.Attribution.Subagents` is documented "empty when `subagentsDir == \"\"`", and committed-checkpoint reads pass `""` (as condensation already does at `manual_commit_condensation.go:1546`). Subagent attribution on this path must come from `ToolUseRef.SubagentType` on `Emitted`, or from committed task records — which the spec explicitly defers ("Task records / `ReadTaskRecords` across stores — … a later refinement").
+
+4. Trivial: `claudecode/transcript.go` is **+37**, not +36 (the awk range yields 36 function lines plus a separator).
+
+**Unverifiable:** the rejected split's "**+1,806**". I could not derive it from any subset of the manifest. Report it as an estimate or drop it.
+
+---
+
+### Issues
+
+**[Task 3, Step 3] A — Missing plumbing step (the one you asked about).** As above: the call belongs in `loadCheckpointTokensReport`, and every existing error path there returns early with an error. Attribution must be explicitly non-fatal, which the plan implies but never specifies. Without that step written down, an implementer wires a transcript-read failure into a command failure and breaks Decision 3.
+
+**[Task 2/3] B — Multi-session checkpoints unhandled.** `readCheckpointTokenSessionMetadata` loops `len(summary.Sessions)`. Attribution needs N `ReadSessionContent` calls, each with its own `TokenTranscriptStart`, then a merge. `tokens-report` had `MergeContributors(perSession []Attributed)` for exactly this. The plan speaks only of "the session" throughout.
+
+**[Task 3, Step 3] C — Cost profile change, ungated.** `checkpoint tokens` is metadata-only today. `ReadSessionContent` auto-fetches missing blobs over the network (the store is opened with `BlobFetcher: FetchBlobsByHash`) and runs `reinjectAssets` on transcripts capped at 50MB. `explain` wraps this in `prefetchCheckpointBlobs` + a spinner (`explain.go:878-900`); `checkpoint tokens` has neither, and the plan adds no spinner, no size guard, and no `--no-attribution` escape.
+
+**[Task 2/3] D — Collides with PR 1's existing "Likely contributors" surface, unaddressed.** The base already has `Contributors []sessionTokensContributor` populated with kinds `subagents`, `context_pressure`, `skills` (`checkpoint_tokens.go:234,267,289`) and `writeTokenContributors` (`session_tokens.go:642`). `tokens-report`'s own design used a single `Contributor` type for exactly this. The plan invents a parallel row type and a parallel section without reconciling them — two sections naming skills and subagents, with no stated render order. This is a design decision the plan skips, not a detail.
+
+**[Task 2 Step 1, Task 3 Step 4] E — No conservation and no window-independence assertion.** The spec's stated Review focus is "*the attribution walk and the conservation property*", with acceptance "*Σ(breakdown rows) == the checkpoint's `token_usage` total, exactly*" and "*attribution over `[start, end]` is identical whether computed from the full walk or a sliced one — this caught a real slice-boundary bug in B1*". Task 2 Step 1 asserts sorting and merging; Step 4 asserts degradation. Nothing asserts either spec property at the aggregation layer, which is precisely where the largest-remainder split and the input-proportioning live.
+
+**[Task 2 Step 3] F — `exactPercents` caveats.** It discards `exactPercentsFloat`'s `bool`, so a zero total silently yields all-zeros; and shares sum to 100 only over the **full** row set — if the section renders top-N, the displayed shares will not sum to 100, which is the exact invariant the plan cites as the reason to reuse it.
+
+**[Task 3 Step 4] G — Name the sentinel.** "a checkpoint whose transcript is absent" surfaces as `checkpoint.ErrNoTranscript` (`persistent.go:1515`), not a nil result. Actionable but underspecified.
+
+**[Task 2 Step 3] H — The "not recorded" count has no destination.** Correctly separating `UsageUnknown` from zero, but Step 3 never says where the count renders.
+
+**I — `--json` and `--agent-brief` unmentioned.** `printJSON(cmd.OutOrStdout(), report)` emits any new field automatically. Spec permits "additive breakdown rows", so this is probably fine — but it is decided by omission rather than stated.
+
+**J — Sibling-conflict claim: accurate in spirit, understated in mechanism.** #2269 is +47/−123 on `checkpoint_tokens.go` across three hunks, and its second hunk (`@@ -646,98 +646,16 @@`) rewrites the **body of `writeCheckpointTokensText` itself** — replacing `writeCheckpointTokenClasses(w, report.Classes)` with `writeTokenClasses(w, report.Classes, subagentTotalOf(report.Tokens))` and extracting `formatSharePercent`/`formatCostSharePercent`/`subsetNote` out of the file. So PR 3's render line lands *inside* the rewritten hunk, not adjacent to it. Git will conflict; the resolution is a few lines, and the resolver must keep #2269's renderer. "Trivial" holds. "One line" does not (see Wrong #2). The struct-field edit at lines 18-38 is a second, cleaner region; the `loadCheckpointTokensReport` edit is conflict-free.
+
+**No TODOs or placeholders found.** Expected outputs are thin, though: Task 3 Step 1 asserts only "the output names the tool and its detail" and Step 5 only "a section naming actual tools" — no sample rendering anywhere, unlike PR 1's and PR 2's precedent of a literal expected block. An implementer is inventing the format.
+
+---
+
+### Budget assessment
+
+**The spec contradiction note is accurate** — verified: the sequence table row 3 reads "Per-tool drill-down, first agent (transcript walk + the seam) | ≤ 1,400"; the `## PR 3 — Codex support` section reads "Budget: ≤ 600" and describes Codex. Following the table is the right call.
+
+**The stated overrun is itself too low.** `~+250` is the load-bearing number and it is off by 2–3×. `tokens-report`'s equivalent aggregator is `cmd/entire/cli/tokenreport/attribution.go` at **733 lines + 897 test lines**, doing exactly what Task 2 Step 3 describes (group by tool+detail, proportional input attribution across `Consumed`, subagent absorption, largest-remainder shares, unpriced tracking). Strip cost weighting and subagents and you still need: aggregator ~100-150, renderer ~50, struct+JSON ~20, the read/lookup/slice/degradation wiring ~60-80, and five command-level tests at the ~40-line-per-test shape of the existing harness ~250-350. Realistic: **+450 to +800**. Projected total **~2,700-3,100 — 95-120% over**, not 80%.
+
+**The reasoning is partly rationalising, because the framing is a false binary.** "Strip the tests or eat the overrun" omits a third option the plan never considers: **land the harvest narrower.** `stringutil/shell.go` (+151/+164) and `transcript/tool_detail.go` (+200/+305) are **820 lines — 36% of the harvest** — and exist solely to produce the `Detail` drill-down string. Task 2's own test needs only `Tool` + `Detail`, and `SanitizeShellCommand` has exactly one caller here. Deferring the detail drill-down to PR 4 (tool *names* attributed, no command/file/host detail) cuts ~820 and lands ~1,700 — 21% over instead of 95%+ — while still shipping the user-visible change the plan exists for. Spec Rule 2 ("the budget is not advisory") and Rule 3 ("no abstraction before the second caller") both point there. The plan should either take that path or state explicitly why a tool name without its detail is not worth shipping.
+
+Two sub-points that are honest and correct: landing a credential-sanitising formatter untested would indeed be worse than the overrun, and the engine-only split does violate Rules 1 and 3. But note the corrected arithmetic changes the picture: implementation-only is **1,158**, which *fits* under 1,400. The break comes from harvested tests plus rendering, not from the engine.
+
+**Decision 3 is achievable** — the classes block is built from metadata in `buildCheckpointTokensReport` and is structurally independent of any transcript read, so attribution cannot displace it — **provided** Issue A is fixed. Put the call in `writeCheckpointTokensText` as Decision 2 says and it is not merely unachievable, it does not compile.
+
+---
+
+### Recommendations (advisory)
+
+1. Fix Decision 2 and Task 3 Step 3 to place the read in `loadCheckpointTokensReport`, add the explicit "attribution failure is non-fatal, classes block survives" step, and restate the `checkpoint_tokens.go` surface as three small edits.
+2. Correct the test-line figure to 1,117 / implementation 1,158, and re-estimate the rendering half against `tokenreport/attribution.go`'s 733+897. Either accept a ~100% overrun with that number stated, or take the narrow-harvest split (drop `stringutil` + `tool_detail`, −820) and land at ~21% over.
+3. Add a Task 2 step asserting conservation (Σ rows == the checkpoint's `token_usage` total) and window independence at the aggregation layer — both are spec acceptance criteria and the spec's named review focus.
+4. Resolve the subagent story: attribute from `ToolUseRef.SubagentType` on `Emitted`, or drop subagents from PR 3. `SubagentRecord` is empty on this path.
+5. Add a multi-session step (loop sessions, per-session `TokenTranscriptStart`, merge) or scope PR 3 to single-session checkpoints and say so.
+6. Decide the `Contributors` collision explicitly — extend `sessionTokensContributor` or state why a second section is right — and add a sample expected rendering to Task 3.
+7. Add a perf note for Step 5: blob auto-fetch plus asset reinjection on a large transcript, with no spinner. Consider a size cap or an opt-out.
+8. Name `checkpoint.ErrNoTranscript` in Task 3 Step 4, and say where the `UsageUnknown` count renders.</result>
+<usage><subagent_tokens>145976</subagent_tokens><tool_uses>43</tool_uses><duration_ms>372238</duration_ms></usage>
+</task-notification>
+
+---
+
+instead of percentages, give me real numbers

@@ -1,0 +1,118 @@
+<task-notification>
+<task-id>a6a068ed598355b26</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-fix-conflicts/402265d6-604e-475f-b017-a6b0acbe245d/tasks/a6a068ed598355b26.output</output-file>
+<status>completed</status>
+<summary>Agent "Research agent home env vars" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Nothing further is needed — every question is now answered from primary sources, so here is the report.
+
+## 1. Gemini CLI — `GEMINI_CLI_HOME` (replaces HOME, not `~/.gemini`)
+
+Source pinned at `google-gemini/gemini-cli` commit `ed2ac40df67a319bf348bd7e3d10494696b31b38` (main, fetched today).
+
+**`packages/core/src/utils/paths.ts` lines 13–28** (https://raw.githubusercontent.com/google-gemini/gemini-cli/main/packages/core/src/utils/paths.ts):
+```ts
+export const GEMINI_DIR = '.gemini';
+...
+/**
+ * Returns the home directory.
+ * If GEMINI_CLI_HOME environment variable is set, it returns its value.
+ * Otherwise, it returns the user's home directory.
+ */
+export function homedir(): string {
+  const envHome = process.env['GEMINI_CLI_HOME'];
+  if (envHome) {
+    return envHome;
+  }
+  return os.homedir();
+}
+```
+
+**`packages/core/src/config/storage.ts`** (https://raw.githubusercontent.com/google-gemini/gemini-cli/main/packages/core/src/config/storage.ts), lines 54–60, 154–156, 181–185, 365:
+```ts
+static getGlobalGeminiDir(): string {
+  const homeDir = homedir();
+  if (!homeDir) {
+    return path.join(os.tmpdir(), GEMINI_DIR);
+  }
+  return path.join(homeDir, GEMINI_DIR);
+}
+static getGlobalTempDir(): string {
+  return path.join(Storage.getGlobalGeminiDir(), TMP_DIR_NAME);   // TMP_DIR_NAME = 'tmp'
+}
+getProjectTempDir(): string {
+  const identifier = this.getProjectIdentifier();
+  const tempDir = Storage.getGlobalTempDir();
+  return path.join(tempDir, identifier);
+}
+const chatsDir = path.join(this.getProjectTempDir(), 'chats');
+```
+So the chain is `$GEMINI_CLI_HOME` → `join(homeDir, '.gemini')` → `/tmp` → `/&lt;project-hash&gt;` → `/chats`. The variable substitutes for `os.homedir()`; `.gemini` is appended afterwards. Result: **`$GEMINI_CLI_HOME/.gemini/tmp/&lt;project-hash&gt;/chats/`**.
+
+**Docs confirm the same reading.** `docs/reference/configuration.md` lines 2626–2633 (https://github.com/google-gemini/gemini-cli/blob/main/docs/reference/configuration.md):
+&gt; **`GEMINI_CLI_HOME`**: Specifies the root directory for Gemini CLI's user-level configuration and storage. By default, this is the user's system home directory. The CLI will create a `.gemini` folder inside this directory. Useful for shared compute environments or keeping CLI state isolated. Example: `export GEMINI_CLI_HOME="/path/to/user/config"`
+
+`docs/cli/enterprise.md` lines 223–226 (https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/enterprise.md):
+&gt; By default, Gemini CLI stores configuration and history in `~/.gemini`. You can use the `GEMINI_CLI_HOME` environment variable to point to a unique directory for a specific user or job. The CLI will create a `.gemini` folder inside the specified path.
+
+Note: `GEMINI_CLI_HOME` only overrides the `homedir()` helper. Tests in the repo (`trackerTools.test.ts`, `acknowledgedAgents.test.ts`, etc.) stub it to redirect state, confirming it is the intended isolation knob.
+
+**Documented relocation variable: `GEMINI_CLI_HOME` replaces the HOME directory (result is `$GEMINI_CLI_HOME/.gemini/...`), not `~/.gemini` itself.**
+
+## 2. Cursor CLI — `CURSOR_CONFIG_DIR` / `XDG_CONFIG_HOME`, documented for `cli-config.json` only
+
+`docs.cursor.com/en/cli/...` returns HTTP 308 to `cursor.com/docs`; the live page is https://cursor.com/docs/cli/reference/configuration. Verbatim (whitespace collapsed; table rendered inline):
+
+&gt; Configure the Agent CLI using the `cli-config.json` file.
+&gt; **File location** — Global / macOS/Linux: `~/.cursor/cli-config.json` · Global / Windows: `$env:USERPROFILE\.cursor\cli-config.json` · Project / All: `&lt;project&gt;/.cursor/cli.json`
+&gt; Only permissions can be configured at the project level. All other CLI settings must be set globally.
+&gt; Override with environment variables:
+&gt; `CURSOR_CONFIG_DIR`: custom directory path
+&gt; `XDG_CONFIG_HOME` (Linux/BSD): uses `$XDG_CONFIG_HOME/cursor/cli-config.json`
+
+What the docs do **not** say, checked across configuration, parameters, overview, installation, headless, and authentication pages (`/cli/reference/environment-variables` is a 404):
+- Chat storage location is never documented; `~/.cursor/chats` appears nowhere in the CLI docs.
+- Whether `CURSOR_CONFIG_DIR` moves anything besides `cli-config.json` is not stated. The variable is introduced as an override for the config-file location; no sentence ties it to chats, sessions, or `~/.cursor` as a whole.
+- The only other `~/.cursor` paths the CLI docs name are hardcoded, with no mention of following the variable: `~/.cursor/worktrees/&lt;reponame&gt;/&lt;name&gt;` (`--worktree`) and `~/.cursor/mcp.json` (`agent mcp login`), both on https://cursor.com/docs/cli/reference/parameters.
+- The `XDG_CONFIG_HOME` layout is `$XDG_CONFIG_HOME/cursor/cli-config.json` (a `cursor` directory, no dot), so at least in the XDG case the result is not `$VAR/.cursor/...`. For `CURSOR_CONFIG_DIR` the docs say only "custom directory path" and do not spell out whether `cli-config.json` lands at `$CURSOR_CONFIG_DIR/cli-config.json` or deeper.
+- No `CURSOR_HOME` exists in the docs. The only CLI env vars documented are `CURSOR_API_KEY`, `HTTP_PROXY`, `HTTPS_PROXY`, `NODE_USE_ENV_PROXY`, `NODE_EXTRA_CA_CERTS`.
+
+**Documented relocation variable: `CURSOR_CONFIG_DIR` (and `XDG_CONFIG_HOME` on Linux/BSD) replaces the directory holding `cli-config.json`; relocation of `~/.cursor/chats` is not documented.**
+
+## 3. Factory AI Droid — no relocation variable
+
+Checked the settings page (https://docs.factory.ai/droid-cli/settings), the CLI reference (https://docs.factory.ai/droid-cli/cli-reference), and the full Mintlify docs dump (https://docs.factory.ai/llms-full.txt, 1.17 MB, fetched today).
+
+Settings page, verbatim: settings live at `~/.factory/settings.json` (macOS/Linux) and `%USERPROFILE%\.factory\settings.json` (Windows), with overrides at `~/.factory/settings.local.json` and `&lt;project&gt;/.factory/settings.local.json`. No environment variable is mentioned for the directory.
+
+Every `FACTORY_*` / `DROID_*` variable that appears anywhere in the docs dump: `FACTORY_API_KEY`, `FACTORY_PROJECT_DIR`, `DROID_PLUGIN_ROOT`, `FACTORY_API_KEY_HELPER_TTL_MS`, `DROID_PARENT_SESSION_ID`, `FACTORY_DROID_AUTO_UPDATE_ENABLED`, `FACTORY_LOG_FILE`, `FACTORY_DISABLE_KEYRING`, `DROID_SHIELD_VIOLATION`, `DROID_CWD`, `DROID_CLIENT_ERROR`. None relocates `~/.factory`:
+- `FACTORY_PROJECT_DIR` is the project root for hook scripts ("Use `"$FACTORY_PROJECT_DIR"/path/to/script.sh` for project scripts").
+- `FACTORY_LOG_FILE` / `FACTORY_DISABLE_KEYRING` appear only in a changelog line: "New environment variables for log file output and keyring control".
+- `DROID_CWD` is the hook working-directory variable (migrated from Claude Code's `CLAUDE_CWD`).
+
+`FACTORY_HOME`, `FACTORY_CONFIG_DIR`, `DROID_HOME`, `XDG_CONFIG_HOME`: zero hits. `~/.factory/sessions` is also never mentioned — the docs name `~/.factory/settings.json`, `mcp.json`, `hooks.json`, `droids/`, `skills/`, `worktrees`, `logs/`, `.ssh/`, `config.json`, etc., but not a sessions directory; the closest is "`listSessions()` reads local Droid session storage" (Sessions API page), with no path given.
+
+**No documented relocation variable found.**
+
+## Summary table
+
+| Agent | Variable | What it replaces | Chats/sessions follow it? |
+|---|---|---|---|
+| Gemini CLI | `GEMINI_CLI_HOME` | HOME → `$VAR/.gemini/...` | Yes, by source (`chats` is under `getProjectTempDir()` → `getGlobalGeminiDir()` → `homedir()`) |
+| Cursor CLI | `CURSOR_CONFIG_DIR`, `XDG_CONFIG_HOME` | directory of `cli-config.json` | Not documented |
+| Factory Droid | none | — | Not documented; `~/.factory` is hardcoded in docs |
+
+Scratch copies of the fetched sources are in `/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-fix-conflicts/402265d6-604e-475f-b017-a6b0acbe245d/scratchpad/` (`gemini-cli-docs/` sparse clone, `cursor_cfg.txt`, `factory_llms.txt`) if you want to re-grep.</result>
+<usage><subagent_tokens>150521</subagent_tokens><tool_uses>16</tool_uses><duration_ms>187684</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>bps5lk8mm</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-fix-conflicts/402265d6-604e-475f-b017-a6b0acbe245d/tasks/bps5lk8mm.output</output-file>
+<status>completed</status>
+<summary>Background command "Extract exact GEMINI_CLI_HOME resolution code" completed (exit code 0)</summary>
+</task-notification>

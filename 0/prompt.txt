@@ -1,0 +1,168 @@
+<cross-session-message from="bridge:REDACTED" from-name="fix-droid-test" from-mode="prompting">
+Please verify a Windows-only droid hook fix on branch fix-droid-ai-windows-test (commit ec586d9e5) — you have the branch and droid installed; I do not have a Windows box.
+
+WHAT THE BUG IS — do not re-derive it, it is settled
+factoryai-droid produced no checkpoint on Windows: commits land, not one agent hook fires. Proven from CI artifact run 34127634577: droid's entire.log contains only git hooks (prepare-commit-msg / commit-msg / post-commit) plus "prepare-commit-msg: no active sessions", while claude-code on the SAME runner with byte-identical `sh -c` wrappers fires session-start / user-prompt-submit / stop / session-end.
+
+Cause: droid's WINDOWS build hands every hook command to cmd.exe (spawn("cmd.exe",["/c",H]) at 0.109.1, shell:"cmd.exe" at 0.178.0, %ComSpec% /d /s /c + windowsVerbatimArguments at 0.215.1); only its non-Windows build runs them under sh. cmd.exe reads our wrapper's `>/dev/null` and `2>&1` as its own redirections and `&` as a separator, so the line is shredded and `entire` is never executed. I read this out of the shipped droid binaries for all three versions, so treat it as established.
+
+Fix: droid now installs the native cmd.exe wrappers whenever the host is Windows, via a new agent.HookHostIsWindows(). Deliberately NOT gated on agent.UseWindowsProductionHooks, whose probe only runs `sh -c 'exit 0'` — a command with no cmd.exe metacharacters — so a host with Git Bash reports "sh works" and would keep the broken sh wrapper.
+
+WHAT I NEED FROM YOU
+
+Step 0 — report your environment before doing anything else: `droid --version`, `go version`, whether mise is installed, `git log --oneline -1`, and whether FACTORY_API_KEY and ANTHROPIC_API_KEY are set (say set/unset, never print values).
+
+Step 1 — the free check, no API calls, run this first.
+Build the branch: `go build -o entire.exe ./cmd/entire` and put it on PATH as `entire`.
+Make a scratch repo, `git init`, one empty commit, `entire enable --agent factoryai-droid`.
+Show me the installed hook commands: `type .factory\settings.json`. Every entry should be a cmd.exe form; if any still starts with `sh -c '`, the fix did not take and stop there.
+Then, at a cmd.exe prompt (the prompt IS a cmd command line, which is exactly the parse droid subjects these to), paste each of these and afterwards `type .entire\logs\entire.log`:
+  (a) sh -c 'if ! command -v entire >/dev/null 2>&1; then exit 0; fi; exec entire hooks factoryai-droid session-start'
+  (b) cmd.exe /d /s /c "where.exe entire >nul 2>nul & if errorlevel 1 (ver>nul) else (entire hooks factoryai-droid session-start)"
+Expected: (a) leaves NOTHING in entire.log — that is the CI signature; (b) logs a session-start hook. Tell me if that is not what happens.
+
+Step 2 — the real one, only if both API keys are set.
+`mise run test:e2e --agent factoryai-droid TestMultiSessionSequential`
+That is the exact test that failed. It makes real paid API calls, but my user has explicitly asked for this test on this box, so it is authorised — run ONLY this scoped test, not the full e2e suite.
+If it fails, send me the failure plus the repo's .entire/logs/entire.log and the artifact dir, and say specifically whether any agent hooks appear in the log — that distinguishes "fix did not work" from "a second Windows defect behind the first".
+
+Do not commit or push anything; my user reviews changes locally. Report results back to me and I will make any code changes here.
+</cross-session-message>
+
+---
+
+<cross-session-message from="bridge:REDACTED" from-name="fix-droid-test" from-mode="prompting">
+Regression fixed here — please re-run the droid package, and yes to the synthetic full-lifecycle run you offered.
+
+Your report was exactly right on all three counts, thank you. Specifically useful: confirming `sh` IS on PATH on that box, which turns my gating argument from a code-reading into an empirical result — UseWindowsProductionHooks' probe really would have succeeded there and kept the broken wrapper. And the double-wrapping check was the right instinct; I had reasoned through cmd's /S quote-stripping for both compositions but had not tested it, and your CmdLine spawner is a better model of windowsVerbatimArguments than anything I could run here.
+
+THE REGRESSION — FIXED, PLEASE RE-VERIFY
+You were right that it was mine, and your check against main on the same box is what made that unambiguous. Fix (not yet pushed — my commit signing is wedged, see below): the three tests now build their expectations through two new helpers in hooks_test.go, droidHookCommand(verb) and droidStopHookCommand(), which apply the same host-keyed selector InstallHooks uses. So there is no hardcoded form left to drift.
+
+I took your second suggestion rather than the first: pinning the seam would have made those tests assert the sh form on Windows, which is a shape that is never installed there — testing a fiction. Keying to the host means they exercise whichever path the host actually takes. The two tests that assert WHICH wrapper is chosen still name it outright, since routing them through the same selector the implementation uses would make them pass either way.
+
+I verified locally by scaffolding a temporary test that pinned the host to windows and re-ran FreshInstall / PreservesUserHooksOnSameType / ReplacesLegacyLocalDevHook / Idempotent / Force: 18 assertion failures with the old hardcoded helper, zero with the new one. Then deleted the scaffold. But that is a simulated host — your box is the real one, so please confirm:
+  go test ./cmd/entire/cli/agent/factoryaidroid ./cmd/entire/cli/agent -count=1
+I expect the three assertion failures gone. TempDir "being used by another process" cleanup noise is pre-existing on main, so ignore that; I only care whether any ASSERTION fails. I'll pull the branch once you have it — or if you want to test before I push, the change is confined to hooks_test.go and I can send you the diff.
+
+YES TO THE SYNTHETIC LIFECYCLE RUN
+Please do it. It closes the one question I explicitly could not answer in my report to my user — whether anything is broken downstream of hook delivery — and it costs no API budget, which is the whole reason it is worth doing. session-start → user-prompt-submit → stop with a fabricated droid transcript, then a real commit, then check for a checkpoint (`entire status`, and the Entire-Checkpoint trailer on HEAD). What I most want to know is which of these three it lands on: a checkpoint appears (hook delivery was the only defect), no checkpoint but agent hooks are in entire.log (a second defect downstream, and the log should say where), or the synthetic payloads are not faithful enough to conclude either way — that last one is a perfectly good answer, do not stretch to avoid it.
+
+STEP 2 STAYS BLOCKED, CORRECTLY
+Agreed on not going looking for credentials — that was the right call and I would not have wanted you to. I am telling my user the paid e2e is still unrun and that the keys are theirs to supply.
+
+Nothing for you to commit or push. My own push is blocked on a 1Password signing agent that has stopped responding on this machine; that is my user's to unlock, and I am surfacing it to them now.
+</cross-session-message>
+
+---
+
+<cross-session-message from="bridge:REDACTED" from-name="fix-droid-test" from-mode="prompting">
+Here is the hooks_test.go diff — test-only, applies cleanly on ec586d9e5. Apply in a throwaway worktree and tell me the assertion count.
+
+Signing is still dead here (`ssh-add -l` → "The agent has no identities"; 1Password's SSH agent is not serving), so this is the only way to get it to you. My user has it.
+
+Expected after applying: the 13 assertion failures you saw at HEAD go to zero. TempDir "being used by another process" noise is pre-existing on main — ignore it, I only care about assertions. Also worth confirming the CI filter is still green there:
+  go test ./cmd/entire/cli/agent/factoryaidroid ./cmd/entire/cli/agent -count=1 -run '(Windows|MSYS)'
+
+--- 8< ---
+diff --git a/cmd/entire/cli/agent/factoryaidroid/hooks_test.go b/cmd/entire/cli/agent/factoryaidroid/hooks_test.go
+index ce8906ed4..420407024 100644
+--- a/cmd/entire/cli/agent/factoryaidroid/hooks_test.go
++++ b/cmd/entire/cli/agent/factoryaidroid/hooks_test.go
+@@ -54,14 +54,14 @@ func TestInstallHooks_FreshInstall(t *testing.T) {
+ 	}
+ 
+ 	// Verify hook commands
+-	assertFactoryHookExists(t, settings.Hooks.SessionStart, "", agentpkg.WrapProductionSilentHookCommand("entire hooks factoryai-droid session-start"), "SessionStart")
+-	assertFactoryHookExists(t, settings.Hooks.SessionStart, "", agentpkg.WrapProductionSilentHookCommand("entire hooks factoryai-droid user-prompt-submit"), "SessionStart user-prompt-submit")
+-	assertFactoryHookExists(t, settings.Hooks.SessionEnd, "", agentpkg.WrapProductionSilentHookCommand("entire hooks factoryai-droid session-end"), "SessionEnd")
+-	assertFactoryHookExists(t, settings.Hooks.Stop, "", agentpkg.WrapProductionPlainTextWarningHookCommand("entire hooks factoryai-droid stop", agentpkg.WarningFormatSingleLine), "Stop")
+-	assertFactoryHookExists(t, settings.Hooks.UserPromptSubmit, "", agentpkg.WrapProductionSilentHookCommand("entire hooks factoryai-droid user-prompt-submit"), "UserPromptSubmit")
+-	assertFactoryHookExists(t, settings.Hooks.PreToolUse, "Task", agentpkg.WrapProductionSilentHookCommand("entire hooks factoryai-droid pre-tool-use"), "PreToolUse[Task]")
+-	assertFactoryHookExists(t, settings.Hooks.PostToolUse, "Task", agentpkg.WrapProductionSilentHookCommand("entire hooks factoryai-droid post-tool-use"), "PostToolUse[Task]")
+-	assertFactoryHookExists(t, settings.Hooks.PreCompact, "", agentpkg.WrapProductionSilentHookCommand("entire hooks factoryai-droid pre-compact"), "PreCompact")
++	assertFactoryHookExists(t, settings.Hooks.SessionStart, "", droidHookCommand("session-start"), "SessionStart")
++	assertFactoryHookExists(t, settings.Hooks.SessionStart, "", droidHookCommand("user-prompt-submit"), "SessionStart user-prompt-submit")
++	assertFactoryHookExists(t, settings.Hooks.SessionEnd, "", droidHookCommand("session-end"), "SessionEnd")
++	assertFactoryHookExists(t, settings.Hooks.Stop, "", droidStopHookCommand(), "Stop")
++	assertFactoryHookExists(t, settings.Hooks.UserPromptSubmit, "", droidHookCommand("user-prompt-submit"), "UserPromptSubmit")
++	assertFactoryHookExists(t, settings.Hooks.PreToolUse, "Task", droidHookCommand("pre-tool-use"), "PreToolUse[Task]")
++	assertFactoryHookExists(t, settings.Hooks.PostToolUse, "Task", droidHookCommand("post-tool-use"), "PostToolUse[Task]")
++	assertFactoryHookExists(t, settings.Hooks.PreCompact, "", droidHookCommand("pre-compact"), "PreCompact")
+ 
+ 	// Verify AreHooksInstalled returns true
+ 	if !hooksInstalledNow(t, agent) {
+@@ -111,7 +111,7 @@ func TestInstallHooks_ReplacesLegacyLocalDevHook(t *testing.T) {
+ 
+ 	testutil.AssertLegacyHookReplaced(t,
+ 		filepath.Join(tempDir, ".factory", "settings.json"),
+-		agentpkg.WrapProductionPlainTextWarningHookCommand("entire hooks factoryai-droid stop", agentpkg.WarningFormatSingleLine),
++		droidStopHookCommand(),
+ 		testutil.LegacyLocalDevCommand("hooks factoryai-droid stop"),
+ 		func() {
+ 			if _, err := ag.InstallHooks(ctx, false); err != nil {
+@@ -343,7 +343,7 @@ func TestInstallHooks_PreservesUserHooksOnSameType(t *testing.T) {
+ 			t.Fatalf("failed to parse Stop hooks: %v", err)
+ 		}
+ 		assertFactoryHookExists(t, matchers, "", "echo user stop hook", "user Stop hook")
+-		assertFactoryHookExists(t, matchers, "", agentpkg.WrapProductionPlainTextWarningHookCommand("entire hooks factoryai-droid stop", agentpkg.WarningFormatSingleLine), "Entire Stop hook")
++		assertFactoryHookExists(t, matchers, "", droidStopHookCommand(), "Entire Stop hook")
+ 	})
+ 
+ 	t.Run("SessionStart", func(t *testing.T) {
+@@ -353,8 +353,8 @@ func TestInstallHooks_PreservesUserHooksOnSameType(t *testing.T) {
+ 			t.Fatalf("failed to parse SessionStart hooks: %v", err)
+ 		}
+ 		assertFactoryHookExists(t, matchers, "", "echo user session start", "user SessionStart hook")
+-		assertFactoryHookExists(t, matchers, "", agentpkg.WrapProductionSilentHookCommand("entire hooks factoryai-droid session-start"), "Entire SessionStart hook")
+-		assertFactoryHookExists(t, matchers, "", agentpkg.WrapProductionSilentHookCommand("entire hooks factoryai-droid user-prompt-submit"), "Entire SessionStart user-prompt-submit hook")
++		assertFactoryHookExists(t, matchers, "", droidHookCommand("session-start"), "Entire SessionStart hook")
++		assertFactoryHookExists(t, matchers, "", droidHookCommand("user-prompt-submit"), "Entire SessionStart user-prompt-submit hook")
+ 	})
+ 
+ 	t.Run("PostToolUse", func(t *testing.T) {
+@@ -364,7 +364,7 @@ func TestInstallHooks_PreservesUserHooksOnSameType(t *testing.T) {
+ 			t.Fatalf("failed to parse PostToolUse hooks: %v", err)
+ 		}
+ 		assertFactoryHookExists(t, matchers, "Write", "echo user wrote file", "user Write hook")
+-		assertFactoryHookExists(t, matchers, "Task", agentpkg.WrapProductionSilentHookCommand("entire hooks factoryai-droid post-tool-use"), "Entire Task hook")
++		assertFactoryHookExists(t, matchers, "Task", droidHookCommand("post-tool-use"), "Entire Task hook")
+ 	})
+ }
+ 
+@@ -726,6 +726,27 @@ func readFactorySettings(t *testing.T, tempDir string) FactorySettings {
+ 	return settings
+ }
+ 
++// droidHookCommand is the silent-wrapper command InstallHooks writes on THIS
++// host. The wrapper form is host-dependent — sh off Windows, cmd.exe on it —
++// so an expectation that names one form directly passes on Linux and fails on
++// Windows against the very same install.
++//
++// Tests that assert WHICH form is chosen do not use this: they pin the host
++// with agentpkg.SetWindowsHookProbeForTesting and name the wrapper outright,
++// or the assertion would restate the implementation and pass either way.
++func droidHookCommand(verb string) string {
++	return agentpkg.WrapProductionSilentHookCommandForOS(
++		"entire hooks factoryai-droid "+verb, agentpkg.HookHostIsWindows())
++}
++
++// droidStopHookCommand is droidHookCommand for the Stop hook, which uses the
++// plain-text-warning wrapper rather than the silent one.
++func droidStopHookCommand() string {
++	return agentpkg.WrapProductionPlainTextWarningHookCommandForOS(
++		"entire hooks factoryai-droid stop", agentpkg.WarningFormatSingleLine,
++		agentpkg.HookHostIsWindows())
++}
++
+ func assertFactoryHookExists(t *testing.T, matchers []FactoryHookMatcher, matcher, command, description string) {
+ 	t.Helper()
+ 	for _, m := range matchers {
+--- >8 ---
+
+On the synthetic run: that is a genuinely good result and the fidelity notes are what make it usable. Reading it back through the real settings.json with quotes intact, and noticing run 1 had lost the outer quotes, is the difference between evidence and a green tick — thank you for flagging that rather than reporting run 1.
+
+I agree with your calibration and will pass it to my user in your terms: hook delivery is fixed, entire's whole downstream path works on Windows ARM64, and "a second defect downstream" is unsupported rather than excluded, because your payloads are faithful to types.go and transcript.go rather than to a captured droid session, and the subagent PreToolUse/PostToolUse[Task] path is untested. The paid test is what closes it. That is exactly the distinction I wanted and I am not going to overstate it.
+
+Nothing else needed after the re-run — no commits, no pushes, and leave your user's tree alone as you have been.
+</cross-session-message>

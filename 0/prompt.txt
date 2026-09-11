@@ -1,0 +1,164 @@
+<task-notification>
+<task-id>a80243728f503cadc</task-id>
+<tool-use-id>toolu_01GLBkqBbXduqm1951YPXvkN</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-Documents---Peyton-s-MacBook-Pro-entire-devenv-entireio-cli--worktrees-subagents/f5f23c25-ad0f-4591-864b-d025bcdc2a46/tasks/a80243728f503cadc.output</output-file>
+<status>completed</status>
+<summary>Agent "Review plan chunk 1" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have everything I need; no further reads required.
+
+## Plan Review - Chunk 1
+
+**Status:** Issues Found
+
+**Issues:**
+
+- **[Task 3, Step 1] `ag := newMockAgent(); ag.analyzerFiles = ...` does not compile.** `newMockAgent()` returns `*mockLifecycleAgent` (`lifecycle_test.go:97`), which has no `analyzerFiles` field and does not implement `agent.TranscriptAnalyzer`. The analyzer lives on the wrapper `mockAnalyzerAgent` (`lifecycle_test.go:108-135`). Even if the field were moved, passing a bare `*mockLifecycleAgent` makes `agent.AsTranscriptAnalyzer(ag)` return `!ok`, so `subagentTranscriptAndFiles` returns only `event.ModifiedFiles` (empty) and the test fails for the wrong reason after the fix lands. Must be:
+  ```go
+  ag := &amp;mockAnalyzerAgent{
+      mockLifecycleAgent: newMockAgent(),
+      analyzerFiles:      []string{"docs_red.md"},
+  }
+  ```
+  (exactly the shape `TestHandleLifecycleSubagentEnd_SubagentStop_UnresolvableTranscript_SkipsParentAttribution` uses at line 4001).
+
+- **[Task 3, Step 1] `filepath.Join(repoDir, "docs_red.md")` is dropped by path normalization on macOS, so `assert.Equal(t, []string{"docs_red.md"}, rec.Files)` cannot hold.** `repoDir` comes from `t.TempDir()` (`/var/folders/...`), while `completeSubagentTaskRecord` normalizes against `paths.WorktreeRoot`, which is git's `--show-toplevel` realpath (`/private/var/...`). `paths.ToRelativePath` (`paths/paths.go:339-341`) does `filepath.Rel(root, abs)`, gets a `../..` traversal, and returns `""`, so `FilterAndNormalizePaths` discards the file. The existing test at `lifecycle_test.go:1109-1121` documents this exact trap and uses `filepath.EvalSymlinks(tmpDir)` for that reason. Fix: use a repo-relative name (`"docs_red.md"` — `ToRelativePath` passes non-absolute paths through unchanged, as the UnresolvableTranscript test relies on) or `EvalSymlinks(repoDir)` first. With either fix the rest of the assertions do hold: `filterToUncommittedFiles` keeps any path not in HEAD (`state.go:362-369`), `CompleteTaskRecord` creates the launch stub for a `CompletionWithoutLaunch` event with no marker (`manual_commit_git.go:424-426`), and `applyTaskRecordCompletion` copies `Files`, `DeclaredTranscriptPath`, `TokenUsage` and merges `FilesTouched` (`manual_commit_git.go:390-411`).
+
+- **[Task 2, Step 3] `recordDeferredTaskLaunch` is a structural near-copy of `recordInFlightTaskLaunch` and is likely to trip the `dupl` linter (threshold 75, `.golangci.yaml:111`), which blocks CI per CLAUDE.md.** The two bodies differ only in `AddTaskRecord` vs `EnsureTaskRecord` and in log strings — the closure/struct-literal/switch/two-log-calls skeleton is identical and well over 75 tokens. The plan's own conventions require `mise run fmt &amp;&amp; mise run lint` before each commit, so this will surface at Step 5 with no guidance. Either parameterize one helper (e.g. `recordTaskLaunchMarker(logCtx, event, mutate func(*strategy.SessionState))` with the two call sites supplying `AddTaskRecord`/`EnsureTaskRecord`), or state up front that a `//nolint:dupl` with justification is acceptable. Also add an explicit `mise run fmt &amp;&amp; mise run lint` step before the commit in Tasks 2 and 3.
+
+**Recommendations (advisory):**
+
+- [Task 2, Step 3] The "check `EnsureTaskRecord`'s exact semantics ... if it refuses to add ... fall back" hedge can be removed: `session/state.go:531-553` is verified to add when absent (`AddTaskRecord`) and only fill empty fields when present, returning `false` without touching `CompletedAt`. The line number cited (531) is exact. The test's second half (completed record not reopened by a replayed start) holds.
+- [Task 3, Step 1] The comment "The analyzer's file must exist and be uncommitted for the record to keep it" is inaccurate: `filterToUncommittedFiles` keeps any path absent from the HEAD tree whether or not it exists on disk. The `os.WriteFile` is harmless but unnecessary; if kept, prefer `testutil.WriteFile(t, repoDir, "docs_red.md", "red\n")` per repo convention.
+- [Task 3, Step 1] The "add an `onExtract` assertion" sentence is a good idea but underspecified; concretely, capture the path argument (the mock currently discards it — `ExtractModifiedFilesFromOffset(_ string, _ int)`) and `assert.Equal(t, childPath, scannedPath)`. That is the assertion that actually proves the declared child transcript, not `SessionRef`, was scanned. Extending the mock signature is a small test-only change; call it out as such.
+- [Task 3, Step 3] The comment block above the capture call (`lifecycle.go:1667-1672`, "reaching this point means a live marker WAS found") is already stale for `CompletionWithoutLaunch` events and becomes more misleading once OpenCode routes through it. Worth a one-line touch-up while editing that call site.
+- [Task 3, Step 2] Expected failure is correctly described (`eventFilesOnly` true → no transcript resolution → empty `rec.Files`); note `rec.DeclaredTranscriptPath` will also be empty at that point, so two asserts fail, not one.
+- Copilot behaviour: verified unchanged. `copilotcli/lifecycle.go:228-229` is the only producer of `CompletionWithoutLaunch` and it sets `SubagentTranscriptUnavailable` alongside, so `eventFilesOnly` stays `true` for it; `TestHandleLifecycleSubagentEnd_CorrelatedCompletionCreatesDistinctRecord` (line 3619) sets both flags on every event and remains a valid regression guard.
+
+**Checks that passed:** no TODOs or placeholders; all steps use `- [ ]`; chunk is ~250 lines; Tasks 1–3 map one-to-one onto the spec's "Shared lifecycle" section with no scope creep; `setupSubagentEndTestRepo`, `saveInFlightSession` (saves `PhaseActive`, so the `IsEnded` guard passes), `finalSubagentEvent`, `writeSubagentTranscripts`, `strategy.LoadSessionState`/`MutateSessionState`/`ErrStateNotFound`, `session.TaskRecord` fields, `State.FilesTouched`, and all imports needed by the proposed code (`errors`, `slog`, `session`, `logging` in `lifecycle.go`; `os`, `filepath`, `time` in the test) exist; Task 2's early return correctly skips `CapturePreTaskState` and sits after the Codex branch; the Task 1 field slot (`event.go` after `CompletionWithoutLaunch`, ~line 141) is right.</result>
+<usage><subagent_tokens>150845</subagent_tokens><tool_uses>19</tool_uses><duration_ms>181482</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a2073f145598b15af</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-Documents---Peyton-s-MacBook-Pro-entire-devenv-entireio-cli--worktrees-subagents/f5f23c25-ad0f-4591-864b-d025bcdc2a46/tasks/a2073f145598b15af.output</output-file>
+<status>completed</status>
+<summary>Agent "Review plan chunk 3" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Plan Review - Chunk 3
+
+**Status:** Issues Found
+
+Chunk 3 is 223 lines, uses `- [ ]` on every step, has no TODOs or "similar to X" placeholders, and stays inside the spec's plugin section (child suppression, `subagent-start` from the running task part, `subagent-stop` from `tool.execute.after`, injection guard). The proposed TypeScript fits the existing plugin: `childSessions`/`announcedTasks` sit beside the other `let`/`const` state, the learn/guard block goes at the top of `event` before `switch (event.type) {`, the task-part block lands after the existing turn-start logic in `message.part.updated`, and the new hook sits next to `experimental.chat.system.transform` in the returned object. Every Task 7/8 marker string appears character-for-character in the proposed code (quote style, `?.` chains, trailing `{`), and the negative check `callHook("subagent-stop"` cannot false-positive on `callHookSync("subagent-stop"`. Two things block approval.
+
+**Issues:**
+
+- [Task 7 Step 4 / Step 5 and Task 8 Step 4 / Step 6]: **The committed dogfood copy of the plugin is never updated, so the "Expected: PASS" claims are false.** The repo commits its own copy at `.opencode/plugins/entire.ts`, and `TestCommittedDogfoodPluginIsCurrent` (`hooks_test.go:437`) asserts it is byte-identical to `renderPlugin()`, which is just the embedded template (`hooks.go:54`). After the first edit to `entire_plugin.ts`, `go test ./cmd/entire/cli/agent/opencode/ -count=1` fails on that test until the copy is re-rendered (`cp cmd/entire/cli/agent/opencode/entire_plugin.ts .opencode/plugins/entire.ts`). The file is absent from the File Structure table and from both commit steps' `git add` lists, so each chunk-3 commit would land red; only Task 12's `git add -A` would sweep it in at the very end.
+
+- [Task 8 Step 3, closing note]: **"Type the handler parameters loosely (`input: any, output: any`) if the `Plugin` type complains" contradicts the test marker** `"tool.execute.after": async (input, output) =&gt; {` from Step 1. An implementer who follows the note breaks the test. The note is also unnecessary: `@opencode-ai/plugin@1.18.30` `dist/index.d.ts` declares `tool.execute.after` as `(input: {tool; sessionID; callID; args: any}, output: {title; output; metadata: any})`, so contextual typing already makes `input.args` and `output.metadata` `any`. Replace the note with "do not annotate the parameters; the marker requires the bare form and the `Plugin` type supplies `args`/`metadata`".
+
+**Recommendations (advisory):**
+
+- Task 7 Step 3's note says `session.created` "carries `properties.sessionID` = the child itself". The SDK type is `properties: {info: Session}` with no `sessionID`; the guard reaches the child via the `info?.id` fallback. The learn-before-guard ordering requirement is still correct, just state the actual reason.
+- Contract checks against AGENT.md and the SDK types all hold: `ToolStateRunning` has a required `input` and optional `metadata` (so `state.input.subagent_type`/`description` and `state.metadata.sessionId` are legitimate); `tool.execute.after` input carries `args`; the running part arrives at +7ms with `metadata.sessionId` bound, matching the "first safe join" claim.
+- Suppression does not break the parent's exit path: `server.instance.disposed` has `properties: {directory}` and no session ID, so `eventSessionID` is undefined and the handler runs; `session.diff` is not in the switch. The existing Node canary (`properties: {info: {id: "sess-canary"}}`, no `parentID`) also passes straight through the new learn/guard code.
+- Nested subagents (`subagent_depth &gt; 1`) are a spec non-goal, but a child's own `task` call would fire `tool.execute.after` with `input.sessionID = C` and emit `subagent-stop` for an untracked session. A one-line `if (childSessions.has(input.sessionID)) return` at the top of the handler keeps the acceptance criterion "no hook fires for a child session" strictly true at zero cost.
+- `childSessions` and `announcedTasks` are never cleared (not in `resetSessionTracking`, `session.deleted`, or `server.instance.disposed`). Harmless for correctness since `callID`s are unique per parent, but a short comment or a clear alongside the other resets would avoid a reviewer question.
+- In the `tool.execute.after` body, `childID` is computed for the early return and then the payload re-reads `output?.metadata?.sessionId` (to satisfy the marker). Either use `childID` and change the marker to `subagent_id: childID`, or drop the local and inline the null check.
+- Task 8 Step 5: `&lt;repo&gt;` is a placeholder the implementer must substitute, and `cd /tmp` ignores the scratchpad convention. With an unresolved `@opencode-ai/plugin` import, `Plugin` degrades to `any` and the check catches syntax only; a local copy of the real types exists at `/private/tmp/entire-e2e-opencode-deps-1.18.30/node_modules`, so running `tsc` from a directory containing that `node_modules` gives a real type check. Note also that Step 4's `go test` already loads the plugin under `node --experimental-strip-types` via `TestPlugin_SpawnsHooksUnderNode`, so a syntax error would already surface there.
+- Payload field names (`session_id`, `tool_use_id`, `subagent_id`, `subagent_type`, `task_description`, `model`) agree with the Task 9 `SimulateOpenCodeSubagentStart/Stop` helpers and the Task 5/6 parsers.</result>
+<usage><subagent_tokens>140207</subagent_tokens><tool_uses>12</tool_uses><duration_ms>274510</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a0823a331d2a0f2b2</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-Documents---Peyton-s-MacBook-Pro-entire-devenv-entireio-cli--worktrees-subagents/f5f23c25-ad0f-4591-864b-d025bcdc2a46/tasks/a0823a331d2a0f2b2.output</output-file>
+<status>completed</status>
+<summary>Agent "Review plan chunk 2" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have everything I need; no further lookups are required. Cleaning up the scratch module is unnecessary since it lives in the session scratchpad.
+
+## Plan Review - Chunk 2
+
+**Status:** Approved
+
+Chunk 2 (lines 287–662, ~375 lines) is complete, atomic, uses `- [ ]` on every step, has failing-test → implement → pass → commit cycles with expected outputs, and matches the spec's Go-adapter section (start → `SubagentStart` + `DeferredCompletion`, stop → `Final` + `CompletionWithoutLaunch` + declared path + exact tokens, degrade-not-drop on export failure, no files on the event). No TODOs, placeholders, or "similar to X" steps. Nothing outside the spec's Go-adapter scope is touched.
+
+**Correctness against the code (verified, not inferred):**
+
+- `validation.ValidateToolUseID` exists (`cmd/entire/cli/validation/validators.go:59`), regex `^[a-zA-Z0-9_-]+$`. Executed against `"6lk6RtbDgqXs1W8n"`, `"toolu_01ABCdef"`, `"call_red"` → all accepted; `""` → accepted (which is exactly why the plan's explicit empty check before it is needed and correct). The plan's "if it is stricter, fall back to ValidateSessionID" hedge can be dropped: it is not stricter for any callID shape AGENT.md documents.
+- `ValidateSessionID` rejects `"../etc"`, `"../../evil"` (path separators) and `""` (empty) — every negative case in `TestParseHookEvent_SubagentStart_RejectsUnsafeIDs` and `..._SubagentStop_RejectsUnsafeIDs` produces an error.
+- Signatures match the plan exactly: `func (a *OpenCodeAgent) ReadTranscript(sessionRef string) ([]byte, error)` (`opencode.go:62`), `func (a *OpenCodeAgent) CalculateTokenUsage(transcriptData []byte, fromOffset int) (*agent.TokenUsage, error)` (`transcript.go:288`), `runOpenCodeExportToFileFn func(ctx, root *os.Root, sessionID, outputName string) error` (`cli_commands.go:49`).
+- `agent.TokenUsage` = `types.TokenUsage` with fields `InputTokens`, `OutputTokens`, `CacheReadTokens`, `CacheCreationTokens`, `APICallCount` — the assertions use the right names.
+- `childExportFixture` run through `ParseExportSession` + `CalculateTokenUsage(data, 0)` yields `InputTokens:100 OutputTokens:20 CacheReadTokens:5 APICallCount:1`, and `ExtractModifiedFiles` yields `[/repo/docs/red.md]` (the unknown `info.parentID`/`info.agent`/`metadata.filepath` keys are ignored by `json.Unmarshal`, and `write` is in `FileModificationTools`). Both test assertions hold.
+- `fetchAndCacheExport` under `ENTIRE_TEST_OPENCODE_MOCK_EXPORT` (`lifecycle.go:230`) returns the pre-written `.entire/tmp/&lt;id&gt;.json` if it exists and errors otherwise — the spec's description is accurate. The chunk-2 unit tests don't depend on it (they stub `runOpenCodeExportToFileFn`), and with `t.Chdir` to a non-git temp dir `WorktreeRoot` fails → `repoRoot="."` → `entiredir.OpenAt(".")` absolutizes and creates `&lt;tmp&gt;/.entire`, identical to the existing `TestFetchAndCacheExport_WritesAndValidatesExportFile`. The resulting path is relative (`.entire/tmp/ses_child.json`); the `HasSuffix` and `FileExists` assertions both hold, and `ReadTranscript` → `agent.ReadTranscriptFile` → `entiredir.Split` + `OpenPathForRead(filepath.Abs(...))` reads it fine.
+- Every `agent.Event` field the plan sets or asserts exists today except `DeferredCompletion`, which Chunk 1 Task 1 adds — the ordering dependency is satisfied by the plan's chunk order.
+- `TestHookNames` is at `lifecycle_test.go:228` as stated and compares lengths + set membership, so Step 2's "compile error" and Step 4's PASS are accurate.
+- Logging uses `logging.WithComponent`/`logging.Warn(ctx, msg, attrs...)` correctly and logs only IDs and errors (no `task_description`), honouring the privacy rule.
+
+**Recommendations (advisory):**
+
+- [Task 5, Step 3]: `lifecycle.go` does not currently import `errors`; `validateSubagentIdentity` needs it. Compiler catches it, but say so to save a cycle.
+- [Task 6, Step 1]: `lifecycle_test.go` imports only `testify/require`; the new tests use `assert`. Add `github.com/stretchr/testify/assert` (no other file in the package imports it either).
+- [Task 5, Step 3]: Drop the "if it is stricter…" hedge and instead state the verified fact in the helper comment: `ValidateToolUseID` allows empty, so the explicit empty check is load-bearing.
+- [Task 4, Step 3]: `hooks.go:145` has a comment "HookNames() returns 5 hooks (including compaction), but GetSupportedHooks() returns only 4" — it goes stale at 7. Update it in the same commit.
+- [Task 4/6]: `getHookType` in `cmd/entire/cli/hook_registry.go` classifies hook telemetry by bare string; `"subagent-stop"` collides with `claudecode.HookNameSubagentStop` and so lands in the `subagent` bucket (fine), while `"subagent-start"` falls to `agent`. If the analytics category matters, add both opencode names to that switch — or note it as a known cosmetic gap.
+- [Task 6, Step 1 fixture]: `"metadata":{"filepath":...}` is ignored by the `ToolStateMetadata` type; either drop it or spell it as `"metadata":{"files":[{"filePath":...}]}` so the fixture doesn't imply a shape the parser reads.
+- [Task 6, Step 3]: `sessionTranscriptPath(ctx, raw.SessionID)` re-runs `ValidateSessionID` on the parent after `validateSubagentIdentity` already did — harmless, but if you want one place per check, have the helper only cover the two IDs the parent path doesn't.
+- [All commit steps]: The commit commands omit the `Co-Authored-By: Claude Fable 5.1 &lt;noreply@anthropic.com&gt;` trailer the session requires; the executor should append it.
+- AGENT.md line 130 still recommends "leave `Final` false" for `tool.execute.after`; the spec supersedes it and Task 11 marks the section historical — worth a one-line pointer in Task 6's comment so an implementer reading AGENT.md doesn't second-guess `Final: true`.</result>
+<usage><subagent_tokens>161280</subagent_tokens><tool_uses>20</tool_uses><duration_ms>307967</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a66ae7ca8b04d919b</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-Documents---Peyton-s-MacBook-Pro-entire-devenv-entireio-cli--worktrees-subagents/f5f23c25-ad0f-4591-864b-d025bcdc2a46/tasks/a66ae7ca8b04d919b.output</output-file>
+<status>completed</status>
+<summary>Agent "Review plan chunk 4" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Plan Review - Chunk 4
+
+**Status:** Issues Found
+
+Chunk is 250 lines (886–1136), every step carries `- [ ]` syntax, and it covers the spec's acceptance criteria that belong here (integration proof of the record → checkpoint path, the paid e2e task-record + single-session assertions, docs, gates). No scope creep. The integration test compiles against the real helpers and its assertions are plausible — with the exceptions below.
+
+**Issues:**
+
+- **[Task 9, Step 2]: `require.Error(t, childErr)` is wrong — `GetSessionState` returns `(nil, nil)` for a missing state file** (`cmd/entire/cli/integration_test/hooks.go:593-602`, `os.IsNotExist → return nil, nil`). As written, the test fails on the *success* path (child correctly has no state). The prose hedge at the end of the step acknowledges the uncertainty, but the code block is what gets copied. Replace with `childState, err := env.GetSessionState(child.ID); require.NoError(t, err); require.Nil(t, childState, ...)` and drop the hedge sentence.
+
+- **[Task 9, Step 3]: Wording is self-contradictory.** "Expected: FAIL before the Go work lands in the test binary is impossible here since Chunks 1–3 are done; the expected first failure is a compile error … Run it now to confirm it PASSES" reads as both FAIL and PASS. Rewrite as: "This test is written after the implementation (Chunks 1–3), so it is not a red/green step. Expected: PASS. A failure is a real defect in the adapter/lifecycle, not the test; do not loosen the assertions." Also note that `mise run test:integration -- -run X` appends `-run X` after the package list (`mise.toml:20`), which `go test` accepts but also builds `./cmd/entire/cli/auth/...`; the direct `go test -tags integration ./cmd/entire/cli/integration_test/ -run TestOpenCodeSubagentTaskRecord -count=1` form is the unambiguous one and should be the primary command.
+
+- **[Task 11, Step 3]: Literal placeholder.** `"Behaviour Before Native Tracking (fixed by …)"` — the ellipsis must be filled in (the PR number or the spec path). Same step is also ambiguous about the existing `## Proposed Mapping` section (`cmd/entire/cli/agent/opencode/AGENT.md:122`): "add a short Implemented Mapping paragraph" vs. retitling the section it already has. Say explicitly: retitle `Proposed Mapping` → `Implemented Mapping`, point at the spec, keep the captured-payload sections.
+
+- **[Task 9, Step 1]: `SimulateOpenCodeSubagentStop` adds a third copy of the copy-to-`.entire/tmp` block** already present in `SimulateOpenCodeTurnEnd` (`hooks.go:1029-1044`) and `TestEnv.CopyTranscriptToEntireTmp` (`hooks.go:1206-1220`). `dupl` at the 75-token lint threshold flags *new* duplication, so this is a plausible `mise run lint` failure in Task 12 Step 2. Simplest fix: drop the `childTranscriptPath` parameter from the helper and have the test call the existing `env.CopyTranscriptToEntireTmp(child.ID, childTranscript)` before `SimulateOpenCodeSubagentStop` — that helper exists for exactly this ("mid-turn … fetchAndCacheExport in mock mode expects the file to already exist").
+
+**Verified against code (no change needed):**
+
+- Payload keys in both simulate helpers (`session_id`, `tool_use_id`, `subagent_id`, `subagent_type`, `task_description`, `model`) match the `subagentStartRaw`/`subagentStopRaw` structs in Task 4. `opencode-session-N` passes `ValidateSessionID`; `call_red_1` passes `ValidateToolUseID` (`^[a-zA-Z0-9_-]+$`).
+- `subagent-start` builds `SessionRef` via `sessionTranscriptPath` (`agent/opencode/lifecycle.go:182`), which only joins a path and never exports, so it does not require the parent's mock export to exist yet.
+- Mock export: `fetchAndCacheExport` under `ENTIRE_TEST_OPENCODE_MOCK_EXPORT` does `root.Stat(".entire/tmp/&lt;childID&gt;.json")` (`lifecycle.go:230-235`); the runner sets that env var on every hook (`hooks.go:982`); the helper writes to exactly that path.
+- `CreateOpenCodeTranscript` emits `{"type":"tool","tool":"write","state":{"input":{"filePath":&lt;path&gt;}}}` on an assistant message (`hooks.go:1113-1122`); `write` is in `FileModificationTools`; `extractFilePaths` reads `state.Input["filePath"]` → `docs/red.md`.
+- Uncommitted filter: the relative path passes `paths.ToRelativePath` unchanged (`paths.go:336-338`); `filterToUncommittedFiles` keeps any path absent from HEAD and fails open (`state.go:332-362`). `docs/red.md` is untracked at stop time, so it survives.
+- Final capture: marker exists and is live, `CompletionWithoutLaunch` set, parent ACTIVE → `completeSubagentTaskRecord` runs; `applyTaskRecordCompletion` (`manual_commit_git.go:390-411`) sets `Files`, `DeclaredTranscriptPath`, `TokenUsage` and merges into `FilesTouched`. `CalculateTokenUsage` on the fixture (tokens present) returns non-nil.
+- Materialization: `readFirstTranscript` → `agent.ReadTranscriptFile` (goes through the entiredir root for `.entire/tmp`); stored under `paths.AgentTranscriptFileName(child.ID)` = `agent-&lt;id&gt;.jsonl`; `CheckpointTaskFilePath` signature `(checkpointID, toolUseID, fileName)` matches. Redaction falls back to plain-string redaction on non-JSON lines (`redact/redact.go:825-828`), so the pretty-printed export survives with `docs/red.md` intact.
+- Task 10: `e2e/agents/opencode.go:35` returns `"opencode"`; `meta.Sessions` is `[]SessionRef`; `AssertCheckpointHasTaskRecord(t, dir, cpID)` matches; `meta` is read after the copilot check (line 46) as the plan says. `mise-tasks/test/e2e/canary` accepts a `[filter]` arg.
+- Docs anchors: `agent-guide.md` table rows at 444–445 are `*(not used)*` for OpenCode; "Declaring a subagent transcript" is at line 57; `sessions-and-checkpoints.md` **Producers** at 319, Factory Droid bullet at 342; AGENT.md heading "Current Entire Behaviour (before this work)" at line 100.
+- Task 12: `scripts/test-opencode-subagent-integration.sh` supports `--run-cmd`, `--scenario single|concurrent|readonly`, `PROBE_KEEP`, `ENTIRE_BIN`, `OPENCODE_MODEL`. `/entire`, `/vogon`, `e2e/artifacts/` are gitignored, so `git add -A` will not sweep canary build outputs. `[Task]` row exists in `checkpoint_list.go:139`.
+
+**Recommendations (advisory):**
+
+- Task 9: add one comment line noting the test deliberately uses `GitCommitWithShadowHooks` (TTY) rather than `...AsAgent`, consistent with `opencode_hooks_test.go`, so a future reader does not "fix" it to match `codex_subagent_test.go`.
+- Task 9: consider a second, tiny subtest or a follow-on assertion for the export-failure shape (`TranscriptUnavailable: true`, no files, record still completed) — it is an acceptance criterion in the spec and is only covered at the unit level in Task 6. Achievable by calling `SimulateOpenCodeSubagentStop` with no pre-copied export for a second `toolUseID`.
+- Task 10 Step 4: the mock-vs-real note ("Google works") is machine-specific; keep it but label it as such so it is not read as a repo fact.
+- Task 12 Step 2: the canary lane also runs a roger-roger sub-lane that hard-fails if `roger-roger`/`entire-agent-roger-roger` are not on PATH — worth a one-line heads-up since `mise run check` includes it.</result>
+<usage><subagent_tokens>192618</subagent_tokens><tool_uses>27</tool_uses><duration_ms>482723</duration_ms></usage>
+</task-notification>

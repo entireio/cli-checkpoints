@@ -1,0 +1,342 @@
+entire has a new capability to install plugin on demand, the first one implemented is the graph plugin, it is working greaon un unix based os but, here on windows it does not work. How to check if it is working, on a tty terminal so you get the interactive terminal option to while running entire graph command to install the plugin, so it starts downloading and installing the plugin, the issues i found is it downloands a file where it should be donloaded but, the plugin entire-graph is empty in other words, broken. I want you to find out why, what is broken on the windows path.
+
+---
+
+<task-notification>
+<task-id>a04a0f8cdb647a796</task-id>
+<tool-use-id>toolu_01NNXPRmrAnXhHQN4dY138t5</tool-use-id>
+<output-file>C:\Users\Victor\AppData\Local\Temp\claude\C--Users-Victor-cli\792d3467-76d3-43ee-8c33-cd91a7307a14\tasks\a04a0f8cdb647a796.output</output-file>
+<status>completed</status>
+<summary>Agent "Explore plugin install code path" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>## Summary of the empirical finding first (it pins the bug)
+
+I inspected the live machine state, which makes the diagnosis concrete:
+
+- `C:\Users\Victor\AppData\Local\entire\plugins\pkg\graph\entire-graph.exe` — **75,255,808 bytes, intact**, created 11/09/2026 09:09:30.
+- `...\pkg\graph\manifest.yml` — `tag: v0.4.0`, `asset: entire-graph_0.4.0_windows_arm64.zip`, `sha256`, `binary_sha256` all recorded (so download → checksum verify → zip extract → `pkg/` placement all worked on windows/arm64).
+- `...\plugins\bin\` — currently empty only because the shell history shows `rm ...\bin\entire-graph.exe` was run manually. So `bin\entire-graph.exe` **did** get created.
+- `whoami /priv`: `SeCreateSymbolicLinkPrivilege` is **present but Disabled** in the token (this shell also holds `SeDebugPrivilege`/`SeRestorePrivilege` → admin token). Developer Mode is off (`HKLM\...\AppModelUnlock` exists with **no values**).
+- Go 1.27.1 windows-arm64 toolchain: `os.Root.Symlink` → `internal/syscall/windows.Symlinkat` wraps the call in **`withPrivilege("SeCreateSymbolicLinkPrivilege", …)`**, which does `ImpersonateSelf` + `AdjustTokenPrivileges(SE_PRIVILEGE_ENABLED)` (`at_windows.go:502-511`, `618-653`). A token that *has* the privilege disabled therefore gets it enabled, and **the symlink succeeds**.
+
+⇒ On Windows the `bin/` entry is created by the **symlink branch**, so `bin\entire-graph.exe` is a reparse point. `dir`/`Get-ChildItem` report a Windows symlink's own length as **0 bytes** — that is the "EMPTY binary". The real payload is the 75 MB file in `pkg\graph\`.
+
+Second, independent defect found while tracing: the documented "symlink → hardlink → copy" ladder is really "symlink → *always fails* → copy", because `os.Root.Link` resolves **both** operands inside the root (`$GOROOT/src/os/root_openat.go:277-293` calls `doInRoot(r, oldname, …)`), and `src` is an absolute path outside the root (`splitPathInRoot`, `$GOROOT/src/os/root.go:301-307`, plus `rootCleanPath` on Windows, reject it with `errPathEscapes`). So the hardlink fallback that exists *specifically for Windows* can never fire.
+
+---
+
+## 1. Files implementing plugin install/download
+
+All under `C:\Users\Victor\cli\cmd\entire\cli\`:
+
+| File | Role |
+|---|---|
+| `plugin.go` (296 ln) | kubectl dispatcher, `MaybeRunPlugin`, `resolvePlugin`, `runPlugin` |
+| `plugin_on_demand.go` (160 ln) | `installMissingPlugin` — the `entire graph` prompt path |
+| `plugin_store.go` (639 ln) | `pluginParentDir`, `pluginRoot`, `PluginBinDir`, `InstallPluginFromPath`, `materializeManagedEntry`, `copyFileStreaming` |
+| `plugin_fetch.go` (774 ln) | asset candidates, checksums, `downloadPluginAsset`, `fetchAndVerify`, `extractPluginBinary`, tar.gz/zip extraction, **`writeExecutableLimited`** |
+| `plugin_install_remote.go` (397 ln) | `InstallPluginFromRepo`, `installRepoAtTag`, **`replaceBinary`**, `oldBinaryAsideName`, `sweepOldBinaries` |
+| `plugin_manifest.go` (374 ln) | `windowsExeExt`, `pluginBinaryName`, `PluginManifest`, `PluginMetadata`, pkg dir |
+| `plugin_index.go` (356 ln) | git-cloned index repo, `index.json` |
+| `plugin_gitremote.go`, `plugin_deps.go`, `plugin_group.go`, `plugin_confirm.go`, `plugin_progress.go`, `plugin_env.go`, `plugin_official.go` | tags/metadata, deps, cobra commands, prompt, spinner, env, allowlist |
+| `jsonutil/write.go` | `CreateTempIn`, `WriteFileAtomic`, `WriteFileAtomicIn` |
+| `osroot/osroot.go` | `Shared`, `Forget`, `MkdirAllNoSymlink`, `ReadDirNoSymlinks`, `RemoveNoSymlinks`, `WriteFile` |
+| `internal/entireclient/userdirs/userdirs.go` | `RequireAbsoluteOverride` for `ENTIRE_PLUGIN_DIR` |
+
+Note: **there is no `_windows_test.go` anywhere in the plugin code.** The only Windows-tagged plugin source file is `plugin_signal_windows.go` (14 ln, signal stub).
+
+---
+
+## 2. Full path from `entire graph` to the binary on disk
+
+### a. Dispatch (`cmd/entire/main.go`, `plugin.go`)
+
+`main.go:81` → `cli.PrependPluginBinDirToPATH(ctx)` prepends `%LOCALAPPDATA%\entire\plugins\bin`.
+`main.go:83` → `cli.MaybeRunPlugin(ctx, rootCmd, os.Args[1:])`.
+
+`plugin.go:152-190` `resolvePlugin`: built-ins win; then `exec.LookPath("entire-graph")`. On `exec.ErrNotFound` **and** `name == onDemandInstallPluginName` (`plugin.go:43`, `= "graph"`) it returns `binPath == ""` to signal "offer install".
+
+`plugin.go:84-115` → `installMissingPlugin` → on success prints `Running entire-graph`, then `runPlugin` (`plugin.go:240`).
+
+### b. Prompt (`plugin_on_demand.go:18-129`)
+
+`FindInstalledPlugin(name)` → `interactive.CanPromptInteractively()` gate → `SyncPluginIndex` → `idx.Find("graph")` → `runPluginConfirm(... "Install the entire-graph plugin from &lt;repo&gt;?", true)` → `onDemandPluginInstall(ctx, cmd, installSource{Kind: installFromIndex, Ref: name, Resolved: entry}, remoteInstallFlags{})`.
+
+### c. Install orchestration (`plugin_install_remote.go:113-268`)
+
+```go
+staging, err := os.MkdirTemp("", "entire-plugin-fetch-")        // :171
+stagingRoot, err := osroot.Shared(staging)                      // :187
+asset, err := downloadPluginAsset(ctx, meta, repoURL, name, tag, staging, opts.AllowUnverified) // :192
+
+binBase := pluginBinaryName(name)            // :199  -&gt; "entire-graph.exe" on Windows
+stagedName := "extracted-" + binBase         // :200  -&gt; "extracted-entire-graph.exe"
+if err := extractPluginBinary(asset.Path, name, stagingRoot, stagedName); err != nil { ... } // :201
+
+pkgDir, _  := EnsurePluginPkgDir(name)       // :205
+pkgName, _ := pluginPkgName(name)            // :209  -&gt; "pkg/graph"
+pluginTreeRoot, _ := pluginRoot(true)        // :213
+sweepOldBinaries(pluginTreeRoot, pkgName)    // :217
+pkgBinName := pkgName + "/" + binBase        // :218  -&gt; "pkg/graph/entire-graph.exe"
+pkgBin := filepath.Join(pkgDir, binBase)     // :219
+if err := replaceBinary(stagingRoot, stagedName, pluginTreeRoot, pkgBinName); err != nil { ... } // :220
+
+binDigest, _ := fileSHA256(pkgBin)           // :228
+... SavePluginManifest(manifest)             // :259
+installed, err := InstallPluginFromPath(InstallPluginOptions{SourcePath: pkgBin, Force: true}) // :263
+```
+
+### d. Destination filename on Windows
+
+`plugin_manifest.go:35-36, 86-93`:
+
+```go
+windowsExeExt = ".exe"
+
+func pluginBinaryName(name string) string {
+	if runtime.GOOS == windowsGOOS {
+		return pluginBinaryPrefix + name + windowsExeExt
+	}
+	return pluginBinaryPrefix + name
+}
+```
+
+So `.exe` **is** appended, both in `pkg/graph/` and (via `filepath.Base(src)` in `InstallPluginFromPath`) in `bin/`. Confirmed on disk.
+
+### e. Writing the binary — `writeExecutableLimited` (`plugin_fetch.go:733-774`)
+
+This is the function every extraction branch funnels into:
+
+```go
+func writeExecutableLimited(root *os.Root, destName string, r io.Reader, limit int64) error {
+	tmp, tmpName, err := jsonutil.CreateTempIn(root, destName)
+	if err != nil {
+		return fmt.Errorf("create staging binary: %w", err)
+	}
+	defer func() { _ = root.Remove(tmpName) }() //nolint:errcheck // no-op once the rename succeeds
+
+	n, err := io.Copy(tmp, io.LimitReader(r, limit+1))
+	if err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write binary: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close binary: %w", err)
+	}
+	if n &gt; limit {
+		return fmt.Errorf("plugin binary exceeds the %d byte limit", limit)
+	}
+	// CreateTempIn makes 0600; the dispatcher needs it executable.
+	if err := root.Chmod(tmpName, 0o755); err != nil {
+		return fmt.Errorf("set executable bit: %w", err)
+	}
+	if err := root.Rename(tmpName, destName); err != nil {
+		return fmt.Errorf("place binary: %w", err)
+	}
+	return nil
+}
+```
+
+Answers to the specific questions: temp-file + rename **yes**; file **is closed before rename** (`tmp.Close()` at :761 precedes `root.Rename` at :770); chmod is `root.Chmod` (`os.Root.Chmod`, **not** `syscall.Chmod`), which on Windows only toggles `FILE_ATTRIBUTE_READONLY` (`$GOROOT/src/os/root_windows.go:296-336`) and is a harmless no-op for 0755. Temp name comes from `jsonutil.CreateTempIn` (`jsonutil/write.go:176-193`), `root.OpenFile(candidate, O_RDWR|O_CREATE|O_EXCL, 0600)`, name shape `&lt;dir&gt;/&lt;base&gt;.&lt;16 hex&gt;.tmp`.
+
+### f. `replaceBinary` — staging → `pkg/` (`plugin_install_remote.go:334-364`) — the only explicit `runtime.GOOS == "windows"` branch in the install path
+
+```go
+func replaceBinary(srcRoot *os.Root, srcName string, destRoot *os.Root, destName string) error {
+	src := filepath.Join(srcRoot.Name(), filepath.FromSlash(srcName))
+	dest := filepath.Join(destRoot.Name(), filepath.FromSlash(destName))
+	err := os.Rename(src, dest)
+	if err == nil {
+		return nil
+	}
+	if runtime.GOOS == windowsGOOS {
+		if asideErr := destRoot.Rename(destName, oldBinaryAsideName(destName)); asideErr == nil {
+			if err = os.Rename(src, dest); err == nil {
+				return nil
+			}
+		}
+	}
+	// Cross-device rename: copy + fsync-free write, then remove src.
+	in, openErr := srcRoot.Open(srcName)
+	if openErr != nil {
+		return errors.Join(err, openErr)
+	}
+	defer in.Close()
+	if writeErr := writeExecutable(destRoot, destName, in); writeErr != nil {
+		return errors.Join(err, writeErr)
+	}
+	_ = srcRoot.Remove(srcName)
+	return nil
+}
+```
+
+This step worked here (pkg binary is correct and complete).
+
+### g. `bin/` link — `InstallPluginFromPath` + `materializeManagedEntry` (**where the "empty" file comes from**)
+
+`plugin_store.go:385-485` (relevant excerpt):
+
+```go
+base := filepath.Base(src)          // "entire-graph.exe"
+bare := bareNameFromBinaryName(base) // "graph"
+...
+if runtime.GOOS != windowsGOOS &amp;&amp; srcInfo.Mode()&amp;0o111 == 0 { ... }   // :405 windows branch
+...
+dest     := filepath.Join(binDir, base)   // :420
+destName := pluginBinName(base)           // :421 -&gt; "bin/entire-graph.exe"
+...
+tmpName, err := makeInstallTmpName()                                  // :473 -&gt; "bin/.install-&lt;16hex&gt;"
+if err := materializeManagedEntry(root, src, tmpName, srcInfo); err != nil { ... } // :477
+if err := root.Rename(tmpName, destName); err != nil { ... }          // :480
+return FindInstalledPlugin(bare)                                      // :484
+```
+
+`plugin_store.go:530-541`:
+
+```go
+func materializeManagedEntry(root *os.Root, src, destName string, srcInfo os.FileInfo) error {
+	// Symlink and Link take src as the target, not as something to resolve
+	// inside the root — os.Root refuses to CREATE an absolute symlink but
+	// nothing here needs one created; the target is recorded verbatim.
+	if err := root.Symlink(src, destName); err == nil {
+		return nil
+	}
+	if err := root.Link(src, destName); err == nil {
+		return nil
+	}
+	return copyFileStreaming(root, src, destName, srcInfo)
+}
+```
+
+`plugin_store.go:548-573`:
+
+```go
+func copyFileStreaming(root *os.Root, src, destName string, srcInfo os.FileInfo) error {
+	mode := srcInfo.Mode().Perm()
+	if mode == 0 { mode = 0o755 }
+	in, err := os.Open(src)
+	...
+	out, err := root.OpenFile(destName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	...
+	if _, err := io.Copy(out, in); err != nil { _ = out.Close(); _ = root.Remove(destName); ... }
+	if err := out.Close(); err != nil { _ = root.Remove(destName); ... }
+	return nil
+}
+```
+
+**On Windows, branch 1 (`root.Symlink`) succeeds** whenever the process token carries `SeCreateSymbolicLinkPrivilege` (elevated shell) or Developer Mode is on, because Go re-enables the privilege itself. The result is a reparse point at `bin\entire-graph.exe` that reports **0 bytes**. The copy branch — the one that would produce a real 75 MB `.exe` — only runs for the unprivileged, non-Developer-Mode case (and branch 2 never runs at all, see the `os.Root.Link` note above).
+
+Other `runtime.GOOS == windowsGOOS` sites in the install path: `plugin_store.go:73` (LOCALAPPDATA), `:278` (`pathEntriesEqual` case-fold), `:405`, `:627` (`bareNameFromBinaryName` → `external.StripExeExt`); `plugin_fetch.go:204` (asset extensions), `:517` (`matchesPluginBinary` `.exe` tolerance); `plugin_manifest.go:89`.
+
+---
+
+## 3. Asset selection / index
+
+**Index** (`plugin_index.go:28-51`): a **git clone of an index repository**, not a REST API.
+- `defaultPluginIndexURL = "https://github.com/entireio/plugin-index"`, override `ENTIRE_PLUGIN_INDEX_URL` or `--index`.
+- File at repo root: `index.json`, schema version 1, shallow clone cached in the user cache dir, TTL 24 h, marker `.entire-last-sync`, cap 8 MiB.
+- Entry shape (`plugin_index.go:64-72`): `{name, repo_url, description, official, platforms[]}`. **No asset/URL/checksum data lives in the index** — it only maps name → repo URL.
+- There is **no `testdata/` directory for the plugin index**; tests build index repos inline (`plugin_index_test.go`, `plugin_on_demand_test.go:74`, `integration_test/plugin_remote_install_test.go`).
+
+**Per-repo metadata**: `entire-plugin.yml` at the repo root (`plugin_manifest.go:154-174`) — optional `name`, `description`, `download_url` template (`{name} {tag} {version} {os} {arch} {asset}`), `requires`.
+
+**Asset naming / zip-vs-tar.gz decision** (`plugin_fetch.go:154-214`):
+
+```go
+func assetCandidates(name, tag string) []string {
+	binName := pluginBinaryPrefix + name
+	version := strings.TrimPrefix(tag, "v")
+	stems := make([]string, 0, 16)
+	for _, osName := range osAliases(runtime.GOOS) {          // darwin -&gt; {darwin, macos}
+		for _, arch := range platformArchAliases(runtime.GOOS, runtime.GOARCH) {
+			stems = append(stems,
+				fmt.Sprintf("%s_%s_%s_%s", binName, version, osName, arch),
+				fmt.Sprintf("%s_%s_%s", binName, osName, arch),
+			)
+		}
+	}
+	exts := []string{".tar.gz", ".zip", ""}
+	if runtime.GOOS == windowsGOOS {
+		exts = []string{".zip", ".tar.gz", windowsExeExt}
+	}
+	var out []string
+	for _, ext := range exts {
+		for _, stem := range stems {
+			out = append(out, stem+ext)
+		}
+	}
+	return out
+}
+```
+
+`archAliases` (`:155-164`): `amd64 → {amd64, x86_64}`, `arm64 → {arm64, aarch64}`. **No amd64 fallback for windows/arm64** — an arm64 host will not accept a `windows_amd64` asset. Here it did not matter: the release publishes `entire-graph_0.4.0_windows_arm64.zip` and that is what the manifest records.
+
+Format dispatch is by filename suffix only (`plugin_fetch.go:492-508`):
+
+```go
+func extractPluginBinary(assetPath, name string, destRoot *os.Root, destName string) error {
+	binName := pluginBinaryPrefix + name
+	lower := strings.ToLower(assetPath)
+	switch {
+	case strings.HasSuffix(lower, ".tar.gz") || strings.HasSuffix(lower, ".tgz"):
+		return extractFromTarGz(assetPath, binName, destRoot, destName)
+	case strings.HasSuffix(lower, ".zip"):
+		return extractFromZip(assetPath, binName, destRoot, destName)
+	default:
+		src, err := os.Open(assetPath)
+		...
+		return writeExecutable(destRoot, destName, src)
+	}
+}
+```
+
+Entry matching tolerates `.exe` on Windows (`:512-518`), selection is shallowest-path-then-lexicographic (`archiveEntryPicker`, `:558-573`). `extractFromZip` (`:668-698`) ends in `writeExecutable(destRoot, destName, rc)`.
+
+**Checksums**: `checksumsFileName = "checksums.txt"` plus `&lt;bin&gt;_&lt;ver&gt;_checksums.txt` / `&lt;bin&gt;_checksums.txt` (`:218-229`); `selectAssetFromChecksums` (`:249-256`) picks the first `assetCandidates` entry present in the manifest; `fetchAndVerify` (`:419-486`) streams SHA-256 while writing into the staging root via `stagingRoot.Create(asset)` and deletes the partial on mismatch. Unverified installs are refused unless `--allow-unverified`.
+
+---
+
+## 4. Existing tests
+
+- `plugin_store_test.go` (562 ln): 22 tests. Windows-relevant ones **all skip on Windows** — `TestMaterializeManagedEntry_HappyPath` (:321, `t.Skip("test exercises Unix file modes")`, with a comment admitting *"the hardlink and copy fallbacks exist for Windows-without-Developer-Mode and aren't portably triggerable from an in-process test"*), `TestInstallPluginFromPath_SymlinksAndLists` (:132), `_RejectsNonExecutable` (:196), `_RejectsSelfInstall` (:288), `_TmpDoesNotClobberDottedPlugin` (:387), `_AtomicForceReplace` (:512), `_RemovesAllVariants` (:355). Only `TestPluginParentDir_WindowsIgnoresXDG` (:52) and `TestBareNameFromBinaryName` (:210, windows branch at :226) actually assert Windows behavior, and neither touches install.
+- `plugin_fetch_test.go` (913 ln): extraction tests assert the executable bit **only when `runtime.GOOS != windowsGOOS`** (:340). All fixtures use `.tar.gz` named from live `runtime.GOOS/GOARCH`; nothing forces a `.zip`-on-Windows or `.exe` case.
+- `plugin_install_remote_test.go` (482 ln): 15 tests, all `.tar.gz`.
+- `integration_test/plugin_remote_install_test.go` (310 ln): 4 tests, each `t.Skip` on Windows (:162, :201, :231, :285).
+- `plugin_on_demand_test.go` (404 ln), `plugin_progress_test.go`, `plugin_confirm_test.go` / `_terminal_test.go` — the on-demand feature's tests; no Windows-specific assertions.
+- **No `*_windows_test.go` exists for any plugin file.** There is no test anywhere that asserts the `bin/` entry is a runnable file of nonzero size on Windows.
+
+---
+
+## 5. `docs/architecture/external-commands.md` (308 ln)
+
+Install-relevant content:
+
+- Rule 5 (:20, added on this branch) documents the on-demand `entire graph` install, the prompt wording, the already-installed-but-unreachable case, and the unrunnable-entry case.
+- "Managed install directory" (:24-32): `%LOCALAPPDATA%\entire\plugins\bin` on Windows, `$ENTIRE_PLUGIN_DIR/bin` override, PATH prepend.
+- "Install progress and confirmations" (:34-40).
+- "Remote install" (:42-60), step 5: *"The binary lands in `pkg/&lt;name&gt;/` … and is linked into `bin/` through the same **symlink→hardlink→copy fallback** as local installs."* — this is the documented contract that is wrong on Windows (hardlink is unreachable; symlink is reached more often than the docs assume).
+- "A plugin gets exactly one binary, and does not choose its name" (:62-66): destination is always `entire-&lt;name&gt;[.exe]`.
+- Key-files list (:292-300) names `plugin.go`, `plugin_on_demand.go`, `plugin_env.go`, `plugin_official.go`, `plugin_store.go`.
+
+---
+
+## Where a fix would go
+
+1. `plugin_store.go:530-541` `materializeManagedEntry` — gate the `root.Symlink` branch on `runtime.GOOS != windowsGOOS` (or verify the result is usable), so Windows always gets a real copy; and either drop or fix the `root.Link` branch, which cannot succeed with an absolute `src` through `os.Root`.
+2. `plugin_store.go:548-573` `copyFileStreaming` — no size/verify check after copy; consider reusing `writeExecutableLimited` (temp + rename) for the `bin/` entry too, and comparing against `manifest.BinarySHA256`.
+3. `plugin_store.go:284-348` `ListInstalledPlugins` / `plugin_on_demand.go:145-160` `checkManagedPluginRunnable` — neither treats a Windows symlink/0-byte entry as suspect.
+4. Test gap: everything that would have caught this is `t.Skip`-ed on Windows (`plugin_store_test.go:321`, `:132`, `integration_test/plugin_remote_install_test.go:162`).</result>
+<usage><subagent_tokens>175573</subagent_tokens><tool_uses>38</tool_uses><duration_ms>708128</duration_ms></usage>
+</task-notification>
+
+---
+
+the branch we started has been merged into main, please, change our base to main and fix all the possible conflicts as they might be
+
+---
+
+create a draft PR
+
+---
+
+2 things, do we need all those comments? reduce ti minimun. is it cleaner having a file os implementation of what is different instead of doing if runtinme.GOOS == bla do bla.. ?
